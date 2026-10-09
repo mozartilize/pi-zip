@@ -11,7 +11,7 @@ import { buildBlocks, toolCallIndex } from "../src/plan.ts";
 import { A, type Any, R, U } from "./helpers.ts";
 import { branchOutputs, parseRange, recalledHandlesFromBranch, recallSections, resolveHandlesInBranch, searchOutputs, sliceRecall } from "../src/recall.ts";
 import { handleRowsOf, handleTable, INDEX_TOKENS, skeleton } from "../src/summary.ts";
-import { tokensOf } from "../src/util.ts";
+import { TOOL_FRAME_CHARS, tokensOf } from "../src/util.ts";
 
 const zipRecallName = "zip_recall";
 
@@ -694,11 +694,14 @@ describe("notices and stats", () => {
 	});
 });
 
-test("token estimate follows Pi's chars/4 rules", () => {
+test("token estimate follows Pi's chars/4 rules, plus each tool block's id and framing (what the wire carries and Pi's rule skips)", () => {
 	expect(tokensOf({ role: "user", content: "x".repeat(400) })).toBe(100);
-	expect(tokensOf({ role: "toolResult", content: [{ type: "text", text: "x".repeat(400) }, { type: "image" }] })).toBe(100 + 1200);
-	expect(tokensOf({ role: "assistant", content: [{ type: "thinking", thinking: "x".repeat(40) }, { type: "toolCall", name: "bash", arguments: { command: "ls" } }] })).toBe(Math.ceil((40 + 4 + JSON.stringify({ command: "ls" }).length) / 4));
+	const id = "toolu_01DjyfbHC97yoxCz9pDv7T6R"; // 30 chars, in the call and again in its result
+	expect(tokensOf({ role: "toolResult", toolCallId: id, content: [{ type: "text", text: "x".repeat(400) }, { type: "image" }] })).toBe(Math.ceil((400 + 4800 + 30 + TOOL_FRAME_CHARS) / 4));
+	expect(tokensOf({ role: "assistant", content: [{ type: "thinking", thinking: "x".repeat(40) }, { type: "toolCall", id, name: "bash", arguments: { command: "ls" } }] })).toBe(Math.ceil((40 + 4 + JSON.stringify({ command: "ls" }).length + 30 + TOOL_FRAME_CHARS) / 4));
+	expect(tokensOf({ role: "assistant", content: [{ type: "text", text: "x".repeat(40) }] })).toBe(10); // no tool block, no framing
 	expect(tokensOf({ role: "compactionSummary", summary: "x".repeat(80) })).toBe(20);
+	expect(tokensOf({ role: "system", content: "x".repeat(400) })).toBe(0); // part of O, never content
 });
 
 describe("/zip status after a restart", async () => {

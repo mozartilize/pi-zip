@@ -25,8 +25,15 @@ const IMAGE_CHARS = 4800;
 const contentChars = (c: Any): number =>
 	typeof c === "string" ? c.length : Array.isArray(c) ? c.reduce((a: number, b: Any) => a + (b?.type === "text" ? (b.text?.length ?? 0) : b?.type === "image" ? IMAGE_CHARS : 0), 0) : 0;
 
-/** chars/4 estimate of a message's CONTENT, same rules as Pi's estimateTokens (kept local so plan.ts has no runtime Pi dependency).
- *  A system message counts 0: the system prompt and the tools are the fixed prefix O of plan.ts, never content. */
+/** What every tool call puts on the wire that Pi's chars/4 rule does not see, in chars: the call id (in the call and again in its
+ *  result) and this much framing per block (the provider's tool-use / tool-result markup). It does not shrink when the output is
+ *  folded, so without it the size after a deep fold came out low: Tier1 fold plans that removed over half the content, median
+ *  -9.5% / -7.0% / -10.9% (Claude / GLM / GPT) -> -0.2% / -2.7% / -2.0% with 120 (research round5/affine.md section 8). */
+export const TOOL_FRAME_CHARS = 120;
+
+/** chars/4 estimate of a message's CONTENT as the wire carries it: Pi's estimateTokens rules (kept local so plan.ts has no runtime
+ *  Pi dependency) plus each tool block's id and framing (TOOL_FRAME_CHARS). A system message counts 0: the system prompt and the tools
+ *  are the fixed prefix O of plan.ts, never content. */
 export function tokensOf(m: Any): number {
 	let chars = 0;
 	switch (m?.role) {
@@ -36,8 +43,11 @@ export function tokensOf(m: Any): number {
 			for (const b of m.content ?? []) {
 				if (b?.type === "text") chars += b.text?.length ?? 0;
 				else if (b?.type === "thinking") chars += b.thinking?.length ?? 0;
-				else if (b?.type === "toolCall") chars += (b.name?.length ?? 0) + JSON.stringify(b.arguments ?? {}).length;
+				else if (b?.type === "toolCall") chars += (b.name?.length ?? 0) + JSON.stringify(b.arguments ?? {}).length + String(b.id ?? "").length + TOOL_FRAME_CHARS;
 			}
+			break;
+		case "toolResult":
+			chars = contentChars(m.content) + String(m.toolCallId ?? "").length + TOOL_FRAME_CHARS;
 			break;
 		case "bashExecution":
 			chars = (m.command?.length ?? 0) + (m.output?.length ?? 0);
