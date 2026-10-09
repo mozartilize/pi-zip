@@ -67,7 +67,11 @@ export function shortArgs(args: Any): string {
 	if (typeof args.command === "string") return clipMid(args.command, ARG_CHARS);
 	const path = typeof args.path === "string" ? args.path : typeof args.file_path === "string" ? args.file_path : null;
 	if (path !== null && typeof args.pattern !== "string") {
-		const win = ["offset", "limit"].filter((k) => typeof args[k] === "number" && Number.isFinite(args[k])).map((k) => ` ${k}=${args[k]}`).join(""); // which slice of the file
+		// which slice of the file, written the way Pi's own read row writes it: "src/a.ts:1-2000", "src/a.ts:50-"
+		const num = (k: string) => (typeof args[k] === "number" && Number.isFinite(args[k]) ? (args[k] as number) : undefined);
+		const off = num("offset"), lim = num("limit");
+		const start = off ?? 1;
+		const win = off !== undefined || lim !== undefined ? `:${start}${lim !== undefined ? `-${start + lim - 1}` : ""}` : "";
 		return clipMid(path, ARG_CHARS) + win;
 	}
 	if (typeof args.pattern === "string") return clipMid(args.pattern + (args.path ? " " + args.path : ""), ARG_CHARS);
