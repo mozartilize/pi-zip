@@ -99,11 +99,14 @@ export default function piZip(pi: ExtensionAPI) {
 		zip.welcome(ctx);
 		return r;
 	});
-	pi.on("before_agent_start", (_e, ctx) => {
+	pi.on("before_agent_start", async (e, ctx) => {
 		checkRecall(ctx);
 		zip.refreshFolded(ctx); // the branch may have changed (/tree, fork)
-		return zip.beforeAgentStart(ctx);
+		await zip.beforeAgentStart(ctx, e); // may persist a summary prepared while the user was away through Pi's compaction (Pi is idle here)
+		return undefined;
 	});
+	// answers only the compaction pi-zip itself just asked for; every other compaction (Pi's, /compact, other extensions') gets undefined
+	pi.on("session_before_compact", () => zip.sessionBeforeCompact());
 	pi.on("context_with_system", (e, ctx) => zip.context(e, ctx)); // the complete transcript: system messages stay where Pi put them
 	pi.on("turn_end", (e, ctx) => zip.turnEnd(e, ctx));
 	pi.on("agent_before_settle", (e, ctx) => zip.settle(e, ctx));

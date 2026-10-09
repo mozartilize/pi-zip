@@ -25,6 +25,41 @@ const IMAGE_CHARS = 4800;
 const contentChars = (c: Any): number =>
 	typeof c === "string" ? c.length : Array.isArray(c) ? c.reduce((a: number, b: Any) => a + (b?.type === "text" ? (b.text?.length ?? 0) : b?.type === "image" ? IMAGE_CHARS : 0), 0) : 0;
 
+/** Pi's own estimateTokens (core/compaction/compaction.js), rule for rule: no tool framing, system messages counted. Used only to predict
+ *  what Pi's compaction will decide (plan.ts piCanCompact); every pi-zip size uses tokensOf. */
+export function piTokensOf(m: Any): number {
+	let chars = 0;
+	switch (m?.role) {
+		case "system":
+			chars = contentChars(m.content);
+			for (const s of Object.values(m.sections ?? {})) if (typeof s === "string" && s) chars += s.length;
+			if (m.toolsAdded) chars += JSON.stringify(m.toolsAdded).length;
+			break;
+		case "user":
+		case "custom":
+		case "toolResult":
+			chars = contentChars(m.content);
+			break;
+		case "assistant":
+			for (const b of m.content ?? []) {
+				if (b?.type === "text") chars += b.text?.length ?? 0;
+				else if (b?.type === "thinking") chars += b.thinking?.length ?? 0;
+				else if (b?.type === "toolCall") chars += (b.name?.length ?? 0) + (JSON.stringify(b.arguments ?? {}) ?? "").length;
+			}
+			break;
+		case "bashExecution":
+			chars = (m.command?.length ?? 0) + (m.output?.length ?? 0);
+			break;
+		case "branchSummary":
+		case "compactionSummary":
+			chars = m.summary?.length ?? 0;
+			break;
+		default:
+			return 0;
+	}
+	return Math.ceil(chars / 4);
+}
+
 /** What every tool call puts on the wire that Pi's chars/4 rule does not see, in chars: the call id (in the call and again in its
  *  result) and this much framing per block (the provider's tool-use / tool-result markup). It does not shrink when the output is
  *  folded, so without it the size after a deep fold came out low: Tier1 fold plans that removed over half the content, median

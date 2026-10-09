@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { applyPlanToMessages, buildBlocks, compactionRoom, planContext, RELAX_PREV_TURN, settings, summaryGainOk, legacyValve, VALVE_MIN_REDUCTION, type Cut, type PlanOpts, type RunPlan } from "../src/plan.ts";
+import { applyPlanToMessages, buildBlocks, compactionRoom, contentKeyOf, planContext, rebaseFolds, RELAX_PREV_TURN, settings, spliceNative, summaryGainOk, legacyValve, VALVE_MIN_REDUCTION, type Cut, type FoldTarget, type PlanOpts, type RunPlan } from "../src/plan.ts";
 import { A, AX, flat, longTurn, R, U, type Any } from "./helpers.ts";
 
 const opts = (over: Partial<PlanOpts> = {}): PlanOpts => ({ coldCap: 60_000, cwd: process.cwd(), promptPending: true, ...over });
@@ -396,5 +396,32 @@ describe("age counts only assistant messages the model is sent", () => {
 		expect(ageOf("stop")).toEqual([3, 2]);
 		expect(ageOf("aborted")).toEqual([2, 2]);
 		expect(ageOf("error")).toEqual([2, 2]);
+	});
+});
+
+describe("native compaction: the run plan is made on the view before it and applied to the view after it", () => {
+	// a server that reuses tool call ids: r2 and r3 carry the same id and the same text, both in the kept part; only r3 is folded
+	const same = "same output line\n".repeat(600);
+	const pre = [U("u1", "one"), A("a1", ["c1"]), R("r1", "c1", 9000), A("a2"), U("u2", "two"), A("a3", ["c9"]), R("r2", "c9", 0, same), A("a4", ["c9"]), R("r3", "c9", 0, same), A("a5"), U("u3", "three"), A("a6")];
+	const r3 = pre[8].messages[0] as Any;
+	const fold: FoldTarget = { entryId: "r3", toolCallId: "c9", visIdx: 8, contentKey: contentKeyOf(r3.content), tool: "bash", args: "ls", entryTokens: 2500, phTokens: 50, ph: "[folded by pi-zip · bash ls · handle x]", trig: "cold" };
+	const cutVisibleIdx = 4; // u2
+	const comp = { sourceEntry: { id: "cmp", type: "compaction" }, messages: [{ role: "compactionSummary", summary: "S", tokensBefore: 0, timestamp: 0 }] };
+	const post = [comp, ...pre.slice(4)];
+	const plan = (folds: FoldTarget[]): RunPlan => ({ source: "settle", folds, cut: null, ctxBefore: 0, ctxAfter: 0, ms: 0, persisted: false });
+
+	test("renumbered folds hit their own position (summary first, then the kept part); unrenumbered ones are ambiguous and fold nothing", () => {
+		const out = applyPlanToMessages(flat(post), plan(rebaseFolds([fold], cutVisibleIdx)))!;
+		expect(out.applied).toEqual(new Set(["r3"]));
+		expect(out.messages[5].content[0].text).toBe(fold.ph); // r3: 8 - 4 + 1
+		expect(out.messages[3].content[0].text).toBe(same); // r2, the look-alike, untouched
+		expect(applyPlanToMessages(flat(post), plan([fold]))).toBeNull();
+		expect(rebaseFolds([{ ...fold, visIdx: 2 }], cutVisibleIdx)[0].visIdx).toBe(-1); // before the cut: summarised, never a position after it
+	});
+
+	test("the splice: the view before the compaction plus only what came after the compaction entry", () => {
+		const prompt = U("u4", "back");
+		expect(spliceNative(pre, [...post, prompt], "cmp")!.map((e) => e.sourceEntry.id)).toEqual([...pre.map((e) => e.sourceEntry.id), "u4"]);
+		expect(spliceNative(pre, [...pre, prompt], "cmp")).toBeNull(); // the compaction is not the head (another one came after it): no splice
 	});
 });

@@ -2,7 +2,7 @@
 import { classifyRecoverability, type Recover } from "./classify.ts";
 import { handleFor, makePlaceholderFor, pickKeyLines, RECALL_TOOL, shortArgs } from "./placeholder.ts";
 import { createHash } from "node:crypto";
-import { type Any, PRODUCT, clamp, envInt, textOf, tok4, tokensOf } from "./util.ts";
+import { type Any, PRODUCT, clamp, envInt, piTokensOf, textOf, tok4, tokensOf } from "./util.ts";
 import { PH_MARK } from "./placeholder.ts";
 import { MIN_EXPECT, type Prices } from "./learn.ts";
 
@@ -55,6 +55,56 @@ export function legacyValve(before: number, after: number, room: number | null):
 }
 
 export const PI_KEEP_RECENT = 20_000; // Pi's compaction keepRecentTokens default
+
+/** Pi's compaction keepRecentTokens for this model: compaction.modelOverrides["provider/id"], else compaction.keepRecentTokens, else 20000. */
+export function keepRecentTokensFor(settings: Any, model: Any): number {
+	const c = settings?.compaction;
+	const key = model ? `${model.provider}/${model.id}` : "";
+	for (const v of [c?.modelOverrides?.[key]?.keepRecentTokens, c?.keepRecentTokens]) if (typeof v === "number" && Number.isFinite(v) && v >= 0) return v;
+	return PI_KEEP_RECENT;
+}
+
+const CUT_POINT_ROLES = new Set(["user", "assistant", "bashExecution", "custom", "branchSummary", "compactionSummary"]);
+const TURN_START_ROLES = new Set(["user", "bashExecution", "custom", "branchSummary", "compactionSummary"]);
+
+/**
+ * Would Pi's compact() find something to compact in this projection (the branch as it is now), or throw "Nothing to compact (session
+ * too small)"? A replica of the emptiness test of Pi's prepareCompaction (core/compaction/compaction.js, not exported): Pi cuts where
+ * keepRecent of its chars/4 tokens, counted from the end, begin, at the next cut point; the conversation before that cut (or before the
+ * turn it splits) must not be empty. Pi's own extra moves of the cut (over entries without messages, past recovery omissions) never
+ * empty it. The caller checks "Already compacted" (the newest branch entry is a compaction) itself.
+ */
+export function piCanCompact(entries: Any[], keepRecent: number): boolean {
+	const msgs = (e: Any): Any[] => (Array.isArray(e?.messages) ? e.messages : []);
+	const isComp = (e: Any) => e?.sourceEntry?.type === "compaction";
+	const prev = entries.findIndex((e) => isComp(e) && msgs(e).length > 0);
+	const start = prev >= 0 ? prev + 1 : 0, end = entries.length;
+	const cuts: number[] = [];
+	for (let i = start; i < end; i++) if (!isComp(entries[i]) && msgs(entries[i]).some((m) => CUT_POINT_ROLES.has(m?.role))) cuts.push(i);
+	if (!cuts.length) return false;
+	let cut = cuts[0], acc = 0;
+	for (let i = end - 1; i >= start; i--) {
+		const t = msgs(entries[i]).reduce((a, m) => a + piTokensOf(m), 0);
+		if (!t) continue;
+		acc += t;
+		if (acc >= keepRecent) { cut = cuts.find((c) => c >= i) ?? cuts[cuts.length - 1]; break; }
+	}
+	while (cut > start && !isComp(entries[cut - 1]) && !msgs(entries[cut - 1]).length) cut--;
+	if (!entries[cut]?.sourceEntry?.id) return false;
+	const startsTurn = (e: Any) => !isComp(e) && msgs(e).some((m) => TURN_START_ROLES.has(m?.role));
+	let turn = -1;
+	if (!startsTurn(entries[cut])) for (let i = cut; i >= start; i--) if (startsTurn(entries[i])) { turn = i; break; }
+	const conversation = (from: number, to: number) => entries.slice(from, to).some((e) => !isComp(e) && msgs(e).some((m) => m?.role !== "system"));
+	return turn >= 0 ? conversation(start, turn) || conversation(turn, cut) : conversation(start, cut);
+}
+
+/** The projection a run plan would have seen without pi-zip's native compaction: `pre` (taken right before it) plus what was appended
+ *  after the compaction entry (the prompt and anything sent with it). null when that compaction is no longer the head of `now`. */
+export function spliceNative(pre: Any[], now: Any[], compactionId: string): Any[] | null {
+	if (!compactionId || now[0]?.sourceEntry?.id !== compactionId) return null;
+	const known = new Set(pre.map((e) => e?.sourceEntry?.id).filter((x) => typeof x === "string"));
+	return [...pre, ...now.slice(1).filter((e) => !known.has(e?.sourceEntry?.id))];
+}
 export const G0 = 2_500; // growth per request before the session's own EWMA has data
 
 /** What the law knows at a decision: prices (null = legacy rule), growth per request g (real tokens), P(the cache is warm). */
@@ -189,6 +239,9 @@ export function calibrate(entries: Any[], sys?: SysInfo, branch: Any[] = [], mod
 	const Snow = S >= 0 ? S : sys ? sysEst(sys) : 0;
 	const head = entries[0]?.sourceEntry?.type === "compaction" ? entries[0].sourceEntry : null;
 	const headMs = head ? Date.parse(head.timestamp) || 0 : 0;
+	// a pi-zip summary persisted as a turn_end draft was request-local first (a run plan carries it before its entry exists); one that
+	// went in through Pi's compaction before the run (details.via "native") is carried after its entry, exactly like Pi's own
+	const local = !!head && head.details?.by === PRODUCT && head.details?.via !== "native";
 	const opening = (r: { real: number; est: number } | null | undefined) => !!r && C0 * r.est <= 0.1 * r.real; // content small next to O
 
 	const fit = (want: string, transfer: boolean): Scale => {
@@ -200,9 +253,9 @@ export function calibrate(entries: Any[], sys?: SysInfo, branch: Any[] = [], mod
 		const ci = resp.findIndex((r, i) => i >= sysAt && mine(r)), cur = resp[ci]; // the first response sent with the current system prompt and tools
 		if (cur && (!head || cur.ts > headMs) && opening(cur)) ev.push({ at: ci, O: cur.real - C0 * cur.est, S, src: "first" });
 		if (head) {
-			// the summary at the head was first carried by the first response after its entry, or, for pi-zip's own summary (a run plan,
-			// request-local), by the last one before it; Pi's or another extension's compaction is never sent before its entry
-			const after = resp.findIndex((r) => r.ts > headMs), ours = head.details?.by === PRODUCT;
+			// the summary at the head was first carried by the first response after its entry, or, for pi-zip's own request-local summary
+			// (a run plan), by the last one before it; Pi's, another extension's or a native pi-zip compaction is never sent before its entry
+			const after = resp.findIndex((r) => r.ts > headMs), ours = local;
 			for (const i of after < 0 ? (ours ? [resp.length - 1] : []) : ours ? [after - 1, after] : [after]) {
 				const r = resp[i], prev = resp[i - 1];
 				if (mine(r) && r.read > 0 && r.read < 0.8 * r.real && (!prev || r.read < 0.8 * prev.real)) { ev.push({ at: i, O: r.read, S: sAt(r.nSys), src: "summary" }); break; }
@@ -223,7 +276,7 @@ export function calibrate(entries: Any[], sys?: SysInfo, branch: Any[] = [], mod
 			let p = n - 1;
 			while (p >= 0 && !mine(resp[p])) p--;
 			const P = resp[p];
-			const carried = !(cutLater && head.details?.by !== PRODUCT) && (!P || N.real < P.real || (N.read > 0 && N.read < 0.8 * P.real));
+			const carried = !(cutLater && !local) && (!P || N.real < P.real || (N.read > 0 && N.read < 0.8 * P.real));
 			if (!carried && cutLater) return { O, c: C0, real: N.real, est: 0, source: "default", oSource }; // what it carried is summarised away
 			if (!carried) for (const x of later) { const t = orig.get(x.target); if (t && t.at < N.at) estN += t.d; }
 		}
@@ -375,6 +428,7 @@ export interface RunPlan {
 	untouched?: number; // real tokens before the earliest edited block: what the first request carrying the plan can still read from the cache
 	waitMs?: number; // how long the user waited for this plan's summary (0: none, or it was ready)
 	noticed?: boolean; // its notice is already in the transcript (shown when the first request carrying it went out)
+	native?: Cut; // this run's summary went in through Pi's own compaction before the run: no request-local cut, no compaction draft
 }
 
 export interface PlanOpts {
@@ -649,6 +703,11 @@ export function collapseSystem(messages: Any[]): Any | undefined {
  * message, the summary, then the kept non-system messages. null = nothing to apply. A cut whose kept boundary cannot be
  * located is dropped (folds still apply); an inconsistent split is never sent.
  */
+/** Fold targets of a plan made on the view before a native compaction, renumbered for the request Pi builds after it: Pi's summary
+ *  message first, then the kept part (positions among the non-system messages, as in applyPlanToMessages). */
+export const rebaseFolds = (folds: FoldTarget[], cutVisibleIdx: number): FoldTarget[] =>
+	folds.map((t) => ({ ...t, visIdx: t.visIdx >= 0 && cutVisibleIdx >= 0 && t.visIdx >= cutVisibleIdx ? t.visIdx - cutVisibleIdx + 1 : -1 }));
+
 export function applyPlanToMessages(messages: Any[], plan: RunPlan | null): { messages: Any[]; droppedCut: boolean; applied: Set<string> } | null {
 	if (!plan || plan.persisted || (!plan.folds.length && !plan.cut)) return null;
 	const vis: number[] = []; // indices of the non-system messages
