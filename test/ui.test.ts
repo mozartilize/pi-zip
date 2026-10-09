@@ -184,13 +184,41 @@ describe("transcript wiring", () => {
 		expect(out).toContain("pi-zip: on");
 		expect(f.appended.filter((x: Any) => x.customType === "pi-zip/notice")).toHaveLength(0);
 	});
-	test("a tool allowlist that hides zip_recall: one reread-only line per session", async () => {
-		const { f, ctx, render } = await setup([], { getActiveTools: () => ["read", "bash"] });
+	test("a tool allowlist that hides zip_recall, read, grep and bash: one reread-only line per session", async () => {
+		const { f, ctx, render } = await setup([], { getActiveTools: () => ["edit", "write"] });
 		await f.handlers.get("session_start")({}, ctx);
 		await f.handlers.get("before_agent_start")({}, ctx);
 		const kept = f.appended.filter((x: Any) => x.customType === "pi-zip/notice");
 		expect(kept).toHaveLength(1);
 		expect(render(kept[0])[0]).toStartWith("ƶ pi-zip  reread-only  a tool allowlist hides zip_recall");
+	});
+	test("an allowlist that hides zip_recall but keeps read or bash: file recall is a full mode, one 'on' line naming the recall directory", async () => {
+		const { f, ctx, render } = await setup([], { getActiveTools: () => ["read", "bash"] });
+		ctx.sessionManager.getSessionId = () => "01a120cb-3d40-75a6-aeac-320e71967606";
+		await f.handlers.get("session_start")({}, ctx);
+		await f.handlers.get("before_agent_start")({}, ctx);
+		const kept = f.appended.filter((x: Any) => x.customType === "pi-zip/notice");
+		expect(kept).toHaveLength(1);
+		expect(render(kept[0], 200)[0]).toBe("ƶ pi-zip  on  a tool allowlist hides zip_recall · zipped outputs are read back from files in ~/.cache/pi-zip/recall");
+		// the card: on, with the unzip row; the chart rows are untouched
+		await f.handlers.get("cmd:zip").handler("status", ctx);
+		const card = render(f.appended.filter((x: Any) => x.customType === "pi-zip/notice").at(-1), 200);
+		expect(card[0]).toBe("ƶ pi-zip  on");
+		expect(card).toContain("  unzip    from files in ~/.cache/pi-zip/recall (a tool allowlist hides zip_recall)");
+		expect(card.some((l: string) => l.startsWith("  away "))).toBe(true);
+	});
+	test("a read or grep of a recall file is drawn like zip_recall's row", async () => {
+		const { default: piZip } = await import("../src/index.ts");
+		let resolver: Any = null;
+		const f = fakePi({ registerToolRenderer: (r: Any) => (resolver = r), registerEntryRenderer: () => {} });
+		piZip(f.pi);
+		const base = { renderCall: (args: Any) => ({ render: () => [`read ${args.path}`], invalidate: () => {} }) };
+		const sid = "01a120cb-3d40-75a6-aeac-320e71967606";
+		const read = resolver("read", () => base).renderCall({ path: `~/.cache/pi-zip/recall/${sid}/k3f9a0x1qz.txt`, offset: 120, limit: 40 }, th, { toolCallId: "c1" });
+		expect(read.render(80)).toEqual(["ƶ unzip k3f9a0x1qz  lines 120-159"]);
+		const grep = resolver("grep", () => base).renderCall({ pattern: "SKU-03903", path: `~/.cache/pi-zip/recall/${sid}` }, th, { toolCallId: "c2" });
+		expect(grep.render(80)).toEqual(["ƶ unzip all outputs  /SKU-03903/"]);
+		expect(resolver("read", () => base).renderCall({ path: "src/a.ts" }, th, { toolCallId: "c3" }).render(80)).toEqual(["read src/a.ts"]);
 	});
 	test("a conflicting context manager: a paused line", async () => {
 		const { f, ctx, render } = await setup([], { getAllTools: () => [{ name: "compress", sourceInfo: { path: "/x/node_modules/billion-context/index.js" } }] });

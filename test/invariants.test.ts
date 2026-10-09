@@ -887,10 +887,10 @@ describe("in-turn folds through the real extension: one user message, 60 tool ca
 		expect(r.appended.filter((x: Any) => x.customType === "pi-zip/notice").length).toBe(1); // not again at turn_end
 	});
 
-	test("zip_recall hidden by a --tools allowlist (sub-agents): only rereadable outputs fold, placeholders point at re-reading", async () => {
+	test("an allowlist that hides zip_recall, read, grep and bash: only rereadable outputs fold, placeholders point at re-reading", async () => {
 		process.env.PI_ZIP_COLD_CAP = "8000";
 		const entries = session();
-		const r = await rig(entries, COLD_TS(), {}, { getActiveTools: () => ["read", "bash"] });
+		const r = await rig(entries, COLD_TS(), {}, { getActiveTools: () => ["edit", "write"] });
 		await r.fire("session_start", {});
 		await r.fire("before_agent_start", {});
 		const req1 = await r.fire("context_with_system", { messages: flat(entries) });

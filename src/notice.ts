@@ -27,6 +27,7 @@ export interface NoticeData {
 	v: 2;
 	kind?: "state" | "card"; // absent: a fold/summary notice
 	word?: StateWord;
+	key?: string; // a state line shown once per session under this key (default: its word)
 	reason?: string;
 	card?: CardData;
 	text: string;

@@ -4,8 +4,9 @@ import type { Any } from "./util.ts";
 import { type NoticeData, registerZipCommand, renderNotice } from "./notice.ts";
 import { RECALL_TOOL } from "./placeholder.ts";
 import { registerRecallTool } from "./recall.ts";
+import { parseRecallPath } from "./recallfile.ts";
 import { NOTICE_CUSTOM, Zip } from "./run.ts";
-import { markFirstLine, measure, renderCard, renderState, setMeasure } from "./ui.ts";
+import { markFirstLine, measure, recallCallLine, renderCard, renderState, setMeasure } from "./ui.ts";
 
 export default function piZip(pi: ExtensionAPI) {
 	if (process.env.PI_ZIP_OFF === "1") return; // test only: behave exactly as if not installed (registers nothing)
@@ -59,6 +60,14 @@ export default function piZip(pi: ExtensionAPI) {
 			return {
 				...base,
 				renderCall: (args: Any, theme: Any, c: Any) => {
+					// file recall: a read or grep of a recall file (or of the session's recall directory) reads like zip_recall's row
+					const ref = toolName === "read" || toolName === "grep" ? parseRecallPath(args?.path) : null;
+					if (ref && (ref.handle || toolName === "grep")) {
+						const off = typeof args.offset === "number" ? args.offset : undefined, lim = typeof args.limit === "number" ? args.limit : undefined;
+						const range = toolName === "read" && (off !== undefined || lim !== undefined) ? `${off ?? 1}-${lim !== undefined ? (off ?? 1) + lim - 1 : ""}` : undefined;
+						const a = { handle: ref.handle, grep: toolName === "grep" && typeof args.pattern === "string" ? args.pattern : undefined, range };
+						return { render: (width: number) => recallCallLine(a, Math.max(1, width), theme, measure, (h) => zip.labelOf(h)), invalidate: () => {} };
+					}
 					const comp = base.renderCall(args, theme, c);
 					const id = c?.toolCallId;
 					if (!comp || typeof comp.render !== "function" || typeof id !== "string") return comp;
@@ -83,11 +92,15 @@ export default function piZip(pi: ExtensionAPI) {
 		/* older Pi: notices fall back to the status line */
 	}
 	// A tool allowlist (`pi --tools read,bash`, sub-agent launchers) replaces the whole selection and Pi then does not even register
-	// zip_recall; folds of outputs the model could not get back would be lost, so only rereadable outputs fold then (plan rereadOnly).
+	// zip_recall; folds of outputs the model could not get back would be lost, so only rereadable outputs fold then (plan rereadOnly)...
+	// ... unless read, grep or bash is active: then folds are as in full mode and placeholders name a recall file (recallfile.ts) that the
+	// tool_call hook below writes from the session when a tool asks for it.
 	const checkRecall = (ctx: Any) => {
 		try {
 			const active = pi.getActiveTools?.();
-			if (Array.isArray(active)) zip.setRecallOk(active.includes(RECALL_TOOL), ctx);
+			if (!Array.isArray(active)) return;
+			const tools = { read: active.includes("read"), grep: active.includes("grep"), bash: active.includes("bash") };
+			zip.setRecallMode(active.includes(RECALL_TOOL) ? "tool" : tools.read || tools.grep || tools.bash ? "file" : "reread", tools, ctx);
 		} catch {
 			/* never in the way */
 		}
@@ -111,6 +124,7 @@ export default function piZip(pi: ExtensionAPI) {
 	pi.on("turn_end", (e, ctx) => zip.turnEnd(e, ctx));
 	pi.on("agent_before_settle", (e, ctx) => zip.settle(e, ctx));
 	pi.on("before_provider_request", (e) => zip.providerRequest(e));
+	pi.on("tool_call", (e, ctx) => zip.toolCall(e, ctx)); // a recall file named by a built-in tool: this machine's copy, written on demand
 	pi.on("message_end", (e) => zip.messageEnd(e.message));
 	pi.on("session_shutdown", () => zip.shutdown());
 }

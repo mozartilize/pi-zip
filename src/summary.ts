@@ -3,6 +3,7 @@
 import { randomUUID } from "node:crypto";
 import { handleFor, outcomeHint, pickKeyLines, RECALL_TOOL, shortArgs } from "./placeholder.ts";
 import { type Block, type Cut, type PlanResult, settings, toolCallIndex } from "./plan.ts";
+import { type FileRecall, fileRecallHow } from "./recallfile.ts";
 import { type Any, clamp, clip, textOf, tok4 } from "./util.ts";
 
 export const SUMMARY_MARK = "[summary of earlier conversation by pi-zip]";
@@ -21,6 +22,8 @@ export interface HandleRow {
 }
 
 const TABLE_HEAD = "## Folded outputs (originals recallable with zip_recall; handles stay valid after later summaries or compaction)";
+/** The same heading when zip_recall is hidden and the originals are read from recall files (parseSummary keys on "## Folded outputs"). */
+const tableHead = (file?: FileRecall) => (file ? `## Folded outputs (originals in ${file.dir}/<handle>.txt; handles stay valid after later summaries or compaction)` : TABLE_HEAD);
 const TABLE_ROWS = 40;
 const tableLine = (r: HandleRow) => `- ${r.handle} · ${r.tool}${r.args ? " " + r.args : ""}${r.turn ? ` · turn ${r.turn}` : ""}${r.outcome ? ` · ${r.outcome}` : ""} · ${clip(r.hint, 90)}`;
 
@@ -28,12 +31,12 @@ const tableLine = (r: HandleRow) => `- ${r.handle} · ${r.tool}${r.args ? " " + 
  * Compact table appended to every summary so handles survive it: this prefix's rows merged with the rows of the previous summary's
  * table(s) (hints and outcomes kept), newest TABLE_ROWS rows, each handle once, and a count of the older rows left out.
  */
-export function handleTable(rows: HandleRow[], previous: string | null = null): string | null {
+export function handleTable(rows: HandleRow[], previous: string | null = null, file?: FileRecall): string | null {
 	const prev = parseSummary(previous);
 	const merged = mergeItems(prev.table.items, rows.map(tableLine), prev.table.omitted, TABLE_ROWS, Infinity, (l) => TABLE_ROW.exec(l)?.[1]);
 	if (!merged.kept.length) return null;
 	const lines = merged.omitted ? [`[… ${merged.omitted} older folded outputs omitted from this table …]`, ...merged.kept] : merged.kept;
-	return TABLE_HEAD + "\n" + lines.join("\n");
+	return tableHead(file) + "\n" + lines.join("\n");
 }
 
 /** Keep the newest `n` lines and say how many older ones were left out (never a silent drop). */
@@ -93,7 +96,7 @@ export function handleRowsOf(text: string | null): IndexRow[] {
  * Handles of the tool results the summary would otherwise lose: this prefix's results and the earlier summary's rows, newest first,
  * minus handles already written elsewhere in the summary, under a token budget. Says how many rows did not fit.
  */
-function handleIndex(now: IndexRow[], previous: string | null, listed: string, budgetTokens: number): string | null {
+function handleIndex(now: IndexRow[], previous: string | null, listed: string, budgetTokens: number, file?: FileRecall): string | null {
 	const seen = new Set<string>(listed.match(new RegExp(`\\b${H}\\b`, "g")) ?? []);
 	const rows: IndexRow[] = [];
 	for (const r of [...now].reverse().concat(handleRowsOf(previous).reverse())) {
@@ -102,7 +105,7 @@ function handleIndex(now: IndexRow[], previous: string | null, listed: string, b
 		rows.push({ ...r, args: clip(r.args, 60) });
 	}
 	if (!rows.length) return null;
-	const head = `${INDEX_HEAD} (older outputs, newest first; zip_recall with a handle returns the original)`;
+	const head = `${INDEX_HEAD} (older outputs, newest first; ${file ? `${file.dir}/<handle>.txt holds the original` : "zip_recall with a handle returns the original"})`;
 	let used = tok4(head) + 12; // 12: the "not listed" line
 	const lines: string[] = [];
 	for (const r of rows) {
@@ -321,7 +324,7 @@ const list = (title: string, m: { kept: string[]; omitted: number }, marker: str
  * merged from the previous summary `previous` (any format) and this prefix. `tableText` = the folded-outputs table the caller will
  * append, so the index does not repeat its handles.
  */
-export function skeleton(prefix: Block[], previous: string | null, tableText = ""): { text: string; users: number } {
+export function skeleton(prefix: Block[], previous: string | null, tableText = "", file?: FileRecall): { text: string; users: number } {
 	const calls = toolCallIndex(prefix);
 	const results = new Map<string, Block>();
 	for (const b of prefix) if (b.kind === "toolResult") results.set(b.msg.toolCallId, b);
@@ -378,8 +381,11 @@ export function skeleton(prefix: Block[], previous: string | null, tableText = "
 	const me = mergeItems(prev.errors.items, errors, prev.errors.omitted, BUDGET.errorLines, BUDGET.errors);
 	const out: string[] = [SUMMARY_MARK];
 	out.push(
-		`Covers ${prefix.length} earlier messages. Their tool outputs are no longer in your context but are kept exactly: the 10-character code next to a command, file or call below is its handle. ` +
-			`To use what an output said, ${RECALL_TOOL} it (grep/range for a part; grep alone searches every earlier output) rather than re-running or re-reading (results may differ). Folded blocks later in the conversation work the same way.`,
+		file
+			? `Covers ${prefix.length} earlier messages. Their tool outputs are no longer in your context but are kept exactly: the 10-character code next to a command, file or call below is its handle, and ${file.dir}/<handle>.txt holds that output. ` +
+					`To use what an output said, ${fileRecallHow(file)}${file.grep || file.bash ? ` (grep over ${file.dir} searches every earlier output)` : ""} rather than re-running or re-reading (results may differ). Folded blocks later in the conversation work the same way.`
+			: `Covers ${prefix.length} earlier messages. Their tool outputs are no longer in your context but are kept exactly: the 10-character code next to a command, file or call below is its handle. ` +
+					`To use what an output said, ${RECALL_TOOL} it (grep/range for a part; grep alone searches every earlier output) rather than re-running or re-reading (results may differ). Folded blocks later in the conversation work the same way.`,
 	);
 	out.push(USERS_HEAD);
 	if (mu.omitted) out.push(`[… ${mu.omitted} older requests omitted …]`);
@@ -388,7 +394,7 @@ export function skeleton(prefix: Block[], previous: string | null, tableText = "
 	out.push(...list("## Commands run (with exit status)", mc, "older omitted"));
 	if (mo.kept.length) out.push(...list("## Other tool calls (turn, handle)", mo, "older omitted"));
 	out.push(...list("## Errors", me, "older omitted"));
-	const index = handleIndex(now, previous, out.join("\n") + "\n" + tableText, INDEX_TOKENS);
+	const index = handleIndex(now, previous, out.join("\n") + "\n" + tableText, INDEX_TOKENS, file);
 	if (index) out.push(index);
 	const foreign = !prev.structured;
 	const narr = prev.narrative.join("\n\n");
@@ -480,12 +486,14 @@ export async function buildCut(p: PlanResult, ctx: Any, signal?: AbortSignal): P
 			const tool = call?.name ?? b.msg.toolName ?? "tool";
 			return { handle: handleFor(b.entryId!), tool, args: call ? shortArgs(call.args) : "", turn: b.userTurn, outcome: outcomeHint(textOf((b.raw ?? b.msg).content), tool, !!b.msg.isError), hint: (keys.find((k) => k.why === "error" || k.why === "id") ?? keys[0])?.text ?? "" };
 		});
-	const table = handleTable(rows, prev);
-	const sk = skeleton(prefix.filter((b) => b.kind !== "summary"), prev, table ?? "");
+	const file = p.fileRecall; // zip_recall hidden by an allowlist: the summary names the recall files instead
+	const table = handleTable(rows, prev, file);
+	const sk = skeleton(prefix.filter((b) => b.kind !== "summary"), prev, table ?? "", file);
 	const nb = clamp(p.summaryTokensPlanned - tok4(sk.text), 300, 4000);
 	const nar = await narrative(prefix, ctx, nb, signal);
 	let text = sk.text;
-	text += nar.ok && nar.text ? `\n## Narrative (model-written)\n${nar.text.slice(0, nb * 6)}` : `\n## Narrative\n(unavailable: ${nar.error ?? "n/a"}; rely on the sections above and ${RECALL_TOOL} an output by its handle rather than re-running or re-reading)`;
+	const how = file ? `read an output's file by its handle (${file.dir}/<handle>.txt)` : `${RECALL_TOOL} an output by its handle`;
+	text += nar.ok && nar.text ? `\n## Narrative (model-written)\n${nar.text.slice(0, nb * 6)}` : `\n## Narrative\n(unavailable: ${nar.error ?? "n/a"}; rely on the sections above and ${how} rather than re-running or re-reading)`;
 	if (table) text += "\n" + table;
 	return {
 		firstKeptEntryId: p.blocks[p.cutIdx!].entryId!,

@@ -2,14 +2,15 @@
 // settle preparation and the away-timer for the summary (F12).
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { appendFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 import { detectCold, lastMessageMs, lastPrompt, modelKey, resolveTtl, ttlFor } from "./cache.ts";
 import { describe, lawPrices, loadStats, pWarm, record, sample, statsPath, GAP_EDGES, type Entry } from "./learn.ts";
 import { validateEdits, repairPayload } from "./guard.ts";
 import { fmtK, Stats, noticeDesc, noticeText, type NoticeAction, type NoticeData, type ZipControl } from "./notice.ts";
 import { applyPlanToMessages, buildBlocks, calibrate, countUserTurns, G0, keepRecentTokensFor, piCanCompact, planContext, rebaseFolds, reserveTokensFor, sizeOf, spliceNative, untouchedEst, UNIT, type Block, type Cut, type FoldTarget, type Law, type PlanOpts, type PlanResult, type RunPlan, type Scale, type SysInfo } from "./plan.ts";
 import { handleFor, PH_MARK, RECALL_TOOL } from "./placeholder.ts";
-import { recalledHandlesFromBranch } from "./recall.ts";
+import { branchOutputs, recalledHandlesFromBranch, resolveHandlesInBranch } from "./recall.ts";
+import { cleanupRecall, commandNamesRecall, fileRecallFor, materialize, parseRecallPath, recallRoot, rewriteCommand, RECALL_DIR, sidDir, type FileRecall } from "./recallfile.ts";
 import { buildCut } from "./summary.ts";
 import { type Any, PRODUCT, textOf, tok4 } from "./util.ts";
 import { CHART_COLS, chartGap, fmtLife, type CardData, type StateWord } from "./ui.ts";
@@ -110,18 +111,41 @@ export class Zip implements ZipControl {
 
 	active = () => !this.off && !this.conflict;
 
-	/** zip_recall declared to the model? Checked at session start and before every run (index.ts); a `--tools` allowlist hides it. */
-	recallOk = true;
+	/** How the model gets a folded output back, checked at session start and before every run (index.ts): "tool" = zip_recall is declared;
+	 *  "file" = a `--tools` allowlist hides it but read, grep or bash is active (placeholders name a recall file, written on demand);
+	 *  "reread" = none of those either: only re-readable outputs fold. */
+	recallMode: "tool" | "file" | "reread" = "tool";
+	private recallTools = { read: false, grep: false, bash: false };
+	get recallOk(): boolean {
+		return this.recallMode === "tool";
+	}
 	/** index.ts registered the transcript renderer for NOTICE_CUSTOM (Pi versions without registerEntryRenderer fall back to a status line). */
 	entryRenderer = false;
 	private coldWhy = ""; // the expanded notice's "why now" for this run
 	private noticed = false; // a transcript notice was written in this process (the branch may not show it yet)
 	/** A summary was persisted since the last cold run start: later warm plans make none unless at the compaction room. */
 	summarizedWarm = false;
-	setRecallOk(ok: boolean, ctx?: Any) {
-		if (ok !== this.recallOk) this.ledger({ type: "recall_available", ok });
-		this.recallOk = ok;
-		if (!ok && ctx) this.stateLine(ctx, "reread-only", "a tool allowlist hides zip_recall · only re-readable outputs fold · allow zip_recall to fold more");
+	setRecallMode(mode: "tool" | "file" | "reread", tools: { read: boolean; grep: boolean; bash: boolean }, ctx?: Any) {
+		if (mode !== this.recallMode) this.ledger({ type: "recall_available", ok: mode === "tool", mode, ...tools });
+		this.recallMode = mode;
+		this.recallTools = tools;
+		if (!ctx) return;
+		if (mode === "file" && this.fileRecall(ctx)) this.stateLine(ctx, "on", `a tool allowlist hides zip_recall · zipped outputs are read back from files in ${RECALL_DIR}`, true, "on:file");
+		else if (mode !== "tool") this.stateLine(ctx, "reread-only", "a tool allowlist hides zip_recall · only re-readable outputs fold · allow zip_recall, read, grep or bash to fold more");
+	}
+	/** The recall files this session's placeholders name; undefined outside file mode (or without a session id: then only re-readable outputs fold). */
+	private fileRecall(ctx: Any): FileRecall | undefined {
+		if (this.recallMode !== "file") return undefined;
+		const sid = this.sessionId(ctx);
+		return sid ? fileRecallFor(sid, this.recallTools) : undefined;
+	}
+	private sessionId(ctx: Any): string {
+		try {
+			const sid = ctx?.sessionManager?.getSessionId?.();
+			return typeof sid === "string" ? sid : "";
+		} catch {
+			return "";
+		}
 	}
 
 	/** Folded tool outputs of the current branch by toolCallId -> handle (the transcript marks them). */
@@ -161,14 +185,14 @@ export class Zip implements ZipControl {
 	}
 
 	/** A state change as one transcript line ("ƶ pi-zip  paused  …"); each word once per session unless always. */
-	stateLine(ctx: Any, word: StateWord, reason: string, once = true) {
+	stateLine(ctx: Any, word: StateWord, reason: string, once = true, key: string = word) {
 		const text = `${PRODUCT}  ${word}  ${reason}`;
 		if (ctx?.mode !== "tui" && word !== "paused") return; // print/json/rpc (sub-agents): no transcript to keep it in
-		if (once && (this.statesShown.has(word) || this.branch(ctx).some((e: Any) => e?.type === "custom" && e.customType === NOTICE_CUSTOM && e.data?.kind === "state" && e.data?.word === word))) return;
-		this.statesShown.add(word);
+		if (once && (this.statesShown.has(key) || this.branch(ctx).some((e: Any) => e?.type === "custom" && e.customType === NOTICE_CUSTOM && e.data?.kind === "state" && (e.data?.key ?? e.data?.word) === key))) return;
+		this.statesShown.add(key);
 		this.ledger({ type: "state", word, reason });
 		// a state is not tied to this turn's edits: append now, so it sits where it happened
-		if (!this.show(ctx, { v: 2, kind: "state", word, reason, text, before: 0, after: 0, desc: "" })) this.notify(ctx, text);
+		if (!this.show(ctx, { v: 2, kind: "state", word, reason, text, before: 0, after: 0, desc: "", ...(key !== word ? { key } : {}) })) this.notify(ctx, text);
 	}
 	private statesShown = new Set<string>();
 
@@ -266,7 +290,9 @@ export class Zip implements ZipControl {
 	/** Plan options with the token scale read from the branch. */
 	private opts(ctx: Any, pending: boolean, mode: "cold" | "warm", entries: Any[], pWarm = mode === "cold" ? 0 : 1): { o: PlanOpts; cal: Scale } {
 		const cal = this.scaleOf(ctx, entries);
-		return { cal, o: { mode, scale: cal, cwd: (ctx?.cwd as string) ?? process.cwd(), recalled: this.recalled, model: ctx?.model, promptPending: pending, rereadOnly: !this.recallOk, noSummary: mode === "warm" && this.summarizedWarm, reserve: this.reserve(ctx), steerIds: this.steerIds, law: this.law(ctx, pWarm), trace: [] } };
+		const fileRecall = this.fileRecall(ctx);
+		const rereadOnly = this.recallMode === "reread" || (this.recallMode === "file" && !fileRecall);
+		return { cal, o: { mode, scale: cal, cwd: (ctx?.cwd as string) ?? process.cwd(), recalled: this.recalled, model: ctx?.model, promptPending: pending, rereadOnly, ...(fileRecall ? { fileRecall } : {}), noSummary: mode === "warm" && this.summarizedWarm, reserve: this.reserve(ctx), steerIds: this.steerIds, law: this.law(ctx, pWarm), trace: [] } };
 	}
 
 	private law(ctx: Any, pWarm: number): Law {
@@ -323,7 +349,74 @@ export class Zip implements ZipControl {
 		this.model = ctx?.model;
 		this.ttlNoticed = false;
 		this.detectConflict(ctx);
-		this.ledger({ type: "session_start", off: this.off, quiet: this.quiet, conflict: this.conflict });
+		let recallFilesRemoved = 0;
+		try {
+			recallFilesRemoved = cleanupRecall(); // recall copies older than 14 days (they can be written again from the session)
+		} catch {}
+		this.ledger({ type: "session_start", off: this.off, quiet: this.quiet, conflict: this.conflict, ...(recallFilesRemoved ? { recallFilesRemoved } : {}) });
+	}
+
+	// ---- recall through files (research pi-tricks §2) -----------------------------------------------------------------------
+	/** This machine's directory for this session's recall files. */
+	private localRecallDir(ctx: Any): string | null {
+		const sid = this.sessionId(ctx);
+		return sid ? join(recallRoot(), sidDir(sid)) : null;
+	}
+	/** Write the originals of these handles (from the current branch) if they are not on disk yet: their local paths. */
+	private materializeHandles(ctx: Any, handles: string[]): Map<string, string> {
+		const sid = this.sessionId(ctx);
+		if (!sid || !handles.length) return new Map();
+		const { items } = resolveHandlesInBranch(this.branch(ctx), handles);
+		const found = items.filter((it): it is typeof it & { text: string } => it.text !== null);
+		const out = materialize(recallRoot(), sid, found.map((it) => ({ handle: it.handle, text: it.text })));
+		this.ledger({ type: "recall_file", handles: found.map((it) => it.handle), missing: handles.length - found.length, chars: found.reduce((a, it) => a + it.text.length, 0) });
+		return out;
+	}
+	/** Every output this session's model no longer sees in full (folded, or summarised away): what a grep, ls or find over the directory needs. */
+	private materializeAll(ctx: Any): string | null {
+		const sid = this.sessionId(ctx);
+		if (!sid) return null;
+		let visible = new Set<string>();
+		try {
+			const entries = ((ctx.sessionManager.buildSessionProjection() as Any)?.entries ?? []) as Any[];
+			visible = new Set(entries.filter((pe) => pe?.sourceEntry?.type === "message" && pe.messages?.[0]?.role === "toolResult" && !textOf(pe.messages[0].content).startsWith(PH_MARK)).map((pe) => pe.sourceEntry.id));
+		} catch {}
+		const zipped = branchOutputs(this.branch(ctx)).filter((o) => o.tool !== RECALL_TOOL && !visible.has(o.entryId));
+		materialize(recallRoot(), sid, zipped.map((o) => ({ handle: o.handle, text: o.text })));
+		this.ledger({ type: "recall_file", all: true, count: zipped.length, chars: zipped.reduce((a, o) => a + o.text.length, 0) });
+		return join(recallRoot(), sidDir(sid));
+	}
+	/**
+	 * tool_call: a built-in read, grep, find or ls whose path names a recall file (or this session's recall directory), or a bash command
+	 * that does, gets this machine's copy, written now from the current branch if it is not on disk yet. Any prefix is accepted (another
+	 * machine, another user, a forked session's id): the handle is resolved against the current branch. Never blocks a call.
+	 */
+	toolCall(e: Any, ctx: Any): undefined {
+		try {
+			const input = e?.input, name = e?.toolName;
+			if (!input || typeof input !== "object") return undefined;
+			if ((name === "read" || name === "grep" || name === "find" || name === "ls") && typeof input.path === "string") {
+				const ref = parseRecallPath(input.path);
+				if (!ref) return undefined;
+				if (ref.handle) {
+					const local = this.materializeHandles(ctx, [ref.handle]).get(ref.handle);
+					if (local) input.path = local;
+				} else if (name !== "read") {
+					const dir = this.materializeAll(ctx);
+					if (dir) input.path = dir;
+				}
+			} else if (name === "bash" && typeof input.command === "string" && commandNamesRecall(input.command)) {
+				const dir = this.localRecallDir(ctx);
+				if (!dir) return undefined;
+				const r = rewriteCommand(input.command, dir);
+				if (r.dir) this.materializeAll(ctx);
+				else this.materializeHandles(ctx, r.handles);
+				input.command = r.command;
+			}
+		} catch (err) {
+			this.ledger({ type: "error", where: "tool_call", error: errText(err) });
+		}
+		return undefined;
 	}
 
 	shutdown() {
@@ -938,10 +1031,13 @@ export class Zip implements ZipControl {
 		const byId = new Map(branch.map((e: Any) => [e?.id, e]));
 		let folds = 0, summaries = 0, recalls = 0, usd = 0, key = "";
 		let last: Any = null;
+		const fileRecalls = new Set<string>(); // tool call ids of built-in reads of recall files (file recall): unzips too
 		const byModel = new Map<string, number>(); // chars/4 folded, by the model of the newest response before the fold (the one that planned it)
 		for (const e of branch) {
 			const ph = String(e?.replacement?.content?.[0]?.text ?? "");
 			if (e?.type === "message" && e.message?.role === "assistant" && (e.message.provider || e.message.model)) key = `${e.message.provider ?? ""}/${e.message.model ?? ""}`;
+			if (e?.type === "message" && e.message?.role === "assistant" && Array.isArray(e.message.content))
+				for (const c of e.message.content) if (c?.type === "toolCall" && (c.name === "bash" ? commandNamesRecall(c.arguments?.command) : ["read", "grep", "find", "ls"].includes(c.name) && !!parseRecallPath(c.arguments?.path))) fileRecalls.add(c.id);
 			if (e?.type === "context_edit" && ph.startsWith(PH_MARK)) {
 				folds++;
 				byModel.set(key, (byModel.get(key) ?? 0) + Math.max(0, textOf(byId.get(e.targetId)?.message?.content).length - ph.length) / 4);
@@ -950,7 +1046,7 @@ export class Zip implements ZipControl {
 				usd += Number(e.usage?.cost?.total) || 0;
 			} else if (e?.type === "custom" && e.customType === UNUSED_SUMMARY_CUSTOM) usd += Number(e.data?.usd) || 0;
 			else if (e?.type === "custom" && e.customType === NOTICE_CUSTOM && e.data?.v === 2 && !e.data?.kind) last = e;
-			else if (e?.type === "message" && e.message?.role === "toolResult" && e.message?.toolName === RECALL_TOOL) recalls++;
+			else if (e?.type === "message" && e.message?.role === "toolResult" && (e.message?.toolName === RECALL_TOOL || fileRecalls.has(e.message?.toolCallId))) recalls++;
 		}
 		// chars/4 of the folded text, on the provider's scale: x c of the model that folded it (folded outputs are content)
 		let folded = 0;
@@ -979,10 +1075,12 @@ export class Zip implements ZipControl {
 		const ts = t.last?.timestamp ? new Date(t.last.timestamp) : null;
 		const hhmm = ts && !Number.isNaN(ts.getTime()) ? `${String(ts.getHours()).padStart(2, "0")}:${String(ts.getMinutes()).padStart(2, "0")}  ` : "";
 		const last = t.last ? `${hhmm}${t.last.data.desc}${t.last.data.why ? " · " + t.last.data.why : ""}` : undefined;
-		const state = this.off ? "off" : this.conflict ? "paused" : this.recallOk ? "on" : "reread-only";
+		const file = this.recallMode === "file" && !!this.fileRecall(ctx);
+		const state = this.off ? "off" : this.conflict ? "paused" : this.recallMode === "tool" || file ? "on" : "reread-only"; // file recall is a full mode
 		return {
 			state, stateNote: state === "paused" ? `${this.conflict} also manages context` : state === "off" ? "/zip on to resume" : state === "reread-only" ? "a tool allowlist hides zip_recall · only re-readable outputs fold" : undefined,
 			model: key || undefined, life, measured, alive, folds: t.folds, foldedTokens: fmtK(t.folded), summaries: t.summaries, summaryUsd: t.usd, recalls: t.recalls, last, quiet: this.quiet,
+			...(file ? { unzip: `from files in ${RECALL_DIR} (a tool allowlist hides zip_recall)` } : {}),
 		};
 	}
 	status(ctx?: Any): string {
