@@ -377,7 +377,10 @@ export function skeleton(prefix: Block[], previous: string | null, tableText = "
 	const mo = mergeItems(prev.others.items, others, prev.others.omitted, BUDGET.lines, BUDGET.others);
 	const me = mergeItems(prev.errors.items, errors, prev.errors.omitted, BUDGET.errorLines, BUDGET.errors);
 	const out: string[] = [SUMMARY_MARK];
-	out.push(`Covers ${prefix.length} earlier messages. Tool outputs in the kept part of the conversation may have been folded; call zip_recall with a handle to get one back exactly.`);
+	out.push(
+		`Covers ${prefix.length} earlier messages. Their tool outputs are no longer in your context but are kept exactly: the 10-character code next to a command, file or call below is its handle. ` +
+			`To use what an output said, ${RECALL_TOOL} it (grep/range for a part; grep alone searches every earlier output) rather than re-running or re-reading (results may differ). Folded blocks later in the conversation work the same way.`,
+	);
 	out.push(USERS_HEAD);
 	if (mu.omitted) out.push(`[… ${mu.omitted} older requests omitted …]`);
 	out.push(...(userLines.length ? userLines : [NONE_ROW]));
