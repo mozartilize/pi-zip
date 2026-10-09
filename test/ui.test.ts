@@ -3,7 +3,7 @@ import { rmSync, existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { recallSections, resolveHandlesInBranch } from "../src/recall.ts";
 import { handleFor } from "../src/placeholder.ts";
-import { cardText, fmtLife, markFirstLine, recallCallLine, recallResultLines, renderCard, renderState, sparkline, type CardData } from "../src/ui.ts";
+import { cardText, fmtLife, markFirstLine, recallCallLine, recallResultLines, renderCard, renderState, type CardData } from "../src/ui.ts";
 import { fakeCtx, fakePi } from "./helpers.ts";
 
 type Any = any;
@@ -24,32 +24,30 @@ describe("state lines", () => {
 });
 
 const card: CardData = {
-	state: "on", model: "gateway-gpt/gpt-6.1-sol", cls: "explicit", life: "~1 h (learned from 42 replies)", alive: [1, 1, 1, 1, 1, 1, 1, 1, 1, 0.95, 0.9, 0.85, 0.6, 0.4, 0.1, 0],
+	state: "on", model: "gateway-gpt/gpt-6.1-sol", life: "~1 h", measured: true,
 	folds: 56, foldedTokens: "310K", summaries: 2, summaryUsd: 0.41, recalls: 3, last: "10:50  folded 12 old outputs · cache cold (away 47 min)", quiet: false,
 };
 describe("status card", () => {
-	test("labelled rows, sparkline of what the cache learner believes", () => {
-		expect(sparkline([0, 0.5, 1])).toBe("▁▅█");
+	test("labelled rows in plain words: no classes, no curves, no row that only states the default", () => {
 		expect(cardText(card)).toEqual([
-			"cache    gateway-gpt/gpt-6.1-sol · explicit · lives ~1 h (learned from 42 replies)",
-			"alive    ██████████▇▇▅▄▂▁  30 s → 2 h",
+			"cache    gateway-gpt/gpt-6.1-sol · expires after ~1 h idle (measured)",
 			"session  56 zipped ~310K  ·  2 summaries $0.41  ·  3 unzips",
 			"last     10:50  folded 12 old outputs · cache cold (away 47 min)",
-			"mode     full (zip_recall available)",
 		]);
+		expect(cardText({ ...card, life: "~5 min", measured: false })[0]).toBe("cache    gateway-gpt/gpt-6.1-sol · expires after ~5 min idle");
 		const lines = renderCard(card, 120, th);
 		expect(lines[0]).toBe("ƶ pi-zip  on");
-		expect(lines[3]).toBe("  session  56 zipped ~310K  ·  2 summaries $0.41  ·  3 unzips");
+		expect(lines[2]).toBe("  session  56 zipped ~310K  ·  2 summaries $0.41  ·  3 unzips");
 		for (const w of [10, 30, 60, 120]) expect(fits(renderCard(card, w, tag), w, plainW)).toBe(true);
 	});
 	test("reread-only and quiet show up; the session row is the only one in the text colour", () => {
 		const t = cardText({ ...card, state: "reread-only", quiet: true });
-		expect(t.at(-1)).toBe("mode     reread-only (zip_recall hidden by a tool allowlist) · notices off");
+		expect(t.at(-1)).toBe("notices  off  (/zip quiet turns them back on)");
 		const l = renderCard(card, 200, tag);
 		expect(l.filter((x) => x.includes("<text>"))).toHaveLength(1);
-		expect(renderCard({ ...card, state: "reread-only" }, 200, tag).at(-1)).toContain("<warning>");
+		expect(renderCard({ ...card, state: "reread-only", stateNote: "a tool allowlist hides zip_recall" }, 200, tag)[0]).toContain("<warning>reread-only</warning>");
 	});
-	test("fmtLife", () => expect([fmtLife(45), fmtLife(300), fmtLife(3600), fmtLife(9000)]).toEqual(["~45 s", "~5 min", "~60 min", "~2.5 h"]));
+	test("fmtLife", () => expect([fmtLife(45), fmtLife(300), fmtLife(3600), fmtLife(9000)]).toEqual(["~45 s", "~5 min", "~1 h", "~2.5 h"]));
 });
 
 describe("zip_recall row", () => {
@@ -143,7 +141,7 @@ describe("transcript wiring", () => {
 		expect(kept.map((x: Any) => x.data.kind)).toEqual(["card", "state", "state", "state"]);
 		const c = render(kept[0]);
 		expect(c[0]).toBe("ƶ pi-zip  on");
-		expect(c.join("\n")).toContain("cache    p/m · class unknown until the first reply · lives ~5 min (declared)");
+		expect(c.join("\n")).toContain("cache    p/m · expires after ~5 min idle");
 		expect(c.join("\n")).toContain("session  0 zipped ~0K");
 		expect(render(kept[1])[0]).toStartWith("ƶ pi-zip  off  Nothing is folded");
 		expect(render(kept[2])[0]).toBe("ƶ pi-zip  on  folding resumes");
