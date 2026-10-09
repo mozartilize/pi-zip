@@ -170,6 +170,33 @@ describe("transcript wiring", () => {
 		expect(render(kept[2])[0]).toBe("ƶ pi-zip  on  folding resumes");
 		expect(render(kept[3])[0]).toBe("ƶ pi-zip  quiet  per-turn notices off (folding continues)");
 	});
+	test("a notice shows the real size of the request that carried its plan once that request is answered (estimate before; errors skipped; old notices unchanged)", async () => {
+		const { default: piZip } = await import("../src/index.ts");
+		const renderers = new Map<string, Any>();
+		const f = fakePi({ registerEntryRenderer: (t: string, fn: Any) => renderers.set(t, fn), registerToolRenderer: () => {} });
+		piZip(f.pi);
+		const branch: Any[] = [];
+		let walks = 0;
+		const { ctx } = fakeCtx([], { sessionManager: { getBranch: () => (walks++, branch), getEntryCount: () => branch.length, buildSessionProjection: () => ({ entries: [] }) } });
+		await f.handlers.get("session_start")({}, ctx);
+		const t0 = Date.now();
+		const data = { v: 2, text: "x", before: 74_000, after: 43_000, desc: "zipped 12 old outputs in 6 ms", reqTs: t0 };
+		const render = (d: Any) => renderers.get("pi-zip/notice")({ id: "n1", data: d }, { expanded: false }, th).render(120)[0];
+		walks = 0;
+		expect(render(data)).toBe("ƶ zipped 12 old outputs   74K → 43K   6 ms"); // not answered yet: the estimate
+		render(data);
+		expect(walks).toBe(1); // nothing new in the session: not looked at again
+		branch.push({ type: "message", id: "a0", message: { role: "assistant", timestamp: t0 - 5, usage: { input: 1, cacheRead: 99_000, cacheWrite: 0 } } }); // an earlier request
+		branch.push({ type: "message", id: "a1", message: { role: "assistant", timestamp: t0 + 3, stopReason: "error", usage: { input: 0, cacheRead: 0, cacheWrite: 0 } } }); // failed: its retry carries the plan
+		expect(render(data)).toBe("ƶ zipped 12 old outputs   74K → 43K   6 ms");
+		branch.push({ type: "message", id: "a2", message: { role: "assistant", timestamp: t0 + 9, stopReason: "toolUse", usage: { input: 1_200, cacheRead: 38_000, cacheWrite: 1_300 } } });
+		expect(render(data)).toBe("ƶ zipped 12 old outputs   74K → 40.5K   6 ms"); // input + cacheRead + cacheWrite
+		const w = walks;
+		branch.push({ type: "message", id: "a3", message: { role: "assistant", timestamp: t0 + 20, usage: { input: 5, cacheRead: 60_000, cacheWrite: 0 } } });
+		for (let i = 0; i < 5; i++) expect(render(data)).toBe("ƶ zipped 12 old outputs   74K → 40.5K   6 ms");
+		expect(walks).toBe(w); // found once, kept
+		expect(render({ ...data, reqTs: undefined })).toBe("ƶ zipped 12 old outputs   74K → 43K   6 ms"); // a notice from before: as it was
+	});
 	test("print mode: /zip status stays plain text on stderr, nothing appended", async () => {
 		const { f, ctx } = await setup();
 		ctx.mode = "print";

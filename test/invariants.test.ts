@@ -911,6 +911,7 @@ describe("in-turn folds through the real extension: one user message, 60 tool ca
 		const early = r.appended.filter((x: Any) => x.customType === "pi-zip/notice");
 		expect(early.length).toBe(1); // before the model answered
 		expect(early[0].data.after).toBeLessThan(early[0].data.before);
+		expect(Math.abs(early[0].data.reqTs - Date.now())).toBeLessThan(1_000); // when that request went out: the renderer finds its response by it
 		await r.fire("context_with_system", { messages: flat(entries) }); // the run's second request
 		await r.fire("turn_end", turnEnd([...entries, ...tail, A("a63")], "a63", 1));
 		await sleep(5);

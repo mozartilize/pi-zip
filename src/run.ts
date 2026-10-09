@@ -173,6 +173,38 @@ export class Zip implements ZipControl {
 		}
 	}
 
+	// ---- the real size of the request that carried a plan (notices, research pi-tricks §3.4) ---------------------------------------
+	private liveCtx: Any = null; // the newest handler context: its sessionManager resolves to the current session at call time
+	private realMemo = new Map<number, { real: number } | { n: number }>();
+	/** input + cacheRead + cacheWrite of the first assistant message stamped at or after reqTs (errors and aborts skipped): the request
+	 *  that carried the plan. undefined until that response exists (the notice keeps its estimate); 0 when it reports no usage. A found
+	 *  value is kept; a miss is looked at again only when the session has grown. */
+	realSizeAfter(reqTs: number): number | undefined {
+		const memo = this.realMemo.get(reqTs);
+		if (memo && "real" in memo) return memo.real;
+		let sm: Any = null, n = -1;
+		try {
+			sm = this.liveCtx?.sessionManager;
+			n = typeof sm?.getEntryCount === "function" ? sm.getEntryCount() : -1;
+		} catch {
+			return undefined;
+		}
+		if (memo && n >= 0 && memo.n === n) return undefined;
+		let branch: Any[] = [];
+		try {
+			branch = sm?.getBranch?.() ?? [];
+		} catch {}
+		for (const e of branch) {
+			const m = e?.type === "message" ? e.message : null;
+			if (m?.role !== "assistant" || !(Number(m.timestamp) >= reqTs) || m.stopReason === "error" || m.stopReason === "aborted") continue;
+			const u = m.usage, real = u ? (Number(u.input) || 0) + (Number(u.cacheRead) || 0) + (Number(u.cacheWrite) || 0) : 0;
+			this.realMemo.set(reqTs, { real });
+			return real;
+		}
+		this.realMemo.set(reqTs, { n });
+		return undefined;
+	}
+
 	/** /zip output in the transcript (custom entry, never sent to the model). */
 	show(ctx: Any, data: NoticeData): boolean {
 		if (ctx?.mode !== "tui" || !this.entryRenderer) return false;
@@ -335,6 +367,7 @@ export class Zip implements ZipControl {
 
 	// ---- events ----------------------------------------------------------------------------------------------
 	sessionStart(ctx: Any) {
+		this.liveCtx = ctx;
 		const branch = this.branch(ctx);
 		for (let i = branch.length - 1; i >= 0; i--) {
 			const en = branch[i];
@@ -426,6 +459,7 @@ export class Zip implements ZipControl {
 	}
 
 	async beforeAgentStart(ctx: Any, e?: Any): Promise<void> {
+		this.liveCtx = ctx;
 		this.cancelTimer(); // the user is back: nothing is started behind their back any more
 		this.model = ctx?.model;
 		this.cold = false;
@@ -891,7 +925,9 @@ export class Zip implements ZipControl {
 		const ITEMS = 8;
 		const items = live.slice(0, ITEMS).map((t) => ({ label: `${t.tool}${t.args ? " " + t.args : ""}`, tokens: Math.round(c * t.entryTokens), handle: handleFor(t.entryId) }));
 		const why = valve || !this.cold ? "cache warm · worth it at this size" : this.coldWhy;
-		const data: NoticeData = { v: 2, text: noticeText(notices), before: Math.round(notices[0].tokensBefore), after: Math.round(notices[notices.length - 1].tokensAfter), desc: noticeDesc(notices), why: why || undefined, items, more: Math.max(0, live.length - ITEMS) || undefined, first: !this.noticed && !this.branch(ctx).some((en: Any) => en?.type === "custom" && en.customType === NOTICE_CUSTOM) };
+		// reqTs: a run plan is announced as its first request goes out, a valve plan at turn_end, before the next request that first carries
+		// it; either way the first assistant message stamped at or after this moment answered the request that carried the plan
+		const data: NoticeData = { v: 2, text: noticeText(notices), before: Math.round(notices[0].tokensBefore), after: Math.round(notices[notices.length - 1].tokensAfter), desc: noticeDesc(notices), why: why || undefined, items, more: Math.max(0, live.length - ITEMS) || undefined, first: !this.noticed && !this.branch(ctx).some((en: Any) => en?.type === "custom" && en.customType === NOTICE_CUSTOM), reqTs: Date.now() };
 		this.noticed = true;
 		this.notify(ctx, data.text, data);
 	}
