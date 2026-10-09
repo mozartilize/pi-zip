@@ -1,6 +1,7 @@
 // One group per invariant of design §6 (I1-I6), driven through the real extension with a fake Pi.
-import { afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
-import { rmSync } from "node:fs";
+import { afterEach, beforeAll, beforeEach, describe, expect, jest, test } from "bun:test";
+import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { repairPayload, validateEdits } from "../src/guard.ts";
 import { record } from "../src/learn.ts";
 import { buildBlocks, planContext, applyPlanToMessages, reserveTokensFor, type Block, type RunPlan } from "../src/plan.ts";
@@ -335,43 +336,106 @@ describe("F12 summary prepared while the user is away (timer at 0.8 x TTL)", () 
 			expect(st.calls).toBe(1);
 		});
 
-		test("while Pi keeps deciding warm (and refreshing), no summary; once it falls silent, the summary is prepared", async () => {
-			const st = { calls: 0 };
-			const r = await rig(done, COLD_TS(), { modelRegistry: { complete: mkComplete(st) } }, idle);
-			await settle(r);
-			const base = r.ctx.sessionManager.getBranch();
-			const refreshes: Any[] = [];
-			r.ctx.sessionManager.getBranch = () => [...base, ...refreshes];
-			for (let i = 0; i < 6; i++) { // a decision every 0.3 s, each followed by its refresh (Pi persists a cache_warm usage entry)
-				expect(await decide(r, "warm")).toBeUndefined();
-				await sleep(30);
-				refreshes.push({ type: "usage", kind: "cache_warm", timestamp: new Date().toISOString() });
-				await sleep(270);
-			}
-			expect(st.calls).toBe(0); // 1.8 s: past the warming delay and the margin, and Pi is still warming
-			await sleep(1_600); // no decision since: the last refresh was seen, the next decision was due and did not come
-			expect(st.calls).toBe(1);
-		});
+		// the timing on a fake clock (jest.useFakeTimers fakes setTimeout and Date): no real sleeps, so no slack to run out of on a busy CI
+		describe("on a fake clock", () => {
+			let ledger = "";
+			const settings = () => join(process.env.PI_CODING_AGENT_DIR!, "settings.json"); // Pi's global settings (test/setup.ts)
+			beforeEach(() => {
+				ledger = `/tmp/pi-zip-warm-clock-${process.pid}-${Math.random().toString(36).slice(2)}.jsonl`;
+				process.env.PI_ZIP_LEDGER = ledger;
+			});
+			afterEach(() => {
+				jest.useRealTimers();
+				delete process.env.PI_ZIP_LEDGER;
+				rmSync(ledger, { force: true });
+				rmSync(settings(), { force: true });
+			});
+			const rows = (type: string): Any[] => (existsSync(ledger) ? readFileSync(ledger, "utf8").trim().split("\n").map((l) => JSON.parse(l)).filter((x) => x.type === type) : []);
+			const started = () => rows("away_summary_start").length;
+			const unblocked = () => rows("away_unblocked").map((x) => x.reason);
 
-		test("a warm decision with no refresh after it (another extension answered stop): the summary is prepared after the refresh check", async () => {
-			const st = { calls: 0 };
-			const r = await rig(done, COLD_TS(), { modelRegistry: { complete: mkComplete(st) } }, idle);
-			await settle(r);
-			await decide(r, "warm");
-			await sleep(800);
-			expect(st.calls).toBe(0);
-			await sleep(800); // 1.3 s check: no cache_warm entry since the decision
-			expect(st.calls).toBe(1);
-		});
+			test("while Pi keeps deciding warm (and refreshing), no summary; once it falls silent, the summary is prepared", async () => {
+				const r = await rig(done, COLD_TS(), { modelRegistry: { complete: mkComplete({ calls: 0 }) } }, idle);
+				jest.useFakeTimers();
+				await settle(r);
+				const base = r.ctx.sessionManager.getBranch();
+				const refreshes: Any[] = [];
+				r.ctx.sessionManager.getBranch = () => [...base, ...refreshes];
+				for (let i = 0; i < 6; i++) { // a decision every 0.3 s, each followed by its refresh (Pi persists a cache_warm usage entry)
+					expect(await decide(r, "warm")).toBeUndefined();
+					jest.advanceTimersByTime(100);
+					refreshes.push({ type: "usage", kind: "cache_warm", timestamp: new Date().toISOString() });
+					jest.advanceTimersByTime(200);
+				}
+				expect([started(), unblocked()]).toEqual([0, []]); // 1.8 s: past the warming delay and the margin, and Pi is still warming
+				jest.advanceTimersByTime(900); // no decision since the last refresh (1.6 s): the next one was due at 1.8 s, the margin is 1 s
+				expect(started()).toBe(0);
+				jest.advanceTimersByTime(200);
+				expect([started(), unblocked()]).toEqual([1, ["no warming decision"]]);
+			});
 
-		test("Pi never decides (it is not warming this request after all): the summary starts just after the decision was due, not at 0.8 x TTL", async () => {
-			const st = { calls: 0 };
-			const r = await rig(done, COLD_TS(), { modelRegistry: { complete: mkComplete(st) } }, idle);
-			await settle(r);
-			await sleep(700);
-			expect(st.calls).toBe(0);
-			await sleep(900); // 0.2 s + 1 s margin
-			expect(st.calls).toBe(1);
+			test("a warm decision with no refresh after it (another extension answered stop): the summary is prepared at the refresh check", async () => {
+				const r = await rig(done, COLD_TS(), { modelRegistry: { complete: mkComplete({ calls: 0 }) } }, idle);
+				jest.useFakeTimers();
+				await settle(r);
+				await decide(r, "warm");
+				jest.advanceTimersByTime(1_250);
+				expect(started()).toBe(0);
+				jest.advanceTimersByTime(50); // the check, 10.2 s / 8 after the decision: no cache_warm entry since it
+				expect([started(), unblocked()]).toEqual([1, ["no refresh after a warm decision"]]);
+			});
+
+			test("Pi never decides (it is not warming this request after all): the summary starts just after the decision was due, not at 0.8 x TTL", async () => {
+				const r = await rig(done, COLD_TS(), { modelRegistry: { complete: mkComplete({ calls: 0 }) } }, idle);
+				jest.useFakeTimers();
+				await settle(r);
+				jest.advanceTimersByTime(1_150);
+				expect(started()).toBe(0);
+				jest.advanceTimersByTime(100); // 0.2 s + the 1 s margin
+				expect([started(), unblocked()]).toEqual([1, ["no warming decision"]]);
+			});
+
+			test("a refresh slower than the margin: Pi's next decision is expected a warming delay after the refresh finished, not after the decision", async () => {
+				const r = await rig(done, COLD_TS(), { modelRegistry: { complete: mkComplete({ calls: 0 }) } }, idle);
+				jest.useFakeTimers();
+				await settle(r);
+				const base = r.ctx.sessionManager.getBranch();
+				const refreshes: Any[] = [];
+				r.ctx.sessionManager.getBranch = () => [...base, ...refreshes];
+				for (let i = 0; i < 4; i++) {
+					await decide(r, "warm");
+					jest.advanceTimersByTime(1_200); // the refresh takes 1.2 s, more than the 1 s margin; Pi persists it as it finishes
+					refreshes.push({ type: "usage", kind: "cache_warm", timestamp: new Date().toISOString() });
+					jest.advanceTimersByTime(200); // Pi decides again one warming delay (0.2 s) after the refresh finished
+					expect([i, started(), unblocked()]).toEqual([i, 0, []]);
+				}
+				jest.advanceTimersByTime(900); // silent from now: the decision due 0.2 s after the last refresh does not come; 1 s margin
+				expect([started(), unblocked()]).toEqual([0, []]);
+				jest.advanceTimersByTime(200);
+				expect([started(), unblocked()]).toEqual([1, ["no warming decision"]]);
+			});
+
+			test("idle warming set only in the project settings (Pi reads cacheWarming from the global ones only): no decision is waited for", async () => {
+				writeFileSync(settings(), JSON.stringify({ defaultModel: "m" })); // the global settings: Pi warms during runs only
+				const r = await rig(done, COLD_TS(), { modelRegistry: { complete: mkComplete({ calls: 0 }) } }, idle); // merged: "idle"
+				jest.useFakeTimers();
+				await settle(r);
+				jest.advanceTimersByTime(8_000); // a due decision (0.2 s) and its margin (1 s) are long past; 0.8 x 10.2 s is not yet
+				expect([started(), unblocked()]).toEqual([0, []]);
+				jest.advanceTimersByTime(300);
+				expect([started(), unblocked()]).toEqual([1, []]); // the plain away timer
+			});
+
+			test("idle warming in the global settings: decisions are waited for", async () => {
+				writeFileSync(settings(), JSON.stringify({ cacheWarming: "idle" }));
+				const r = await rig(done, COLD_TS(), { modelRegistry: { complete: mkComplete({ calls: 0 }) } }, idle);
+				jest.useFakeTimers();
+				await settle(r);
+				jest.advanceTimersByTime(1_100);
+				expect(started()).toBe(0);
+				jest.advanceTimersByTime(200); // 0.2 s + 1 s: the decision did not come
+				expect([started(), unblocked()]).toEqual([1, ["no warming decision"]]);
+			});
 		});
 
 		test("without idle warming a decision changes nothing (no summary waits for one)", async () => {
@@ -387,13 +451,14 @@ describe("F12 summary prepared while the user is away (timer at 0.8 x TTL)", () 
 	// ---- the prepared summary goes in through Pi's own compaction (pi-tricks §1b, variant 1) -------------------------------
 	/** The cold return as Pi runs it: before_agent_start sees the session WITHOUT the prompt (Pi appends it after the hook), then the
 	 *  first request. `pi` fakes Pi's side: ctx.compact (asks session_before_compact, appends the entry, projects it), isIdle, settings. */
-	const comeBackNative = async (r: Any, settled: Any, o: { idle?: boolean; compact?: "ok" | "error" | "none"; tail?: Any[] } = {}) => {
+	const comeBackNative = async (r: Any, settled: Any, o: { idle?: boolean; compact?: "ok" | "error" | "none"; abort?: boolean; tail?: Any[] } = {}) => {
 		const st = { compactCalls: 0, answer: undefined as Any };
 		let branch: Any[] = [...branchOf(done, COLD_TS()), ...(settled?.entries?.length ? [settled.entries.at(-1)] : []), ...(o.tail ?? [])];
 		let comp: Any = null;
 		r.ctx.sessionManager.getBranch = () => branch;
 		r.ctx.sessionManager.buildSessionProjection = () => ({ entries: done });
 		r.ctx.isIdle = () => o.idle !== false;
+		if (o.abort !== false) r.ctx.abort = () => {}; // Pi's ctx.abort (it cancels a pending compaction)
 		if (o.compact !== "none") {
 			r.ctx.compact = (opts: Any) => {
 				st.compactCalls++;
@@ -446,6 +511,7 @@ describe("F12 summary prepared while the user is away (timer at 0.8 x TTL)", () 
 			["already compacted", { tail: [foreignComp] }, {}],
 			["nothing to compact", {}, { getSettings: () => ({ compaction: { keepRecentTokens: 10_000_000 } }) }],
 			["no ctx.compact (older Pi)", { compact: "none" }, {}],
+			["no ctx.abort (nothing could cancel a compaction another handler holds up)", { abort: false }, {}],
 			["compaction failed", { compact: "error" }, {}],
 		];
 		for (const [name, o, piExtra] of cases) {
@@ -793,6 +859,34 @@ describe("I6 / F10 warm cache: nothing changes unless the context passes the val
 		const te = await first.fire("turn_end", turnEnd([...entries, A("zN")], "zN"));
 		expect(te.entries.filter((e: Any) => e.type === "context_edit").length).toBe(79);
 		expect(first.notes[0]).toMatch(/^pi-zip  zipped \d+ old outputs  [\d.]+K → [\d.]+K  [\d.]+ m?s$/);
+	});
+
+	test("a warm plan committed at a run's last turn_end, then a cold return: its notice keeps the estimate (the next response answers a later run)", async () => {
+		const renderers = new Map<string, Any>();
+		const big = session(80);
+		const r = await rig(session(3), WARM_TS(), { model: model(undefined) }, { registerEntryRenderer: (t: string, fn: Any) => renderers.set(t, fn) });
+		await r.fire("before_agent_start", {});
+		expect(await r.fire("context_with_system", { messages: flat(session(3)) })).toBeUndefined();
+		const te = await r.fire("turn_end", turnEnd([...big, A("zN")], "zN")); // the run's last turn: no request of this run carries the plan
+		expect(te.entries.some((e: Any) => e.type === "context_edit")).toBe(true);
+		await sleep(5);
+		const notice = r.appended.filter((x: Any) => x.customType === "pi-zip/notice").at(-1);
+		const reqTs = notice.data.reqTs as number;
+		expect(typeof reqTs).toBe("number");
+		const th = { fg: (_c: string, t: string) => t };
+		const render = (d: Any) => renderers.get("pi-zip/notice")({ id: "nv", data: d }, { expanded: false }, th).render(200)[0];
+		const estimate = render({ ...notice.data, reqTs: undefined });
+		// the next run: the user comes back after the TTL; its first response (after its own cold plan, or Pi's compaction) is much smaller
+		const prompt = { type: "message", id: "u-back", message: { role: "user", content: "back", timestamp: reqTs + 600_000 } };
+		const reply = { type: "message", id: "a-back", message: { role: "assistant", timestamp: reqTs + 601_000, stopReason: "stop", usage: { input: 900, cacheRead: 0, cacheWrite: 7_000 } } };
+		let branch: Any[] = [...branchOf(big, reqTs - 50), ...te.entries, notice, prompt, reply];
+		r.ctx.sessionManager.getBranch = () => branch;
+		r.ctx.sessionManager.getEntryCount = () => branch.length;
+		expect(render(notice.data)).toBe(estimate);
+		expect(render(notice.data)).not.toContain("7.9K");
+		// the same reply without a later prompt before it would be this plan's own (the next request of the same run): its real size
+		branch = branch.filter((e) => e !== prompt);
+		expect(render({ ...notice.data, reqTs: reqTs + 1 })).toContain("→ 7.9K");
 	});
 });
 

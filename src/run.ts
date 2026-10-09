@@ -1,18 +1,18 @@
 // The per-session state machine behind index.ts: cold detection, the run plan (F8), the warm valve (F10), persistence at turn_end,
 // settle preparation and the away-timer for the summary (F12).
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { appendFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { detectCold, lastMessageMs, lastPrompt, modelKey, payloadRetention, resolveTtl, ttlFor } from "./cache.ts";
-import { describe, lawPrices, loadStats, pWarm, record, sample, statsPath, GAP_EDGES, type Entry } from "./learn.ts";
+import { agentDir, describe, lawPrices, loadStats, pWarm, record, sample, statsPath, GAP_EDGES, type Entry } from "./learn.ts";
 import { validateEdits, repairPayload } from "./guard.ts";
 import { fmtK, Stats, noticeDesc, noticeText, type NoticeAction, type NoticeData, type ZipControl } from "./notice.ts";
 import { applyPlanToMessages, buildBlocks, calibrate, countUserTurns, G0, keepRecentTokensFor, piCanCompact, planContext, rebaseFolds, reserveTokensFor, sizeOf, spliceNative, untouchedEst, UNIT, type Block, type Cut, type FoldTarget, type Law, type PlanOpts, type PlanResult, type RunPlan, type Scale, type SysInfo } from "./plan.ts";
 import { handleFor, PH_MARK, RECALL_TOOL } from "./placeholder.ts";
 import { branchOutputs, recalledHandlesFromBranch, resolveHandlesInBranch } from "./recall.ts";
-import { cleanupRecall, commandNamesRecall, fileRecallFor, materialize, parseRecallPath, recallRoot, rewriteCommand, RECALL_DIR, sidDir, type FileRecall } from "./recallfile.ts";
+import { cleanupRecall, commandNamesRecall, fileRecallFor, materialize, parseRecallPath, recallRoot, recallRootShown, rewriteCommand, sidDir, type FileRecall } from "./recallfile.ts";
 import { buildCut } from "./summary.ts";
-import { type Any, PRODUCT, textOf, tok4 } from "./util.ts";
+import { type Any, envInt, PRODUCT, textOf, tok4 } from "./util.ts";
 import { CHART_COLS, chartGap, fmtLife, type CardData, type StateWord } from "./ui.ts";
 
 export const PLAN_CUSTOM = "pi-zip/plan";
@@ -60,9 +60,16 @@ function waitFor<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T | null
 }
 
 const errText = (err: unknown) => (err instanceof Error ? (err.stack ?? err.message) : String(err));
+/** A compaction another extension supplied (through session_before_compact): not Pi's own summary, not pi-zip's. */
+const foreignCompaction = (e: Any): boolean => e?.type === "compaction" && !!e.fromHook && e.details?.by !== PRODUCT;
 
-/** How long pi-zip waits for Pi to report its own compaction (it takes milliseconds: the summary is ready); a safety net only. */
-const NATIVE_TIMEOUT_MS = 30_000;
+/** pi-zip's own compaction takes milliseconds: the summary is done. Pi runs every extension's session_before_compact handler for it, so
+ *  one that is not finished by this deadline has another handler at work (writing its own summary, say): pi-zip cancels it then, so it
+ *  can never land during the run, and the draft path takes the summary. */
+const nativeDeadlineMs = () => envInt("NATIVE_MS", 2_000);
+/** A compaction slower than this (or half the deadline) had another handler at work too: the native path ends for the process, so its
+ *  work (a model call, say) is not paid for, and waited for, at every cold return. */
+const NATIVE_SLOW_MS = 250;
 
 /** The prompt Pi appends right after before_agent_start, as a projected entry without an id: the plan made before it counts its size. */
 function pendingPrompt(e: Any): Any | null {
@@ -110,7 +117,13 @@ export class Zip implements ZipControl {
 	private pending: { gapS: number; expect: number; edited: boolean; key: string } | null = null;
 	private justEdited = false; // the newest response answered a request that first carried an edit: the next request gets no warm edit
 	// pi-zip's own ctx.compact() in flight: the only compaction session_before_compact answers (compaction null = cancel a late ask)
-	private nativeAsk: { compaction: Any | null; answered: boolean; until: number } | null = null;
+	private nativeAsk: { compaction: Any | null; answered: boolean; askedAt: number; until: number } | null = null;
+	// the native path ended for this process, and why: another extension took part in pi-zip's compaction (answered, cancelled or
+	// replaced it, or took its time), or Pi's compaction failed. Summaries then ride along with the first request (the draft path).
+	private nativeOff: string | null = null;
+	// this run's return went in through another extension's compaction (it answered pi-zip's): the run plan adds no summary on top of
+	// it (folds only, a summary only at Pi's compaction room), and the summary prepared for the context it replaced is discarded
+	private foreignRun = false;
 	// this run's away summary went in through Pi's compaction before the run: the projection just before it, for the run plan (I1)
 	private nativeRun: { key: string; cut: Cut; before: number; after: number; pre: Any[]; entryId: string } | null = null;
 	// the cache tier (PI_CACHE_RETENTION) of the current model's requests: the payload of its newest request when seen, else the
@@ -140,14 +153,24 @@ export class Zip implements ZipControl {
 		this.recallMode = mode;
 		this.recallTools = tools;
 		if (!ctx) return;
-		if (mode === "file" && this.fileRecall(ctx)) this.stateLine(ctx, "on", `a tool allowlist hides zip_recall · zipped outputs are read back from files in ${RECALL_DIR}`, true, "on:file");
+		if (mode === "file" && this.fileRecall(ctx)) this.stateLine(ctx, "on", `a tool allowlist hides zip_recall · zipped outputs are read back from files in ${recallRootShown()}`, true, "on:file");
+		else if (mode === "file") this.stateLine(ctx, "reread-only", "a tool allowlist hides zip_recall · only re-readable outputs fold · no session file (--no-session), so no recall copies are written either", true, "reread-only:no-session");
 		else if (mode !== "tool") this.stateLine(ctx, "reread-only", "a tool allowlist hides zip_recall · only re-readable outputs fold · allow zip_recall, read, grep or bash to fold more");
 	}
-	/** The recall files this session's placeholders name; undefined outside file mode (or without a session id: then only re-readable outputs fold). */
+	/** The recall files this session's placeholders name; undefined outside file mode, and without a session file (`--no-session`: the
+	 *  outputs are in no file, so none is written for them either): then only re-readable outputs fold. */
 	private fileRecall(ctx: Any): FileRecall | undefined {
 		if (this.recallMode !== "file") return undefined;
-		const sid = this.sessionId(ctx);
+		const sid = this.recallSid(ctx);
 		return sid ? fileRecallFor(sid, this.recallTools) : undefined;
+	}
+	/** The session id recall copies are written under: none without a session file (`pi --no-session` keeps the session in memory). */
+	private recallSid(ctx: Any): string {
+		try {
+			return typeof ctx?.sessionManager?.getSessionFile?.() === "string" ? this.sessionId(ctx) : "";
+		} catch {
+			return "";
+		}
 	}
 	private sessionId(ctx: Any): string {
 		try {
@@ -185,10 +208,12 @@ export class Zip implements ZipControl {
 
 	// ---- the real size of the request that carried a plan (notices, research pi-tricks §3.4) ---------------------------------------
 	private liveCtx: Any = null; // the newest handler context: its sessionManager resolves to the current session at call time
-	private realMemo = new Map<number, { real: number } | { n: number }>();
+	private realMemo = new Map<number, { real: number | undefined } | { n: number }>();
 	/** input + cacheRead + cacheWrite of the first assistant message stamped at or after reqTs (errors and aborts skipped): the request
-	 *  that carried the plan. undefined until that response exists (the notice keeps its estimate); 0 when it reports no usage. A found
-	 *  value is kept; a miss is looked at again only when the session has grown. */
+	 *  that carried the plan. undefined until that response exists (the notice keeps its estimate); 0 when it reports no usage. A user
+	 *  message stamped after reqTs before it ends the search for good: what follows answers a later run (a valve plan committed at a run's
+	 *  last turn_end, a plan whose request failed), so the estimate stays. The run's own prompt is stamped before reqTs (its millisecond at
+	 *  the latest). A found value is kept; a miss is looked at again only when the session has grown. */
 	realSizeAfter(reqTs: number): number | undefined {
 		const memo = this.realMemo.get(reqTs);
 		if (memo && "real" in memo) return memo.real;
@@ -206,6 +231,10 @@ export class Zip implements ZipControl {
 		} catch {}
 		for (const e of branch) {
 			const m = e?.type === "message" ? e.message : null;
+			if (m?.role === "user" && Number(m.timestamp) > reqTs) {
+				this.realMemo.set(reqTs, { real: undefined }); // a later prompt came first: no response can be this plan's any more
+				return undefined;
+			}
 			if (m?.role !== "assistant" || !(Number(m.timestamp) >= reqTs) || m.stopReason === "error" || m.stopReason === "aborted") continue;
 			const u = m.usage, real = u ? (Number(u.input) || 0) + (Number(u.cacheRead) || 0) + (Number(u.cacheWrite) || 0) : 0;
 			this.realMemo.set(reqTs, { real });
@@ -391,7 +420,7 @@ export class Zip implements ZipControl {
 			if (e.type === "context_edit" && e.replacement != null) {
 				const text = textOf(e.replacement.content);
 				if (!text.startsWith(PH_MARK)) rec = { kind: "context_edit", targetId: e.targetId ?? null, chars: text.length, head: text.slice(0, 60) };
-			} else if (e.type === "compaction" && e.fromHook && e.details?.by !== PRODUCT) rec = { kind: "compaction", by: e.details?.by ?? null, firstKeptEntryId: e.firstKeptEntryId ?? null, chars: String(e.summary ?? "").length };
+			} else if (foreignCompaction(e)) rec = { kind: "compaction", by: e.details?.by ?? null, firstKeptEntryId: e.firstKeptEntryId ?? null, chars: String(e.summary ?? "").length };
 			if (!rec) continue;
 			this.foreignSeen.add(e.id);
 			this.ledger({ type: "foreign_edit", where, id: e.id, ...rec });
@@ -443,12 +472,12 @@ export class Zip implements ZipControl {
 	// ---- recall through files (research pi-tricks §2) -----------------------------------------------------------------------
 	/** This machine's directory for this session's recall files. */
 	private localRecallDir(ctx: Any): string | null {
-		const sid = this.sessionId(ctx);
+		const sid = this.recallSid(ctx);
 		return sid ? join(recallRoot(), sidDir(sid)) : null;
 	}
-	/** Write the originals of these handles (from the current branch) if they are not on disk yet: their local paths. */
+	/** Write the originals of these handles (from the current branch) if they are not on disk as they are: their local paths. */
 	private materializeHandles(ctx: Any, handles: string[]): Map<string, string> {
-		const sid = this.sessionId(ctx);
+		const sid = this.recallSid(ctx);
 		if (!sid || !handles.length) return new Map();
 		const { items } = resolveHandlesInBranch(this.branch(ctx), handles);
 		const found = items.filter((it): it is typeof it & { text: string } => it.text !== null);
@@ -458,7 +487,7 @@ export class Zip implements ZipControl {
 	}
 	/** Every output this session's model no longer sees in full (folded, or summarised away): what a grep, ls or find over the directory needs. */
 	private materializeAll(ctx: Any): string | null {
-		const sid = this.sessionId(ctx);
+		const sid = this.recallSid(ctx);
 		if (!sid) return null;
 		let visible = new Set<string>();
 		try {
@@ -519,6 +548,7 @@ export class Zip implements ZipControl {
 		this.runEdits = false;
 		this.runPlan = null;
 		this.nativeRun = null;
+		this.foreignRun = false;
 		this.settleIds = [];
 		this.bgWaitMs = 0;
 		this.wireLedgered = false;
@@ -560,25 +590,42 @@ export class Zip implements ZipControl {
 			try {
 				await this.nativeSummary(ctx, e);
 			} catch (err) {
-				this.nativeAsk = null;
+				const a = this.nativeAsk;
+				if (a && !a.answered) a.compaction = null; // a late ask of pi-zip's compaction is cancelled, never left to Pi's own summary
 				this.ledger({ type: "error", where: "native_summary", error: errText(err) });
 			}
 		}
 	}
 
 	/** session_before_compact: answers ONLY the compaction pi-zip itself asked for a moment ago (nativeAsk): its own summary and its own
-	 *  tokensBefore. Pi's threshold and overflow compactions, /compact and other extensions' compactions get undefined and run untouched. */
-	sessionBeforeCompact(): Any {
+	 *  tokensBefore. Pi's threshold and overflow compactions, /compact and other extensions' compactions get undefined and run untouched.
+	 *  Once pi-zip has given up on its compaction (compaction null), a late ask of it is cancelled, never one with a live signal: that is
+	 *  another compaction (pi-zip's own was aborted). */
+	sessionBeforeCompact(e?: Any): Any {
 		const a = this.nativeAsk;
 		if (!a || a.answered || Date.now() > a.until) return undefined;
+		if (e?.reason !== undefined && e.reason !== "manual") return undefined; // ctx.compact() is a manual compaction
+		if (!a.compaction && e?.signal && e.signal.aborted !== true) return undefined;
 		a.answered = true;
+		a.askedAt = performance.now();
 		return a.compaction ? { compaction: a.compaction } : { cancel: true };
+	}
+
+	/** The native path ends for the rest of the process (logged once): from now on summaries ride along with the first request. */
+	private endNative(reason: string) {
+		if (this.nativeOff) return;
+		this.nativeOff = reason;
+		this.ledger({ type: "native_off", reason });
 	}
 
 	/** Why Pi's own compaction cannot take this summary now (null: it can). Each reason keeps today's path: the run plan carries the summary
 	 *  request-locally and turn_end persists it as a draft. */
 	private nativeGate(ctx: Any, branch: Any[], pre: Any[]): string | null {
+		if (this.nativeOff) return "off for this process";
 		if (typeof ctx?.compact !== "function") return "no ctx.compact";
+		if (typeof ctx?.abort !== "function") return "no ctx.abort"; // what cancels a compaction another handler holds up
+		// another extension supplies compactions in this session: its session_before_compact handler would run for pi-zip's too
+		if (branch.some(foreignCompaction)) return "another extension's compaction is in this branch";
 		let idle = false;
 		try {
 			idle = ctx.isIdle?.() === true; // compact() aborts whatever runs first: only ever called while Pi is idle (it is, here, in 1.1.0)
@@ -599,6 +646,9 @@ export class Zip implements ZipControl {
 	 * "before", provider scale), so Pi's "[compaction] Compacted from N tokens" shows that number. It takes milliseconds: the summary is
 	 * done. The run plan is then made on the projection as it was before the compaction, so the run's first request carries the same
 	 * bytes as the draft path would have sent; any gate that fails keeps the draft path.
+	 * Pi runs every extension's session_before_compact handler for it (the last answer wins, a cancel stops it): unless pi-zip's own
+	 * entry is the one that went in, fast, the native path ends for the process (endNative). A compaction not finished by the deadline
+	 * is cancelled first, and a summary prepared for a context another extension's compaction has replaced is discarded, never adopted.
 	 */
 	private async nativeSummary(ctx: Any, e: Any): Promise<void> {
 		const b = this.bg;
@@ -619,28 +669,61 @@ export class Zip implements ZipControl {
 		if (gate) return skip(gate);
 		const before = Math.round(p.ctxTokens);
 		const compaction = { summary: cut.text, firstKeptEntryId: cut.firstKeptEntryId, tokensBefore: before, details: { by: PRODUCT, via: "native", trigger: cut.trigger }, usage: cut.usage };
-		this.nativeAsk = { compaction, answered: false, until: Infinity };
-		const t0 = performance.now();
-		const res = await new Promise<{ ok: boolean; err?: string }>((resolve) => {
-			const timer = setTimeout(() => resolve({ ok: false, err: "timeout" }), NATIVE_TIMEOUT_MS);
+		const known = new Set(branch.map((en: Any) => en?.id));
+		const ask = { compaction: compaction as Any | null, answered: false, askedAt: 0, until: Infinity };
+		this.nativeAsk = ask;
+		const deadline = nativeDeadlineMs(), t0 = performance.now();
+		const res = await new Promise<{ ok: boolean; err?: string; late?: boolean }>((resolve) => {
+			let settled = false;
+			const finish = (r: { ok: boolean; err?: string; late?: boolean }) => {
+				if (settled) return;
+				settled = true;
+				clearTimeout(timer);
+				resolve(r);
+			};
+			const timer = setTimeout(() => {
+				if (!ask.answered) ask.compaction = null; // asked after this, pi-zip cancels: never Pi's own summary on pi-zip's behalf
+				ask.until = Date.now() + 60_000;
+				finish({ ok: false, late: true });
+			}, deadline);
 			timer.unref?.();
-			const done = (r: { ok: boolean; err?: string }) => (clearTimeout(timer), resolve(r));
+			const done = (r: { ok: boolean; err?: string }) => {
+				if (this.nativeAsk === ask) this.nativeAsk = null; // pi-zip's compaction is over: nothing is answered for it any more
+				finish(r);
+			};
 			try {
 				ctx.compact({ onComplete: () => done({ ok: true }), onError: (err: Any) => done({ ok: false, err: err instanceof Error ? err.message : String(err) }) });
 			} catch (err) {
 				done({ ok: false, err: errText(err) });
 			}
 		});
-		const answered = !!this.nativeAsk?.answered;
-		// a timeout before Pi asked: if it asks later after all, that compaction is cancelled (never Pi's own summary on pi-zip's behalf)
-		this.nativeAsk = res.err === "timeout" && !answered ? { compaction: null, answered: false, until: Date.now() + 60_000 } : null;
-		const ms = Math.round(performance.now() - t0);
-		const after = this.branch(ctx);
-		let entry: Any = null;
-		for (let i = after.length - 1; i >= 0 && !entry; i--) if (after[i]?.type === "compaction" && after[i].details?.via === "native" && after[i].summary === cut.text) entry = after[i];
+		const ms = Math.round(performance.now() - t0), askMs = ask.askedAt ? Math.round(ask.askedAt - t0) : null;
+		// what went in: compactions added since the call (pi-zip's is the one carrying its summary; Pi keeps the last handler's answer)
+		const added = this.branch(ctx).filter((en: Any) => en?.type === "compaction" && !known.has(en?.id));
+		const last = added[added.length - 1] ?? null;
+		const entry = last && last.summary === cut.text ? last : null;
+		// still pending at the deadline: cancel it now, before the run starts (Pi checks its abort signal right before it appends)
+		if (res.late && !last) {
+			try {
+				ctx.abort?.();
+			} catch {}
+		}
+		const off = entry
+			? added.length > 1 ? "another compaction went in as well" : res.late || ms > Math.min(NATIVE_SLOW_MS, deadline / 2) ? `Pi's compaction took ${ms} ms: another session_before_compact handler at work` : null
+			: last ? "another extension's compaction went in instead of pi-zip's"
+			: res.late ? (ask.answered ? `Pi's compaction was not done ${deadline} ms after pi-zip answered (cancelled)` : `another session_before_compact handler ran before pi-zip's (cancelled after ${deadline} ms)`)
+			: `Pi's compaction failed: ${res.err ?? "no compaction entry"}`;
+		if (off) this.endNative(off);
 		if (!entry?.id) {
-			this.ledger({ type: "native_fail", ms, answered, error: res.err ?? "no compaction entry" });
-			return; // the draft path: the run plan adopts the prepared summary as before
+			this.ledger({ type: "native_fail", ms, askMs, answered: ask.answered, error: res.late ? "deadline" : (res.err ?? "no compaction entry"), foreign: !!last });
+			if (last) {
+				// another extension's compaction replaced the context this summary was written for: adopting it, or writing a new one on
+				// top of it, would summarise twice. It is this stretch's summary (summarizedWarm, as after a pi-zip summary).
+				this.discardBg();
+				this.foreignRun = true;
+				this.summarizedWarm = true;
+			}
+			return; // nothing went in: the draft path, the run plan adopts the prepared summary as before
 		}
 		this.bg = null; // adopted by Pi's compaction
 		this.summarizedWarm = true; // one summary per warm stretch, as for a draft (commit)
@@ -653,7 +736,7 @@ export class Zip implements ZipControl {
 		s.summaryUsd += cut.costUsd;
 		s.activeSaved += cutSaved;
 		s.writeSavedTokens += cutSaved;
-		this.ledger({ type: "summary", via: "native", trigger: cut.trigger, source: "settle", count: cut.count, tokensBefore: before, prefixTokens: Math.round(p.scale.c * cut.prefixTokens), summaryTokens: Math.round(p.scale.c * cut.summaryTokens), ms: cut.ms, compactMs: ms, waitedMs: 0, llmOk: cut.llmOk, llmError: cut.llmError, costUsd: cut.costUsd, ...this.usageOf(cut) });
+		this.ledger({ type: "summary", via: "native", trigger: cut.trigger, source: "settle", count: cut.count, tokensBefore: before, prefixTokens: Math.round(p.scale.c * cut.prefixTokens), summaryTokens: Math.round(p.scale.c * cut.summaryTokens), ms: cut.ms, compactMs: ms, askMs, waitedMs: 0, llmOk: cut.llmOk, llmError: cut.llmError, costUsd: cut.costUsd, ...this.usageOf(cut) });
 	}
 
 	private cancelTimer() {
@@ -751,8 +834,9 @@ export class Zip implements ZipControl {
 		// a summary that went in through Pi's compaction before the run (nativeSummary): plan on the projection as it was right before
 		// it, plus what came after, so folds, scale and placeholders are exactly what the draft path computes (the run's first request
 		// carries the same bytes); the request Pi builds already starts with the summary
-		const nat = this.nativeRun;
+		const nat = this.nativeRun, foreign = this.foreignRun;
 		this.nativeRun = null;
+		this.foreignRun = false;
 		const spliced = nat ? spliceNative(nat.pre, now, nat.entryId) : null;
 		if (!this.cold && this.justEdited) { // no warm edit on the request right after an edited one (no back-to-back warm rewrites)
 			this.ledger({ type: "b2b_skip", where: "run" });
@@ -762,6 +846,7 @@ export class Zip implements ZipControl {
 		const plan = (entries: Any[]) => {
 			const { o, cal } = this.opts(ctx, false, this.cold ? "cold" : "warm", entries, this.pWarm);
 			o.pastTtl = this.pastTtl;
+			if (foreign) o.noSummary = true; // another extension's compaction just went in: folds only (a summary only at Pi's compaction room)
 			return { o, cal, p: planContext(entries, o) };
 		};
 		let { o, cal, p } = plan(spliced ?? now);
@@ -896,12 +981,20 @@ export class Zip implements ZipControl {
 
 	// ---- Pi's own idle cache warming (research pi-tricks §3.3): observed, never answered ----------------------------------------
 	private awayPlan: { p: PlanResult; ctx: Any } | null = null; // a summary waiting for Pi's warming decision
-	/** Does Pi refresh the cache between runs by itself? (settings cacheWarming "idle"; the default "streaming" warms only during a run) */
+	/** Does Pi refresh the cache between runs by itself? (settings cacheWarming "idle"; the default "streaming" warms only during a run)
+	 *  Pi reads it from the global settings only (settings-manager getCacheWarmingMode: warming costs money), so a project-level "idle"
+	 *  in the merged settings warms nothing: the global file decides; only when it cannot be read do the merged settings. */
 	private idleWarming(): boolean {
 		try {
-			return this.pi.getSettings?.()?.cacheWarming === "idle";
+			if (this.pi.getSettings?.()?.cacheWarming !== "idle") return false;
 		} catch {
 			return false;
+		}
+		try {
+			const global = JSON.parse(readFileSync(join(agentDir(), "settings.json"), "utf8"));
+			return global?.cacheWarming === "idle";
+		} catch {
+			return true;
 		}
 	}
 	private startAway(reason: string) {
@@ -932,8 +1025,11 @@ export class Zip implements ZipControl {
 		this.ledger({ type: "away_postponed", reason: "Pi warms the cache" });
 		this.armAway(warmCheckMs(ttl), () => {
 			this.awayPlan = a;
-			if (!this.branch(a.ctx).some((en: Any) => en?.type === "usage" && en.kind === "cache_warm" && Date.parse(en.timestamp) >= t)) return this.startAway("no refresh after a warm decision");
-			this.armAway(t + (warmingDelayMs(ttl) ?? ttl) + warmingMargin(ttl) - Date.now(), () => {
+			let done = NaN; // when the refresh finished: its cache_warm entry is appended right before Pi schedules the next decision
+			for (const en of this.branch(a.ctx)) if (en?.type === "usage" && en.kind === "cache_warm" && Date.parse(en.timestamp) >= t) done = Date.parse(en.timestamp);
+			if (Number.isNaN(done)) return this.startAway("no refresh after a warm decision");
+			// Pi's next decision is due one warming delay after the refresh finished (cache-warmer.js schedule), not after the decision
+			this.armAway(done + (warmingDelayMs(ttl) ?? ttl) + warmingMargin(ttl) - Date.now(), () => {
 				this.awayPlan = a;
 				this.startAway("no warming decision");
 			});
@@ -1241,10 +1337,11 @@ export class Zip implements ZipControl {
 		const last = t.last ? `${hhmm}${t.last.data.desc}${t.last.data.why ? " · " + t.last.data.why : ""}` : undefined;
 		const file = this.recallMode === "file" && !!this.fileRecall(ctx);
 		const state = this.off ? "off" : this.conflict ? "paused" : this.recallMode === "tool" || file ? "on" : "reread-only"; // file recall is a full mode
+		const rereadWhy = this.recallMode === "file" ? "a tool allowlist hides zip_recall · no session file, so no recall copies" : "a tool allowlist hides zip_recall · only re-readable outputs fold";
 		return {
-			state, stateNote: state === "paused" ? `${this.conflict} also manages context` : state === "off" ? "/zip on to resume" : state === "reread-only" ? "a tool allowlist hides zip_recall · only re-readable outputs fold" : undefined,
+			state, stateNote: state === "paused" ? `${this.conflict} also manages context` : state === "off" ? "/zip on to resume" : state === "reread-only" ? rereadWhy : undefined,
 			model: key || undefined, life, measured, alive, folds: t.folds, foldedTokens: fmtK(t.folded), summaries: t.summaries, summaryUsd: t.usd, recalls: t.recalls, last, quiet: this.quiet,
-			...(file ? { unzip: `from files in ${RECALL_DIR} (a tool allowlist hides zip_recall)` } : {}),
+			...(file ? { unzip: `from files in ${recallRootShown()} (a tool allowlist hides zip_recall)` } : {}),
 		};
 	}
 	status(ctx?: Any): string {

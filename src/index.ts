@@ -121,7 +121,7 @@ export default function piZip(pi: ExtensionAPI) {
 		return undefined;
 	});
 	// answers only the compaction pi-zip itself just asked for; every other compaction (Pi's, /compact, other extensions') gets undefined
-	pi.on("session_before_compact", () => zip.sessionBeforeCompact());
+	pi.on("session_before_compact", (e) => zip.sessionBeforeCompact(e));
 	pi.on("context_with_system", (e, ctx) => zip.context(e, ctx)); // the complete transcript: system messages stay where Pi put them
 	pi.on("turn_end", (e, ctx) => zip.turnEnd(e, ctx));
 	pi.on("agent_before_settle", (e, ctx) => zip.settle(e, ctx));

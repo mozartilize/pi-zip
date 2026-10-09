@@ -2,6 +2,7 @@
 // projection of persisted edits. test/helpers.ts' own projector is NOT used here, so Pi's behaviour decides what is right.
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { createEventBus, discoverAndLoadExtensions, ExtensionRunner, SessionManager, convertToLlm } from "@earendil-works/pi-coding-agent";
+import { readFileSync, rmSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { collapseSystemMessages, getCurrentSystemMessage, normalizeContext, resolveTranscript } from "@earendil-works/pi-ai";
 import { collapseSystem } from "../src/plan.ts";
@@ -10,6 +11,8 @@ import type { Any } from "./helpers.ts";
 // tokensBefore Pi writes for a compaction draft are Pi's, not a re-implementation
 import { AgentSession } from "../node_modules/@earendil-works/pi-coding-agent/dist/core/agent-session.js";
 import { estimateProjectedContextTokens, prepareCompaction } from "../node_modules/@earendil-works/pi-coding-agent/dist/core/compaction/compaction.js";
+// another extension, loaded through Pi's own loader from a factory, before or after pi-zip (the runner calls handlers in load order)
+import { loadExtensionFromFactory } from "../node_modules/@earendil-works/pi-coding-agent/dist/core/extensions/loader.js";
 
 const CWD = "/tmp/pi-zip-integration";
 const T0 = Date.now() - 3 * 3_600_000; // every message is hours old: the cache is cold
@@ -55,46 +58,66 @@ interface RigOpts {
 	idle?: boolean; // ctx.isIdle() (default true)
 	start?: boolean; // emit before_agent_start right away (default true)
 	settings?: Any;
+	// another extension's session_before_compact handler (Pi runs every extension's for pi-zip's compaction too), loaded before or after pi-zip
+	foreign?: { at: "before" | "after"; on: (e: Any, ctx: Any) => Any };
 }
 
 async function rig(setup: (sm: SessionManager) => void = populate, opts: RigOpts = {}) {
 	const sm = opts.file ? SessionManager.inMemory(CWD, undefined, structuredClone(opts.file)) : SessionManager.inMemory(CWD); // the manager appends to the array it is given
 	if (!opts.file) setup(sm);
 	// the real loader, from the real entry file: exactly how `pi -e` loads the extension
-	const loaded = await discoverAndLoadExtensions([fileURLToPath(new URL("../src/index.ts", import.meta.url))], CWD, "/tmp/pi-zip-integration-agent", createEventBus());
+	const bus = createEventBus();
+	const loaded = await discoverAndLoadExtensions([fileURLToPath(new URL("../src/index.ts", import.meta.url))], CWD, "/tmp/pi-zip-integration-agent", bus);
 	expect(loaded.errors).toEqual([]);
 	const runtime = loaded.runtime;
+	let extensions = loaded.extensions;
+	const foreignCalls: string[] = [];
+	if (opts.foreign) {
+		const f = opts.foreign;
+		const other = await loadExtensionFromFactory((api: Any) => api.on("session_before_compact", async (e: Any, c: Any) => (foreignCalls.push(e.reason), f.on(e, c))), CWD, bus, runtime, "<other-compactor>");
+		extensions = f.at === "before" ? [other, ...extensions] : [...extensions, other];
+	}
 	const narrativeCalls: Any[] = [];
 	const registry: Any = {
 		complete: async (_m: Any, c: Any) => (narrativeCalls.push(c), { stopReason: "stop", content: [{ type: "text", text: "## Decisions\nnarrative" }], usage: { cost: { total: 0 } } }),
 	};
-	const runner = new ExtensionRunner(loaded.extensions, runtime, CWD, sm, registry);
+	const runner = new ExtensionRunner(extensions, runtime, CWD, sm, registry);
 	const noop = () => {};
 	const compactions: Any[] = [];
+	const compactCalls = { n: 0, ended: 0 };
+	let compacting: AbortController | null = null; // Pi's _compactionAbortController: ctx.abort() reaches it (abort -> abortCompaction)
 	/** AgentSession.compact() as Pi 1.1.0 runs it for an extension (minus the abort of an idle session and the UI events): Pi's own
-	 *  prepareCompaction decides "Already compacted" / "Nothing to compact", session_before_compact supplies the result, appendCompaction. */
+	 *  prepareCompaction decides "Already compacted" / "Nothing to compact", session_before_compact supplies the result (every extension's
+	 *  handler in load order: the last answer wins, a cancel stops it), the abort signal is checked right before appendCompaction. */
 	const piCompact = (options: Any) => {
 		void (async () => {
+			const controller = new AbortController();
+			compacting = controller;
+			compactCalls.n++;
 			try {
 				const branch = sm.getBranch();
 				const settings = { enabled: true, reserveTokens: 16_384, keepRecentTokens: opts.settings?.compaction?.keepRecentTokens ?? 20_000 };
 				const preparation = prepareCompaction(branch as Any, settings);
 				if (!preparation) throw new Error(branch[branch.length - 1]?.type === "compaction" ? "Already compacted" : "Nothing to compact (session too small)");
-				const result: Any = await runner.emit({ type: "session_before_compact", preparation, branchEntries: branch, reason: "manual", willRetry: false, signal: new AbortController().signal } as Any);
+				const result: Any = await runner.emit({ type: "session_before_compact", preparation, branchEntries: branch, reason: "manual", willRetry: false, signal: controller.signal } as Any);
 				if (result?.cancel) throw new Error("Compaction cancelled");
 				if (!result?.compaction) throw new Error("rig: Pi would write its own summary with the model here");
+				if (controller.signal.aborted) throw new Error("Compaction cancelled");
 				const c = result.compaction;
 				sm.appendCompaction(c.summary, c.firstKeptEntryId, c.tokensBefore, c.details, true, c.usage);
 				compactions.push(c);
 				options?.onComplete?.({ ...c });
 			} catch (err) {
 				options?.onError?.(err instanceof Error ? err : new Error(String(err)));
+			} finally {
+				if (compacting === controller) compacting = null;
+				compactCalls.ended++;
 			}
 		})();
 	};
 	runner.bindCore(
 		{ sendMessage: noop, sendUserMessage: noop, appendEntry: (t: string, d: Any) => sm.appendCustomEntry(t, d), setSessionName: noop, getSessionName: () => undefined, setLabel: noop, getActiveTools: () => ["read", "bash", "zip_recall"], getAllTools: () => [], getSettings: () => opts.settings ?? {}, setActiveTools: noop, refreshTools: noop, getCommands: () => [], setModel: async () => false, getThinkingLevel: () => "off", setThinkingLevel: noop } as Any,
-		{ getModel: () => MODEL, getScopedModels: () => [], isIdle: () => opts.idle !== false, isProjectTrusted: () => true, getSignal: () => undefined, abort: noop, hasPendingMessages: () => false, shutdown: noop, getContextUsage: () => undefined, compact: opts.native ? piCompact : (o: Any) => o?.onError?.(new Error("rig: no compaction")), getSystemPrompt: () => "You are a coding agent." } as Any,
+		{ getModel: () => MODEL, getScopedModels: () => [], isIdle: () => opts.idle !== false && !compacting, isProjectTrusted: () => true, getSignal: () => undefined, abort: () => compacting?.abort(), hasPendingMessages: () => false, shutdown: noop, getContextUsage: () => undefined, compact: opts.native ? piCompact : (o: Any) => o?.onError?.(new Error("rig: no compaction")), getSystemPrompt: () => "You are a coding agent." } as Any,
 	);
 	if (opts.tui) runner.setUIContext({ notify: noop, setWorkingMessage: noop, setStatus: noop, setWidget: noop } as Any, "tui");
 	const projectionMessages = () => sm.buildSessionContext().messages as Any[];
@@ -122,7 +145,7 @@ async function rig(setup: (sm: SessionManager) => void = populate, opts: RigOpts
 	const beforeAgentStart = (text = "next request") => runner.emitBeforeAgentStart(text, undefined, { cwd: CWD } as Any);
 	await runner.emit({ type: "session_start", reason: "startup" } as Any);
 	if (opts.start !== false) await beforeAgentStart();
-	return { sm, runner, request, turnEnd, settle, beforeAgentStart, narrativeCalls, projectionMessages, compactions };
+	return { sm, runner, request, turnEnd, settle, beforeAgentStart, narrativeCalls, projectionMessages, compactions, compactCalls, foreignCalls };
 }
 
 const saved: Record<string, string | undefined> = {};
@@ -288,6 +311,202 @@ describe("real Pi: a summary prepared while the user was away goes in through Pi
 		expect(preparation).toBeDefined();
 		const out = await r.runner.emit({ type: "session_before_compact", preparation, branchEntries: branch, reason: "threshold", willRetry: false, signal: new AbortController().signal } as Any);
 		expect(out).toBeUndefined();
+	});
+});
+
+describe("real Pi: another extension's session_before_compact handler takes part in pi-zip's compaction (Pi runs them all)", () => {
+	const sleep = (ms: number) => new Promise((res) => setTimeout(res, ms));
+	const template = (extra?: (sm: SessionManager) => void) => {
+		const sm = SessionManager.inMemory(CWD);
+		populate(sm, 6000); // long prose: folds alone cannot reach the cap, so the cold return needs a summary
+		extra?.(sm);
+		return [sm.getHeader() as Any, ...sm.getEntries()];
+	};
+	const moreTurns = (sm: SessionManager, ts: number, n: number) => {
+		for (let i = 0; i < n; i++) {
+			sm.appendMessage(user(`later ${i}`, ts + 2 * i));
+			sm.appendMessage(asst([{ type: "text", text: `later done ${i} ${"explanation ".repeat(6000)}` }], "stop", ts + 2 * i + 1));
+		}
+	};
+	const OTHER = (e: Any) => ({ compaction: { summary: "OTHER SUMMARY", firstKeptEntryId: e.preparation.firstKeptEntryId, tokensBefore: e.preparation.tokensBefore, details: { by: "other" } } });
+	/** Another extension's own keep policy: it keeps the last three turns (from "request 4"), more than Pi's 20K tokens would. */
+	const OTHER_KEEPS_MORE = (e: Any) => ({ compaction: { ...OTHER(e).compaction, firstKeptEntryId: e.branchEntries.find((x: Any) => x.type === "message" && x.message.content === "request 4").id } });
+	const PIZIP = "[summary of earlier conversation by pi-zip]";
+	let ledger = "";
+	beforeEach(() => {
+		process.env.PI_ZIP_TTL_SECS = "0.1";
+		process.env.PI_ZIP_NATIVE_MS = "200"; // the deadline of pi-zip's own compaction (2 s in production)
+		ledger = `/tmp/pi-zip-coexist-${process.pid}-${Math.random().toString(36).slice(2)}.jsonl`;
+		process.env.PI_ZIP_LEDGER = ledger;
+	});
+	afterEach(() => {
+		delete process.env.PI_ZIP_NATIVE_MS;
+		delete process.env.PI_ZIP_LEDGER;
+		rmSync(ledger, { force: true });
+	});
+	const rows = (type: string): Any[] => {
+		try {
+			return readFileSync(ledger, "utf8").trim().split("\n").map((l) => JSON.parse(l)).filter((x) => x.type === type);
+		} catch {
+			return [];
+		}
+	};
+	/** Away past the TTL: settle plans, the timer prepares the summary (stubbed narrative call). */
+	const away = async (r: Any) => {
+		await r.settle();
+		await sleep(250);
+	};
+	/** The return: before_agent_start (timed: the user's prompt waits for it), Pi appends the prompt, the run's first request. */
+	const back = async (r: Any, text = "next request", ts = 10_000_000) => {
+		const t0 = performance.now();
+		await r.beforeAgentStart(text);
+		const waited = performance.now() - t0;
+		r.sm.appendMessage(user(text, ts));
+		const req1 = (await r.request()) as Any[];
+		await sleep(5);
+		return { req1, waited };
+	};
+	const finishTurn = async (r: Any, ts = 10_000_001) => {
+		const id = r.sm.appendMessage(asst([call("c9")], "toolUse", ts));
+		r.sm.appendMessage(result("c9", "tiny", ts + 1));
+		return (await r.turnEnd(id, asst([call("c9")], "toolUse"))) as Any[];
+	};
+	const comps = (r: Any) => (r.sm.getBranch() as Any[]).filter((e) => e.type === "compaction");
+	const summaries = (req: Any[]) => req.filter((m) => m.role === "compactionSummary").map((m) => String(m.summary));
+
+	test("loaded after pi-zip, it answers with its own summary (Pi keeps the last answer): that compaction stays the only one; pi-zip neither adopts its prepared summary nor writes one on top", async () => {
+		const r = await rig(undefined, { file: template(), tui: true, native: true, start: false, foreign: { at: "after", on: OTHER_KEEPS_MORE } });
+		await away(r);
+		const { req1 } = await back(r);
+		expect(r.foreignCalls).toEqual(["manual"]); // Pi ran it for pi-zip's compaction
+		expect(comps(r).map((c) => c.summary)).toEqual(["OTHER SUMMARY"]);
+		expect(summaries(req1)).toEqual(["OTHER SUMMARY"]); // nothing of pi-zip's on top of it
+		const drafts = await finishTurn(r);
+		expect(drafts.filter((d) => d.type === "compaction")).toEqual([]);
+		expect(comps(r)).toHaveLength(1);
+		expect(r.narrativeCalls.length).toBe(1); // the summary prepared while away, and no second one
+		expect((r.sm.getBranch() as Any[]).some((e) => e.type === "custom" && e.customType === "pi-zip/unused-summary")).toBe(true); // discarded: its cost is booked
+		expect(rows("native_off").map((x) => x.reason)).toEqual(["another extension's compaction went in instead of pi-zip's"]);
+	});
+
+	test("loaded before pi-zip, it answers at once: pi-zip's answer comes last and wins; the native path stays on", async () => {
+		const r = await rig(undefined, { file: template(), tui: true, native: true, start: false, foreign: { at: "before", on: OTHER } });
+		await away(r);
+		const { req1 } = await back(r);
+		expect(r.foreignCalls).toEqual(["manual"]);
+		expect(comps(r)).toHaveLength(1);
+		expect(comps(r)[0]).toMatchObject({ fromHook: true, details: { by: "pi-zip", via: "native" } });
+		expect(summaries(req1)).toHaveLength(1);
+		expect(summaries(req1)[0]).toContain(PIZIP);
+		expect(rows("native_off")).toEqual([]);
+	});
+
+	test("loaded before pi-zip, it takes its time (it writes its own summary, ignoring the abort): cancelled at the deadline, the prompt goes on at once, nothing lands later, the draft path carries pi-zip's summary", async () => {
+		const seen: Any = {};
+		const slow = async (e: Any) => {
+			await sleep(1_000);
+			seen.aborted = e.signal.aborted;
+			return OTHER(e);
+		};
+		const r = await rig(undefined, { file: template(), tui: true, native: true, start: false, foreign: { at: "before", on: slow } });
+		await away(r);
+		const { req1, waited } = await back(r);
+		expect(waited).toBeLessThan(600); // the deadline (200 ms here), not the 1 s the other handler takes
+		expect(comps(r)).toEqual([]);
+		expect(summaries(req1)).toHaveLength(1);
+		expect(summaries(req1)[0]).toContain(PIZIP); // request-local, as on the draft path
+		await sleep(1_100); // the other handler has answered by now; Pi's compaction ends, cancelled
+		expect(seen.aborted).toBe(true);
+		expect(r.compactCalls).toEqual({ n: 1, ended: 1 });
+		expect(comps(r)).toEqual([]); // nothing went in during the run
+		const drafts = await finishTurn(r);
+		expect(drafts.filter((d) => d.type === "compaction").map((d) => d.details)).toEqual([{ by: "pi-zip", trigger: "cold" }]);
+		expect(comps(r)).toHaveLength(1);
+		expect(rows("native_off").map((x) => x.reason)).toEqual(["another session_before_compact handler ran before pi-zip's (cancelled after 200 ms)"]);
+	});
+
+	test("loaded before pi-zip, it finishes in time but not at once (a model call, say): pi-zip's answer wins this once, then the native path ends, so that call is not paid for and waited for at every cold return", async () => {
+		process.env.PI_ZIP_NATIVE_MS = "2000"; // the production deadline: 400 ms is inside it, and over the 250 ms of a compaction that is pi-zip's alone
+		const modelCall = async (e: Any) => (await sleep(400), OTHER(e));
+		const r = await rig(undefined, { file: template(), tui: true, native: true, start: false, foreign: { at: "before", on: modelCall } });
+		await away(r);
+		const first = await back(r);
+		expect(comps(r).map((c) => c.details)).toEqual([{ by: "pi-zip", via: "native", trigger: "cold" }]);
+		expect(summaries(first.req1)[0]).toContain(PIZIP);
+		expect(rows("native_off").map((x) => x.reason)).toEqual([expect.stringMatching(/^Pi's compaction took \d+ ms: another session_before_compact handler at work$/)]);
+		await finishTurn(r);
+		moreTurns(r.sm, 10_100_000, 3);
+		await away(r);
+		const second = await back(r, "and again", 10_200_000);
+		expect(second.waited).toBeLessThan(300);
+		expect(r.compactCalls.n).toBe(1);
+		expect(r.foreignCalls).toEqual(["manual"]);
+		expect(rows("native_skip").map((x) => x.reason)).toEqual(["off for this process"]);
+		expect(summaries(second.req1)).toHaveLength(1);
+		expect(summaries(second.req1)[0]).toContain(PIZIP); // the draft path carries it, as before
+	});
+
+	test("loaded after pi-zip, it takes its time: pi-zip does not wait past the deadline, and Pi's compaction is cancelled, so its late result never lands during the run", async () => {
+		const seen: Any = {};
+		const slow = async (e: Any) => {
+			await sleep(1_000);
+			seen.aborted = e.signal.aborted;
+			return undefined; // pi-zip's answer would stand
+		};
+		const r = await rig(undefined, { file: template(), tui: true, native: true, start: false, foreign: { at: "after", on: slow } });
+		await away(r);
+		const { req1, waited } = await back(r);
+		expect(waited).toBeLessThan(600);
+		expect(comps(r)).toEqual([]);
+		expect(summaries(req1)[0]).toContain(PIZIP);
+		await sleep(1_100);
+		expect(seen.aborted).toBe(true);
+		expect(r.compactCalls).toEqual({ n: 1, ended: 1 });
+		expect(comps(r)).toEqual([]); // pi-zip's answer was the last one, but Pi saw its abort signal before appending
+		const drafts = await finishTurn(r);
+		expect(drafts.filter((d) => d.type === "compaction")).toHaveLength(1);
+		expect(comps(r)).toHaveLength(1);
+		expect(rows("native_off").map((x) => x.reason)).toEqual(["Pi's compaction was not done 200 ms after pi-zip answered (cancelled)"]);
+	});
+
+	for (const at of ["before", "after"] as const) {
+		test(`loaded ${at} pi-zip, it cancels manual compactions: the draft path takes the summary, and the next cold return does not ask Pi again`, async () => {
+			const cancels = (e: Any) => (e.reason === "manual" ? { cancel: true } : undefined);
+			const r = await rig(undefined, { file: template(), tui: true, native: true, start: false, foreign: { at, on: cancels } });
+			await away(r);
+			const first = await back(r);
+			expect(r.compactCalls.n).toBe(1);
+			expect(comps(r)).toEqual([]);
+			expect(summaries(first.req1)[0]).toContain(PIZIP);
+			const drafts = await finishTurn(r);
+			expect(drafts[0]).toMatchObject({ type: "compaction", details: { by: "pi-zip" } });
+			expect(rows("native_off").map((x) => x.reason)).toEqual(["Pi's compaction failed: Compaction cancelled"]);
+			// the next cold return in this process: no second ctx.compact (Pi's red "Compaction cancelled" at most once)
+			moreTurns(r.sm, 10_100_000, 3); // still in the past: every message is hours old, so this return is cold too
+			await away(r);
+			const second = await back(r, "and again", 10_200_000);
+			expect(r.narrativeCalls.length).toBe(2);
+			expect(r.compactCalls.n).toBe(1);
+			expect(r.foreignCalls).toEqual(["manual"]);
+			expect(summaries(second.req1)).toHaveLength(1);
+			expect(summaries(second.req1)[0]).toContain(PIZIP);
+			expect(rows("native_skip").map((x) => x.reason)).toEqual(["off for this process"]);
+		});
+	}
+
+	test("a compaction another extension supplied is already in the branch: pi-zip does not ask Pi at all (that extension's handler would run for pi-zip's too)", async () => {
+		const file = template((sm) => {
+			const kept = sm.getBranch().filter((e: Any) => e.type === "message" && e.message.role === "user").at(1) as Any;
+			sm.appendCompaction("EARLIER OTHER SUMMARY", kept.id, 50_000, { by: "other" }, true);
+			moreTurns(sm, 9_000_000, 3);
+		});
+		const r = await rig(undefined, { file, tui: true, native: true, start: false });
+		await away(r);
+		const { req1 } = await back(r);
+		expect(r.compactCalls.n).toBe(0);
+		expect(rows("native_skip").map((x) => x.reason)).toEqual(["another extension's compaction is in this branch"]);
+		expect(summaries(req1)).toHaveLength(1);
+		expect(summaries(req1)[0]).toContain(PIZIP); // the draft path, as before
 	});
 });
 

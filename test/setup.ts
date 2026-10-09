@@ -10,3 +10,5 @@ import { dirname } from "node:path";
 writeFileSync(join(dirname(process.env.PI_ZIP_CACHE_STATS), "welcomed"), "test\n");
 // ... and keeps its recall files (file recall, src/recallfile.ts) in a throwaway cache directory, never in ~/.cache.
 process.env.XDG_CACHE_HOME = mkdtempSync(join(tmpdir(), "pi-zip-test-cache-"));
+// ... and reads Pi's global settings (cacheWarming, src/run.ts idleWarming) from a throwaway agent directory, never ~/.pi/agent.
+process.env.PI_CODING_AGENT_DIR = mkdtempSync(join(tmpdir(), "pi-zip-test-agent-"));
