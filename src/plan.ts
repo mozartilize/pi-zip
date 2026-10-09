@@ -23,7 +23,21 @@ export const RELAX_PREV_TURN = true;
  *  constant (largest saving with lost <= prod in every stratum); the old rereadable-only filter cost 1.026 / 1.018x at -0.6 lost items. */
 export const INTURN_AGE = 60;
 
-const PROTECT_USER_TURNS = 2; // the latest user turn and the one before it are never summarised; folded only by relax (cold plan, previous turn, rereadable) or in-turn (old enough)
+const PROTECT_USER_TURNS = 2; // the latest user turn and the one before it are never summarised (but see LOOKAHEAD); folded only by relax (cold plan, previous turn, rereadable) or in-turn (old enough)
+
+/** F1: a warm (valve) summary passes the same summary gate as a cold one, the call priced in (before: a warm plan skipped it, so a
+ *  summary the cold gate had just refused was written one request later anyway). PlanOpts.warmSummaryGate. */
+export const WARM_SUMMARY_GATE = true;
+/** F2: a cold plan that does not summarise looks one user turn ahead: if the warm valve would summarise at the next user turn, once the
+ *  protected window has slid past the previous turn, the cold plan summarises now (the rewrite is free now, not then), its cut allowed
+ *  inside the previous user turn up to that turn's final assistant answer, which stays verbatim with everything after it. PlanOpts.lookahead. */
+export const LOOKAHEAD = false;
+/** F3: the summary gates price the call the code makes (summary.ts narrative): uncached input of the prefix the narrative reads (the
+ *  previous summary is not sent: its sections are carried forward by code) plus output of at most the narrative budget, instead of
+ *  w x the prefix + out x the whole planned summary (which counts the carried-forward previous summary as model output). PlanOpts.narrativePrice. */
+export const NARRATIVE_PRICE = true;
+/** The narrative's token budget (chars/4), summary.ts buildCut: clamp(planned - skeleton, 300, NARRATIVE_MAX). */
+export const NARRATIVE_MAX = 4000;
 const SUMMARY_FLOOR = 1000;
 const SUMMARY_CAP = 8000;
 const SUMMARY_RATIO = 0.1;
@@ -409,6 +423,7 @@ export interface Cut {
 	costUsd: number; // what the narrative model call cost (0 when unknown)
 	usage?: Any;
 	ms: number; // total production time (the narrative model call included)
+	ahead?: boolean; // F2: a lookahead cut (inside the previous user turn, before its final answer; guard.ts)
 }
 
 /** What a run sends from its first request on and persists verbatim at turn_end (F8). */
@@ -453,6 +468,11 @@ export interface PlanOpts {
 	rereadOnly?: boolean; // zip_recall is not available to the model: fold only outputs that can be re-read (classify "rereadable")
 	fileRecall?: FileRecall; // zip_recall is hidden but read, grep or bash is active: fold as in full mode, placeholders name the recall file
 	pastTtl?: boolean; // a user return after the declared TTL: a warm plan may relax into the previous user turn too (RELAX_PREV_TURN)
+	warmSummaryGate?: boolean; // F1, default WARM_SUMMARY_GATE
+	lookahead?: boolean; // F2, default LOOKAHEAD (cold plans only)
+	narrativePrice?: boolean; // F3, default NARRATIVE_PRICE
+	slide?: number; // internal (F2): plan as if this many more user turns had started (the protected window slid)
+	valveB?: number; // internal (F2): the real context the slid warm plan's law sees (the cold plan's folds already applied)
 }
 
 export interface PlanResult {
@@ -471,6 +491,17 @@ export interface PlanResult {
 	cutVisibleIdx: number;
 	cutKeptFirstMsg: Any;
 	fileRecall?: FileRecall; // the summary of this plan names recall files instead of zip_recall (PlanOpts.fileRecall)
+	ahead?: boolean; // F2: the cut was decided by the lookahead (it may lie inside the previous user turn, before its final answer)
+}
+
+/** Index of the final assistant message of user turn `turn` (the answer the user saw), -1 if none. */
+export function finalAnswerIdx(blocks: Block[], turn: number): number {
+	for (let i = blocks.length - 1; i >= 0; i--) {
+		const b = blocks[i];
+		if (b.userTurn < turn) break;
+		if (b.userTurn === turn && b.kind === "assistant" && b.entryId && b.msg?.stopReason !== "error" && b.msg?.stopReason !== "aborted") return i;
+	}
+	return -1;
 }
 
 /** Estimated content before the earliest edited block: what stays cached through the edit with O (real: O + c x it). A cut edits from the start. */
@@ -489,7 +520,7 @@ export const contentKeyOf = (content: Any): string => {
 
 /** The planner. Cold: fold everything outside the protected window, relax into the previous turn if still above the cap,
  *  summarise only if folds cannot reach the cap and the law prices the summary call in. Warm: null unless the context is above the
- *  cold cap and the law fires for the plan (the summary call is sunk there); then the cold plan minus the previous-turn relax (a warm plan
+ *  cold cap and the law fires for the plan; its summary passes the same summary gate (WARM_SUMMARY_GATE); then the cold plan minus the previous-turn relax (a warm plan
  *  folds the previous user turn by relax only at a return after the declared TTL, o.pastTtl). A cold plan with P(warm) > 0
  *  passes the same law (expected cost). The cap never exceeds Pi's compaction room. Returns null when there is nothing to plan on
  *  or the law says no. */
@@ -517,7 +548,8 @@ export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
 	const inturnAge = o.inturnAge ?? s.inturnAge;
 	const blocks = buildBlocks(entries, o.steerIds);
 	if (!blocks.length) return null;
-	const userTurns = countUserTurns(blocks) + (o.promptPending ? 1 : 0); // the upcoming prompt is a new user turn
+	const userTurns = countUserTurns(blocks) + (o.promptPending ? 1 : 0) + (o.slide ?? 0); // the upcoming prompt is a new user turn
+	const f1 = o.warmSummaryGate ?? WARM_SUMMARY_GATE, f2 = mode === "cold" && (o.lookahead ?? LOOKAHEAD), f3 = o.narrativePrice ?? NARRATIVE_PRICE;
 	const calls = toolCallIndex(blocks);
 	const recalled = o.recalled ?? new Set<string>();
 	const ctxEst = blocks.reduce((a, b) => a + b.tokens, 0); // content
@@ -607,39 +639,55 @@ export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
 	let cutIdx: number | null = null;
 	let prefixTokens = 0;
 	let summaryTokensPlanned = 0;
-	if (sumTrigger) {
-		const limit = blocks.findIndex((b) => protectedTurn(b));
+	let ahead = false;
+	const minCut = blocks[0].kind === "summary" ? 2 : 1; // never re-summarise a prefix that is only the previous summary
+	const pre: number[] = [];
+	const S = (x: number) => Math.max(clamp(SUMMARY_RATIO * x, SUMMARY_FLOOR, SUMMARY_CAP), prevSum); // the next summary carries the previous one forward
+	/** The cut for cut points minCut..maxCut: the first that brings the context to the cap, else the deepest; gated = the summary law
+	 *  (no prices: the legacy gain rule) must pass. Applies it (folds in the prefix are void) and returns true, or changes nothing. */
+	const summarise = (maxCut: number, gated: boolean): boolean => {
 		const cuts: number[] = [];
-		const minCut = blocks[0].kind === "summary" ? 2 : 1; // never re-summarise a prefix that is only the previous summary
-		for (let i = minCut; i < blocks.length; i++) {
-			if (limit >= 0 && i > limit) break;
-			if (blocks[i].entryId && (blocks[i].kind === "user" || blocks[i].kind === "assistant")) cuts.push(i);
-		}
-		const pre: number[] = [];
+		for (let i = minCut; i < blocks.length && i <= maxCut; i++) if (blocks[i].entryId && (blocks[i].kind === "user" || blocks[i].kind === "assistant")) cuts.push(i);
+		if (!cuts.length) return false;
 		let acc = 0;
 		for (let i = 0; i < blocks.length; i++) {
 			pre[i] = acc;
 			acc += tokOverride.get(i) ?? blocks[i].tokens;
 		}
 		const total = acc;
-		const S = (x: number) => Math.max(clamp(SUMMARY_RATIO * x, SUMMARY_FLOOR, SUMMARY_CAP), prevSum); // the next summary carries the previous one forward
-		if (cuts.length) {
-			let pick = cuts[cuts.length - 1];
-			for (const c of cuts) if (total - pre[c] + S(pre[c]) <= coldCap) { pick = c; break; }
-			// cold: the summary call must pay for itself (verdict: call = w X + out S for an uncached call); warm: it is sunk in the plan's law
-			const X = c * pre[pick], Sr = c * S(pre[pick]);
-			const gain = !law.pr ? summaryGainOk(X, Sr, real(total), minGain) : mode === "warm" || gate("summary", X, Sr, null, law.pr.w * X + law.pr.out * Sr, Sr);
-			if (pre[pick] >= 2 * S(pre[pick]) && gain) {
-				cutIdx = pick;
-				prefixTokens = pre[pick];
-				summaryTokensPlanned = S(pre[pick]);
-				for (let i = folds.length - 1; i >= 0; i--) {
-					const bi = blocks.findIndex((b) => b.entryId === folds[i].entryId);
-					if (bi < pick) { tokOverride.delete(bi); folds.splice(i, 1); } // the prefix is replaced: its folds are void
-				}
-				ctxAfterFolds = ctxEst - savings();
-			}
+		let pick = cuts[cuts.length - 1];
+		for (const c of cuts) if (total - pre[c] + S(pre[c]) <= coldCap) { pick = c; break; }
+		const X = c * pre[pick], Sr = c * S(pre[pick]);
+		if (gated) {
+			// the summary call must pay for itself, cold or warm (F1, WARM_SUMMARY_GATE; before, a warm plan skipped the gate). The call is
+			// the narrative call summary.ts makes (F3, NARRATIVE_PRICE): uncached input of the prefix without the previous summary, which it
+			// never reads, + output of at most the narrative budget; without F3 the verdict's w X + out S (the carried summary as output)
+			const call = !law.pr ? 0 : f3 ? law.pr.input * c * Math.max(pre[pick] - prevSum, 0) + law.pr.out * c * Math.min(S(pre[pick]), NARRATIVE_MAX) : law.pr.w * X + law.pr.out * Sr;
+			const ok = !law.pr ? summaryGainOk(X, Sr, real(total), minGain) : (mode === "warm" && !f1) || gate("summary", X, Sr, null, call, Sr);
+			if (!ok) return false;
 		}
+		if (!(pre[pick] >= 2 * S(pre[pick]))) return false;
+		cutIdx = pick;
+		prefixTokens = pre[pick];
+		summaryTokensPlanned = S(pre[pick]);
+		for (let i = folds.length - 1; i >= 0; i--) {
+			const bi = blocks.findIndex((b) => b.entryId === folds[i].entryId);
+			if (bi < pick) { tokOverride.delete(bi); folds.splice(i, 1); } // the prefix is replaced: its folds are void
+		}
+		ctxAfterFolds = ctxEst - savings();
+		return true;
+	};
+	if (sumTrigger) {
+		const limit = blocks.findIndex((b) => protectedTurn(b));
+		summarise(limit >= 0 ? limit : blocks.length - 1, true);
+	}
+	if (f2 && cutIdx === null && law.pr && ctxAfterFolds > coldCap && (!o.noSummary || atRoom)) {
+		// F2 lookahead: the warm valve's plan at the next user turn (this context, its folds applied, the window slid by one turn). If it
+		// would summarise, the summary is written now, at the cold return, where the rewrite costs nothing extra (and at settle it is
+		// prepared while the user is away), instead of one turn later as a warm rewrite the user waits for.
+		const next = planContext(entries, { ...o, mode: "warm", slide: (o.slide ?? 0) + 1, lookahead: false, pastTtl: false, noSummary: false, trace: undefined, law: { ...law, pWarm: 1 }, valveB: real(ctxAfterFolds) });
+		const fa = finalAnswerIdx(blocks, userTurns - 1);
+		if (next && next.cutIdx !== null && fa >= minCut && summarise(fa, false)) ahead = true;
 	}
 	// where the kept part starts among the projected non-system messages (the request-local view drops everything before it)
 	let cutVisibleIdx = -1;
@@ -665,8 +713,8 @@ export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
 	// F10: a warm rewrite must pay back; a cold plan with some chance of a warm cache is priced by expectation (no prices: cold always fires).
 	// T = A (the whole post-edit context, O included, as tuned: the cheaper A - O fires warm edits earlier and loses items offline);
 	// the suffix after the earliest edit goes to the ledger only.
-	if ((mode === "warm" || (planned && law.pr)) && !gate("plan", real(ctxEst), real(after), room, 0, real(after), c * (after - untouched))) return null;
-	return { blocks, calls, folds, cutIdx, firstKeptEntryId: cutIdx !== null ? blocks[cutIdx].entryId : null, prefixTokens, summaryTokensPlanned, sumTrigger, scale: o.scale ?? UNIT, ctxTokens: real(ctxEst), ctxAfterFolds: real(ctxAfterFolds), userTurns, cutVisibleIdx, cutKeptFirstMsg, ...(o.fileRecall ? { fileRecall: o.fileRecall } : {}) };
+	if ((mode === "warm" || (planned && law.pr)) && !gate("plan", Math.max(o.valveB ?? real(ctxEst), real(after)), real(after), room, 0, real(after), c * (after - untouched))) return null;
+	return { blocks, calls, folds, cutIdx, firstKeptEntryId: cutIdx !== null ? blocks[cutIdx].entryId : null, prefixTokens, summaryTokensPlanned, sumTrigger: cutIdx !== null ? (sumTrigger ?? trig) : sumTrigger, scale: o.scale ?? UNIT, ctxTokens: real(ctxEst), ctxAfterFolds: real(ctxAfterFolds), userTurns, cutVisibleIdx, cutKeptFirstMsg, ...(o.fileRecall ? { fileRecall: o.fileRecall } : {}), ...(ahead ? { ahead } : {}) };
 }
 
 const sameMsg = (a: Any, b: Any): boolean =>
