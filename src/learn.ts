@@ -44,7 +44,9 @@ interface File { v: 1; models: Record<string, Entry> }
 export const statsPath = (): string =>
 	process.env.PI_ZIP_CACHE_STATS || join(process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent"), "pi-zip", "cache-survival.json");
 
-export const binOf = (gapS: number): number => GAP_EDGES.findLastIndex((e) => gapS >= e); // -1 = below 30 s: not recorded
+/** ES2023's Array.prototype.findLastIndex (Node >= 18 and Bun have it); tsconfig's lib is ES2022, so it is typed here (types only). */
+interface FindLastIndex { findLastIndex(predicate: (value: number, index: number) => boolean): number }
+export const binOf = (gapS: number): number => (GAP_EDGES as number[] & FindLastIndex).findLastIndex((e) => gapS >= e); // -1 = below 30 s: not recorded
 const fin = (x: Any) => typeof x === "number" && Number.isFinite(x) && x >= 0;
 
 /** The persisted stats; a missing, unreadable or malformed file is ignored (empty). */
