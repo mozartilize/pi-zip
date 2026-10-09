@@ -316,6 +316,74 @@ describe("F12 summary prepared while the user is away (timer at 0.8 x TTL)", () 
 		expect(st.calls).toBe(0);
 	});
 
+	// ---- Pi's idle cache warming (pi-tricks §3.3): observed, never answered -------------------------------------------------
+	describe("Pi warms the cache between runs (cacheWarming idle)", () => {
+		// a 10.2 s lifetime: Pi decides at 0.2 s (at least 10 s before expiry), pi-zip gives up waiting 1 s after a due decision, and
+		// looks for the refresh of a "warm" decision 1.3 s later (10.2 / 8); the old rule would start the summary at 8.2 s
+		beforeEach(() => { process.env.PI_ZIP_TTL_SECS = "10.2"; });
+		const idle = { getSettings: () => ({ cacheWarming: "idle" }) };
+		const decide = (r: Any, action: string) => r.handlers.get("cache_warming_decision")({ type: "cache_warming_decision", action, warmCost: 0.01, missCost: 1, continuationProbability: 0.15 }, r.ctx);
+
+		test("Pi decides stop: the summary is prepared at once, as without warming; the decision is never answered", async () => {
+			const st = { calls: 0 };
+			const r = await rig(done, COLD_TS(), { modelRegistry: { complete: mkComplete(st) } }, idle);
+			await settle(r);
+			await sleep(100);
+			expect(st.calls).toBe(0); // waiting for Pi's decision
+			expect(await decide(r, "stop")).toBeUndefined();
+			await sleep(50);
+			expect(st.calls).toBe(1);
+		});
+
+		test("while Pi keeps deciding warm (and refreshing), no summary; once it falls silent, the summary is prepared", async () => {
+			const st = { calls: 0 };
+			const r = await rig(done, COLD_TS(), { modelRegistry: { complete: mkComplete(st) } }, idle);
+			await settle(r);
+			const base = r.ctx.sessionManager.getBranch();
+			const refreshes: Any[] = [];
+			r.ctx.sessionManager.getBranch = () => [...base, ...refreshes];
+			for (let i = 0; i < 6; i++) { // a decision every 0.3 s, each followed by its refresh (Pi persists a cache_warm usage entry)
+				expect(await decide(r, "warm")).toBeUndefined();
+				await sleep(30);
+				refreshes.push({ type: "usage", kind: "cache_warm", timestamp: new Date().toISOString() });
+				await sleep(270);
+			}
+			expect(st.calls).toBe(0); // 1.8 s: past the warming delay and the margin, and Pi is still warming
+			await sleep(1_600); // no decision since: the last refresh was seen, the next decision was due and did not come
+			expect(st.calls).toBe(1);
+		});
+
+		test("a warm decision with no refresh after it (another extension answered stop): the summary is prepared after the refresh check", async () => {
+			const st = { calls: 0 };
+			const r = await rig(done, COLD_TS(), { modelRegistry: { complete: mkComplete(st) } }, idle);
+			await settle(r);
+			await decide(r, "warm");
+			await sleep(800);
+			expect(st.calls).toBe(0);
+			await sleep(800); // 1.3 s check: no cache_warm entry since the decision
+			expect(st.calls).toBe(1);
+		});
+
+		test("Pi never decides (it is not warming this request after all): the summary starts just after the decision was due, not at 0.8 x TTL", async () => {
+			const st = { calls: 0 };
+			const r = await rig(done, COLD_TS(), { modelRegistry: { complete: mkComplete(st) } }, idle);
+			await settle(r);
+			await sleep(700);
+			expect(st.calls).toBe(0);
+			await sleep(900); // 0.2 s + 1 s margin
+			expect(st.calls).toBe(1);
+		});
+
+		test("without idle warming a decision changes nothing (no summary waits for one)", async () => {
+			const st = { calls: 0 };
+			const r = await rig(done, COLD_TS(), { modelRegistry: { complete: mkComplete(st) } });
+			await settle(r);
+			expect(await decide(r, "stop")).toBeUndefined();
+			await sleep(100);
+			expect(st.calls).toBe(0); // the usual timer (0.8 x 10.2 s) has not fired
+		});
+	});
+
 	// ---- the prepared summary goes in through Pi's own compaction (pi-tricks §1b, variant 1) -------------------------------
 	/** The cold return as Pi runs it: before_agent_start sees the session WITHOUT the prompt (Pi appends it after the hook), then the
 	 *  first request. `pi` fakes Pi's side: ctx.compact (asks session_before_compact, appends the entry, projects it), isIdle, settings. */

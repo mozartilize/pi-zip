@@ -127,6 +127,8 @@ export default function piZip(pi: ExtensionAPI) {
 	pi.on("agent_before_settle", (e, ctx) => zip.settle(e, ctx));
 	pi.on("before_provider_request", (e) => zip.providerRequest(e));
 	pi.on("tool_call", (e, ctx) => zip.toolCall(e, ctx)); // a recall file named by a built-in tool: this machine's copy, written on demand
+	// Pi's idle cache warming: observed only (the return value is undefined, so Pi's own decision stands); an older Pi never fires it
+	pi.on("cache_warming_decision", (e) => zip.cacheWarmingDecision(e));
 	pi.on("message_end", (e) => zip.messageEnd(e.message));
 	pi.on("session_shutdown", () => zip.shutdown());
 }
