@@ -368,6 +368,48 @@ describe("recall", () => {
 		expect(none.text).toContain("Nothing matched");
 		const paged = searchOutputs(outs, "error", { limit: 40 });
 		expect(paged.text).toContain("offset=40"); // pages like any recall
+		expect(paged.text).toContain("or narrow the pattern, or pass one of the handles above with grep]");
+	});
+	test("a search pages by 8,000 characters by default (a recall by handle by 20,000); an explicit limit still wins", () => {
+		const big = [{ handle: "h1", tool: "bash", label: "bash x", text: Array.from({ length: 600 }, (_, i) => `error ${i} ` + "x".repeat(40)).join("\n") }];
+		const s = searchOutputs(big, "error");
+		expect(s.chars).toBe(8000);
+		expect(s.text).toMatch(/\[chars 0-8000 of \d+\]/);
+		expect(s.text).toContain("call zip_recall again with offset=8000");
+		expect(searchOutputs(big, "error", { limit: 20_000 }).chars).toBe(20_000);
+		expect(sliceRecall(big[0].text, {}).body.length).toBe(20_000);
+	});
+	test("a later page of a search sees the pool of its first page: an output that arrived in between does not shift the offsets", async () => {
+		const { registerRecallTool, searchPoolOf } = await import("../src/recall.ts");
+		let def: any;
+		registerRecallTool({ registerTool: (t: any) => (def = t) } as any, { onRecall: () => {} });
+		const lines = (tag: string) => Array.from({ length: 300 }, (_, i) => `hit ${tag} ${i} ` + "y".repeat(30)).join("\n");
+		const branch: any[] = [
+			{ type: "message", id: "u1", message: { role: "user", content: "go" } },
+			call("a1", "c1", "bash", { command: "one" }),
+			res("e1", "c1", "bash", lines("A")),
+			call("a2", "c2", "bash", { command: "two" }),
+			res("e2", "c2", "bash", lines("B")),
+		];
+		const ctx = { sessionManager: { getBranch: () => branch } };
+		const p1 = await def.execute("t", { grep: "hit" }, undefined, undefined, ctx);
+		expect(p1.details.pool).toBe(2);
+		const whole = searchOutputs(branchOutputs(branch), "hit", { limit: 50_000 }).text;
+		// page 1 lands in the session, then a parallel call's output arrives before page 2
+		const r1 = res("e3", "c3", zipRecallName, p1.content[0].text);
+		branch.push(call("a3", "c3", zipRecallName, { grep: "hit" }), { ...r1, message: { ...r1.message, details: p1.details } });
+		branch.push(call("a4", "c4", "bash", { command: "three" }), res("e4", "c4", "bash", lines("C")));
+		expect(searchPoolOf(branch, "hit")).toBe(2);
+		const p2 = await def.execute("t", { grep: "hit", offset: 8000 }, undefined, undefined, ctx);
+		expect(p2.content[0].text).toContain("over all 2 earlier tool outputs");
+		expect(p2.content[0].text).not.toContain("hit C");
+		const body = (t: string) => t.slice(t.indexOf("]\n", t.indexOf("[chars ")) + 2, t.lastIndexOf("\n[…"));
+		const bodyOf = (t: string) => t.slice(t.indexOf("\n") + 1);
+		expect(body(p1.content[0].text) + body(p2.content[0].text)).toBe(bodyOf(whole).slice(0, 16_000)); // pages join up exactly
+		// a new first page (no offset) searches everything again, including the new output
+		const fresh = await def.execute("t", { grep: "hit" }, undefined, undefined, ctx);
+		expect(fresh.details.pool).toBe(3);
+		expect(fresh.content[0].text).toContain("hit C");
 	});
 	test("zip_recall with grep alone goes through execute as a search; with neither handle nor grep it says what to pass", async () => {
 		const { registerRecallTool } = await import("../src/recall.ts");

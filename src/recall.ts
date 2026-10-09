@@ -5,6 +5,7 @@ import { measure, recallCallLine, recallResultLines, type RecallSectionInfo } fr
 import { type Any, clamp, textOf } from "./util.ts";
 
 const RECALL_PAGE_CHARS = 20_000; // default page
+const SEARCH_PAGE_CHARS = 8_000; // default page of grep without a handle: a broad pattern over every output stays small (search results are never folded)
 const RECALL_MAX_PAGE_CHARS = 50_000;
 const RECALL_MAX_HITS = 400;
 const GREP_MAX_PATTERN = 256;
@@ -55,7 +56,7 @@ const isLow = (c: number) => c >= 0xdc00 && c <= 0xdfff;
  * Full text, a line range or grep matches of an original, then one page of it by CHARACTERS (offset, limit): a single
  * 45,000-character line is reachable too. Pages never split a surrogate pair, so concatenated pages are the selection byte for byte.
  */
-export function sliceRecall(text: string, opts: { grep?: string; range?: string; offset?: unknown; limit?: unknown }): RecallSlice {
+export function sliceRecall(text: string, opts: { grep?: string; range?: string; offset?: unknown; limit?: unknown; pageChars?: number; narrow?: string }): RecallSlice {
 	const lines = text.split("\n");
 	const totalLines = lines.length;
 	let sel: string;
@@ -83,7 +84,7 @@ export function sliceRecall(text: string, opts: { grep?: string; range?: string;
 		sel = text;
 	}
 	const limitIn = int(opts.limit);
-	const limit = clamp(limitIn ?? RECALL_PAGE_CHARS, 1, RECALL_MAX_PAGE_CHARS);
+	const limit = clamp(limitIn ?? opts.pageChars ?? RECALL_PAGE_CHARS, 1, RECALL_MAX_PAGE_CHARS);
 	let offset = clamp(int(opts.offset) ?? 0, 0, sel.length);
 	if (offset > 0 && offset < sel.length && isLow(sel.charCodeAt(offset))) offset--; // never start inside a surrogate pair
 	let end = Math.min(sel.length, offset + limit);
@@ -93,7 +94,7 @@ export function sliceRecall(text: string, opts: { grep?: string; range?: string;
 	const paged = more || offset > 0;
 	const pageHeader = paged ? `[chars ${offset}-${end} of ${sel.length}${header ? " of the selection" : ""}]\n` : "";
 	const hint = more
-		? `\n[… ${sel.length - end} more chars: call ${RECALL_TOOL} again with offset=${end} for the next page (limit up to ${RECALL_MAX_PAGE_CHARS}), or narrow it with grep or range]`
+		? `\n[… ${sel.length - end} more chars: call ${RECALL_TOOL} again with offset=${end} for the next page (limit up to ${RECALL_MAX_PAGE_CHARS}), or ${opts.narrow ?? "narrow it with grep or range"}]`
 		: "";
 	return { text: header + pageHeader + body + hint, body, totalLines, matched, clipped: more, offset, nextOffset: more ? end : null, selectionChars: sel.length };
 }
@@ -166,12 +167,15 @@ export function resolveHandlesInBranch(branch: Any[], handles: string[]): { item
 
 /**
  * grep without a handle: every earlier tool output of the branch (zip_recall results excepted), newest output first, each match
- * under its output's handle and call, then one page by characters. For outputs whose handle the model cannot see any more (a long
- * summary lists only the newest) and for questions that name the content rather than the output.
+ * under its output's handle and call, then one page by characters (default SEARCH_PAGE_CHARS). For outputs whose handle the model
+ * cannot see any more (a long summary lists only the newest) and for questions that name the content rather than the output.
+ * `upTo` pins the pool to its first n outputs (branch order, oldest first; new outputs only append): a later page of the same search
+ * passes the pool size of its first page, so an output that arrived in between cannot shift the character offsets.
  */
-export function searchOutputs(outputs: Array<RecallItem & { text: string }>, grep: string, opts: { offset?: unknown; limit?: unknown } = {}): { text: string; matched: number; hits: number; chars: number; sections: RecallSectionInfo[] } {
+export function searchOutputs(outputs: Array<RecallItem & { text: string }>, grep: string, opts: { offset?: unknown; limit?: unknown; upTo?: number } = {}): { text: string; matched: number; hits: number; chars: number; pool: number; sections: RecallSectionInfo[] } {
 	const { re, literal } = grepMatcher(grep);
-	const pool = outputs.filter((o) => o.tool !== RECALL_TOOL);
+	const all = outputs.filter((o) => o.tool !== RECALL_TOOL);
+	const pool = opts.upTo !== undefined && opts.upTo >= 0 && opts.upTo < all.length ? all.slice(0, opts.upTo) : all;
 	const parts: string[] = [];
 	const sections: RecallSectionInfo[] = [];
 	let hits = 0;
@@ -196,9 +200,18 @@ export function searchOutputs(outputs: Array<RecallItem & { text: string }>, gre
 		sections.push({ handle: it.handle, label: it.label ?? it.tool ?? undefined, turn: it.turn, totalLines: lines.length, shownLines: got.length, how: "grep" });
 	}
 	const head = `[grep${literal ? " (searched as literal text: the pattern is not a safe regular expression)" : ""} over all ${pool.length} earlier tool outputs (no handle given): ${hits} matching line(s) in ${sections.length} output(s), newest output first${stopped ? "; stopped early (time or hit cap), narrow the pattern or pass a handle" : ""}]\n`;
-	if (!hits) return { text: head + "Nothing matched. Try a shorter or different pattern, or pass the handle shown in a folded block or a summary.", matched: 0, hits, chars: 0, sections };
-	const page = sliceRecall(parts.join("\n\n"), { offset: opts.offset, limit: opts.limit });
-	return { text: head + page.text, matched: sections.length, hits, chars: page.body.length, sections };
+	if (!hits) return { text: head + "Nothing matched. Try a shorter or different pattern, or pass the handle shown in a folded block or a summary.", matched: 0, hits, chars: 0, pool: pool.length, sections };
+	const page = sliceRecall(parts.join("\n\n"), { offset: opts.offset, limit: opts.limit, pageChars: SEARCH_PAGE_CHARS, narrow: "narrow the pattern, or pass one of the handles above with grep" });
+	return { text: head + page.text, matched: sections.length, hits, chars: page.body.length, pool: pool.length, sections };
+}
+
+/** The pool size recorded by the newest earlier search with this same pattern (its first page), for a later page of it. */
+export function searchPoolOf(branch: Any[], grep: string): number | undefined {
+	for (let i = branch.length - 1; i >= 0; i--) {
+		const m = branch[i]?.type === "message" ? branch[i].message : null;
+		if (m?.role === "toolResult" && m.toolName === RECALL_TOOL && m.details?.search === grep && typeof m.details.pool === "number") return m.details.pool;
+	}
+	return undefined;
 }
 
 /** Handles the model already recalled in this branch (F4: never refold them). */
@@ -241,7 +254,7 @@ export function registerRecallTool(pi: ExtensionAPI, hooks: RecallHooks) {
 				grep: { type: "string", description: "Optional: only lines matching this case-insensitive regular expression, with line numbers (applied to every handle). Without any handle: searches every earlier tool output of the session" },
 				range: { type: "string", description: 'Optional: only this line range, e.g. "120-240" (applied to every handle)' },
 				offset: { type: "number", description: "Optional: start this many characters into the (selected) text, for the next page of a large output or a very long single line (applied to every handle)" },
-				limit: { type: "number", description: `Optional: page size in characters (default ${RECALL_PAGE_CHARS}, at most ${RECALL_MAX_PAGE_CHARS})` },
+				limit: { type: "number", description: `Optional: page size in characters (default ${RECALL_PAGE_CHARS}; ${SEARCH_PAGE_CHARS} for grep without a handle; at most ${RECALL_MAX_PAGE_CHARS})` },
 			},
 			required: [],
 		} as Any,
@@ -263,9 +276,11 @@ export function registerRecallTool(pi: ExtensionAPI, hooks: RecallHooks) {
 			if (Array.isArray(params?.handles)) for (const h of params.handles) if (typeof h === "string" && h.trim() && !handles.includes(h.trim())) handles.push(h.trim());
 			if (!handles.length && grep !== undefined && grep.trim() !== "") {
 				try {
-					const out = searchOutputs(branchOutputs(ctx.sessionManager.getBranch() as Any[]), grep, { offset, limit });
+					const branch = ctx.sessionManager.getBranch() as Any[];
+					const later = (int(offset) ?? 0) > 0; // a later page: search the pool its first page saw
+					const out = searchOutputs(branchOutputs(branch), grep, { offset, limit, upTo: later ? searchPoolOf(branch, grep) : undefined });
 					hooks.onRecall([], out.chars, []); // a search marks nothing as recalled: only what the model asks for by handle is kept unfolded
-					return { content: [{ type: "text", text: out.text }], details: { handles: [], search: grep, resolved: out.matched, missing: 0, sections: out.sections }, isError: false };
+					return { content: [{ type: "text", text: out.text }], details: { handles: [], search: grep, pool: out.pool, resolved: out.matched, missing: 0, sections: out.sections }, isError: false };
 				} catch (err) {
 					return { content: [{ type: "text", text: `${RECALL_TOOL} failed: ${err instanceof Error ? err.message : String(err)}` }], details: {}, isError: true };
 				}
