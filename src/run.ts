@@ -657,7 +657,7 @@ export class Zip implements ZipControl {
 		if (live.length) notices.push({ kind: "fold", count: live.length, tokensBefore: ctxTokens, tokensAfter: cut || !realAfter ? ctxTokens - (before - after) : realAfter, ms: plan.ms + (performance.now() - o.t0), pressure: valve });
 		if (cut) {
 			const prepared = plan.source === "settle" && waitMs < 500; // finished while the user was away: report the real production time, not the zero wait
-			notices.push({ kind: "summary", count: cut.count, tokensBefore: ctxTokens - (before - after), tokensAfter: realAfter || estAfter, ms: prepared ? cut.ms : waitMs, prepared, pressure: valve });
+			notices.push({ kind: "summary", count: cut.count, tokensBefore: ctxTokens - (before - after), tokensAfter: realAfter || estAfter, ms: Math.max(cut.ms, waitMs), waitMs, prepared, pressure: valve });
 		}
 		if (notices.length && !this.quiet) {
 			const ITEMS = 8;

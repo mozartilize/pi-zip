@@ -9,6 +9,7 @@ export interface NoticeAction {
 	tokensBefore: number;
 	tokensAfter: number;
 	ms: number;
+	waitMs?: number; // summary: how long the user waited for it (ms = how long it took to write)
 	prepared?: boolean; // summary computed while the user was away
 	pressure?: boolean; // done by the warm valve (the law fired while the cache is still warm), not because the cache was cold
 }
@@ -42,13 +43,18 @@ export const fmtK = (tokens: number): string => `${tokens >= 99_500 ? Math.round
 
 const plural = (n: number, w: string) => `${n} ${w}${n === 1 ? "" : "s"}`;
 const secs = (ms: number) => `${(Math.round(ms / 100) / 10).toFixed(1)} s`;
+const dur = (ms: number) => (ms < 950 ? `${Math.max(1, Math.round(ms))} ms` : secs(ms));
 
 /** The words after the numbers: what happened, plus how long the user waited for a summary (if at all). */
 export function noticeDesc(actions: NoticeAction[]): string {
 	return actions
 		.map((a) => {
-			if (a.kind === "fold") return `folded ${plural(a.count, "old output")}`;
-			return `summarized ${plural(a.count, "request")} · ${a.prepared ? "ready while you were away" : `waited ${secs(a.ms)}`}`;
+			if (a.kind === "fold") return `folded ${plural(a.count, "old output")} in ${dur(a.ms)}`;
+			const wait = a.prepared ? 0 : (a.waitMs ?? a.ms);
+			const took = `summarized ${plural(a.count, "request")}`;
+			if (a.prepared) return `${took} in ${dur(a.ms)} · ready while you were away`;
+			if (wait >= a.ms - 500) return `${took} · waited ${secs(wait)}`; // the user waited for all of it
+			return `${took} in ${dur(a.ms)} · waited ${secs(wait)}`; // started while away, finished after the return
 		})
 		.join(" · ");
 }

@@ -537,12 +537,14 @@ describe("notices and stats", () => {
 	const fold: NoticeAction = { kind: "fold", count: 12, tokensBefore: 84200, tokensAfter: 31500, ms: 0.94 };
 	const sync: NoticeAction = { kind: "summary", count: 64, tokensBefore: 182000, tokensAfter: 41000, ms: 8400 };
 	test("exact formats; fold and summary merge into ONE line, numbers first", () => {
-		expect(noticeText([fold])).toBe("pi-zip  84.2K → 31.5K  folded 12 old outputs");
-		expect(noticeText([sync])).toBe("pi-zip  182K → 41K  summarized 64 requests · waited 8.4 s");
-		expect(noticeText([{ ...sync, prepared: true }])).toBe("pi-zip  182K → 41K  summarized 64 requests · ready while you were away");
+		expect(noticeText([fold])).toBe("pi-zip  84.2K → 31.5K  folded 12 old outputs in 1 ms");
+		expect(noticeText([{ ...fold, ms: 1234 }])).toBe("pi-zip  84.2K → 31.5K  folded 12 old outputs in 1.2 s");
+		expect(noticeText([sync])).toBe("pi-zip  182K → 41K  summarized 64 requests · waited 8.4 s"); // waited for all of it
+		expect(noticeText([{ ...sync, ms: 41200, waitMs: 12000 }])).toBe("pi-zip  182K → 41K  summarized 64 requests in 41.2 s · waited 12.0 s"); // started while away
+		expect(noticeText([{ ...sync, ms: 41200, prepared: true }])).toBe("pi-zip  182K → 41K  summarized 64 requests in 41.2 s · ready while you were away");
 		const merged = noticeText([fold, { ...sync, tokensBefore: 31500, tokensAfter: 20000 }]);
-		expect(merged).toBe("pi-zip  84.2K → 20K  folded 12 old outputs · summarized 64 requests · waited 8.4 s");
-		expect(noticeText([{ ...fold, count: 1 }])).toBe("pi-zip  84.2K → 31.5K  folded 1 old output");
+		expect(merged).toBe("pi-zip  84.2K → 20K  folded 12 old outputs in 1 ms · summarized 64 requests · waited 8.4 s");
+		expect(noticeText([{ ...fold, count: 1 }])).toBe("pi-zip  84.2K → 31.5K  folded 1 old output in 1 ms");
 	});
 	test("ratio bar: ten cells, filled by what is left, never empty", () => {
 		expect(ratioBar(74000, 43000)).toBe("▰▰▰▰▰▰▱▱▱▱");

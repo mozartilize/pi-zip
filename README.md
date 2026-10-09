@@ -38,15 +38,15 @@ Known limits:
 At most one line per turn in the transcript, only when the context was folded or summarized. The numbers come first, and the bar shows how much is left:
 
 ```
-▸ pi-zip  74K → 43K  ▰▰▰▰▰▰▱▱▱▱  folded 12 old outputs
+▸ pi-zip  74K → 43K  ▰▰▰▰▰▰▱▱▱▱  folded 12 old outputs in 6 ms
           originals are kept; the model can recall any of them with zip_recall
-▸ pi-zip  182K → 41K  ▰▰▱▱▱▱▱▱▱▱  summarized 64 requests · ready while you were away
+▸ pi-zip  182K → 41K  ▰▰▱▱▱▱▱▱▱▱  summarized 64 requests in 38.2 s · ready while you were away
 ```
 
 The second line appears once per session. Click the notice (or expand tool output with ctrl+o) to see why it happened now and what was folded:
 
 ```
-▸ pi-zip  74K → 43K  ▰▰▰▰▰▰▱▱▱▱  folded 12 old outputs
+▸ pi-zip  74K → 43K  ▰▰▰▰▰▰▱▱▱▱  folded 12 old outputs in 6 ms
           cache cold (away 47 min): this request rewrites it anyway, so editing is free
           bash npm test        turn 1     14K  k3x9q2m7ab
           read src/payment.ts  turn 1      9K  p8d2x1qa0m
@@ -83,7 +83,7 @@ While a summary started in the background is being finished, Pi's working line s
   cache    anthropic/claude-sonnet-5-5 · explicit · lives ~5 min (declared)
   alive    ██████▁▁▁▁▁▁▁▁▁▁  30 s → 2 h
   session  56 folds ~310K  ·  2 summaries $0.41  ·  3 recalls
-  last     10:50  folded 12 old outputs · cache cold (away 47 min): this request rewrites it anyway, so editing is free
+  last     10:50  folded 12 old outputs in 6 ms · cache cold (away 47 min): this request rewrites it anyway, so editing is free
   mode     full (zip_recall available)
 ```
 
