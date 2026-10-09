@@ -485,7 +485,7 @@ export async function buildCut(p: PlanResult, ctx: Any, signal?: AbortSignal): P
 	const nb = clamp(p.summaryTokensPlanned - tok4(sk.text), 300, 4000);
 	const nar = await narrative(prefix, ctx, nb, signal);
 	let text = sk.text;
-	text += nar.ok && nar.text ? `\n## Narrative (model-written)\n${nar.text.slice(0, nb * 6)}` : `\n## Narrative\n(unavailable: ${nar.error ?? "n/a"}; rely on the sections above and re-read files as needed)`;
+	text += nar.ok && nar.text ? `\n## Narrative (model-written)\n${nar.text.slice(0, nb * 6)}` : `\n## Narrative\n(unavailable: ${nar.error ?? "n/a"}; rely on the sections above and ${RECALL_TOOL} an output by its handle rather than re-running or re-reading)`;
 	if (table) text += "\n" + table;
 	return {
 		firstKeptEntryId: p.blocks[p.cutIdx!].entryId!,
