@@ -132,6 +132,12 @@ export function renderCard(c: CardData, width: number, th: Th, m: Measure = plai
 			if (say && !beside) under = th.fg("dim", m.cut(" ".repeat(indent.length + LABEL_W) + say, width));
 			continue;
 		}
+		if (!c.alive?.length && c.model && c.life && row.startsWith("cache ")) {
+			// Narrow: keep the fact whole, dropping the model name first, then "(measured)".
+			const head = (indent + "cache").padEnd(indent.length + LABEL_W), room = width - m.vw(head);
+			const v = [row.slice(LABEL_W), lifeText(c), lifeText({ ...c, measured: false })].find((x) => m.vw(x) <= room);
+			if (v) { out.push(th.fg("dim", head + v)); continue; }
+		}
 		const line = m.cut(indent + row, width);
 		if (!line) continue;
 		const k = line.slice(0, indent.length + LABEL_W), v = line.slice(indent.length + LABEL_W);

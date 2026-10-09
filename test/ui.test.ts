@@ -64,7 +64,9 @@ describe("status card", () => {
 		const mid = renderCard({ ...c, measured: true }, 60, th);
 		expect(mid[3]).toStartWith("  away         1m");
 		expect(mid[4]).toBe("           expires after ~5 min idle (measured)");
-		expect(renderCard(c, 40, th)[1]).toStartWith("  cache    anthropic/claude-sonnet-5-5");
+		expect(renderCard({ ...c, alive: undefined }, 80, th)[1]).toBe("  cache    anthropic/claude-sonnet-5-5 · expires after ~5 min idle");
+		expect(renderCard(c, 40, th)[1]).toBe("  cache    expires after ~5 min idle"); // the model name goes before the fact is cut
+		expect(renderCard({ ...c, measured: true }, 38, th)[1]).toBe("  cache    expires after ~5 min idle");
 		expect(renderCard(c, 40, th).filter((x) => /^  (model|away) /.test(x))).toEqual([]); // no model or away row without the chart
 	});
 	test("fmtLife", () => expect([fmtLife(45), fmtLife(300), fmtLife(3600), fmtLife(9000)]).toEqual(["~45 s", "~5 min", "~1 h", "~2.5 h"]));
