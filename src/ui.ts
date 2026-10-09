@@ -5,6 +5,7 @@ import { PRODUCT } from "./util.ts";
 
 export interface Th {
 	fg(color: string, text: string): string;
+	bold?(text: string): string;
 }
 /** Display width and truncation: Pi's visibleWidth / truncateToWidth in the renderer, string length in tests. */
 export interface Measure {
@@ -110,30 +111,32 @@ export interface RecallSectionInfo {
 	missing?: boolean;
 }
 
-/** "↺ recall k3x9q2m7ab  grep "Expected"" */
-export function recallCallLine(args: { handle?: string; handles?: string[]; grep?: string; range?: string; offset?: number }, width: number, th: Th, m: Measure = plainMeasure): string[] {
+/** "recall read src/learn.ts  "HALF_LIFE"": the same shape as Pi's own tool rows (bold name, accent argument); the argument says
+ *  WHAT comes back (the folded output's label), not its handle. `labelOf` maps a handle to that label when it is known. */
+export function recallCallLine(args: { handle?: string; handles?: string[]; grep?: string; range?: string; offset?: number }, width: number, th: Th, m: Measure = plainMeasure, labelOf: (h: string) => string | undefined = () => undefined): string[] {
 	const hs = [...(typeof args?.handle === "string" ? [args.handle] : []), ...(Array.isArray(args?.handles) ? args.handles.filter((h) => typeof h === "string") : [])];
-	const what = hs.length > 1 ? `${hs.length} handles` : (hs[0] ?? "");
-	const opt = [args?.grep ? `grep "${args.grep}"` : "", args?.range ? `lines ${args.range}` : "", args?.offset ? `from char ${args.offset}` : ""].filter(Boolean).join(" · ");
-	const plain = m.cut(`↺ recall ${what}${opt ? "  " + opt : ""}`, width);
-	const head = "↺ recall";
-	if (!plain.startsWith(head)) return [th.fg("toolTitle", plain)];
-	return [th.fg("toolTitle", head) + th.fg("accent", plain.slice(head.length, head.length + 1 + what.length)) + th.fg("dim", plain.slice(head.length + 1 + what.length))];
+	const what = hs.length > 1 ? `${hs.length} outputs` : hs[0] ? (labelOf(hs[0].trim()) ?? hs[0]) : "";
+	const opt = [args?.grep ? `"${args.grep}"` : "", args?.range ? `lines ${args.range}` : "", args?.offset ? `from char ${args.offset}` : ""].filter(Boolean).join(" · ");
+	const head = "recall";
+	const plain = m.cut(`${head} ${what}${opt ? "  " + opt : ""}`, width);
+	const bold = (t: string) => (th.bold ? th.bold(t) : t);
+	if (!plain.startsWith(head + " ")) return [th.fg("toolTitle", bold(plain))];
+	const w = plain.slice(head.length + 1, head.length + 1 + what.length);
+	return [th.fg("toolTitle", bold(head)) + " " + th.fg("accent", w) + th.fg("dim", plain.slice(head.length + 1 + w.length))];
 }
 
-export function sectionLine(s: RecallSectionInfo): string {
+export function sectionLine(s: RecallSectionInfo, many = false): string {
 	if (s.missing) return `${s.handle} not found`;
-	const where = [s.label, s.turn ? `turn ${s.turn}` : ""].filter(Boolean).join(" · ");
 	const total = s.totalLines ?? 0;
 	const got = s.how === "all" ? `all ${total} lines` : `${s.shownLines ?? 0} of ${total} lines`;
-	return `${where || s.handle}  ${got}`;
+	return many ? `${s.label || s.handle}  ${got}` : got;
 }
 
-/** Collapsed: one line per handle ("bash npm test · turn 1  3 of 812 lines"). Expanded: the recalled text, at most maxLines. */
+/** Collapsed: what came back ("2 of 142 lines"; one line per output for a batch). Expanded: the recalled text, at most maxLines. */
 export function recallResultLines(sections: RecallSectionInfo[], text: string, expanded: boolean, width: number, th: Th, m: Measure = plainMeasure, maxLines = 40): string[] {
 	const out: string[] = [];
 	for (const s of sections) {
-		const l = m.cut(sectionLine(s), width);
+		const l = m.cut(sectionLine(s, sections.length > 1), width);
 		if (l) out.push(s.missing ? th.fg("error", l) : th.fg("dim", l));
 	}
 	if (!sections.length && text) out.push(th.fg("dim", m.cut(clean(text.split("\n")[0]), width)));
@@ -146,10 +149,10 @@ export function recallResultLines(sections: RecallSectionInfo[], text: string, e
 
 // ---- the mark on a folded output ---------------------------------------------------------------------------------------
 
-/** Right-aligns "▸ folded · <handle>" on the first line of a tool call row, if it fits; otherwise leaves the row alone. */
+/** Right-aligns "▸ folded" on the first line of a tool call row, if it fits; otherwise leaves the row alone. */
 export function markFirstLine(lines: string[], handle: string, width: number, th: Th, m: Measure = plainMeasure): string[] {
 	if (!lines.length) return lines;
-	const mark = `${MARK}folded · ${handle}`;
+	const mark = `${MARK}folded`; // the handle is in the notice (ctrl+o) and in the model's view; here it would only be noise
 	// renderers often pad a row to the full width (and may close styles after the padding): drop the padding, keep the codes
 	const first = lines[0].replace(/ +((?:\x1b\[[0-9;]*m)*)$/, "$1");
 	const gap = width - m.vw(first) - m.vw(mark);

@@ -761,23 +761,20 @@ describe("in-turn folds through the real extension: one user message, 60 tool ca
 		expect(c2.render(200)).toEqual(wide);
 	});
 
-	test("the notice's 'after' is the real size the edited request carried (matches Pi's context meter); 'before' stays the calibrated one", async () => {
+	test("the notice is in the transcript when the first request carrying the plan goes out (top of the turn), once per plan", async () => {
 		process.env.PI_ZIP_COLD_CAP = "8000";
-		const run = async (real: number) => {
-			const entries = session();
-			const r = await rig(entries, COLD_TS(), {}, { registerEntryRenderer: () => {} });
-			await r.fire("before_agent_start", {});
-			await r.fire("context_with_system", { messages: flat(entries) });
-			const te = turnEnd([...entries, ...tail, A("a63")], "a63", 1);
-			te.message.usage.input = real;
-			await r.fire("turn_end", te);
-			await sleep(5);
-			return r.appended.find((x: Any) => x.customType === "pi-zip/notice").data;
-		};
-		const a = await run(6000), b = await run(9000);
-		expect(a.after).toBe(6000);
-		expect(b.after).toBe(9000);
-		expect(b.before).toBe(a.before); // before is the calibrated size of the previous request: never rescaled by the after side
+		const entries = session();
+		const r = await rig(entries, COLD_TS(), {}, { registerEntryRenderer: () => {} });
+		await r.fire("before_agent_start", {});
+		await r.fire("context_with_system", { messages: flat(entries) });
+		await sleep(5);
+		const early = r.appended.filter((x: Any) => x.customType === "pi-zip/notice");
+		expect(early.length).toBe(1); // before the model answered
+		expect(early[0].data.after).toBeLessThan(early[0].data.before);
+		await r.fire("context_with_system", { messages: flat(entries) }); // the run's second request
+		await r.fire("turn_end", turnEnd([...entries, ...tail, A("a63")], "a63", 1));
+		await sleep(5);
+		expect(r.appended.filter((x: Any) => x.customType === "pi-zip/notice").length).toBe(1); // not again at turn_end
 	});
 
 	test("zip_recall hidden by a --tools allowlist (sub-agents): only rereadable outputs fold, placeholders point at re-reading", async () => {

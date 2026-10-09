@@ -113,14 +113,21 @@ export class Zip implements ZipControl {
 	/** Folded tool outputs of the current branch by toolCallId -> handle (the transcript marks them). */
 	readonly foldedCalls = new Map<string, string>();
 	foldedHandle = (toolCallId: string): string | undefined => this.foldedCalls.get(toolCallId);
+	/** handle -> what was folded ("read src/learn.ts"), from the placeholders of this branch: the recall row names it. */
+	readonly labels = new Map<string, string>();
+	labelOf = (handle: string): string | undefined => this.labels.get(handle);
 	refreshFolded(ctx: Any) {
 		const branch = this.branch(ctx);
 		const byId = new Map(branch.map((e: Any) => [e?.id, e]));
 		this.foldedCalls.clear();
 		for (const e of branch) {
-			if (e?.type !== "context_edit" || !String(e?.replacement?.content?.[0]?.text ?? "").startsWith(PH_MARK)) continue;
+			const ph = String(e?.replacement?.content?.[0]?.text ?? "");
+			if (e?.type !== "context_edit" || !ph.startsWith(PH_MARK)) continue;
+			const h = handleFor(e.targetId);
+			const label = ph.slice(0, ph.indexOf("\n") >>> 0).split(" · ")[1];
+			if (label) this.labels.set(h, label);
 			const id = byId.get(e.targetId)?.message?.toolCallId;
-			if (typeof id === "string") this.foldedCalls.set(id, handleFor(e.targetId));
+			if (typeof id === "string") this.foldedCalls.set(id, h);
 		}
 	}
 
@@ -313,7 +320,7 @@ export class Zip implements ZipControl {
 		this.survSrc = src;
 		this.runChecked = false; // the first request decides (cold: the cold plan; warm: only above the cap, if the law fires)
 		this.coldReason = reason;
-		this.coldWhy = src === "model switch" ? "model switched: its cache starts empty, so this request rewrites it anyway" : cold && gapS !== null ? `cache cold (away ${fmtAway(gapS)}): this request rewrites it anyway, so editing is free` : "";
+		this.coldWhy = src === "model switch" ? "model switched" : cold && gapS !== null ? `away ${fmtAway(gapS)}` : "";
 		for (const h of recalledHandlesFromBranch(branch)) this.recalled.add(h);
 		for (let i = branch.length - 1; i >= 0; i--) {
 			const en = branch[i];
@@ -370,6 +377,11 @@ export class Zip implements ZipControl {
 				if (!this.runPlan.sent) this.nextEdit = this.runPlan.untouched ?? 0;
 				this.runPlan.sent = true;
 				this.runPlan.applied = out.applied;
+				if (!this.runPlan.noticed) { // say it where it happens: at the top of the turn, before the model answers
+					this.runPlan.noticed = true;
+					const live = this.runPlan.folds.filter((t) => out.applied.has(t.entryId));
+					this.noticeFor(ctx, this.runPlan, live, this.runPlan.cut, this.runPlan.ctxBefore, 0);
+				}
 				return { messages: out.messages };
 			}
 		}
@@ -453,7 +465,7 @@ export class Zip implements ZipControl {
 			}
 		}
 		const ctxAfter = cut ? (p?.ctxAfterFolds ?? 0) - cal.k * (cut.prefixTokens - cut.summaryTokens) : (p?.ctxAfterFolds ?? 0);
-		this.runPlan = { source, folds, cut, ctxBefore: p?.ctxTokens ?? 0, ctxAfter, ms: foldMs, k: cal.k, persisted: false, cutVisibleIdx: p?.cutVisibleIdx ?? -1, cutKeptFirstMsg: p?.cutKeptFirstMsg, untouched: p ? p.k * untouchedEst(p.blocks, folds, !!cut, o.sys) : 0 };
+		this.runPlan = { source, folds, cut, ctxBefore: p?.ctxTokens ?? 0, ctxAfter, ms: foldMs, k: cal.k, persisted: false, waitMs: cut ? (adopted ? this.bgWaitMs : cut.ms) : 0, cutVisibleIdx: p?.cutVisibleIdx ?? -1, cutKeptFirstMsg: p?.cutKeptFirstMsg, untouched: p ? p.k * untouchedEst(p.blocks, folds, !!cut, o.sys) : 0 };
 		this.ledger({ type: "cold_plan", trigger, source, folds: folds.length, summary: !!cut, ...this.calOf(cal), ctxBefore: Math.round(this.runPlan.ctxBefore), ctxAfter: Math.round(ctxAfter), ms: Math.round(foldMs), ...(cut ? { summaryMs: cut.ms, llmOk: cut.llmOk, waitedMs: Math.round(adopted ? this.bgWaitMs : cut.ms), ...this.usageOf(cut) } : {}) });
 	}
 
@@ -594,6 +606,33 @@ export class Zip implements ZipControl {
 		return this.commit(e, ctx, plan, o);
 	}
 
+	/**
+	 * The transcript notice for one plan. Facts only, no claims: what changed (sizes), how long it took, and, expanded, why now
+	 * ("away 47 min") and what was folded. Whether the cache really was cold is learned from the response, silently (/zip shows it).
+	 * `realAfter` > 0: the size the provider reported for the request that carried the plan (shown instead of the estimate).
+	 */
+	private noticeFor(ctx: Any, plan: RunPlan, live: FoldTarget[], cut: Cut | null, ctxTokens: number, realAfter: number) {
+		if (this.quiet || (!live.length && !cut)) return;
+		const k = plan.k, valve = plan.source === "valve";
+		const before = k * live.reduce((a, t) => a + t.entryTokens, 0), after = k * live.reduce((a, t) => a + t.phTokens, 0);
+		const cutSaved = cut ? k * (cut.prefixTokens - cut.summaryTokens) : 0;
+		const estAfter = ctxTokens - (before - after) - cutSaved;
+		const waitMs = cut ? (plan.waitMs ?? (plan.source === "settle" ? this.bgWaitMs : cut.ms)) : 0;
+		const notices: NoticeAction[] = [];
+		if (live.length) notices.push({ kind: "fold", count: live.length, tokensBefore: ctxTokens, tokensAfter: cut || !realAfter ? ctxTokens - (before - after) : realAfter, ms: plan.ms, pressure: valve });
+		if (cut) {
+			const prepared = plan.source === "settle" && waitMs < 500; // finished while the user was away: report the real production time, not the zero wait
+			notices.push({ kind: "summary", count: cut.count, tokensBefore: ctxTokens - (before - after), tokensAfter: realAfter || estAfter, ms: Math.max(cut.ms, waitMs), waitMs, prepared, pressure: valve });
+		}
+		for (const t of live) this.labels.set(handleFor(t.entryId), `${t.tool}${t.args ? " " + t.args : ""}`);
+		const ITEMS = 8;
+		const items = live.slice(0, ITEMS).map((t) => ({ label: `${t.tool}${t.args ? " " + t.args : ""}`, tokens: Math.round(k * t.entryTokens), handle: handleFor(t.entryId) }));
+		const why = valve || !this.cold ? "cache warm · worth it at this size" : this.coldWhy;
+		const data: NoticeData = { v: 2, text: noticeText(notices), before: Math.round(notices[0].tokensBefore), after: Math.round(notices[notices.length - 1].tokensAfter), desc: noticeDesc(notices), why: why || undefined, items, more: Math.max(0, live.length - ITEMS) || undefined, first: !this.noticed && !this.branch(ctx).some((en: Any) => en?.type === "custom" && en.customType === NOTICE_CUSTOM) };
+		this.noticed = true;
+		this.notify(ctx, data.text, data);
+	}
+
 	private commit(e: Any, ctx: Any, plan: RunPlan, o: { t0: number; blocks: Block[]; userTurns: number; sys: number; usageTotal: number }) {
 		plan.persisted = true;
 		const k = plan.k; // one scale for the whole run: stats, notices and the ledger agree with what the plan compared against the limits
@@ -645,28 +684,9 @@ export class Zip implements ZipControl {
 			coldReason: this.coldReason, prepared: plan.source === "settle", ...(stale ? { staleTargets: stale } : {}),
 		});
 		if (cut) this.ledger({ type: "summary", trigger: cut.trigger, source: plan.source, count: cut.count, prefixTokens: cut.prefixTokens, summaryTokens: cut.summaryTokens, ms: cut.ms, waitedMs: Math.round(waitMs), llmOk: cut.llmOk, llmError: cut.llmError, costUsd: cut.costUsd, ...this.usageOf(cut) });
-		const valve = plan.source === "valve";
-		// What the user sees should match Pi's own context meter. "Before" is already real: the plan is calibrated on the usage of
-		// the request before it. A run plan was carried by the request that just ended, so that request's usage IS the real size
-		// after the edits: show it instead of the estimate. Never rescale "before" with it: a fixed overhead (system prompt, tool
-		// schemas: 30-55K on real sessions) does not shrink with the edits, so a single ratio is wrong for one side or the other.
-		// A valve plan only applies from the next request: keep the estimate. Display only; decisions stay on the plan's k.
-		const estAfter = ctxTokens - (before - after) - cutSaved;
-		const realAfter = !valve && o.usageTotal > 0 ? o.usageTotal : 0;
-		const notices: NoticeAction[] = [];
-		if (live.length) notices.push({ kind: "fold", count: live.length, tokensBefore: ctxTokens, tokensAfter: cut || !realAfter ? ctxTokens - (before - after) : realAfter, ms: plan.ms + (performance.now() - o.t0), pressure: valve });
-		if (cut) {
-			const prepared = plan.source === "settle" && waitMs < 500; // finished while the user was away: report the real production time, not the zero wait
-			notices.push({ kind: "summary", count: cut.count, tokensBefore: ctxTokens - (before - after), tokensAfter: realAfter || estAfter, ms: Math.max(cut.ms, waitMs), waitMs, prepared, pressure: valve });
-		}
-		if (notices.length && !this.quiet) {
-			const ITEMS = 8;
-			const items = live.slice(0, ITEMS).map((t) => ({ label: `${t.tool}${t.args ? " " + t.args : ""}`, turn: byId.get(t.entryId)?.userTurn, tokens: Math.round(k * t.entryTokens), handle: handleFor(t.entryId) }));
-			const why = valve ? "cache still warm, but the context passed the warm-cache limit" : this.cold ? this.coldWhy : "cache warm: the reads saved pay for the rewrite";
-			const data: NoticeData = { v: 2, text: noticeText(notices), before: Math.round(notices[0].tokensBefore), after: Math.round(notices[notices.length - 1].tokensAfter), desc: noticeDesc(notices), why: why || undefined, items, more: Math.max(0, live.length - ITEMS) || undefined, first: !this.noticed && !this.branch(ctx).some((en: Any) => en?.type === "custom" && en.customType === NOTICE_CUSTOM) };
-			this.noticed = true;
-			this.notify(ctx, data.text, data);
-		}
+		// a run plan was announced when its first request went out; a valve plan (between turns) is announced now
+		if (!plan.noticed) this.noticeFor(ctx, plan, live, cut, ctxTokens, plan.source === "valve" ? 0 : o.usageTotal);
+		plan.noticed = true;
 		return { entries: [...e.entries, ...ours] }; // append, never overwrite other extensions' drafts
 	}
 

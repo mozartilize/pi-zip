@@ -565,11 +565,11 @@ describe("notices and stats", () => {
 		for (const w of [5, 12, 25, 40, 60, 80, 120]) for (const ex of [false, true]) for (const l of renderNotice({ ...data, first: true }, ex, w, th)) expect(l.length).toBeLessThanOrEqual(w);
 	});
 	test("the session's first notice says once that originals are kept; ctrl+o lists why and what", () => {
-		expect(renderNotice({ ...data, first: true }, false, 120, th)[1]).toBe("          originals are kept; the model can recall any of them with zip_recall");
+		expect(renderNotice({ ...data, first: true }, false, 120, th)[1]).toBe("          originals are kept · the model can recall any of them");
 		const ex = renderNotice(data, true, 120, th);
 		expect(ex[1]).toBe("          cache cold (away 47 min), so folding was free");
-		expect(ex[2]).toBe("          bash npm test        turn 1     14K  k3x9q2m7ab");
-		expect(ex[3]).toContain("read src/payment.ts  turn 1");
+		expect(ex[2]).toMatch(/^ {10}bash npm test +14K  k3x9q2m7ab$/);
+		expect(ex[3]).toMatch(/^ {10}read src\/payment\.ts +\d+K  \w{10}$/);
 		expect(ex[4]).toBe("          … 10 more");
 	});
 	test("colours by meaning: brand accent, old size muted, new size + kept cells success, verb text, context dim", () => {
