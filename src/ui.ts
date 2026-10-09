@@ -119,7 +119,7 @@ export interface RecallSectionInfo {
 export function recallCallLine(args: { handle?: string; handles?: string[]; grep?: string; range?: string; offset?: number }, width: number, th: Th, m: Measure = plainMeasure, labelOf: (h: string) => string | undefined = () => undefined): string[] {
 	const hs = [...(typeof args?.handle === "string" ? [args.handle] : []), ...(Array.isArray(args?.handles) ? args.handles.filter((h) => typeof h === "string") : [])];
 	const label = (h: string) => (labelOf(h.trim()) ?? h).replace(/^read /, ""); // "read src/a.ts" reads as "unzip src/a.ts"
-	const what = hs.length > 1 ? `${hs.length} outputs` : hs[0] ? label(hs[0]) : "";
+	const what = hs.length > 1 ? `${hs.length} outputs` : hs[0] ? label(hs[0]) : args?.grep ? "all outputs" : ""; // grep without a handle searches every output
 	const opt = [args?.grep ? `/${args.grep}/` : "", args?.range ? `lines ${args.range}` : "", args?.offset ? `from char ${args.offset}` : ""].filter(Boolean).join(" · ");
 	const head = `${SYM} unzip`;
 	const plain = m.cut(`${head} ${what}${opt ? "  " + opt : ""}`, width);
@@ -136,7 +136,7 @@ export function sectionLine(s: RecallSectionInfo, many = false): string {
 	return many ? `${s.label || s.handle}  ${got}` : got;
 }
 
-const RECALL_FRAME = /^\[(handle \S+( · |\]| not found)|grep( \(|: )|range: lines |chars \d+-\d+ of |… \d+ more chars: )/;
+const RECALL_FRAME = /^\[(handle \S+( · |\]| not found)|grep( \(|: | over )|range: lines |chars \d+-\d+ of |… \d+ more chars: )/;
 
 /** Collapsed: what came back ("2 of 142 lines"; one line per output for a batch). Expanded: the recalled text, at most maxLines. */
 export function recallResultLines(sections: RecallSectionInfo[], text: string, expanded: boolean, width: number, th: Th, m: Measure = plainMeasure, maxLines = 40): string[] {
