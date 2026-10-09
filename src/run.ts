@@ -22,6 +22,13 @@ const fmtAway = (s: number) => (s < 90 ? `${Math.round(s)} s` : s < 5400 ? `${Ma
 export const NOTICE_CUSTOM = "pi-zip/notice"; // a fold/summary notice kept in the transcript (rendered by index.ts, never sent to the model)
 export const UNUSED_SUMMARY_CUSTOM = "pi-zip/unused-summary"; // a background summary nobody adopted: its cost, so the session totals stay honest
 export const AWAY_FRACTION = 0.8; // the away-timer fires this far into the cache lifetime
+/** Pi's idle cache warmer decides before each refresh at 0.9 x TTL, at least 10 s before expiry (core/cache-warmer.js getCacheWarmingDelayMs);
+ *  undefined: a lifetime of 10 s or less, which Pi never warms. */
+export const warmingDelayMs = (ttlMs: number): number | undefined => (ttlMs <= 10_000 ? undefined : Math.max(1, Math.floor(Math.min(ttlMs * 0.9, ttlMs - 10_000))));
+/** How long after a due warming decision pi-zip concludes that none is coming (15 s at a 5-minute TTL). */
+const warmingMargin = (ttlMs: number): number => Math.max(1_000, Math.min(15_000, 0.05 * ttlMs));
+/** A refresh lands this soon after a "warm" decision (it is one tiny request): 10 s at a 5-minute TTL. */
+const warmCheckMs = (ttlMs: number): number => Math.min(10_000, ttlMs / 8);
 // Other context managers rewrite the view too (F14); two writers give unpredictable results, so we pause and keep only the Guard.
 const CONFLICT_RE = /billion-context|bc-pi|magic-context|smart-compact|hot-compact|context-prune|pi-vcc|context-mode|prefix-cache/i;
 
@@ -633,6 +640,7 @@ export class Zip implements ZipControl {
 		this.timerGen++;
 		if (this.timer) clearTimeout(this.timer);
 		this.timer = null;
+		this.awayPlan = null;
 	}
 
 	/** A summary nobody adopted still cost money: abort it if it is still running, book it if it finished. */
@@ -839,16 +847,82 @@ export class Zip implements ZipControl {
 	/** Start the away-timer for a summary; returns the delay in ms. unref'd: it never keeps the process alive. */
 	private scheduleSummary(p: PlanResult, ctx: Any): number {
 		const ttl = ttlFor(ctx.model, this.branch(ctx), this.tier(ctx.model));
-		const delay = Math.max(0, (this.lastReqMs || Date.now()) + AWAY_FRACTION * ttl - Date.now());
-		const gen = ++this.timerGen;
-		this.timer = setTimeout(() => void this.runAway(p, ctx, gen), delay);
-		this.timer.unref?.();
+		const last = this.lastReqMs || Date.now();
+		const warm = this.idleWarming() ? warmingDelayMs(ttl) : undefined;
+		if (warm !== undefined) {
+			// Pi keeps the cache warm between runs (cacheWarming "idle") and decides before each refresh, at its warming delay: a summary
+			// written now would be thrown away at a warm return, so it waits for Pi's decision (cacheWarmingDecision); should none come
+			// (Pi is not warming this request after all), it starts just after the decision was due
+			this.awayPlan = { p, ctx };
+			const delay = Math.max(0, last + warm + warmingMargin(ttl) - Date.now());
+			this.armAway(delay, () => this.startAway("no warming decision"));
+			return Math.round(delay);
+		}
+		const delay = Math.max(0, last + AWAY_FRACTION * ttl - Date.now());
+		this.armAway(delay, () => void this.runAway(p, ctx));
 		return Math.round(delay);
 	}
 
-	private async runAway(p: PlanResult, ctx: Any, gen: number) {
-		this.timer = null;
-		if (gen !== this.timerGen || !this.active()) return; // the user came back, or we were switched off
+	/** One timer for the away summary (unref'd: it never keeps the process alive); a newer one, or the user's return, cancels it. */
+	private armAway(delayMs: number, fn: () => void) {
+		if (this.timer) clearTimeout(this.timer);
+		const gen = ++this.timerGen;
+		this.timer = setTimeout(() => {
+			this.timer = null;
+			if (gen === this.timerGen && this.active()) fn(); // else the user came back, or we were switched off
+		}, Math.max(0, delayMs));
+		this.timer.unref?.();
+	}
+
+	// ---- Pi's own idle cache warming (research pi-tricks §3.3): observed, never answered ----------------------------------------
+	private awayPlan: { p: PlanResult; ctx: Any } | null = null; // a summary waiting for Pi's warming decision
+	/** Does Pi refresh the cache between runs by itself? (settings cacheWarming "idle"; the default "streaming" warms only during a run) */
+	private idleWarming(): boolean {
+		try {
+			return this.pi.getSettings?.()?.cacheWarming === "idle";
+		} catch {
+			return false;
+		}
+	}
+	private startAway(reason: string) {
+		const a = this.awayPlan;
+		this.awayPlan = null;
+		if (!a) return;
+		this.ledger({ type: "away_unblocked", reason });
+		void this.runAway(a.p, a.ctx);
+	}
+	/** cache_warming_decision: Pi is about to refresh the cache ("warm") or to let it expire ("stop"). Only observed: never answered.
+	 *  While Pi warms, the away summary waits; once Pi stops, it is prepared as without warming (the cache now expires on its own). */
+	cacheWarmingDecision(e: Any): undefined {
+		const action = e?.action;
+		this.ledger({ type: "cache_warming", action, warmCost: e?.warmCost, missCost: e?.missCost, p: e?.continuationProbability, waiting: !!this.awayPlan });
+		const a = this.awayPlan;
+		if (!a || !this.active()) return undefined;
+		if (action === "stop") {
+			this.armAway(0, () => {
+				this.awayPlan = a;
+				this.startAway("Pi stopped warming");
+			});
+			return undefined;
+		}
+		if (action !== "warm") return undefined;
+		// Pi refreshes now, unless another extension overrides the decision (its answer is not visible here): a refresh shows up as a
+		// cache_warm usage entry within seconds. With one, wait for the next decision; without one, Pi stopped: prepare the summary now.
+		const t = Date.now(), ttl = ttlFor(a.ctx.model, this.branch(a.ctx), this.tier(a.ctx.model));
+		this.ledger({ type: "away_postponed", reason: "Pi warms the cache" });
+		this.armAway(warmCheckMs(ttl), () => {
+			this.awayPlan = a;
+			if (!this.branch(a.ctx).some((en: Any) => en?.type === "usage" && en.kind === "cache_warm" && Date.parse(en.timestamp) >= t)) return this.startAway("no refresh after a warm decision");
+			this.armAway(t + (warmingDelayMs(ttl) ?? ttl) + warmingMargin(ttl) - Date.now(), () => {
+				this.awayPlan = a;
+				this.startAway("no warming decision");
+			});
+		});
+		return undefined;
+	}
+
+	private async runAway(p: PlanResult, ctx: Any) {
+		if (!this.active()) return;
 		const controller = new AbortController();
 		const bg: Bg = { key: p.firstKeptEntryId, done: null, promise: Promise.resolve(null), controller };
 		bg.promise = buildCut(p, ctx, controller.signal)

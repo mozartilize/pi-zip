@@ -334,3 +334,11 @@ describe("real Pi: pi-zip predicts Pi's 'Nothing to compact' exactly (piCanCompa
 		expect([...seen].sort()).toEqual([false, true]); // both answers occur
 	});
 });
+
+describe("real Pi: the idle cache warmer's timing", () => {
+	test("warmingDelayMs is Pi's own getCacheWarmingDelayMs", async () => {
+		const { getCacheWarmingDelayMs } = await import("../node_modules/@earendil-works/pi-coding-agent/dist/core/cache-warmer.js");
+		const { warmingDelayMs } = await import("../src/run.ts");
+		for (const ttl of [1_000, 10_000, 10_001, 10_200, 15_000, 60_000, 100_000, 300_000, 3_600_000]) expect([ttl, warmingDelayMs(ttl)]).toEqual([ttl, getCacheWarmingDelayMs(ttl)]);
+	});
+});
