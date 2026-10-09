@@ -1,7 +1,7 @@
 // Token scale: real = O + c x content, both read from the branch itself (no stored state), used by every limit and every number shown.
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { readFileSync, unlinkSync } from "node:fs";
-import { buildBlocks, C0, C_MAX, C_MIN, calibrate, planContext, R0, sizeOf, sysEst, UNIT } from "../src/plan.ts";
+import { buildBlocks, C0, C_MAX, C_MIN, calibrate, coldTarget, planContext, R0, sizeOf, sysEst, UNIT } from "../src/plan.ts";
 import { lawPrices } from "../src/learn.ts";
 import { A, AX, fakeCtx, fakePi, flat, R, U, type Any } from "./helpers.ts";
 
@@ -235,25 +235,53 @@ describe("calibrate: per model, Pi's compaction, dropped responses", () => {
 describe("every limit and every number on the right scale", () => {
 	const turns = (n: number, chars: number) => Array.from({ length: n }, (_, t) => [U(`u${t}`, `q${t}`), A(`a${t}`, [`c${t}`]), R(`r${t}`, `c${t}`, chars), A(`z${t}`)]).flat();
 
-	test("the cold cap is on content above O: 30K of content is under a 40K cap however large O is, 41K of content is over it", () => {
+	test("the cold target is the whole context while O is small and O + half the cap once O is large: never inside O, never 40K of conversation on top of it", () => {
+		expect(coldTarget(40_000, 0, null)).toBe(40_000);
+		expect(coldTarget(40_000, 3_000, null)).toBe(40_000); // a bare Pi: the cap as tuned, on the whole context
+		expect(coldTarget(40_000, 20_000, null)).toBe(40_000); // the kink: O is half the cap
+		expect(coldTarget(40_000, 36_000, null)).toBe(56_000); // a 36K prefix: 20K of conversation (0.2.9 left 4K, the cap on content 40K)
+		expect(coldTarget(40_000, 52_000, null)).toBe(72_000); // O above the cap: 0.2.9's target lay inside O, out of reach
+		expect(coldTarget(60_000, 52_000, null)).toBe(82_000); // PI_ZIP_COLD_CAP scales both parts
+		expect(coldTarget(40_000, 52_000, 60_000)).toBe(60_000); // never above Pi's compaction room
+	});
+
+	test("a warm plan is considered only above the target: with a small O the whole context counts, with a large O half the cap of conversation", () => {
 		const model = { provider: "p", id: "m", contextWindow: 1_000_000 };
 		const law = { pr: lawPrices("explicit", false), g: 2_500, pWarm: 0 }; // P = 0: the law always fires, only the cap decides
 		const warm = (entries: Any[], O: number) => planContext(entries, { mode: "warm", cwd: ".", promptPending: false, model, coldCap: 40_000, law, scale: { ...UNIT, O, c: 1 } });
-		for (const O of [0, 50_000, 500_000]) expect(warm([...turns(3, 40_000), U("uN", "now")], O)).toBeNull(); // the old total rule: over the cap for O >= 10K
-		const over = warm([...turns(4, 41_000), U("uN", "now")], 50_000)!;
-		expect(over).not.toBeNull();
-		expect(over.ctxTokens).toBeGreaterThan(50_000 + 41_000);
-		// a cold return relaxes into the previous turn's re-readable outputs only down to the cap ON CONTENT (O + 40K), never towards a 40K
-		// total it cannot reach (the total rule would fold all six and then summarise)
+		const view = (chars: number) => [...turns(3, chars), U("uN", "now")];
+		const [v15, v25, v35, v38] = [19_500, 32_800, 46_000, 50_500].map(view);
+		for (const [v, lo, hi] of [[v15, 14_000, 16_000], [v25, 24_000, 26_000], [v35, 34_000, 36_000], [v38, 37_500, 39_000]] as const) {
+			expect(content(v)).toBeGreaterThan(lo);
+			expect(content(v)).toBeLessThan(hi);
+		}
+		// O = 3K: 38K of conversation is a 41K context, over the 40K cap (the cap on content let it grow to 43K); 35K (38K in all) is under
+		expect(warm(v38, 3_000)).not.toBeNull();
+		expect(warm(v35, 3_000)).toBeNull();
+		// a large O: 15K of conversation is under O + 20K however large O is (0.2.9: over a 40K it could never reach), 25K is over it
+		// (the cap on content kept up to 40K of conversation on top of O)
+		for (const O of [50_000, 500_000]) {
+			expect(warm(v15, O)).toBeNull();
+			expect(warm(v25, O)).not.toBeNull();
+		}
+	});
+
+	test("a cold return with a large O relaxes into the previous turn only down to O + half the cap: not to O + 40K, not towards a 40K it cannot reach", () => {
+		const model = { provider: "p", id: "m", contextWindow: 1_000_000 };
 		const prev: Any[] = [U("u1", "one"), A("a1"), U("u2", "prev")];
 		for (let i = 1; i <= 6; i++) prev.push(A(`p${i}`, [`c${i}`]), R(`r${i}`, `c${i}`, 40_000));
 		prev.push(A("pe"), U("u3", "now"));
+		const out = buildBlocks(prev).find((b) => b.entryId === "r1")!.tokens;
+		expect(content(prev)).toBeGreaterThan(6 * out); // six re-readable outputs of the previous turn, ~10K each
 		const cold = planContext(prev, { mode: "cold", cwd: ".", promptPending: false, model, coldCap: 40_000, scale: { ...UNIT, O: 50_000, c: 1 } })!;
-		expect(cold.cutIdx).toBeNull();
-		expect(cold.folds.length).toBeGreaterThanOrEqual(2);
-		expect(cold.folds.length).toBeLessThanOrEqual(3);
-		expect(cold.ctxAfterFolds).toBeLessThanOrEqual(50_000 + 40_000);
-		expect(cold.ctxAfterFolds).toBeGreaterThan(50_000 + 25_000);
+		expect(cold.cutIdx).toBeNull(); // the target is reachable by folding: no summary
+		expect(cold.folds.length).toBe(5); // the cap on content folded 3 (stopping at O + 40K), 0.2.9's 40K total all 6
+		expect(cold.ctxAfterFolds).toBeLessThanOrEqual(50_000 + 20_000);
+		expect(cold.ctxAfterFolds).toBeGreaterThan(50_000 + 20_000 - out); // it stops as soon as it is under
+		// with a small O the same view is planned against the whole-context cap, as before the affine scale
+		const small = planContext(prev, { mode: "cold", cwd: ".", promptPending: false, model, coldCap: 40_000, scale: { ...UNIT, O: 3_000, c: 1 } })!;
+		expect(small.ctxAfterFolds).toBeLessThanOrEqual(40_000);
+		expect(small.ctxAfterFolds).toBeGreaterThan(40_000 - out);
 	});
 
 	test("the compaction room is Pi's trigger on the whole context: O counts toward it", () => {
@@ -305,8 +333,8 @@ describe("every limit and every number on the right scale", () => {
 		const real = 52_000 + 2.1 * sent.reduce((a: number, m: Any) => a + buildBlocks([{ sourceEntry: { type: "message", message: m }, messages: [m] }])[0].tokens, 0);
 		expect(Math.abs(notice.after / real - 1)).toBeLessThan(0.01);
 		expect(Math.abs(notice.before / (52_000 + 2.1 * content(all)) - 1)).toBeLessThan(0.01);
-		// the content above O is at the cap, not the whole context
-		expect(notice.after - 52_000).toBeLessThanOrEqual(40_000 + 100);
+		// O is above half the cap: the target is O + 20K of conversation (not a 40K total inside O, not 40K of conversation on top of it)
+		expect(notice.after - 52_000).toBeLessThanOrEqual(20_000 + 100);
 		for (const it of notice.items) expect(it.tokens).toBeGreaterThan(2.1 * 7_000); // an output's own size on the provider's scale
 	});
 });

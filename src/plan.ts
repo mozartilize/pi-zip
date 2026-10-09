@@ -241,8 +241,16 @@ export function calibrate(entries: Any[], sys?: SysInfo, branch: Any[] = [], mod
 	return fit(model || [...resp].reverse().find((r) => r.key)?.key || "", true);
 }
 
+/** The cold cap's target in real tokens of the WHOLE context (system prompt and tools included, as the cap was tuned): max(cap, O + cap/2),
+ *  never above Pi's compaction room. While O is under half the cap this is the plain whole-context cap. Above that the target is O plus
+ *  half the cap of conversation: never at or below O, where no edit reaches it (0.2.9's 40K with O = 29-55K summarised at every cold
+ *  return), and not 40K of conversation on top of O either (the cap on content alone cost +13% live on a 36K prefix, with no quality
+ *  difference measured). Offline it never loses more items than the whole-context cap (research round5/affine.md section 11). */
+export const CAP_CONTENT_MIN = 0.5;
+export const coldTarget = (cap: number, O: number, room: number | null): number => Math.min(Math.max(cap, O + CAP_CONTENT_MIN * cap), room ?? Infinity);
+
 export const settings = () => ({
-	coldCap: envInt("COLD_CAP", 40_000), // cold: fold, then summarise, down to this many real tokens of content (above O: the system prompt and tools are kept anyway)
+	coldCap: envInt("COLD_CAP", 40_000), // cold: fold, then summarise, down to this many real tokens of the whole context, but never below O + half of it (coldTarget)
 	foldMin: envInt("FOLD_MIN", 500), // outputs below this many tokens are never folded
 	keepLines: envInt("KEEP_LINES", 8),
 	minGain: envInt("MIN_GAIN", 10_000), // legacy rule only (no prices): a summary must remove at least max(minGain, 15% of the context)
@@ -432,13 +440,13 @@ export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
 	const s = settings();
 	const mode = o.mode ?? "cold";
 	// limits are in real tokens; the plan works in content estimate units (real = O + c x estimate), so they are converted once, here.
-	// The cold cap is the working set: content above O (offline: a cap on the whole context is out of reach once O >= cap, every cold
-	// return then folds all it may and summarises, and loses items where the same cap on content does not; research round5/affine.md).
-	// The compaction room is Pi's trigger on the whole context.
+	// The cold cap is on the whole context, but leaves at least half of itself for the conversation above O (coldTarget): a cap the
+	// fixed prefix alone fills is out of reach, and every cold return then folds all it may and summarises. The compaction room is
+	// Pi's trigger on the whole context.
 	const { O, c } = o.scale ?? UNIT;
 	const real = (est: number) => O + c * est;
 	const room = compactionRoom(o.model, o.reserve);
-	const coldCap = Math.min(o.coldCap ?? s.coldCap, (room ?? Infinity) - O) / c;
+	const coldCap = (coldTarget(o.coldCap ?? s.coldCap, O, room) - O) / c;
 	const law: Law = o.law ?? { pr: null, g: G0, pWarm: mode === "cold" ? 0 : 1 };
 	const gate = (where: "summary" | "plan", B: number, A: number, r: number | null, call: number, T: number, Tsuf?: number): boolean => {
 		const t = lawTerms(B, A, law.pWarm, r, law.pr, law.g, call, T);
