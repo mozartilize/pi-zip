@@ -44,12 +44,34 @@ export function observedTier(branch: Any[], key: string): "1h" | "5m" | undefine
 
 export interface TtlInfo { ms: number; source: "declared" | "observed"; note?: string }
 
-/** Declared TTL, corrected by what the provider was seen to write. PI_ZIP_TTL_SECS wins. `note` = the one-time mismatch notice text. */
-export function resolveTtl(model: Any, branch: Any[] = []): TtlInfo {
+/** The cache tier a request asked for, read from the payload Pi built (null: the payload does not say). Anthropic: a 1-hour
+ *  cache_control ttl is the long tier, cache_control without one the short tier; OpenAI: prompt_cache_retention "24h" is long. */
+export function payloadRetention(p: Any): "short" | "long" | null {
+	if (!p || typeof p !== "object") return null;
+	if (typeof p.prompt_cache_retention === "string") return p.prompt_cache_retention === "24h" ? "long" : "short";
+	let seen = false;
+	const one = (x: Any): boolean => {
+		const cc = x?.cache_control;
+		if (!cc || typeof cc !== "object") return false;
+		seen = true;
+		return cc.ttl === "1h";
+	};
+	for (const list of [p.system, p.tools]) if (Array.isArray(list)) for (const b of list) if (one(b)) return "long";
+	if (Array.isArray(p.messages)) for (const m of p.messages) {
+		if (one(m)) return "long";
+		if (Array.isArray(m?.content)) for (const b of m.content) if (one(b)) return "long";
+	}
+	return seen ? "short" : null;
+}
+
+/** Declared TTL, corrected by what the provider was seen to write. PI_ZIP_TTL_SECS wins. `note` = the one-time mismatch notice text.
+ *  `tier` = the retention the request used (the provider-scoped PI_CACHE_RETENTION, or the request payload itself; run.ts); without it,
+ *  the process environment decides, as before. */
+export function resolveTtl(model: Any, branch: Any[] = [], tier?: "short" | "long"): TtlInfo {
 	if (process.env.PI_ZIP_TTL_SECS) return { ms: envInt("TTL_SECS", 300) * 1000, source: "declared" };
 	const pc = model?.promptCache;
-	const declared = cacheTtlMs(pc);
-	const long = process.env.PI_CACHE_RETENTION === "long";
+	const long = tier ? tier === "long" : process.env.PI_CACHE_RETENTION === "long";
+	const declared = cacheTtlMs(pc, DEFAULT_TTL_MS, { cacheRetention: long ? "long" : "short" });
 	const seen = declared > 0 ? observedTier(branch, modelKey(model)) : undefined;
 	const mismatch = (req: string, got: string, ms: number): TtlInfo => ({ ms, source: "observed", note: `${PRODUCT} · requested ${req} prompt cache, provider wrote ${got} · using ${got}` });
 	if (long && seen === "5m") return mismatch("1h", "5m", cacheTtlMs(pc, DEFAULT_TTL_MS, { cacheRetention: "short" }));
@@ -57,7 +79,7 @@ export function resolveTtl(model: Any, branch: Any[] = []): TtlInfo {
 	return { ms: declared, source: "declared" };
 }
 
-export const ttlFor = (model: Any, branch: Any[] = []): number => resolveTtl(model, branch).ms;
+export const ttlFor = (model: Any, branch: Any[] = [], tier?: "short" | "long"): number => resolveTtl(model, branch, tier).ms;
 
 /** Cold = a prior request exists and nothing touched the cache for longer than the TTL. No prior request counts as warm. */
 export const isColdByTtl = (lastActivityMs: number, nowMs: number, ttlMs: number): boolean => lastActivityMs > 0 && nowMs - lastActivityMs > ttlMs;
@@ -102,8 +124,8 @@ export interface ColdInfo { cold: boolean; reason: string; ttl: TtlInfo; pWarm: 
 
 /** Cold by time, or because the model changed: a cache entry belongs to one provider and model. `learned` = P(warm) after a gap from the
  *  survival the provider was seen to have (learn.ts); without it, or under PI_ZIP_TTL_SECS (tests), the TTL decides. cold = P(warm) < 0.5. */
-export function detectCold(model: Any, lastReqMs: number, branch: Any[], nowMs = Date.now(), lastModel = "", learned?: Survival): ColdInfo {
-	const ttl = resolveTtl(model, branch);
+export function detectCold(model: Any, lastReqMs: number, branch: Any[], nowMs = Date.now(), lastModel = "", learned?: Survival, tier?: "short" | "long"): ColdInfo {
+	const ttl = resolveTtl(model, branch, tier);
 	const last = Math.max(lastReqMs, lastMessageMs(branch));
 	const prev = lastModel || lastModelInBranch(branch);
 	if (last && prev && modelKey(model) && prev !== modelKey(model)) return { cold: true, reason: `model switch ${prev} -> ${modelKey(model)}`, ttl, pWarm: 0, src: "model switch", gapS: null, pastTtl: false };
