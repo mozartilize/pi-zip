@@ -114,6 +114,19 @@ describe("sectioned carry-forward: nested summaries, 4 levels deep", () => {
 		expect(last).not.toContain("## Earlier summary (carried forward)");
 	});
 
+	test("no narrative (model call failed): the fallback line points at recall by handle, like the header, not at re-reading", async () => {
+		const entries = [...level(1), U("keep1", "kept"), A("keepA1")];
+		const blocks = buildBlocks(entries);
+		const p: Any = { blocks, calls: toolCallIndex(blocks), cutIdx: blocks.findIndex((b) => b.entryId === "keep1"), prefixTokens: 50_000, summaryTokensPlanned: 7000, sumTrigger: "cold" };
+		const complete = async () => ({ stopReason: "error", errorMessage: "down", content: [], usage: { cost: { total: 0 } } });
+		const cut = await buildCut(p, { model: { id: "m" }, modelRegistry: { complete } } as Any);
+		expect(cut.llmOk).toBe(false);
+		const line = cut.text.split("\n")[cut.text.split("\n").indexOf("## Narrative") + 1];
+		expect(line).toMatch(/^\(unavailable: .*; rely on the sections above and zip_recall an output by its handle rather than re-running or re-reading\)$/);
+		expect(cut.text).not.toContain("re-read files as needed");
+		expect(parseSummary(cut.text).narrative).toEqual([]); // still not taken for content when carried forward
+	});
+
 	test("size stays flat from level 2 on (it does not grow with depth)", async () => {
 		const sizes = (await chain(5)).map((t) => Math.ceil(t.length / 4));
 		expect(sizes[4]).toBeLessThan(sizes[2] * 1.25);

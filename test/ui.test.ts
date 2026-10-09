@@ -74,6 +74,7 @@ describe("zip_recall row", () => {
 		expect(recallCallLine({ handle: h, grep: "Expected" }, 120, th, undefined, (x) => (x === h ? "bash npm test" : undefined))).toEqual([`ƶ unzip bash npm test  /Expected/`]);
 		expect(recallCallLine({ handle: h }, 120, { fg: (c: string, t: string) => `<${c}>${t}</${c}>`, bold: (t: string) => `*${t}*` }, undefined, () => "read src/a.ts")).toEqual(["<accent>*ƶ*</accent> <toolTitle>*unzip*</toolTitle> <accent>src/a.ts</accent><dim></dim>"]);
 		expect(recallCallLine({ handles: [h, "x"] }, 120, th)).toEqual(["ƶ unzip 2 outputs"]);
+		expect(recallCallLine({ grep: "Expected" }, 120, th)).toEqual(["ƶ unzip all outputs  /Expected/"]); // grep without a handle searches every output
 		const secs = [{ handle: h, label: "bash npm test", turn: 1, totalLines: 812, shownLines: 1, how: "grep" as const }];
 		expect(recallResultLines(secs, "x", false, 120, th)).toEqual(["1 of 812 lines"]);
 		expect(recallResultLines([...secs, { ...secs[0], label: "read a.ts", how: "all" as const, totalLines: 9 }], "x", false, 120, th)).toEqual(["bash npm test  1 of 812 lines", "read a.ts  all 9 lines"]);

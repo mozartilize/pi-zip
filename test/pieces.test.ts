@@ -9,7 +9,7 @@ import { colorTail, fmtK, noticeText, renderNotice, splitDesc, type NoticeAction
 import { clipMid, handleFor, makePlaceholder, makePlaceholderFor, outcomeHint, pickKeyLines, shortArgs } from "../src/placeholder.ts";
 import { buildBlocks, toolCallIndex } from "../src/plan.ts";
 import { A, type Any, R, U } from "./helpers.ts";
-import { parseRange, recalledHandlesFromBranch, recallSections, resolveHandlesInBranch, sliceRecall } from "../src/recall.ts";
+import { branchOutputs, parseRange, recalledHandlesFromBranch, recallSections, resolveHandlesInBranch, searchOutputs, sliceRecall } from "../src/recall.ts";
 import { handleRowsOf, handleTable, INDEX_TOKENS, skeleton } from "../src/summary.ts";
 import { tokensOf } from "../src/util.ts";
 
@@ -89,6 +89,15 @@ describe("handles and placeholders", () => {
 		expect(t).toContain("- h2 · bash bun test · turn 9 · exit 1, 8 passed, 2 failed · x");
 		const blocks = buildBlocks([U("u1", "x"), A("a1", ["c1"]), R("r1", "c1", 9000), A("a2")]);
 		expect(skeleton(blocks, null).text).toMatch(/`ls` -> exit 0 \(turn 1, [0-9a-z]{10}\)/);
+	});
+	test("the summary header says the codes are recall handles and that recalling beats re-running or re-reading", () => {
+		const text = skeleton(buildBlocks([U("u1", "x"), A("a1", ["c1"]), R("r1", "c1", 9000), A("a2")]), null).text;
+		const head = text.split("\n")[1];
+		expect(head).toMatch(/^Covers \d+ earlier messages\. Their tool outputs are no longer in your context but are kept exactly/);
+		expect(head).toContain("is its handle");
+		expect(head).toContain(`${zipRecallName} it (grep/range for a part; grep alone searches every earlier output) rather than re-running or re-reading`);
+		const again = skeleton(buildBlocks([{ sourceEntry: { id: "s", type: "compaction" }, messages: [{ role: "compactionSummary", summary: text }] }, U("u2", "y")]).slice(1), text).text;
+		expect(again.split("\n").filter((l) => l.startsWith("Covers "))).toHaveLength(1); // carried forward, the header is not taken for content
 	});
 	test("summary lists the handle of every result, small ones included, and each resolves with recall", () => {
 		const tcall = (id: string, calls: Any[]) => {
@@ -325,6 +334,98 @@ describe("recall", () => {
 		expect(secs).toMatchObject({ ok: 2, missing: 1 });
 		expect(secs.text).toContain("[handle zzzzzzzzzz] not found");
 		expect(secs.text).toContain("41: line 41: alpha");
+	});
+	const call = (id: string, cid: string, name: string, args: object) => ({ type: "message", id, message: { role: "assistant", content: [{ type: "toolCall", id: cid, name, arguments: args }] } });
+	const res = (id: string, cid: string, name: string, text: string) => ({ type: "message", id, message: { role: "toolResult", toolCallId: cid, toolName: name, content: [{ type: "text", text }] } });
+	const session = [
+		{ type: "message", id: "u1", message: { role: "user", content: "go" } },
+		call("a1", "c1", "bash", { command: "npm test" }),
+		res("e1", "c1", "bash", "ok 1\nERROR one: timeout 30s\nok 3"),
+		{ type: "compaction", id: "k1", summary: "s", firstKeptEntryId: "u2" },
+		{ type: "message", id: "u2", message: { role: "user", content: "more" } },
+		call("a2", "c2", "read", { path: "src/a.ts" }),
+		res("e2", "c2", "read", "x\nthrow new Error('ERROR two')"),
+		call("a3", "c3", zipRecallName, { handle: handleFor("e1") }),
+		res("e3", "c3", zipRecallName, "ERROR one (a recall result)"),
+	];
+	test("recalled sections name the call that produced the output, so look-alike outputs can be told apart", () => {
+		const out = recallSections(resolveHandlesInBranch(session, [handleFor("e1")]).items, { grep: "error" });
+		expect(out.text).toBe(`[handle ${handleFor("e1")} \u00b7 bash npm test \u00b7 32 chars \u00b7 3 lines]\n[grep: 1 matching line(s) of 3]\n2: ERROR one: timeout 30s`);
+	});
+	test("grep without a handle searches every earlier output (before a compaction too), newest first, labelled; recall results are skipped", () => {
+		const outs = branchOutputs(session);
+		expect(outs.map((o) => o.label)).toEqual(["bash npm test", "read src/a.ts", `${zipRecallName} {"handle":"${handleFor("e1")}"}`]);
+		const s = searchOutputs(outs, "error");
+		expect(s.text.split("\n")[0]).toBe("[grep over all 2 earlier tool outputs (no handle given): 2 matching line(s) in 2 output(s), newest output first]");
+		expect(s.text).not.toContain("a recall result");
+		const a = s.text.indexOf(`[handle ${handleFor("e2")} \u00b7 read src/a.ts \u00b7`), b = s.text.indexOf(`[handle ${handleFor("e1")} \u00b7 bash npm test \u00b7`);
+		expect(a > 0 && b > a).toBe(true); // newest output first
+		expect(s.text).toContain("2: throw new Error('ERROR two')");
+		expect(s.text).toContain("2: ERROR one: timeout 30s");
+		expect(s.sections.map((x) => x.handle)).toEqual([handleFor("e2"), handleFor("e1")]);
+		const none = searchOutputs(outs, "zzznope");
+		expect(none.matched).toBe(0);
+		expect(none.text).toContain("Nothing matched");
+		const paged = searchOutputs(outs, "error", { limit: 40 });
+		expect(paged.text).toContain("offset=40"); // pages like any recall
+		expect(paged.text).toContain("or narrow the pattern, or pass one of the handles above with grep]");
+	});
+	test("a search pages by 8,000 characters by default (a recall by handle by 20,000); an explicit limit still wins", () => {
+		const big = [{ handle: "h1", tool: "bash", label: "bash x", text: Array.from({ length: 600 }, (_, i) => `error ${i} ` + "x".repeat(40)).join("\n") }];
+		const s = searchOutputs(big, "error");
+		expect(s.chars).toBe(8000);
+		expect(s.text).toMatch(/\[chars 0-8000 of \d+\]/);
+		expect(s.text).toContain("call zip_recall again with offset=8000");
+		expect(searchOutputs(big, "error", { limit: 20_000 }).chars).toBe(20_000);
+		expect(sliceRecall(big[0].text, {}).body.length).toBe(20_000);
+	});
+	test("a later page of a search sees the pool of its first page: an output that arrived in between does not shift the offsets", async () => {
+		const { registerRecallTool, searchPoolOf } = await import("../src/recall.ts");
+		let def: any;
+		registerRecallTool({ registerTool: (t: any) => (def = t) } as any, { onRecall: () => {} });
+		const lines = (tag: string) => Array.from({ length: 300 }, (_, i) => `hit ${tag} ${i} ` + "y".repeat(30)).join("\n");
+		const branch: any[] = [
+			{ type: "message", id: "u1", message: { role: "user", content: "go" } },
+			call("a1", "c1", "bash", { command: "one" }),
+			res("e1", "c1", "bash", lines("A")),
+			call("a2", "c2", "bash", { command: "two" }),
+			res("e2", "c2", "bash", lines("B")),
+		];
+		const ctx = { sessionManager: { getBranch: () => branch } };
+		const p1 = await def.execute("t", { grep: "hit" }, undefined, undefined, ctx);
+		expect(p1.details.pool).toBe(2);
+		const whole = searchOutputs(branchOutputs(branch), "hit", { limit: 50_000 }).text;
+		// page 1 lands in the session, then a parallel call's output arrives before page 2
+		const r1 = res("e3", "c3", zipRecallName, p1.content[0].text);
+		branch.push(call("a3", "c3", zipRecallName, { grep: "hit" }), { ...r1, message: { ...r1.message, details: p1.details } });
+		branch.push(call("a4", "c4", "bash", { command: "three" }), res("e4", "c4", "bash", lines("C")));
+		expect(searchPoolOf(branch, "hit")).toBe(2);
+		const p2 = await def.execute("t", { grep: "hit", offset: 8000 }, undefined, undefined, ctx);
+		expect(p2.content[0].text).toContain("over all 2 earlier tool outputs");
+		expect(p2.content[0].text).not.toContain("hit C");
+		const body = (t: string) => t.slice(t.indexOf("]\n", t.indexOf("[chars ")) + 2, t.lastIndexOf("\n[…"));
+		const bodyOf = (t: string) => t.slice(t.indexOf("\n") + 1);
+		expect(body(p1.content[0].text) + body(p2.content[0].text)).toBe(bodyOf(whole).slice(0, 16_000)); // pages join up exactly
+		// a new first page (no offset) searches everything again, including the new output
+		const fresh = await def.execute("t", { grep: "hit" }, undefined, undefined, ctx);
+		expect(fresh.details.pool).toBe(3);
+		expect(fresh.content[0].text).toContain("hit C");
+	});
+	test("zip_recall with grep alone goes through execute as a search; with neither handle nor grep it says what to pass", async () => {
+		const { registerRecallTool } = await import("../src/recall.ts");
+		let def: any;
+		const seen: any[] = [];
+		registerRecallTool({ registerTool: (t: any) => (def = t) } as any, { onRecall: (...a: any[]) => seen.push(a) });
+		const ctx = { sessionManager: { getBranch: () => session } };
+		const r = await def.execute("t", { grep: "timeout \\d+s" }, undefined, undefined, ctx);
+		expect(r.isError).toBe(false);
+		expect(r.content[0].text).toContain("1 matching line(s) in 1 output(s)");
+		expect(r.content[0].text).toContain(`[handle ${handleFor("e1")} \u00b7 bash npm test`);
+		expect(seen[0][0]).toEqual([]); // a search marks nothing as recalled
+		const bad = await def.execute("t", {}, undefined, undefined, ctx);
+		expect(bad.isError).toBe(true);
+		expect(bad.content[0].text).toContain("grep alone");
+		expect(def.description).toContain("grep alone searches every earlier tool output");
 	});
 	test("the recalled set is rebuilt from zip_recall calls in the branch (and only those)", () => {
 		const call = (id: string, name: string, args: object) => ({ type: "message", id, message: { role: "assistant", content: [{ type: "toolCall", id: "t" + id, name, arguments: args }] } });
