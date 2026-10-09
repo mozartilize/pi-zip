@@ -1322,7 +1322,7 @@ export class Zip implements ZipControl {
 		const n = (x: number, one: string, many: string) => `${x} ${x === 1 ? one : many}`;
 		return `this session: ${folds} zipped (~${fmtK(folded)} tokens), ${n(summaries, "summary", "summaries")}${usd > 0 ? ` (summary calls $${usd.toFixed(4)})` : ""}, ${n(recalls, "unzip", "unzips")}`;
 	}
-	/** The /zip status card (rendered by ui.ts renderCard). */
+	/** The /zip card (rendered by ui.ts renderCard). */
 	card(ctx?: Any): CardData {
 		const t = this.totals(ctx);
 		const model = ctx?.model ?? this.model;

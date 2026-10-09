@@ -483,7 +483,7 @@ describe("/zip output", () => {
 	test("without a UI to notify, command text goes to stderr and never into stdout (JSON mode)", async () => {
 		const { registerZipCommand } = await import("../src/notice.ts");
 		let cmd: any;
-		registerZipCommand({ registerCommand: (_n: string, c: any) => (cmd = c) } as any, { status: () => "pi-zip: on", statsLine: () => "", setOff: () => "", toggleQuiet: () => "" });
+		registerZipCommand({ registerCommand: (_n: string, c: any) => (cmd = c) } as any, { status: () => "pi-zip: on", setOff: () => "", toggleQuiet: () => "" });
 		const out: string[] = [];
 		const err: string[] = [];
 		const so = process.stdout.write;
@@ -502,6 +502,22 @@ describe("/zip output", () => {
 		const seen: string[] = [];
 		await cmd.handler("status", { mode: "tui", ui: { notify: (t: string) => seen.push(t) } });
 		expect(seen).toEqual(["pi-zip: on"]);
+	});
+
+	test("one form: /zip shows the card; status and stats are silent aliases; completion offers off, on, quiet only", async () => {
+		const { registerZipCommand } = await import("../src/notice.ts");
+		let cmd: any;
+		registerZipCommand({ registerCommand: (_n: string, c: any) => (cmd = c) } as any, { status: () => "pi-zip: on", setOff: () => "", toggleQuiet: () => "" });
+		expect(cmd.description).toBe("pi-zip: off | on | quiet");
+		const seen: string[] = [];
+		const ctx = { mode: "tui", ui: { notify: (t: string) => seen.push(t) } };
+		for (const a of ["", "  ", "status", "STATS"]) await cmd.handler(a, ctx);
+		expect(seen).toEqual(["pi-zip: on", "pi-zip: on", "pi-zip: on", "pi-zip: on"]);
+		await cmd.handler("nope", ctx);
+		expect(seen.at(-1)).toContain("use /zip, or /zip off | on | quiet");
+		expect(cmd.getArgumentCompletions("").map((i: any) => i.value)).toEqual(["off", "on", "quiet"]);
+		expect(cmd.getArgumentCompletions("o").map((i: any) => i.value)).toEqual(["off", "on"]);
+		expect(cmd.getArgumentCompletions("st")).toBeNull();
 	});
 });
 

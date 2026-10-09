@@ -137,7 +137,7 @@ export function pWarm(e: Entry | undefined, gapS: number, priorS: number): { p: 
 	return { p, src: p === prior ? "prior" : "learned" };
 }
 
-/** /zip status text: class and the learned curve ("360-420s 0.80 n1"). */
+/** /zip text: class and the learned curve ("360-420s 0.80 n1"). */
 export function describe(e: Entry | undefined, priorS: number): string {
 	const c = curve(e, priorS);
 	const bins = c.map((x) => `${GAP_EDGES[x.bin]}-${GAP_EDGES[x.bin + 1] ?? "∞"}s ${x.p.toFixed(2)} n${Math.round(x.n * 10) / 10}`).join(", ");

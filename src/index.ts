@@ -15,7 +15,7 @@ export default function piZip(pi: ExtensionAPI) {
 	registerZipCommand(pi, zip);
 	try {
 		// Everything pi-zip shows lives in the transcript as custom entries (never part of the model's context): fold/summary
-		// notices, state lines and the /zip status card. Widths are measured with Pi's own pi-tui once it has loaded.
+		// notices, state lines and the /zip card. Widths are measured with Pi's own pi-tui once it has loaded.
 		import("@earendil-works/pi-tui").then((m: Any) => {
 			if (typeof m?.visibleWidth === "function" && typeof m?.truncateToWidth === "function")
 				setMeasure({ vw: m.visibleWidth, cut: (s: string, w: number) => (m.visibleWidth(s) <= w ? s : w <= 0 ? "" : m.truncateToWidth(s, w, "…")) });
