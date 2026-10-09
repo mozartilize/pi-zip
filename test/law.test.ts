@@ -4,7 +4,7 @@ import { readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { lawPrices, loadStats, MIN_EXPECT, pWarm, record, sample, type Prices } from "../src/learn.ts";
-import { compactionRoom, editAllowed, lawTerms, legacyValve, planContext, settings, untouchedEst, type Law } from "../src/plan.ts";
+import { compactionRoom, editAllowed, lawTerms, legacyValve, planContext, settings, sizeOf, UNIT, untouchedEst, type Law } from "../src/plan.ts";
 import { Zip } from "../src/run.ts";
 import { A, AX, fakeCtx, fakePi, flat, longTurn, project, R, U, type Any } from "./helpers.ts";
 
@@ -39,7 +39,7 @@ describe("verdict section 8 tests", () => {
 		delete process.env.PI_ZIP_INTURN_AGE;
 		expect(settings().inturnAge).toBe(60);
 		const s = longTurn(56, { chars: 11_500 }); // ~1.9K tokens per output, ~106K in one user turn
-		const o = { sys: 0, cwd: ".", promptPending: false, model: { contextWindow: 1_000_000 }, law: { pr: ANTH, g: 2_400, pWarm: 1 } as Law };
+		const o = { cwd: ".", promptPending: false, model: { contextWindow: 1_000_000 }, law: { pr: ANTH, g: 2_400, pWarm: 1 } as Law };
 		const ctx = planContext(s, { ...o, mode: "cold" })!;
 		expect(Math.abs(ctx.ctxTokens - 106_000)).toBeLessThan(2_000);
 		expect(ctx.folds).toHaveLength(0);
@@ -95,7 +95,7 @@ describe("rewrite base T: the law accepts any T <= A; the planner passes T = A",
 		const outs = (n: number) => Array.from({ length: n }, (_, t) => [U(`u${t}`, `q${t}`), A(`a${t}`, [`c${t}`]), R(`r${t}`, `c${t}`, 12_000), A(`z${t}`)]).flat();
 		const tail = [U("uP", "prev"), A("aP"), U("uN", "now")];
 		const prose = [U("up", "talk"), AX("x0", 160_000)]; // ~40K tokens nothing can fold
-		const o = { mode: "warm" as const, sys: 0, cwd: ".", promptPending: false, coldCap: 45_000, model: { contextWindow: 1_000_000 }, law: { pr: ANTH, g: 2_400, pWarm: 1 }, trace: [] as Any[] };
+		const o = { mode: "warm" as const, cwd: ".", promptPending: false, coldCap: 45_000, model: { contextWindow: 1_000_000 }, law: { pr: ANTH, g: 2_400, pWarm: 1 }, trace: [] as Any[] };
 		expect(planContext([...prose, ...outs(10), ...tail], o)).toBeNull(); // folds start after the prose: the suffix ~3K would fire, T = A does not
 		const t = o.trace.at(-1);
 		expect(t.T).toBe(t.A);
@@ -193,7 +193,7 @@ describe("final model (research round 5, final-model.md section 8 tests 1-5)", (
 	let saved: Record<string, string | undefined> = {};
 	beforeEach(() => { saved = Object.fromEntries(keep.map((k) => [k, process.env[k]])); for (const k of ["PI_ZIP_TTL_SECS", "PI_ZIP_COLD_CAP", "PI_ZIP_INTURN_AGE"]) delete process.env[k]; process.env.PI_ZIP_CACHE_STATS = tmpFile(); process.env.PI_ZIP_LEDGER = tmpFile(); });
 	afterEach(() => { for (const k of ["PI_ZIP_CACHE_STATS", "PI_ZIP_LEDGER"]) rmSync(process.env[k]!, { force: true }); keep.forEach((k) => (saved[k] === undefined ? delete process.env[k] : (process.env[k] = saved[k]))); });
-	const base = { sys: 0, cwd: ".", promptPending: false, model: { contextWindow: 1_000_000 } };
+	const base = { cwd: ".", promptPending: false, model: { contextWindow: 1_000_000 } };
 	const ids = (p: Any) => p.folds.map((f: Any) => f.entryId).sort();
 	const ledger = () => readFileSync(process.env.PI_ZIP_LEDGER!, "utf8").trim().split("\n").map((l) => JSON.parse(l));
 
@@ -228,10 +228,10 @@ describe("final model (research round 5, final-model.md section 8 tests 1-5)", (
 	test("observability: on an automatic cache no fold starts inside the first MIN_EXPECT real tokens, so the next sample is uncensored", () => {
 		const older = Array.from({ length: 10 }, (_, t) => [U(`u${t}`, `q${t}`), A(`a${t}`, [`c${t}`]), R(`r${t}`, `c${t}`, 9_000), A(`z${t}`)]).flat();
 		const s = [...older, U("uP", "prev"), A("zP"), U("uN", "now")];
-		const o = { ...base, sys: 1_000, k: 1.5, coldCap: 1_000, mode: "cold" as const };
+		const o = { ...base, scale: { ...UNIT, O: 1_500, c: 1.5 }, coldCap: 1_000, mode: "cold" as const };
 		const plan = (cls?: "automatic" | "explicit") => planContext(s, { ...o, law: { pr: lawPrices(cls, false), g: 2_400, pWarm: 0 } })!;
 		const auto = plan("automatic");
-		const head = 1.5 * untouchedEst(auto.blocks, auto.folds, false, 1_000);
+		const head = sizeOf(o.scale, untouchedEst(auto.blocks, auto.folds, false)); // real tokens: O + c x the untouched content
 		expect(head).toBeGreaterThanOrEqual(MIN_EXPECT);
 		expect(head).toBeLessThan(MIN_EXPECT + 1.5 * 2_300); // the head ends at the first output past MIN_EXPECT, no later
 		expect(ids(auto)).not.toContain("r0");

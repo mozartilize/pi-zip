@@ -603,8 +603,9 @@ describe("/zip status after a restart", async () => {
 		const branch = [out("a"), out("b"), out("c"), ph("a"), ph("b"), ph("c"), recall, { type: "context_edit", targetId: "x", replacement: { content: [{ type: "text", text: "someone else" }] } }, { type: "compaction", summary: "s", details: { by: "pi-zip" } }, { type: "compaction", summary: "pi", details: {} }];
 		const zip = new Zip(fakePi().pi); // a fresh process: its own counters are all 0
 		const { ctx } = fakeCtx([], { branch });
-		expect(zip.status(ctx)).toContain("this session: 3 folded outputs (~30K tokens), 1 summary, 1 recall");
+		// 30K chars/4 of folded text on the provider's scale: x c, here C0 = 1.5 (this branch has no usage to calibrate from)
+		expect(zip.status(ctx)).toContain("this session: 3 folded outputs (~45K tokens), 1 summary, 1 recall");
 		expect(zip.status(ctx)).not.toContain("since pi started");
-		expect(zip.statsLine(ctx)).toContain("this session: 3 folded outputs (~30K tokens), 1 summary, 1 recall");
+		expect(zip.statsLine(ctx)).toContain("this session: 3 folded outputs (~45K tokens), 1 summary, 1 recall");
 	});
 });

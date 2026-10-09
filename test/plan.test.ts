@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { applyPlanToMessages, buildBlocks, compactionRoom, planContext, RELAX_PREV_TURN, settings, summaryGainOk, legacyValve, VALVE_MIN_REDUCTION, type Cut, type PlanOpts, type RunPlan } from "../src/plan.ts";
 import { A, AX, flat, longTurn, R, U, type Any } from "./helpers.ts";
 
-const opts = (over: Partial<PlanOpts> = {}): PlanOpts => ({ coldCap: 60_000, sys: 0, cwd: process.cwd(), promptPending: true, ...over });
+const opts = (over: Partial<PlanOpts> = {}): PlanOpts => ({ coldCap: 60_000, cwd: process.cwd(), promptPending: true, ...over });
 
 // settle view of a finished run: 2 user turns, big outputs in both
 const prevRun = [U("u1", "one"), A("a1", ["c1"]), R("r1", "c1"), A("a2"), U("u2", "two"), A("a3", ["c2"]), R("r2", "c2"), A("a4")];
@@ -220,11 +220,11 @@ describe("cold cap default", () => {
 	test("a ~45K context is over the default cap (it would have been under the old 60K)", () => {
 		delete process.env.PI_ZIP_COLD_CAP;
 		const prose = [U("u1", "one"), AX("x1", 90_000), U("u2", "two"), AX("x2", 90_000), U("u3", "three"), A("a3"), U("u4", "now")]; // ~45K tokens of prose
-		const p = planContext(prose, { sys: 0, cwd: ".", promptPending: false })!;
+		const p = planContext(prose, { cwd: ".", promptPending: false })!;
 		expect(p.ctxTokens).toBeGreaterThan(40_000);
 		expect(p.ctxTokens).toBeLessThan(60_000);
 		expect(p.sumTrigger).toBe("cold");
-		expect(planContext(prose, { sys: 0, cwd: ".", promptPending: false, coldCap: 60_000 })!.sumTrigger).toBeNull();
+		expect(planContext(prose, { cwd: ".", promptPending: false, coldCap: 60_000 })!.sumTrigger).toBeNull();
 	});
 });
 
@@ -262,11 +262,11 @@ describe("warm valve gate (VALVE_MIN_REDUCTION)", () => {
 		e.push(U("uw", "write it"), call, big, A("zw"), U("uN", "now"));
 		return e;
 	};
-	const warm = (entries: Any[], contextWindow?: number) => planContext(entries, { mode: "warm", sys: 0, cwd: ".", promptPending: false, model: contextWindow ? { provider: "p", id: "m", contextWindow } : undefined });
+	const warm = (entries: Any[], contextWindow?: number) => planContext(entries, { mode: "warm", cwd: ".", promptPending: false, model: contextWindow ? { provider: "p", id: "m", contextWindow } : undefined });
 
 	test("planner: 183K -> 131K is blocked, 200K -> 90K fires (unknown window, V = 160K)", () => {
 		const blocked = session(24, 512_000); // ~54K of foldable reads + a ~128K protected write
-		const cold = planContext(blocked, { sys: 0, cwd: ".", promptPending: false, coldCap: 1000 })!;
+		const cold = planContext(blocked, { cwd: ".", promptPending: false, coldCap: 1000 })!;
 		expect(cold.ctxTokens).toBeGreaterThan(180_000);
 		expect(cold.ctxTokens).toBeLessThan(186_000);
 		expect(cold.ctxAfterFolds).toBeGreaterThan(128_000);

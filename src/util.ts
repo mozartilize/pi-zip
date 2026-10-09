@@ -25,10 +25,13 @@ const IMAGE_CHARS = 4800;
 const contentChars = (c: Any): number =>
 	typeof c === "string" ? c.length : Array.isArray(c) ? c.reduce((a: number, b: Any) => a + (b?.type === "text" ? (b.text?.length ?? 0) : b?.type === "image" ? IMAGE_CHARS : 0), 0) : 0;
 
-/** chars/4 estimate, same rules as Pi's estimateTokens (kept local so plan.ts has no runtime Pi dependency). */
+/** chars/4 estimate of a message's CONTENT, same rules as Pi's estimateTokens (kept local so plan.ts has no runtime Pi dependency).
+ *  A system message counts 0: the system prompt and the tools are the fixed prefix O of plan.ts, never content. */
 export function tokensOf(m: Any): number {
 	let chars = 0;
 	switch (m?.role) {
+		case "system":
+			return 0;
 		case "assistant":
 			for (const b of m.content ?? []) {
 				if (b?.type === "text") chars += b.text?.length ?? 0;
