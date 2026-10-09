@@ -761,7 +761,7 @@ describe("in-turn folds through the real extension: one user message, 60 tool ca
 		expect(c2.render(200)).toEqual(wide);
 	});
 
-	test("the notice's 'after' is the real size the edited request carried (matches Pi's context meter), not the estimate", async () => {
+	test("the notice's 'after' is the real size the edited request carried (matches Pi's context meter); 'before' stays the calibrated one", async () => {
 		process.env.PI_ZIP_COLD_CAP = "8000";
 		const run = async (real: number) => {
 			const entries = session();
@@ -777,7 +777,7 @@ describe("in-turn folds through the real extension: one user message, 60 tool ca
 		const a = await run(6000), b = await run(9000);
 		expect(a.after).toBe(6000);
 		expect(b.after).toBe(9000);
-		expect(b.before / a.before).toBeCloseTo(1.5, 2); // before scales with the same ratio
+		expect(b.before).toBe(a.before); // before is the calibrated size of the previous request: never rescaled by the after side
 	});
 
 	test("zip_recall hidden by a --tools allowlist (sub-agents): only rereadable outputs fold, placeholders point at re-reading", async () => {
