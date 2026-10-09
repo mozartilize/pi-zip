@@ -138,6 +138,12 @@ export function renderCard(c: CardData, width: number, th: Th, m: Measure = plai
 			const v = [row.slice(LABEL_W), lifeText(c), lifeText({ ...c, measured: false })].find((x) => m.vw(x) <= room);
 			if (v) { out.push(th.fg("dim", head + v)); continue; }
 		}
+		if (row.startsWith("unzip ")) {
+			// Narrow: the bracketed reason goes first, so where the files are stays whole.
+			const head = (indent + "unzip").padEnd(indent.length + LABEL_W), room = width - m.vw(head);
+			const v = [row.slice(LABEL_W), row.slice(LABEL_W).replace(/ \([^()]*\)$/, "")].find((x) => m.vw(x) <= room);
+			if (v) { out.push(th.fg("dim", head + v)); continue; }
+		}
 		const line = m.cut(indent + row, width);
 		if (!line) continue;
 		const k = line.slice(0, indent.length + LABEL_W), v = line.slice(indent.length + LABEL_W);

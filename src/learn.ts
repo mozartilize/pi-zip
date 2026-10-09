@@ -41,8 +41,10 @@ export const MIN_EXPECT = 8192;
 export interface Entry { cls?: CacheClass; bins: Record<string, [number, number]>; n: number } // bin index -> [alive, dead] (decayed counts)
 interface File { v: 1; models: Record<string, Entry> }
 
-export const statsPath = (): string =>
-	process.env.PI_ZIP_CACHE_STATS || join(process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent"), "pi-zip", "cache-survival.json");
+/** Pi's agent directory (settings.json, sessions): PI_CODING_AGENT_DIR, else ~/.pi/agent. */
+export const agentDir = (): string => process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
+
+export const statsPath = (): string => process.env.PI_ZIP_CACHE_STATS || join(agentDir(), "pi-zip", "cache-survival.json");
 
 /** ES2023's Array.prototype.findLastIndex (Node >= 18 and Bun have it); tsconfig's lib is ES2022, so it is typed here (types only). */
 interface FindLastIndex { findLastIndex(predicate: (value: number, index: number) => boolean): number }

@@ -70,6 +70,15 @@ describe("status card", () => {
 		expect(renderCard(c, 40, th).filter((x) => /^  (model|away) /.test(x))).toEqual([]); // no model or away row without the chart
 	});
 	test("fmtLife", () => expect([fmtLife(45), fmtLife(300), fmtLife(3600), fmtLife(9000)]).toEqual(["~45 s", "~5 min", "~1 h", "~2.5 h"]));
+	test("the unzip row: narrow, the bracketed reason goes first, so where the files are is never cut mid-word", () => {
+		const c: CardData = { ...card, unzip: "from files in ~/.cache/pi-zip/recall (a tool allowlist hides zip_recall)" };
+		const row = (w: number) => renderCard(c, w, th).find((l) => l.startsWith("  unzip "));
+		expect(row(120)).toBe("  unzip    from files in ~/.cache/pi-zip/recall (a tool allowlist hides zip_recall)");
+		expect(row(80)).toBe("  unzip    from files in ~/.cache/pi-zip/recall");
+		expect(row(47)).toBe("  unzip    from files in ~/.cache/pi-zip/recall");
+		expect(row(46)).toBe("  unzip    from files in ~/.cache/pi-zip/reca\u2026"); // narrower than the place itself: cut like any row
+		for (const w of [10, 30, 46, 47, 60, 80, 120]) expect(fits(renderCard(c, w, tag), w, plainW)).toBe(true);
+	});
 });
 
 describe("zip_recall row", () => {
@@ -224,16 +233,18 @@ describe("transcript wiring", () => {
 	test("an allowlist that hides zip_recall but keeps read or bash: file recall is a full mode, one 'on' line naming the recall directory", async () => {
 		const { f, ctx, render } = await setup([], { getActiveTools: () => ["read", "bash"] });
 		ctx.sessionManager.getSessionId = () => "01a120cb-3d40-75a6-aeac-320e71967606";
+		ctx.sessionManager.getSessionFile = () => "/tmp/pi-zip-test-sessions/s.jsonl";
 		await f.handlers.get("session_start")({}, ctx);
 		await f.handlers.get("before_agent_start")({}, ctx);
 		const kept = f.appended.filter((x: Any) => x.customType === "pi-zip/notice");
 		expect(kept).toHaveLength(1);
-		expect(render(kept[0], 200)[0]).toBe("ƶ pi-zip  on  a tool allowlist hides zip_recall · zipped outputs are read back from files in ~/.cache/pi-zip/recall");
+		const where = join(process.env.XDG_CACHE_HOME!, "pi-zip", "recall"); // where the copies are ($XDG_CACHE_HOME here), not always ~/.cache
+		expect(render(kept[0], 200)[0]).toBe(`ƶ pi-zip  on  a tool allowlist hides zip_recall · zipped outputs are read back from files in ${where}`);
 		// the card: on, with the unzip row; the chart rows are untouched
 		await f.handlers.get("cmd:zip").handler("status", ctx);
 		const card = render(f.appended.filter((x: Any) => x.customType === "pi-zip/notice").at(-1), 200);
 		expect(card[0]).toBe("ƶ pi-zip  on");
-		expect(card).toContain("  unzip    from files in ~/.cache/pi-zip/recall (a tool allowlist hides zip_recall)");
+		expect(card).toContain(`  unzip    from files in ${where} (a tool allowlist hides zip_recall)`);
 		expect(card.some((l: string) => l.startsWith("  away "))).toBe(true);
 	});
 	test("a read or grep of a recall file is drawn like zip_recall's row", async () => {

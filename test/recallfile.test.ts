@@ -1,17 +1,20 @@
 // Recall through files (research pi-tricks §2): a tool allowlist hides zip_recall, but read, grep or bash can read the original from a
 // file that the tool_call hook writes from the session when a tool names it.
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, readFileSync, readdirSync, rmSync, statSync, utimesSync } from "node:fs";
+import { appendFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { handleFor, makePlaceholder } from "../src/placeholder.ts";
 import { planContext } from "../src/plan.ts";
 import { recalledHandlesFromBranch } from "../src/recall.ts";
 import { cleanupRecall, commandRecallHandles, fileRecallFor, fileRecallHow, materialize, parseRecallPath, recallRoot, RECALL_DIR, RECALL_MAX_AGE_MS, rewriteCommand } from "../src/recallfile.ts";
+import * as recallfile from "../src/recallfile.ts"; // newer exports through the namespace: one missing fails only its own test
 import { handleTable, skeleton } from "../src/summary.ts";
 import { buildBlocks } from "../src/plan.ts";
 import { A, fakeCtx, fakePi, flat, longTurn, R, U, type Any } from "./helpers.ts";
 
 const SID = "01a120cb-3d40-75a6-aeac-320e71967606";
+const SESSION_FILE = `/tmp/pi-zip-test-sessions/2026-10-09_${SID}.jsonl`; // a persisted session (never opened: only its name is asked for)
 const OTHER = "0199aaaa-0000-7000-8000-000000000000";
 const ALL = { read: true, grep: true, bash: true };
 const ENV = ["PI_ZIP_TTL_SECS", "PI_ZIP_COLD_CAP", "PI_ZIP_INTURN_AGE"];
@@ -44,18 +47,77 @@ describe("recall files: paths, placeholder text, disk", () => {
 		expect(how(false, true, true)).toBe("read it with bash (sed -n for pages) or grep it");
 	});
 
-	test("written once from the text it is given: directory 0700, file 0600, under $XDG_CACHE_HOME", () => {
+	test("written from the text it is given: directory 0700, file 0600, under $XDG_CACHE_HOME; an intact copy is left as it is", () => {
 		expect(recallRoot()).toBe(join(process.env.XDG_CACHE_HOME!, "pi-zip", "recall"));
 		const root = recallRoot();
-		const out = materialize(root, SID, [{ handle: "aaaaaaaaaa", text: "original\nbytes ü\n" }, { handle: "../../evil", text: "x" }]);
+		const text = "original\nbytes ü\n";
+		const out = materialize(root, SID, [{ handle: "aaaaaaaaaa", text }, { handle: "../../evil", text: "x" }]);
 		const f = join(root, SID, "aaaaaaaaaa.txt");
 		expect([...out.entries()]).toEqual([["aaaaaaaaaa", f]]); // a handle that is not one is never a file name
-		expect(readFileSync(f, "utf8")).toBe("original\nbytes ü\n");
+		expect(readFileSync(f, "utf8")).toBe(text);
 		expect(statSync(f).mode & 0o777).toBe(0o600);
 		expect(statSync(join(root, SID)).mode & 0o777).toBe(0o700);
-		materialize(root, SID, [{ handle: "aaaaaaaaaa", text: "something else" }]);
-		expect(readFileSync(f, "utf8")).toBe("original\nbytes ü\n"); // the original never changes: an existing copy stays
+		const hourAgo = (Date.now() - 3_600_000) / 1000;
+		utimesSync(f, hourAgo, hourAgo);
+		materialize(root, SID, [{ handle: "aaaaaaaaaa", text }]);
+		expect(Math.round(statSync(f).mtimeMs / 1000)).toBe(Math.round(hourAgo)); // intact: not written again (its age stays)
 		rmSync(join(root, SID), { recursive: true, force: true });
+	});
+
+	test("a copy that no longer holds the original (appended to, edited in place, emptied, replaced by a symlink) is written again", () => {
+		const root = recallRoot();
+		const text = "original\nbytes ü\n";
+		const f = join(root, SID, "aaaaaaaaaa.txt");
+		materialize(root, SID, [{ handle: "aaaaaaaaaa", text }]);
+		const changes: [string, () => void][] = [
+			["echo >> it", () => appendFileSync(f, "appended\n")],
+			["sed -i, same size", () => writeFileSync(f, "ORIGINAL\nbytes ü\n")],
+			["> it", () => writeFileSync(f, "")],
+		];
+		for (const [name, change] of changes) {
+			change();
+			materialize(root, SID, [{ handle: "aaaaaaaaaa", text }]);
+			expect([name, readFileSync(f, "utf8")]).toEqual([name, text]);
+		}
+		const elsewhere = join(process.env.XDG_CACHE_HOME!, "elsewhere.txt");
+		writeFileSync(elsewhere, "not pi-zip's");
+		rmSync(f);
+		symlinkSync(elsewhere, f);
+		materialize(root, SID, [{ handle: "aaaaaaaaaa", text }]);
+		expect(lstatSync(f).isSymbolicLink()).toBe(false); // replaced, never written through
+		expect(readFileSync(f, "utf8")).toBe(text);
+		expect(statSync(f).mode & 0o777).toBe(0o600);
+		expect(readFileSync(elsewhere, "utf8")).toBe("not pi-zip's");
+		rmSync(join(root, SID), { recursive: true, force: true });
+		rmSync(elsewhere, { force: true });
+	});
+
+	test("$XDG_CACHE_HOME counts only when it is absolute (the XDG spec): a relative one would put the copies in the project folder", () => {
+		const saved = process.env.XDG_CACHE_HOME;
+		try {
+			process.env.XDG_CACHE_HOME = "relative/cache";
+			expect(recallRoot()).toBe(join(homedir(), ".cache", "pi-zip", "recall"));
+			process.env.XDG_CACHE_HOME = "";
+			expect(recallRoot()).toBe(join(homedir(), ".cache", "pi-zip", "recall"));
+			process.env.XDG_CACHE_HOME = "/var/cache/someone";
+			expect(recallRoot()).toBe("/var/cache/someone/pi-zip/recall");
+		} finally {
+			process.env.XDG_CACHE_HOME = saved;
+		}
+	});
+
+	test("the user is shown where the copies really are: ~ for the home directory, else the full path", () => {
+		const saved = process.env.XDG_CACHE_HOME;
+		try {
+			delete process.env.XDG_CACHE_HOME;
+			expect(recallfile.recallRootShown()).toBe("~/.cache/pi-zip/recall");
+			process.env.XDG_CACHE_HOME = join(homedir(), ".xdg-cache");
+			expect(recallfile.recallRootShown()).toBe("~/.xdg-cache/pi-zip/recall");
+			process.env.XDG_CACHE_HOME = "/var/cache/someone";
+			expect(recallfile.recallRootShown()).toBe("/var/cache/someone/pi-zip/recall");
+		} finally {
+			process.env.XDG_CACHE_HOME = saved;
+		}
 	});
 
 	test("cleanup: copies older than 14 days go, newer ones stay, an emptied session directory goes", () => {
@@ -72,6 +134,31 @@ describe("recall files: paths, placeholder text, disk", () => {
 		rmSync(root, { recursive: true, force: true });
 	});
 
+	test("cleanup deletes only pi-zip's own copies: a symlinked session directory or file is never followed, other names stay", () => {
+		const base = mkdtempSync(join(tmpdir(), "pi-zip-cleanup-"));
+		const root = join(base, "recall"), outside = join(base, "elsewhere");
+		mkdirSync(outside);
+		const old = (Date.now() - RECALL_MAX_AGE_MS - 3_600_000) / 1000;
+		const stale = (f: string, text: string) => (writeFileSync(f, text), utimesSync(f, old, old));
+		stale(join(outside, "notes.txt"), "someone's notes"); // what a symlinked session directory leads to
+		stale(join(outside, "aaaaaaaaaa.txt"), "looks like a copy, is not one");
+		materialize(root, SID, [{ handle: "oldoldoldo", text: "a" }, { handle: "newnewnewn", text: "b" }]);
+		utimesSync(join(root, SID, "oldoldoldo.txt"), old, old);
+		stale(join(root, SID, "oldoldoldo.txt.4242.tmp"), "a write that never finished");
+		stale(join(root, SID, "NOTES.md"), "not a copy name");
+		symlinkSync(join(outside, "aaaaaaaaaa.txt"), join(root, SID, "bbbbbbbbbb.txt")); // a copy name that is a symlink
+		symlinkSync(outside, join(root, OTHER)); // a session directory that is a symlink
+		mkdirSync(join(root, "not a session"));
+		stale(join(root, "not a session", "cccccccccc.txt"), "x");
+		expect(cleanupRecall(root)).toBe(2); // oldoldoldo.txt and its leftover .tmp
+		expect(readFileSync(join(outside, "notes.txt"), "utf8")).toBe("someone's notes");
+		expect(readFileSync(join(outside, "aaaaaaaaaa.txt"), "utf8")).toBe("looks like a copy, is not one");
+		expect(readdirSync(join(root, SID)).sort()).toEqual(["NOTES.md", "bbbbbbbbbb.txt", "newnewnewn.txt"]);
+		expect(lstatSync(join(root, OTHER)).isSymbolicLink()).toBe(true);
+		expect(existsSync(join(root, "not a session", "cccccccccc.txt"))).toBe(true);
+		rmSync(base, { recursive: true, force: true });
+	});
+
 	test("a shell command: every recall path points at this machine's copy; the handles, or the directory, are reported", () => {
 		const r1 = rewriteCommand(`grep -n SKU-03903 ~/.cache/pi-zip/recall/${SID}/k3f9a0x1qz.txt | head -5`, "/l/recall/s");
 		expect(r1).toEqual({ command: "grep -n SKU-03903 /l/recall/s/k3f9a0x1qz.txt | head -5", handles: ["k3f9a0x1qz"], dir: false });
@@ -79,6 +166,16 @@ describe("recall files: paths, placeholder text, disk", () => {
 		expect(rewriteCommand(`cat "$HOME/.cache/pi-zip/recall/${SID}"/*.txt`, "/l/s").command).toBe(`cat "/l/s"/*.txt`);
 		expect(rewriteCommand(`sed -n 1,9p ~/.cache/pi-zip/recall/${SID}/k3f9a0x1qz.txt`, "/with space/s")).toEqual({ command: `sed -n 1,9p ~/.cache/pi-zip/recall/${SID}/k3f9a0x1qz.txt`, handles: ["k3f9a0x1qz"], dir: false }); // would need quoting: left alone
 		expect(rewriteCommand("ls -la src", "/l/s")).toEqual({ command: "ls -la src", handles: [], dir: false });
+		// the path starts after =, a comma or a brace: an assignment, an --opt=, a brace expansion keep their own text
+		const p = `~/.cache/pi-zip/recall/${SID}/k3f9a0x1qz.txt`;
+		expect(rewriteCommand(`X=${p}; grep foo "$X"`, "/l/s")).toEqual({ command: `X=/l/s/k3f9a0x1qz.txt; grep foo "$X"`, handles: ["k3f9a0x1qz"], dir: false });
+		expect(rewriteCommand(`grep --file=${p} src/`, "/l/s").command).toBe("grep --file=/l/s/k3f9a0x1qz.txt src/");
+		expect(rewriteCommand(`cat {/tmp/a.txt,${p}}`, "/l/s").command).toBe("cat {/tmp/a.txt,/l/s/k3f9a0x1qz.txt}");
+		expect(rewriteCommand(`cat {${p},/tmp/a.txt}`, "/l/s").command).toBe("cat {/l/s/k3f9a0x1qz.txt,/tmp/a.txt}");
+		expect(rewriteCommand(`sort -o=${p} x`, "/l/s").command).toBe("sort -o=/l/s/k3f9a0x1qz.txt x");
+		// ... while a variable in braces is part of the path
+		expect(rewriteCommand(`grep -n x \${HOME}/.cache/pi-zip/recall/${SID}/k3f9a0x1qz.txt`, "/l/s").command).toBe("grep -n x /l/s/k3f9a0x1qz.txt");
+		expect(rewriteCommand(`ls "\${XDG_CACHE_HOME}/pi-zip/recall/${SID}"`, "/l/s")).toEqual({ command: `ls "/l/s"`, handles: [], dir: true });
 		expect(commandRecallHandles(`wc -l ~/.cache/pi-zip/recall/${SID}/aaaaaaaaaa.txt ~/.cache/pi-zip/recall/${SID}/bbbbbbbbbb.txt`)).toEqual(["aaaaaaaaaa", "bbbbbbbbbb"]);
 	});
 
@@ -108,7 +205,7 @@ async function rig(entries: Any[], tools: string[], over: Any = {}, piExtra: Any
 	const f = fakePi({ getActiveTools: () => tools, ...piExtra });
 	piZip(f.pi);
 	const branch = over.branch ?? branchOf(entries, Date.now() - 60_000);
-	const { ctx, notes } = fakeCtx(entries, { branch, ...over, sessionManager: { getBranch: () => branch, buildSessionProjection: () => ({ entries: over.projection ?? entries }), getSessionId: () => SID, ...over.sessionManager } });
+	const { ctx, notes } = fakeCtx(entries, { branch, ...over, sessionManager: { getBranch: () => branch, buildSessionProjection: () => ({ entries: over.projection ?? entries }), getSessionId: () => SID, getSessionFile: () => SESSION_FILE, ...over.sessionManager } });
 	return { ...f, ctx, notes, fire: async (name: string, e: Any) => f.handlers.get(name)(e, ctx) };
 }
 const folded = (msgs: Any[]) => msgs.filter((m) => m.role === "toolResult" && String(m.content[0].text).startsWith("[folded by pi-zip"));
@@ -141,6 +238,31 @@ describe("file recall through the extension", () => {
 		const rr = folded((await none.fire("context_with_system", { messages: flat(session()) })).messages);
 		expect(rr.map((m: Any) => m.toolCallId)).not.toContain("c3");
 		for (const m of rr) expect(String(m.content[0].text)).toContain("re-read the file");
+	});
+
+	test("--no-session (no session file): only re-readable outputs fold, the line says why, and no recall copy is ever written", async () => {
+		process.env.PI_ZIP_INTURN_AGE = "20";
+		process.env.PI_ZIP_COLD_CAP = "8000";
+		const dir = join(recallRoot(), SID);
+		rmSync(dir, { recursive: true, force: true });
+		const r = await rig(session(), ["read", "grep", "bash"], { sessionManager: { getSessionFile: () => undefined } });
+		await r.fire("session_start", {});
+		await r.fire("before_agent_start", {});
+		const got = folded((await r.fire("context_with_system", { messages: flat(session()) })).messages);
+		expect(got.length).toBeGreaterThan(0);
+		expect(got.map((m: Any) => m.toolCallId)).not.toContain("c3"); // an npm test output: not re-readable, so not folded
+		for (const m of got) expect(String(m.content[0].text)).toContain("re-read the file");
+		expect(r.notes.join("\n")).toContain("reread-only  a tool allowlist hides zip_recall · only re-readable outputs fold · no session file (--no-session)");
+		const h = handleFor("r1");
+		const read = { toolName: "read", input: { path: `~/.cache/pi-zip/recall/${SID}/${h}.txt` } };
+		await r.fire("tool_call", read);
+		expect(read.input.path).toBe(`~/.cache/pi-zip/recall/${SID}/${h}.txt`);
+		const bash = { toolName: "bash", input: { command: `grep -n x ~/.cache/pi-zip/recall/${SID}/${h}.txt` } };
+		await r.fire("tool_call", bash);
+		expect(bash.input.command).toBe(`grep -n x ~/.cache/pi-zip/recall/${SID}/${h}.txt`);
+		const grep = { toolName: "grep", input: { pattern: "x", path: `~/.cache/pi-zip/recall/${SID}` } };
+		await r.fire("tool_call", grep);
+		expect(existsSync(dir)).toBe(false); // nothing on disk
 	});
 
 	test("the tool_call hook writes the original from the branch and points read, grep, find, ls and bash at it, whatever the prefix", async () => {
@@ -198,13 +320,18 @@ describe("file recall through the extension", () => {
 		const { Zip } = await import("../src/run.ts");
 		const entries = [U("u1", "one")];
 		const z = new Zip(fakePi().pi);
-		const { ctx } = fakeCtx(entries, { sessionManager: { getBranch: () => [], buildSessionProjection: () => ({ entries }), getSessionId: () => SID } });
+		const { ctx } = fakeCtx(entries, { sessionManager: { getBranch: () => [], buildSessionProjection: () => ({ entries }), getSessionId: () => SID, getSessionFile: () => SESSION_FILE } });
 		z.setRecallMode("file", { read: true, grep: false, bash: true });
-		expect(z.card(ctx)).toMatchObject({ state: "on", unzip: `from files in ${RECALL_DIR} (a tool allowlist hides zip_recall)` });
+		expect(z.card(ctx)).toMatchObject({ state: "on", unzip: `from files in ${join(process.env.XDG_CACHE_HOME!, "pi-zip", "recall")} (a tool allowlist hides zip_recall)` }); // where they really are
 		expect(z.card(ctx).stateNote).toBeUndefined();
 		z.setRecallMode("reread", { read: false, grep: false, bash: false });
 		expect(z.card(ctx)).toMatchObject({ state: "reread-only" });
 		expect(z.card(ctx).unzip).toBeUndefined();
+		// read and bash are there, but no session file (--no-session): reread-only, saying why
+		const mem = fakeCtx(entries, { sessionManager: { getBranch: () => [], buildSessionProjection: () => ({ entries }), getSessionId: () => SID, getSessionFile: () => undefined } }).ctx;
+		z.setRecallMode("file", { read: true, grep: false, bash: true });
+		expect(z.card(mem)).toMatchObject({ state: "reread-only", stateNote: "a tool allowlist hides zip_recall · no session file, so no recall copies" });
+		expect(z.card(mem).unzip).toBeUndefined();
 		z.setRecallMode("tool", { read: true, grep: true, bash: true });
 		expect(z.card(ctx)).toMatchObject({ state: "on" });
 		expect(z.card(ctx).unzip).toBeUndefined();
