@@ -53,9 +53,8 @@ export interface CardData {
 	state: "on" | "off" | "paused" | "reread-only";
 	stateNote?: string; // why paused / reread-only
 	model?: string; // provider/id
-	cls?: string; // explicit | automatic
-	life?: string; // "~5 min (declared)" | "~1 h (learned from 42 returns)"
-	alive?: number[]; // P(warm) at SPARK_GAPS
+	life?: string; // "~5 min" | "~1 h" | "2 h+": how long the cache outlives the last reply
+	measured?: boolean; // life comes from this provider's own replies, not the declared TTL
 	folds: number;
 	foldedTokens: string; // "310K"
 	summaries: number;
@@ -65,27 +64,21 @@ export interface CardData {
 	quiet: boolean;
 }
 
-/** Gaps (seconds) the "alive" sparkline samples: 30 s to 2 h, denser where caches usually expire. */
-export const SPARK_GAPS = [30, 60, 120, 180, 240, 300, 360, 420, 600, 900, 1200, 1800, 2700, 3600, 5400, 7200];
-const SPARK = "▁▂▃▄▅▆▇█";
-export const sparkline = (ps: number[]): string => ps.map((p) => SPARK[Math.max(0, Math.min(7, Math.round(p * 7)))]).join("");
-
 /** "~5 min", "~1 h", "~2.5 h" */
 export function fmtLife(s: number): string {
 	if (s < 90) return `~${Math.round(s)} s`;
-	if (s < 5400) return `~${Math.round(s / 60)} min`;
+	if (Math.round(s / 60) < 60) return `~${Math.round(s / 60)} min`;
 	return `~${+(s / 3600).toFixed(1)} h`;
 }
 
 export function cardText(c: CardData): string[] {
 	const rows: [string, string][] = [];
-	if (c.model) rows.push(["cache", [c.model, c.cls ?? "class unknown until the first reply", c.life ? `lives ${c.life}` : ""].filter(Boolean).join(" · ")]);
-	if (c.alive?.length) rows.push(["alive", `${sparkline(c.alive)}  30 s → 2 h`]);
+	// Plain words only: one fact the user can act on ("come back within ~5 min and nothing is touched"), no classes, no curves.
+	if (c.model) rows.push(["cache", `${c.model}${c.life ? ` · expires after ${c.life} idle${c.measured ? " (measured)" : ""}` : ""}`]);
 	const n = (x: number, one: string, many = one + "s") => `${x} ${x === 1 ? one : many}`;
 	rows.push(["session", `${c.folds} zipped ~${c.foldedTokens}  ·  ${n(c.summaries, "summary", "summaries")}${c.summaryUsd > 0 ? ` $${c.summaryUsd.toFixed(2)}` : ""}  ·  ${n(c.recalls, "unzip")}`]);
 	if (c.last) rows.push(["last", c.last]);
-	const mode = c.state === "reread-only" ? "reread-only (zip_recall hidden by a tool allowlist)" : "full (zip_recall available)";
-	rows.push(["mode", `${mode}${c.quiet ? " · notices off" : ""}`]);
+	if (c.quiet) rows.push(["notices", "off  (/zip quiet turns them back on)"]); // the default says nothing, so it is not shown
 	return rows.map(([k, v]) => `${k.padEnd(LABEL_W)}${v}`);
 }
 
@@ -95,9 +88,8 @@ export function renderCard(c: CardData, width: number, th: Th, m: Measure = plai
 	for (const row of cardText(c)) {
 		const line = m.cut(indent + row, width);
 		if (!line) continue;
-		const warn = row.startsWith("mode") && c.state === "reread-only";
 		const k = line.slice(0, indent.length + LABEL_W), v = line.slice(indent.length + LABEL_W);
-		out.push(th.fg("dim", k) + (row.startsWith("session") ? th.fg("text", v) : th.fg(warn ? "warning" : "dim", v)));
+		out.push(th.fg("dim", k) + (row.startsWith("session") ? th.fg("text", v) : th.fg("dim", v)));
 	}
 	return out;
 }
