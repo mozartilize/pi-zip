@@ -63,6 +63,7 @@ export interface CardData {
 	recalls: number;
 	last?: string; // "10:50  folded 12 old outputs · cache cold (away 47 min)"
 	quiet: boolean;
+	unzip?: string; // how the model gets folded outputs back, when it is not zip_recall (file recall under a tool allowlist)
 }
 
 /** "~5 min", "~1 h", "~2.5 h" */
@@ -103,6 +104,7 @@ export function cardText(c: CardData): string[] {
 	const n = (x: number, one: string, many = one + "s") => `${x} ${x === 1 ? one : many}`;
 	rows.push(["session", `${c.folds} zipped ~${c.foldedTokens}  ·  ${n(c.summaries, "summary", "summaries")}${c.summaryUsd > 0 ? ` $${c.summaryUsd.toFixed(2)}` : ""}  ·  ${n(c.recalls, "unzip")}`]);
 	if (c.last) rows.push(["last", c.last]);
+	if (c.unzip) rows.push(["unzip", c.unzip]);
 	if (c.quiet) rows.push(["notices", "off  (/zip quiet turns them back on)"]); // the default says nothing, so it is not shown
 	return rows.map(([k, v]) => `${k.padEnd(LABEL_W)}${v}`);
 }

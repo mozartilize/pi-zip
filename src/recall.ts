@@ -1,6 +1,7 @@
 // zip_recall (F3): exact, batched retrieval of folded originals from the session file (I2).
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { handleFor, RECALL_TOOL, shortArgs } from "./placeholder.ts";
+import { commandRecallHandles, parseRecallPath } from "./recallfile.ts";
 import { measure, recallCallLine, recallResultLines, type RecallSectionInfo } from "./ui.ts";
 import { type Any, clamp, textOf } from "./util.ts";
 
@@ -221,10 +222,17 @@ export function recalledHandlesFromBranch(branch: Any[]): Set<string> {
 		const m = en?.type === "message" ? en.message : null;
 		if (m?.role !== "assistant" || !Array.isArray(m.content)) continue;
 		for (const c of m.content) {
-			if (c?.type !== "toolCall" || c.name !== RECALL_TOOL) continue;
+			if (c?.type !== "toolCall") continue;
 			const a: Any = c.arguments ?? {};
-			if (typeof a.handle === "string" && a.handle.trim()) out.add(a.handle.trim());
-			if (Array.isArray(a.handles)) for (const h of a.handles) if (typeof h === "string" && h.trim()) out.add(h.trim());
+			if (c.name === RECALL_TOOL) {
+				if (typeof a.handle === "string" && a.handle.trim()) out.add(a.handle.trim());
+				if (Array.isArray(a.handles)) for (const h of a.handles) if (typeof h === "string" && h.trim()) out.add(h.trim());
+			} else if (c.name === "bash") {
+				for (const h of commandRecallHandles(a.command)) out.add(h); // file recall: a shell reading a recall file
+			} else if (c.name === "read" || c.name === "grep") {
+				const h = parseRecallPath(a.path)?.handle; // file recall: read or grep of a recall file
+				if (h) out.add(h);
+			}
 		}
 	}
 	return out;

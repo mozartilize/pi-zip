@@ -5,6 +5,7 @@ import { createHash } from "node:crypto";
 import { type Any, PRODUCT, clamp, envInt, piTokensOf, textOf, tok4, tokensOf } from "./util.ts";
 import { PH_MARK } from "./placeholder.ts";
 import { MIN_EXPECT, type Prices } from "./learn.ts";
+import { commandNamesRecall, parseRecallPath, type FileRecall } from "./recallfile.ts";
 
 /** Default: when a COLD plan (P(warm) < 0.5) is still above the cap, also fold REREADABLE outputs of the previous user turn, biggest
  *  first. A warm plan does so only at a user return after the declared TTL (PlanOpts.pastTtl): the very returns where the TTL rule
@@ -450,6 +451,7 @@ export interface PlanOpts {
 	inturnAge?: number; // default settings().inturnAge (PI_ZIP_INTURN_AGE, 60); 0 = outputs of the protected turns never fold on age
 	noSummary?: boolean; // a summary was already made while this cache stayed warm: no second one unless the context is at/above the compaction room
 	rereadOnly?: boolean; // zip_recall is not available to the model: fold only outputs that can be re-read (classify "rereadable")
+	fileRecall?: FileRecall; // zip_recall is hidden but read, grep or bash is active: fold as in full mode, placeholders name the recall file
 	pastTtl?: boolean; // a user return after the declared TTL: a warm plan may relax into the previous user turn too (RELAX_PREV_TURN)
 }
 
@@ -468,6 +470,7 @@ export interface PlanResult {
 	userTurns: number;
 	cutVisibleIdx: number;
 	cutKeptFirstMsg: Any;
+	fileRecall?: FileRecall; // the summary of this plan names recall files instead of zip_recall (PlanOpts.fileRecall)
 }
 
 /** Estimated content before the earliest edited block: what stays cached through the edit with O (real: O + c x it). A cut edits from the start. */
@@ -538,7 +541,7 @@ export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
 	};
 	const addFold = (b: Block, trig: string): boolean => {
 		if (tokOverride.has(b.idx) || recalled.has(handleFor(b.entryId!))) return false; // F4: never refold what the model recalled
-		const ph = makePlaceholderFor(b, calls, keepLines, !!o.rereadOnly);
+		const ph = makePlaceholderFor(b, calls, keepLines, !!o.rereadOnly, o.fileRecall);
 		if (ph === null) return false;
 		const phTok = tokensOf({ ...b.msg, content: [{ type: "text", text: ph }] }); // the folded message: its id and framing stay
 		if (!(phTok < 0.9 * b.tokens)) return false;
@@ -548,7 +551,13 @@ export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
 		return true;
 	};
 	// a zip_recall result IS content the model just asked for: folding it would undo the recall (and loop); never
-	const isRecall = (b: Block) => (calls.get(b.msg.toolCallId)?.name ?? b.msg.toolName) === RECALL_TOOL;
+	// ... and so is a built-in read, grep, find, ls or bash call on a recall file (file recall, when an allowlist hides zip_recall)
+	const isRecall = (b: Block) => {
+		const call = calls.get(b.msg.toolCallId), name = call?.name ?? b.msg.toolName;
+		if (name === RECALL_TOOL) return true;
+		if (name === "bash") return commandNamesRecall(call?.args?.command);
+		return (name === "read" || name === "grep" || name === "find" || name === "ls") && !!parseRecallPath(call?.args?.path);
+	};
 	// Observability: on an automatic (prefix) cache no fold starts inside the first MIN_EXPECT real tokens, so the next response's cacheRead
 	// is an uncensored survival sample (learn.ts sample). Without it every idle return folded into the first 1-7K tokens and its sample was
 	// censored, so the learned curve never saw a return (live GLM bench). Explicit caches are exempt: the provider looks back only ~20
@@ -657,7 +666,7 @@ export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
 	// T = A (the whole post-edit context, O included, as tuned: the cheaper A - O fires warm edits earlier and loses items offline);
 	// the suffix after the earliest edit goes to the ledger only.
 	if ((mode === "warm" || (planned && law.pr)) && !gate("plan", real(ctxEst), real(after), room, 0, real(after), c * (after - untouched))) return null;
-	return { blocks, calls, folds, cutIdx, firstKeptEntryId: cutIdx !== null ? blocks[cutIdx].entryId : null, prefixTokens, summaryTokensPlanned, sumTrigger, scale: o.scale ?? UNIT, ctxTokens: real(ctxEst), ctxAfterFolds: real(ctxAfterFolds), userTurns, cutVisibleIdx, cutKeptFirstMsg };
+	return { blocks, calls, folds, cutIdx, firstKeptEntryId: cutIdx !== null ? blocks[cutIdx].entryId : null, prefixTokens, summaryTokensPlanned, sumTrigger, scale: o.scale ?? UNIT, ctxTokens: real(ctxEst), ctxAfterFolds: real(ctxAfterFolds), userTurns, cutVisibleIdx, cutKeptFirstMsg, ...(o.fileRecall ? { fileRecall: o.fileRecall } : {}) };
 }
 
 const sameMsg = (a: Any, b: Any): boolean =>
