@@ -106,6 +106,9 @@ export interface RecallItem {
 	turn?: number;
 }
 
+/** "[handle h · bash npm test · 812 chars · 40 lines]": the call that produced an output, so the model can tell look-alike outputs apart. */
+const sectionHead = (it: RecallItem & { text: string }) => `[handle ${it.handle}${it.label || it.tool ? " · " + (it.label ?? it.tool) : ""} · ${it.text.length} chars · ${it.text.split("\n").length} lines]`;
+
 export function recallSections(items: RecallItem[], opts: { grep?: string; range?: string; offset?: unknown; limit?: unknown }): { text: string; ok: number; missing: number; sections: RecallSectionInfo[] } {
 	const parts: string[] = [];
 	const sections: RecallSectionInfo[] = [];
@@ -124,31 +127,78 @@ export function recallSections(items: RecallItem[], opts: { grep?: string; range
 		const how = grep ? "grep" : range ? "range" : slice.clipped || slice.offset > 0 ? "page" : "all";
 		const shown = grep ? (slice.matched ?? 0) : slice.body ? slice.body.split("\n").length : 0;
 		sections.push({ handle: it.handle, label: it.label ?? it.tool ?? undefined, turn: it.turn, totalLines: slice.totalLines, shownLines: shown, how });
-		parts.push(`[handle ${it.handle}${it.tool ? " · " + it.tool : ""} · ${it.text.length} chars · ${slice.totalLines} lines]\n${slice.text}`);
+		parts.push(`${sectionHead({ ...it, text: it.text })}\n${slice.text}`);
 	}
 	return { text: parts.join("\n\n"), ok, missing, sections };
 }
 
-/** Resolve handles against the session branch (which spans entries before any compaction): exact originals. */
-export function resolveHandlesInBranch(branch: Any[], handles: string[]): { items: RecallItem[]; entryIds: (string | null)[] } {
-	const items: RecallItem[] = handles.map((h) => ({ handle: h, text: null, tool: null }));
-	const entryIds: (string | null)[] = handles.map(() => null);
+/** Every tool output of the session branch (which spans entries before any compaction), oldest first, with the call that produced it. */
+export function branchOutputs(branch: Any[]): Array<RecallItem & { text: string; entryId: string }> {
+	const out: Array<RecallItem & { text: string; entryId: string }> = [];
 	const calls = new Map<string, Any>();
 	let turn = 0;
 	for (const en of branch) {
 		const msg = en?.type === "message" ? en.message : null;
 		if (msg?.role === "user") turn++;
 		if (msg?.role === "assistant" && Array.isArray(msg.content)) for (const c of msg.content) if (c?.type === "toolCall" && c.id) calls.set(c.id, c);
-		if (msg?.role !== "toolResult") continue;
-		const k = handles.indexOf(handleFor(en.id));
-		if (k < 0) continue;
+		if (msg?.role !== "toolResult" || !en.id) continue;
 		const call = calls.get(msg.toolCallId);
 		const tool = msg.toolName ?? call?.name ?? null;
 		const args = call ? shortArgs(call.arguments) : "";
-		items[k] = { handle: handles[k], text: textOf(msg.content), tool, label: tool ? `${tool}${args ? " " + args : ""}` : undefined, turn: turn || undefined };
-		entryIds[k] = en.id;
+		out.push({ entryId: en.id, handle: handleFor(en.id), text: textOf(msg.content), tool, label: tool ? `${tool}${args ? " " + args : ""}` : undefined, turn: turn || undefined });
+	}
+	return out;
+}
+
+/** Resolve handles against the session branch: exact originals. */
+export function resolveHandlesInBranch(branch: Any[], handles: string[]): { items: RecallItem[]; entryIds: (string | null)[] } {
+	const items: RecallItem[] = handles.map((h) => ({ handle: h, text: null, tool: null }));
+	const entryIds: (string | null)[] = handles.map(() => null);
+	for (const o of branchOutputs(branch)) {
+		const k = handles.indexOf(o.handle);
+		if (k < 0) continue;
+		const { entryId, ...it } = o;
+		items[k] = it;
+		entryIds[k] = entryId;
 	}
 	return { items, entryIds };
+}
+
+/**
+ * grep without a handle: every earlier tool output of the branch (zip_recall results excepted), newest output first, each match
+ * under its output's handle and call, then one page by characters. For outputs whose handle the model cannot see any more (a long
+ * summary lists only the newest) and for questions that name the content rather than the output.
+ */
+export function searchOutputs(outputs: Array<RecallItem & { text: string }>, grep: string, opts: { offset?: unknown; limit?: unknown } = {}): { text: string; matched: number; hits: number; chars: number; sections: RecallSectionInfo[] } {
+	const { re, literal } = grepMatcher(grep);
+	const pool = outputs.filter((o) => o.tool !== RECALL_TOOL);
+	const parts: string[] = [];
+	const sections: RecallSectionInfo[] = [];
+	let hits = 0;
+	let stopped = false;
+	const t0 = Date.now();
+	for (let k = pool.length - 1; k >= 0 && !stopped; k--) {
+		const it = pool[k];
+		const lines = it.text.split("\n");
+		const got: string[] = [];
+		for (let i = 0; i < lines.length; i++) {
+			if (hits >= RECALL_MAX_HITS || Date.now() - t0 > GREP_BUDGET_MS) {
+				stopped = true;
+				break;
+			}
+			if (re.test(lines[i])) {
+				got.push(`${i + 1}: ${lines[i]}`);
+				hits++;
+			}
+		}
+		if (!got.length) continue;
+		parts.push(`${sectionHead(it)}\n${got.join("\n")}`);
+		sections.push({ handle: it.handle, label: it.label ?? it.tool ?? undefined, turn: it.turn, totalLines: lines.length, shownLines: got.length, how: "grep" });
+	}
+	const head = `[grep${literal ? " (searched as literal text: the pattern is not a safe regular expression)" : ""} over all ${pool.length} earlier tool outputs (no handle given): ${hits} matching line(s) in ${sections.length} output(s), newest output first${stopped ? "; stopped early (time or hit cap), narrow the pattern or pass a handle" : ""}]\n`;
+	if (!hits) return { text: head + "Nothing matched. Try a shorter or different pattern, or pass the handle shown in a folded block or a summary.", matched: 0, hits, chars: 0, sections };
+	const page = sliceRecall(parts.join("\n\n"), { offset: opts.offset, limit: opts.limit });
+	return { text: head + page.text, matched: sections.length, hits, chars: page.body.length, sections };
 }
 
 /** Handles the model already recalled in this branch (F4: never refold them). */
@@ -176,18 +226,19 @@ export function registerRecallTool(pi: ExtensionAPI, hooks: RecallHooks) {
 		name: RECALL_TOOL,
 		label: "Recall folded output",
 		description:
-			"Get back the EXACT original content of tool outputs that pi-zip folded earlier in this session. It is instant, free and has no side effects: " +
-			"prefer it over re-running a command or re-reading a file when you need the exact earlier output (a re-run may give different results). " +
-			"Every folded block shows a handle (10 characters) in its marker line, and summaries carry a handle table; handles stay valid " +
-			"after later summaries or compaction. Pass one handle, or several at once with handles for a batch. " +
-			"The text may be large and comes in pages of characters: prefer grep (case-insensitive regular expression; returns matching lines with their line numbers) " +
-			'or range (e.g. "120-240" for that line range); when a page says more is left, call again with offset to continue. Never guess the content of a folded block.',
+			"Get back the EXACT original of earlier tool outputs of this session that are no longer shown in full: a [folded by pi-zip …] block, or an output " +
+			"listed with a handle in a pi-zip summary. Whenever you need what such an output said, recall it first: it is instant, free and has no side effects, " +
+			"while re-running a command or re-reading a file costs a step and may give a different result. Never guess the content of a folded output. " +
+			"Pass its handle (10 characters, from the block's marker line or the summary; handles stay valid after later summaries or compaction), or several with handles. " +
+			'For a part, add grep (case-insensitive regular expression; matching lines with line numbers) or range (e.g. "120-240"). ' +
+			"No handle at hand? grep alone searches every earlier tool output of the session and labels each match with its output's handle and command. " +
+			"Large results come in pages of characters: when a page says more is left, call again with offset.",
 		parameters: {
 			type: "object",
 			properties: {
-				handle: { type: "string", description: "A single handle from a folded block's marker line or the summary's handle table" },
+				handle: { type: "string", description: "A handle from a folded block's marker line or a summary" },
 				handles: { type: "array", items: { type: "string" }, description: "Optional batch: several handles at once; each is returned as its own labelled section" },
-				grep: { type: "string", description: "Optional: only lines matching this case-insensitive regular expression, with line numbers (applied to every handle)" },
+				grep: { type: "string", description: "Optional: only lines matching this case-insensitive regular expression, with line numbers (applied to every handle). Without any handle: searches every earlier tool output of the session" },
 				range: { type: "string", description: 'Optional: only this line range, e.g. "120-240" (applied to every handle)' },
 				offset: { type: "number", description: "Optional: start this many characters into the (selected) text, for the next page of a large output or a very long single line (applied to every handle)" },
 				limit: { type: "number", description: `Optional: page size in characters (default ${RECALL_PAGE_CHARS}, at most ${RECALL_MAX_PAGE_CHARS})` },
@@ -210,7 +261,16 @@ export function registerRecallTool(pi: ExtensionAPI, hooks: RecallHooks) {
 			const handles: string[] = [];
 			if (typeof params?.handle === "string" && params.handle.trim()) handles.push(params.handle.trim());
 			if (Array.isArray(params?.handles)) for (const h of params.handles) if (typeof h === "string" && h.trim() && !handles.includes(h.trim())) handles.push(h.trim());
-			if (!handles.length) return { content: [{ type: "text", text: "Pass handle (one string) or handles (array), copied exactly from the folded block marker lines or the summary handle table." }], details: {}, isError: true };
+			if (!handles.length && grep !== undefined && grep.trim() !== "") {
+				try {
+					const out = searchOutputs(branchOutputs(ctx.sessionManager.getBranch() as Any[]), grep, { offset, limit });
+					hooks.onRecall([], out.chars, []); // a search marks nothing as recalled: only what the model asks for by handle is kept unfolded
+					return { content: [{ type: "text", text: out.text }], details: { handles: [], search: grep, resolved: out.matched, missing: 0, sections: out.sections }, isError: false };
+				} catch (err) {
+					return { content: [{ type: "text", text: `${RECALL_TOOL} failed: ${err instanceof Error ? err.message : String(err)}` }], details: {}, isError: true };
+				}
+			}
+			if (!handles.length) return { content: [{ type: "text", text: "Pass handle (one string) or handles (array), copied exactly from a folded block's marker line or a summary; or grep alone to search every earlier tool output." }], details: {}, isError: true };
 			try {
 				const { items, entryIds } = resolveHandlesInBranch(ctx.sessionManager.getBranch() as Any[], handles);
 				const out = recallSections(items, { grep, range, offset, limit });

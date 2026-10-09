@@ -113,7 +113,7 @@ export interface RecallSectionInfo {
 /** "↺ recall k3x9q2m7ab  grep "Expected"" */
 export function recallCallLine(args: { handle?: string; handles?: string[]; grep?: string; range?: string; offset?: number }, width: number, th: Th, m: Measure = plainMeasure): string[] {
 	const hs = [...(typeof args?.handle === "string" ? [args.handle] : []), ...(Array.isArray(args?.handles) ? args.handles.filter((h) => typeof h === "string") : [])];
-	const what = hs.length > 1 ? `${hs.length} handles` : (hs[0] ?? "");
+	const what = hs.length > 1 ? `${hs.length} handles` : (hs[0] ?? (args?.grep ? "all outputs" : ""));
 	const opt = [args?.grep ? `grep "${args.grep}"` : "", args?.range ? `lines ${args.range}` : "", args?.offset ? `from char ${args.offset}` : ""].filter(Boolean).join(" · ");
 	const plain = m.cut(`↺ recall ${what}${opt ? "  " + opt : ""}`, width);
 	const head = "↺ recall";

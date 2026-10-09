@@ -70,6 +70,7 @@ describe("zip_recall row", () => {
 	test("collapsed: one quiet line per handle; expanded: the text, capped, control characters stripped", () => {
 		expect(recallCallLine({ handle: h, grep: "Expected" }, 120, th)).toEqual([`↺ recall ${h}  grep "Expected"`]);
 		expect(recallCallLine({ handles: [h, "x"] }, 120, th)).toEqual(["↺ recall 2 handles"]);
+		expect(recallCallLine({ grep: "Expected" }, 120, th)).toEqual(['↺ recall all outputs  grep "Expected"']); // grep without a handle searches every output
 		const secs = [{ handle: h, label: "bash npm test", turn: 1, totalLines: 812, shownLines: 1, how: "grep" as const }];
 		expect(recallResultLines(secs, "x", false, 120, th)).toEqual(["bash npm test · turn 1  1 of 812 lines"]);
 		const long = Array.from({ length: 50 }, (_, i) => `\x1b[31mrow\t${i}\x07`).join("\n");

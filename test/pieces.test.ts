@@ -9,7 +9,7 @@ import { fmtK, noticeText, ratioBar, renderNotice, type NoticeAction, type Notic
 import { clipMid, handleFor, makePlaceholder, makePlaceholderFor, outcomeHint, pickKeyLines, shortArgs } from "../src/placeholder.ts";
 import { buildBlocks, toolCallIndex } from "../src/plan.ts";
 import { A, type Any, R, U } from "./helpers.ts";
-import { parseRange, recalledHandlesFromBranch, recallSections, resolveHandlesInBranch, sliceRecall } from "../src/recall.ts";
+import { branchOutputs, parseRange, recalledHandlesFromBranch, recallSections, resolveHandlesInBranch, searchOutputs, sliceRecall } from "../src/recall.ts";
 import { handleRowsOf, handleTable, INDEX_TOKENS, skeleton } from "../src/summary.ts";
 import { tokensOf } from "../src/util.ts";
 
@@ -325,6 +325,56 @@ describe("recall", () => {
 		expect(secs).toMatchObject({ ok: 2, missing: 1 });
 		expect(secs.text).toContain("[handle zzzzzzzzzz] not found");
 		expect(secs.text).toContain("41: line 41: alpha");
+	});
+	const call = (id: string, cid: string, name: string, args: object) => ({ type: "message", id, message: { role: "assistant", content: [{ type: "toolCall", id: cid, name, arguments: args }] } });
+	const res = (id: string, cid: string, name: string, text: string) => ({ type: "message", id, message: { role: "toolResult", toolCallId: cid, toolName: name, content: [{ type: "text", text }] } });
+	const session = [
+		{ type: "message", id: "u1", message: { role: "user", content: "go" } },
+		call("a1", "c1", "bash", { command: "npm test" }),
+		res("e1", "c1", "bash", "ok 1\nERROR one: timeout 30s\nok 3"),
+		{ type: "compaction", id: "k1", summary: "s", firstKeptEntryId: "u2" },
+		{ type: "message", id: "u2", message: { role: "user", content: "more" } },
+		call("a2", "c2", "read", { path: "src/a.ts" }),
+		res("e2", "c2", "read", "x\nthrow new Error('ERROR two')"),
+		call("a3", "c3", zipRecallName, { handle: handleFor("e1") }),
+		res("e3", "c3", zipRecallName, "ERROR one (a recall result)"),
+	];
+	test("recalled sections name the call that produced the output, so look-alike outputs can be told apart", () => {
+		const out = recallSections(resolveHandlesInBranch(session, [handleFor("e1")]).items, { grep: "error" });
+		expect(out.text).toBe(`[handle ${handleFor("e1")} \u00b7 bash npm test \u00b7 32 chars \u00b7 3 lines]\n[grep: 1 matching line(s) of 3]\n2: ERROR one: timeout 30s`);
+	});
+	test("grep without a handle searches every earlier output (before a compaction too), newest first, labelled; recall results are skipped", () => {
+		const outs = branchOutputs(session);
+		expect(outs.map((o) => o.label)).toEqual(["bash npm test", "read src/a.ts", `${zipRecallName} {"handle":"${handleFor("e1")}"}`]);
+		const s = searchOutputs(outs, "error");
+		expect(s.text.split("\n")[0]).toBe("[grep over all 2 earlier tool outputs (no handle given): 2 matching line(s) in 2 output(s), newest output first]");
+		expect(s.text).not.toContain("a recall result");
+		const a = s.text.indexOf(`[handle ${handleFor("e2")} \u00b7 read src/a.ts \u00b7`), b = s.text.indexOf(`[handle ${handleFor("e1")} \u00b7 bash npm test \u00b7`);
+		expect(a > 0 && b > a).toBe(true); // newest output first
+		expect(s.text).toContain("2: throw new Error('ERROR two')");
+		expect(s.text).toContain("2: ERROR one: timeout 30s");
+		expect(s.sections.map((x) => x.handle)).toEqual([handleFor("e2"), handleFor("e1")]);
+		const none = searchOutputs(outs, "zzznope");
+		expect(none.matched).toBe(0);
+		expect(none.text).toContain("Nothing matched");
+		const paged = searchOutputs(outs, "error", { limit: 40 });
+		expect(paged.text).toContain("offset=40"); // pages like any recall
+	});
+	test("zip_recall with grep alone goes through execute as a search; with neither handle nor grep it says what to pass", async () => {
+		const { registerRecallTool } = await import("../src/recall.ts");
+		let def: any;
+		const seen: any[] = [];
+		registerRecallTool({ registerTool: (t: any) => (def = t) } as any, { onRecall: (...a: any[]) => seen.push(a) });
+		const ctx = { sessionManager: { getBranch: () => session } };
+		const r = await def.execute("t", { grep: "timeout \\d+s" }, undefined, undefined, ctx);
+		expect(r.isError).toBe(false);
+		expect(r.content[0].text).toContain("1 matching line(s) in 1 output(s)");
+		expect(r.content[0].text).toContain(`[handle ${handleFor("e1")} \u00b7 bash npm test`);
+		expect(seen[0][0]).toEqual([]); // a search marks nothing as recalled
+		const bad = await def.execute("t", {}, undefined, undefined, ctx);
+		expect(bad.isError).toBe(true);
+		expect(bad.content[0].text).toContain("grep alone");
+		expect(def.description).toContain("grep alone searches every earlier tool output");
 	});
 	test("the recalled set is rebuilt from zip_recall calls in the branch (and only those)", () => {
 		const call = (id: string, name: string, args: object) => ({ type: "message", id, message: { role: "assistant", content: [{ type: "toolCall", id: "t" + id, name, arguments: args }] } });
