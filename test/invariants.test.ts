@@ -272,7 +272,7 @@ describe("I2 lossless: zip_recall(handle) returns the original, byte for byte", 
 	test.each(SEEDS)("random session, seed %i", async (seed) => {
 		process.env.PI_ZIP_COLD_CAP = "1000";
 		const entries = [...randomSession(seed), U("uN", "back")];
-		const p = planContext(entries, { sys: 0, cwd: process.cwd(), coldCap: 1000 })!;
+		const p = planContext(entries, { cwd: process.cwd(), coldCap: 1000 })!;
 		const r = await rig(entries, COLD_TS());
 		const tool = r.handlers.get("tool:zip_recall");
 		const originals = new Map(entries.filter((e) => e.messages[0].role === "toolResult").map((e) => [e.sourceEntry.id, e.messages[0].content[0].text as string]));
@@ -293,7 +293,7 @@ describe("I2 lossless: zip_recall(handle) returns the original, byte for byte", 
 describe("I3 untouched: user messages, tool-call arguments, thinking and the payload's system/tools never change", () => {
 	test.each(SEEDS)("random session, seed %i", (seed) => {
 		const entries = [...randomSession(seed), U("uN", "back")];
-		const p = planContext(entries, { sys: 0, cwd: process.cwd(), coldCap: 1000 })!;
+		const p = planContext(entries, { cwd: process.cwd(), coldCap: 1000 })!;
 		const before = flat(entries);
 		const plan: RunPlan = { source: "runstart", folds: p.folds, cut: null, ctxBefore: 0, ctxAfter: 0, ms: 0, persisted: false };
 		const view = applyPlanToMessages(before, plan)?.messages ?? before;
@@ -519,7 +519,7 @@ describe("I6 / F10 warm cache: nothing changes unless the context passes the val
 		expect(await r.fire("context_with_system", { messages: flat(entries) })).toBeUndefined();
 		expect(await r.fire("turn_end", turnEnd([...entries, A("zN")], "zN"))).toBeUndefined();
 		expect(r.notes).toEqual([]);
-		expect(planContext(entries, { mode: "warm", sys: 0, cwd: ".", model: r.ctx.model })).toBeNull();
+		expect(planContext(entries, { mode: "warm", cwd: ".", model: r.ctx.model })).toBeNull();
 	});
 
 	test("above V the warm cache is edited with the cold plan: first request carries it, turn_end persists exactly it (one valve, no 0.85 threshold)", async () => {
@@ -568,9 +568,9 @@ describe("I6 / F10 warm cache: nothing changes unless the context passes the val
 		expect(await tiny.fire("context_with_system", { messages: flat(small) })).toBeDefined();
 		// the cold cap never exceeds Pi's compaction room either
 		const prose = [U("u1", "one"), A("a1"), AX("x1", 60_000), U("u2", "two"), A("a2"), AX("x2", 60_000), U("u3", "three"), A("a3"), U("u4", "now")]; // ~30K tokens of prose
-		const clamped = planContext(prose, { mode: "cold", sys: 0, cwd: ".", model: model(32_000), coldCap: 60_000, promptPending: false });
+		const clamped = planContext(prose, { mode: "cold", cwd: ".", model: model(32_000), coldCap: 60_000, promptPending: false });
 		expect(clamped!.sumTrigger).not.toBeNull(); // 30K > the compaction room (7.4K): the 60K default cap is clamped
-		const roomy = planContext(prose, { mode: "cold", sys: 0, cwd: ".", model: model(1_000_000), coldCap: 60_000, promptPending: false });
+		const roomy = planContext(prose, { mode: "cold", cwd: ".", model: model(1_000_000), coldCap: 60_000, promptPending: false });
 		expect(roomy!.sumTrigger).toBeNull(); // the same context at a 1M window is under the cap
 	});
 
@@ -648,7 +648,7 @@ describe("run lifecycle: failures, steering", () => {
 		const resumed = await rig(entries, COLD_TS(), { branch: [...branchOf(entries, COLD_TS()), { type: "custom", customType: "pi-zip/steer", data: { ids: ["u3s"] } }] });
 		await resumed.fire("session_start", {});
 		// ... and the plan counts 3 turns, not 4: the steering message is part of turn 3
-		const asTurns = (steerIds?: Set<string>) => planContext(entries, { sys: 0, cwd: ".", promptPending: false, steerIds })!.userTurns;
+		const asTurns = (steerIds?: Set<string>) => planContext(entries, { cwd: ".", promptPending: false, steerIds })!.userTurns;
 		expect(asTurns()).toBe(4);
 		expect(asTurns(new Set(["u3s"]))).toBe(3);
 		const blocks = buildBlocks(entries, new Set(["u3s"]));
@@ -659,10 +659,10 @@ describe("run lifecycle: failures, steering", () => {
 		const prompt = U("u3", "back");
 		const steer = U("u3s", "also");
 		const base = [...prevRun, prompt, A("a5", ["c5"]), R("r5", "c5"), A("a6")];
-		const without = planContext(base, { sys: 0, cwd: ".", promptPending: false })!.folds.map((t) => t.entryId);
-		const withSteer = planContext([...base, steer, A("a7")], { sys: 0, cwd: ".", promptPending: false, steerIds: new Set(["u3s"]) })!.folds.map((t) => t.entryId);
+		const without = planContext(base, { cwd: ".", promptPending: false })!.folds.map((t) => t.entryId);
+		const withSteer = planContext([...base, steer, A("a7")], { cwd: ".", promptPending: false, steerIds: new Set(["u3s"]) })!.folds.map((t) => t.entryId);
 		expect(withSteer).toEqual(without);
-		const counted = planContext([...base, steer, A("a7")], { sys: 0, cwd: ".", promptPending: false })!.folds.map((t) => t.entryId);
+		const counted = planContext([...base, steer, A("a7")], { cwd: ".", promptPending: false })!.folds.map((t) => t.entryId);
 		expect(counted).not.toEqual(without); // unmarked, the same message would shift the protected window
 	});
 });
@@ -838,7 +838,7 @@ describe("in-turn folds through the real extension: one user message, 60 tool ca
 		for (const seed of SEEDS) {
 			const entries = [...randomSession(seed), U("uN", "back")];
 			for (const age of [1, 2, 5]) {
-				const p = planContext(entries, { sys: 0, cwd: process.cwd(), coldCap: 500, inturnAge: age, promptPending: false })!;
+				const p = planContext(entries, { cwd: process.cwd(), coldCap: 500, inturnAge: age, promptPending: false })!;
 				const byId = new Map(p.blocks.map((x) => [x.entryId, x]));
 				const bad = validateEdits(p.blocks, { folds: new Map(p.folds.map((f) => [byId.get(f.entryId)!.idx, f.ph])), recover: new Map(p.folds.map((f) => [byId.get(f.entryId)!.idx, f.recover])), cut: null, inturnAge: age }, p.userTurns);
 				expect(bad).toBeNull();

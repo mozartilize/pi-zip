@@ -7,7 +7,7 @@ import { detectCold, lastMessageMs, lastPrompt, modelKey, resolveTtl, ttlFor } f
 import { describe, lawPrices, loadStats, pWarm, record, sample, statsPath, GAP_EDGES, type Entry } from "./learn.ts";
 import { validateEdits, repairPayload } from "./guard.ts";
 import { fmtK, Stats, noticeDesc, noticeText, type NoticeAction, type NoticeData, type ZipControl } from "./notice.ts";
-import { applyPlanToMessages, buildBlocks, calibrate, countUserTurns, G0, planContext, reserveTokensFor, untouchedEst, type Block, type Calibration, type Cut, type FoldTarget, type Law, type PlanOpts, type PlanResult, type RunPlan } from "./plan.ts";
+import { applyPlanToMessages, buildBlocks, calibrate, countUserTurns, G0, planContext, reserveTokensFor, sizeOf, untouchedEst, UNIT, type Block, type Cut, type FoldTarget, type Law, type PlanOpts, type PlanResult, type RunPlan, type Scale, type SysInfo } from "./plan.ts";
 import { handleFor, PH_MARK, RECALL_TOOL } from "./placeholder.ts";
 import { recalledHandlesFromBranch } from "./recall.ts";
 import { buildCut } from "./summary.ts";
@@ -214,19 +214,32 @@ export class Zip implements ZipControl {
 		}
 	}
 
-	private sysTokens(ctx: Any): number {
+	/** The system prompt and the declared tools from Pi's API: only used when the transcript records no system message (plan.ts calibrate). */
+	private sysInfo(ctx: Any): SysInfo {
+		let text = "", tools: Any[] = [];
 		try {
-			return tok4(ctx.getSystemPrompt?.() ?? "");
+			text = ctx?.getSystemPrompt?.() ?? "";
+		} catch {}
+		try {
+			const active = new Set(this.pi.getActiveTools?.() ?? []);
+			tools = (this.pi.getAllTools?.() ?? []).filter((t: Any) => active.has(t?.name));
+		} catch {}
+		return { text, tools };
+	}
+
+	/** The token scale (O, c) read from the branch: stateless, so a fresh process calibrates exactly like a long-lived one. */
+	scaleOf(ctx: Any, entries?: Any[]): Scale {
+		try {
+			return calibrate(entries ?? ((ctx.sessionManager.buildSessionProjection() as Any)?.entries ?? []), this.sysInfo(ctx), this.branch(ctx));
 		} catch {
-			return 0;
+			return UNIT;
 		}
 	}
 
-	/** Plan options with the token scale read from the branch (stateless: a fresh process calibrates exactly like a long-lived one). */
-	private opts(ctx: Any, pending: boolean, mode: "cold" | "warm", entries: Any[], pWarm = mode === "cold" ? 0 : 1): { o: PlanOpts; cal: Calibration } {
-		const sys = this.sysTokens(ctx);
-		const cal = calibrate(entries, sys);
-		return { cal, o: { mode, sys, k: cal.k, cwd: (ctx?.cwd as string) ?? process.cwd(), recalled: this.recalled, model: ctx?.model, promptPending: pending, rereadOnly: !this.recallOk, noSummary: mode === "warm" && this.summarizedWarm, reserve: this.reserve(ctx), steerIds: this.steerIds, law: this.law(ctx, pWarm), trace: [] } };
+	/** Plan options with the token scale read from the branch. */
+	private opts(ctx: Any, pending: boolean, mode: "cold" | "warm", entries: Any[], pWarm = mode === "cold" ? 0 : 1): { o: PlanOpts; cal: Scale } {
+		const cal = this.scaleOf(ctx, entries);
+		return { cal, o: { mode, scale: cal, cwd: (ctx?.cwd as string) ?? process.cwd(), recalled: this.recalled, model: ctx?.model, promptPending: pending, rereadOnly: !this.recallOk, noSummary: mode === "warm" && this.summarizedWarm, reserve: this.reserve(ctx), steerIds: this.steerIds, law: this.law(ctx, pWarm), trace: [] } };
 	}
 
 	private law(ctx: Any, pWarm: number): Law {
@@ -464,14 +477,14 @@ export class Zip implements ZipControl {
 				else { folds = []; cut = null; }
 			}
 		}
-		const ctxAfter = cut ? (p?.ctxAfterFolds ?? 0) - cal.k * (cut.prefixTokens - cut.summaryTokens) : (p?.ctxAfterFolds ?? 0);
-		this.runPlan = { source, folds, cut, ctxBefore: p?.ctxTokens ?? 0, ctxAfter, ms: foldMs, k: cal.k, persisted: false, waitMs: cut ? (adopted ? this.bgWaitMs : cut.ms) : 0, cutVisibleIdx: p?.cutVisibleIdx ?? -1, cutKeptFirstMsg: p?.cutKeptFirstMsg, untouched: p ? p.k * untouchedEst(p.blocks, folds, !!cut, o.sys) : 0 };
+		const ctxAfter = cut ? (p?.ctxAfterFolds ?? 0) - cal.c * (cut.prefixTokens - cut.summaryTokens) : (p?.ctxAfterFolds ?? 0);
+		this.runPlan = { source, folds, cut, ctxBefore: p?.ctxTokens ?? 0, ctxAfter, ms: foldMs, scale: cal, persisted: false, waitMs: cut ? (adopted ? this.bgWaitMs : cut.ms) : 0, cutVisibleIdx: p?.cutVisibleIdx ?? -1, cutKeptFirstMsg: p?.cutKeptFirstMsg, untouched: p ? sizeOf(cal, untouchedEst(p.blocks, folds, !!cut)) : 0 };
 		this.ledger({ type: "cold_plan", trigger, source, folds: folds.length, summary: !!cut, ...this.calOf(cal), ctxBefore: Math.round(this.runPlan.ctxBefore), ctxAfter: Math.round(ctxAfter), ms: Math.round(foldMs), ...(cut ? { summaryMs: cut.ms, llmOk: cut.llmOk, waitedMs: Math.round(adopted ? this.bgWaitMs : cut.ms), ...this.usageOf(cut) } : {}) });
 	}
 
-	/** Ledger form of a calibration; ctxBefore/ctxAfter next to it are already scaled (k x estimate). */
-	private calOf(cal: Calibration) {
-		return { k: Math.round(cal.k * 1000) / 1000, calReal: cal.real, calEst: Math.round(cal.est), calSource: cal.source };
+	/** Ledger form of a calibration; ctxBefore/ctxAfter next to it are already real (O + c x estimate). */
+	private calOf(cal: Scale) {
+		return { O: Math.round(cal.O), c: Math.round(cal.c * 1000) / 1000, oSource: cal.oSource, calReal: cal.real, calEst: Math.round(cal.est), calSource: cal.source };
 	}
 
 	private usageOf(cut: Cut) {
@@ -576,7 +589,7 @@ export class Zip implements ZipControl {
 		const userTurns = countUserTurns(blocks);
 		const u = msg?.usage;
 		const usageTotal = u ? (u.input ?? 0) + (u.cacheRead ?? 0) + (u.cacheWrite ?? 0) : 0;
-		const o = { t0, blocks, userTurns, sys: this.sysTokens(ctx), usageTotal };
+		const o = { t0, blocks, userTurns, usageTotal };
 		if (this.runEdits) {
 			this.runEdits = false;
 			if (!this.runPlan?.sent && this.runPlan && (this.runPlan.folds.length || this.runPlan.cut)) {
@@ -602,7 +615,8 @@ export class Zip implements ZipControl {
 			const got = await this.takeBg(p.firstKeptEntryId, ctx.signal, ctx);
 			cut = got.cut ?? (await this.working(ctx, `${PRODUCT}: writing a summary (the context is close to the window)`, buildCut(p, ctx))); // the user is here and the cache is warm; the alternative is Pi's lossy compaction
 		} else this.discardBg();
-		const plan: RunPlan = { source: "valve", folds: p.folds, cut, ctxBefore: p.ctxTokens, ctxAfter: p.ctxAfterFolds, ms: performance.now() - t0, k: p.k, persisted: false, untouched: p.k * untouchedEst(p.blocks, p.folds, !!cut, popts.sys) };
+		const ctxAfter = p.ctxAfterFolds - (cut ? p.scale.c * (cut.prefixTokens - cut.summaryTokens) : 0);
+		const plan: RunPlan = { source: "valve", folds: p.folds, cut, ctxBefore: p.ctxTokens, ctxAfter, ms: performance.now() - t0, scale: p.scale, persisted: false, untouched: sizeOf(p.scale, untouchedEst(p.blocks, p.folds, !!cut)) };
 		return this.commit(e, ctx, plan, o);
 	}
 
@@ -613,9 +627,9 @@ export class Zip implements ZipControl {
 	 */
 	private noticeFor(ctx: Any, plan: RunPlan, live: FoldTarget[], cut: Cut | null, ctxTokens: number, realAfter: number) {
 		if (this.quiet || (!live.length && !cut)) return;
-		const k = plan.k, valve = plan.source === "valve";
-		const before = k * live.reduce((a, t) => a + t.entryTokens, 0), after = k * live.reduce((a, t) => a + t.phTokens, 0);
-		const cutSaved = cut ? k * (cut.prefixTokens - cut.summaryTokens) : 0;
+		const { c } = plan.scale, valve = plan.source === "valve"; // amounts scale by c; sizes are O + c x content (plan.ts)
+		const before = c * live.reduce((a, t) => a + t.entryTokens, 0), after = c * live.reduce((a, t) => a + t.phTokens, 0);
+		const cutSaved = cut ? c * (cut.prefixTokens - cut.summaryTokens) : 0;
 		const estAfter = ctxTokens - (before - after) - cutSaved;
 		const waitMs = cut ? (plan.waitMs ?? (plan.source === "settle" ? this.bgWaitMs : cut.ms)) : 0;
 		const notices: NoticeAction[] = [];
@@ -626,17 +640,17 @@ export class Zip implements ZipControl {
 		}
 		for (const t of live) this.labels.set(handleFor(t.entryId), `${t.tool}${t.args ? " " + t.args : ""}`);
 		const ITEMS = 8;
-		const items = live.slice(0, ITEMS).map((t) => ({ label: `${t.tool}${t.args ? " " + t.args : ""}`, tokens: Math.round(k * t.entryTokens), handle: handleFor(t.entryId) }));
+		const items = live.slice(0, ITEMS).map((t) => ({ label: `${t.tool}${t.args ? " " + t.args : ""}`, tokens: Math.round(c * t.entryTokens), handle: handleFor(t.entryId) }));
 		const why = valve || !this.cold ? "cache warm · worth it at this size" : this.coldWhy;
 		const data: NoticeData = { v: 2, text: noticeText(notices), before: Math.round(notices[0].tokensBefore), after: Math.round(notices[notices.length - 1].tokensAfter), desc: noticeDesc(notices), why: why || undefined, items, more: Math.max(0, live.length - ITEMS) || undefined, first: !this.noticed && !this.branch(ctx).some((en: Any) => en?.type === "custom" && en.customType === NOTICE_CUSTOM) };
 		this.noticed = true;
 		this.notify(ctx, data.text, data);
 	}
 
-	private commit(e: Any, ctx: Any, plan: RunPlan, o: { t0: number; blocks: Block[]; userTurns: number; sys: number; usageTotal: number }) {
+	private commit(e: Any, ctx: Any, plan: RunPlan, o: { t0: number; blocks: Block[]; userTurns: number; usageTotal: number }) {
 		plan.persisted = true;
-		const k = plan.k; // one scale for the whole run: stats, notices and the ledger agree with what the plan compared against the limits
-		const ctxTokens = k * (o.sys + o.blocks.reduce((a, b) => a + b.tokens, 0));
+		const sc = plan.scale, c = sc.c; // one scale for the whole run: stats, notices and the ledger agree with what the plan compared against the limits
+		const ctxTokens = sizeOf(sc, o.blocks.reduce((a, b) => a + b.tokens, 0));
 		const byId = new Map(o.blocks.map((b) => [b.entryId, b]));
 		const wasApplied = (t: FoldTarget) => !plan.applied || plan.applied.has(t.entryId); // persist what the requests actually carried
 		const live = plan.folds.filter((t) => byId.has(t.entryId) && wasApplied(t));
@@ -657,9 +671,9 @@ export class Zip implements ZipControl {
 		const ours: Any[] = live.map((t) => ({ type: "context_edit", targetId: t.entryId, replacement: { content: [{ type: "text", text: t.ph }] } }));
 		for (const t of live) if (t.toolCallId) this.foldedCalls.set(t.toolCallId, handleFor(t.entryId));
 		if (cut) ours.push({ type: "compaction", summary: cut.text, firstKeptEntryId: cut.firstKeptEntryId, details: { by: PRODUCT, trigger: cut.trigger }, usage: cut.usage });
-		const before = Math.round(k * live.reduce((a, t) => a + t.entryTokens, 0));
-		const after = Math.round(k * live.reduce((a, t) => a + t.phTokens, 0));
-		const cutSaved = cut ? Math.round(k * (cut.prefixTokens - cut.summaryTokens)) : 0;
+		const before = Math.round(c * live.reduce((a, t) => a + t.entryTokens, 0));
+		const after = Math.round(c * live.reduce((a, t) => a + t.phTokens, 0));
+		const cutSaved = cut ? Math.round(c * (cut.prefixTokens - cut.summaryTokens)) : 0;
 		const waitMs = cut ? (plan.source === "settle" ? this.bgWaitMs : cut.ms) : 0;
 		const s = this.stats;
 		s.folds += live.length;
@@ -680,10 +694,10 @@ export class Zip implements ZipControl {
 		if (live.length) this.ledger({
 			type: "fold", trigger: plan.source, turnIndex: e.turnIndex, count: live.length, entries: live.map((t) => t.entryId), tools: live.map((t) => t.tool),
 			recoverability: live.map((t) => t.recover ?? "?"), trigs: live.map((t) => t.trig), handles: live.map((t) => handleFor(t.entryId)),
-			entryTokensBefore: before, entryTokensAfter: after, ctxBefore: Math.round(ctxTokens), ctxAfter: Math.round(ctxTokens - (before - after) - cutSaved), k: Math.round(k * 1000) / 1000, usageTotal: o.usageTotal,
+			entryTokensBefore: before, entryTokensAfter: after, ctxBefore: Math.round(ctxTokens), ctxAfter: Math.round(ctxTokens - (before - after) - cutSaved), O: Math.round(sc.O), c: Math.round(sc.c * 1000) / 1000, usageTotal: o.usageTotal,
 			coldReason: this.coldReason, prepared: plan.source === "settle", ...(stale ? { staleTargets: stale } : {}),
 		});
-		if (cut) this.ledger({ type: "summary", trigger: cut.trigger, source: plan.source, count: cut.count, prefixTokens: cut.prefixTokens, summaryTokens: cut.summaryTokens, ms: cut.ms, waitedMs: Math.round(waitMs), llmOk: cut.llmOk, llmError: cut.llmError, costUsd: cut.costUsd, ...this.usageOf(cut) });
+		if (cut) this.ledger({ type: "summary", trigger: cut.trigger, source: plan.source, count: cut.count, prefixTokens: Math.round(c * cut.prefixTokens), summaryTokens: Math.round(c * cut.summaryTokens), ms: cut.ms, waitedMs: Math.round(waitMs), llmOk: cut.llmOk, llmError: cut.llmError, costUsd: cut.costUsd, ...this.usageOf(cut) });
 		// a run plan was announced when its first request went out; a valve plan (between turns) is announced now
 		if (!plan.noticed) this.noticeFor(ctx, plan, live, cut, ctxTokens, plan.source === "valve" ? 0 : o.usageTotal);
 		plan.noticed = true;
@@ -701,12 +715,10 @@ export class Zip implements ZipControl {
 		this.stats.readSavedTokens += this.stats.activeSaved;
 		const p: Any = e.payload;
 		if (process.env.PI_ZIP_LEDGER && this.cold && !this.wireLedgered && p && Array.isArray(p.messages)) {
-			this.wireLedgered = true; // proof that the FIRST request after a cold return is already small
+			this.wireLedgered = true; // proof that the FIRST request after a cold return is already small (real scale: O + c x the wire's content)
 			let tok = 0;
-			for (const m of p.messages) tok += tok4(JSON.stringify(m?.content ?? "")) + 8;
-			const sys = p.system;
-			tok += typeof sys === "string" ? tok4(sys) : Array.isArray(sys) ? tok4(sys.map((x: Any) => x?.text ?? "").join("\n")) : 0;
-			this.ledger({ type: "cold_wire", tokens: Math.round(tok), messages: p.messages.length, folds: this.runPlan && !this.runPlan.persisted ? this.runPlan.folds.length : 0, summary: !!this.runPlan?.cut, source: this.runPlan?.source ?? null });
+			for (const m of p.messages) if (m?.role !== "system" && m?.role !== "developer") tok += tok4(JSON.stringify(m?.content ?? "")) + 8;
+			this.ledger({ type: "cold_wire", tokens: Math.round(sizeOf(this.runPlan?.scale ?? UNIT, tok)), messages: p.messages.length, folds: this.runPlan && !this.runPlan.persisted ? this.runPlan.folds.length : 0, summary: !!this.runPlan?.cut, source: this.runPlan?.source ?? null });
 		}
 		if (this.off) return undefined; // strict no-op
 		const r = repairPayload(p);
@@ -782,7 +794,8 @@ export class Zip implements ZipControl {
 			else if (e?.type === "custom" && e.customType === NOTICE_CUSTOM && e.data?.v === 2 && !e.data?.kind) last = e;
 			else if (e?.type === "message" && e.message?.role === "toolResult" && e.message?.toolName === RECALL_TOOL) recalls++;
 		}
-		return { folds, folded, summaries, recalls, usd, last };
+		// chars/4 of the folded text, on the provider's scale: x c of this session (folded outputs are content)
+		return { folds, folded: folds ? this.scaleOf(ctx).c * folded : 0, summaries, recalls, usd, last };
 	}
 	/** What this session carries: folds and summaries persisted in its file (they survive restarts) and the recalls in its branch. */
 	private sessionTotals(ctx: Any): string {
@@ -818,7 +831,7 @@ export class Zip implements ZipControl {
 			`, ${describe(ent, ttl / 1000)}, growth ${(this.g / 1000).toFixed(1)}K/request`;
 		return `${PRODUCT}: ${state}, cache TTL ${Math.round(ttl / 1000)} s, ${this.quiet ? "notices off, " : ""}${this.sessionTotals(ctx)}${cache}`;
 	}
-	statsLine = (ctx?: Any) => `${PRODUCT} ${this.sessionTotals(ctx)} (token counts are chars/4 estimates)`;
+	statsLine = (ctx?: Any) => `${PRODUCT} ${this.sessionTotals(ctx)} (tokens on the provider's scale, calibrated from this session's usage)`;
 	setOff(off: boolean): string {
 		this.off = off;
 		if (off) { this.runPlan = null; this.runEdits = false; this.cancelTimer(); this.discardBg(); }

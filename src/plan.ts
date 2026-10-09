@@ -88,58 +88,131 @@ export function lawTerms(B: number, A: number, P: number, room: number | null, p
 export const editAllowed = (B: number, A: number, P: number, room: number | null, pr: Prices | null, g: number, call = 0, T = A): boolean =>
 	lawTerms(B, A, P, room, pr, g, call, T).ok;
 
-// Token scale. Every size in this file is a chars/4 estimate, and chars/4 undercounts real tokens (JSON-heavy tool calls, code,
-// identifiers, tool definitions that are not in the text at all). `k` = real tokens per estimated token; every limit (cold cap,
-// compaction room, min gain) is compared against k x estimate, so they mean REAL tokens. k is read from the branch itself (the
-// usage of the newest assistant message), so it survives a restart and needs no stored state. With no usage to read, DEFAULT_K
-// applies: 1.7 is the ratio measured on recorded coding sessions (real first-request context / chars/4 estimate: 1.72 after cold
-// returns, 1.71 for previous-prompt peaks), and a too-high k only folds a little deeper, a too-low k leaves the context over the cap.
-export const DEFAULT_K = 1.7;
-export const K_MIN = 1; // an estimate above the real count is not trusted: never scale down
-export const K_MAX = 2.5;
+// Token scale. Every size in this file is a chars/4 estimate of the CONTENT (Pi's own rule); the provider counts real tokens, and the
+// two are not proportional:   real = O + c x content.
+//   O  what every request carries and no edit can shrink: system prompt, tool schemas, the provider's own framing (2-4K on a bare Pi,
+//      29-55K with a large tool set);
+//   c  real tokens per estimated content token (0.7-1.1 GLM / GPT, 1.5-2.2 Claude; more on CJK-heavy content).
+// pi-zip <= 0.2.9 used ONE ratio, k = real / (system prompt + content) clamped to [1, 2.5]: with O a third of the context k sat on its
+// clamp, and every size after an edit came out 10-15K too small (research round5/affine.md). Both are read from the branch on every
+// decision, so a restart or `pi -p` calibrates exactly like a long-lived process, and nothing is stored:
+//   O  1. the cacheRead of the request that first carried the newest summary: everything after the system prompt and tools changed
+//         there, so what the provider still read from its cache is exactly O (when the cache was warm at all);
+//      2. else the session's first request minus C0 x its content (an opening prompt is small next to O);
+//      3. else R0 x the chars/4 of the system prompt and the JSON of the declared tools.
+//      An O measured under another system prompt or tool set moves by R0 x the change of that chars/4 size (MCP tools come and go).
+//   c  (real - O) / content of the newest response, clamped to [C_MIN, C_MAX] (a guard for a tiny content estimate; recorded sessions
+//      span 0.7-3.9); C0 before the first response. A response followed by edits it did not carry (a warm-valve edit is persisted at
+//      turn_end and first sent with the next request: that response's prompt did not shrink) is counted with the originals.
+export const C0 = 1.5;
+export const C_MIN = 0.5;
+export const C_MAX = 4;
+export const R0 = 2;
 
-export interface Calibration {
-	k: number;
-	real: number; // input + cacheRead + cacheWrite of the request that produced the newest usable assistant message (0 = none)
-	est: number; // estimate of what that request carried: system prompt + the view blocks before that message
-	source: "usage" | "default";
+/** The system prompt and the declared tools (Pi API fallback for a transcript that records no system message). */
+export interface SysInfo { text: string; tools: Any[] }
+/** chars/4 of the system prompt plus the JSON of the declared tool definitions (name, description, parameters). */
+export const sysEst = (s: SysInfo): number =>
+	tok4(s.text) + (s.tools.length ? tok4(JSON.stringify(s.tools.map((t: Any) => ({ name: t?.name, description: t?.description, parameters: t?.parameters })))) : 0);
+
+export interface Scale {
+	O: number; // real tokens every request carries before the content (system prompt, tools, framing)
+	c: number; // real tokens per estimated (chars/4) content token
+	real: number; // input + cacheRead + cacheWrite of the newest usable response (0 = none)
+	est: number; // estimated content that request carried
+	source: "usage" | "default"; // where c comes from
+	oSource: "summary" | "first" | "default"; // where O comes from
+}
+/** Sizes taken as real (tests, and the ledger of a plan made without calibration). */
+export const UNIT: Scale = { O: 0, c: 1, real: 0, est: 0, source: "default", oSource: "default" };
+/** Real tokens of a context whose content is estimated at `content`. */
+export const sizeOf = (s: Pick<Scale, "O" | "c">, content: number): number => s.O + s.c * content;
+
+/** Prompt size the provider reported for a response that really ran (0 = none, an error or an abort). */
+const promptOf = (m: Any): number => {
+	const u = m?.role === "assistant" && m.stopReason !== "error" && m.stopReason !== "aborted" ? m.usage : null;
+	return u ? (Number(u.input) || 0) + (Number(u.cacheRead) || 0) + (Number(u.cacheWrite) || 0) : 0;
+};
+/** chars/4 of the system state the transcript records in `msgs` (-1: none recorded). */
+function sysOf(msgs: Any[]): number {
+	const s = collapseSystem(msgs);
+	return s ? sysEst({ text: [textOf(s.content), ...Object.values<string>(s.sections ?? {})].filter((x) => x).join("\n\n"), tools: s.toolsAdded ?? [] }) : -1;
+}
+/** The session's first response on the branch: its prompt, the content before it and the system state it was sent with. */
+function firstRequest(branch: Any[]): { real: number; est: number; S: number } | null {
+	const sys: Any[] = [];
+	let est = 0;
+	for (const e of branch) {
+		const m = e?.type === "message" ? e.message : e?.type === "custom_message" ? { role: "custom", content: e.content } : null;
+		if (!m) continue;
+		if (m.role === "system") { sys.push(m); continue; }
+		const real = promptOf(m);
+		if (real > 0) return { real, est, S: sysOf(sys) };
+		est += tokensOf(m);
+	}
+	return null;
 }
 
-/**
- * k from the branch: the newest assistant message with usage says how many real tokens its request carried; the estimate of the
- * view blocks before it (the projection, with the folds and cut as persisted, which are exactly what that request carried, I1)
- * says how many we would have guessed. Only the INPUT side is used: that message's own output is not part of the request it
- * answered, and thinking tokens may or may not be sent back, so including output would add noise to the ratio.
- * Skipped: errored messages, messages without input usage, and messages older than a compaction Pi made (not ours): their
- * request carried text the projection no longer has.
- */
-export function calibrate(entries: Any[], sys = 0): Calibration {
-	const none: Calibration = { k: DEFAULT_K, real: 0, est: 0, source: "default" };
-	const blocks = buildBlocks(entries);
-	let foreignCompactionMs = 0;
-	for (const pe of entries) {
-		const src = pe.sourceEntry;
-		if (src?.type === "compaction" && src.details?.by !== PRODUCT) foreignCompactionMs = Math.max(foreignCompactionMs, Date.parse(src.timestamp) || 0);
+/** O and c from the projection (`entries`) and, for the session's first request, the branch; `sys` stands in for a transcript without
+ *  system messages. */
+export function calibrate(entries: Any[], sys?: SysInfo, branch: Any[] = []): Scale {
+	type Resp = { at: number; est: number; real: number; read: number; nSys: number; ts: number };
+	const resp: Resp[] = [];
+	const sysMsgs: Any[] = [];
+	const edits: { at: number; target: string }[] = [];
+	const orig = new Map<string, { at: number; d: number }>(); // edited entries: tokens their originals add back
+	let est = 0, sysAt = 0; // sysAt: responses before the newest system message
+	entries.forEach((pe, at) => {
+		const src = pe.sourceEntry, msgs: Any[] = pe.messages ?? [];
+		if (src?.type === "context_edit") edits.push({ at, target: src.targetId });
+		if (src?.type === "message" && msgs.length === 1 && msgs[0] !== src.message) orig.set(src.id, { at, d: tokensOf(src.message) - tokensOf(msgs[0]) });
+		for (const m of msgs) {
+			if (m?.role === "system") { sysMsgs.push(m); sysAt = resp.length; continue; }
+			const real = promptOf(m);
+			if (real > 0) resp.push({ at, est, real, read: Number(m.usage.cacheRead) || 0, nSys: sysMsgs.length, ts: Number(m.timestamp) || 0 });
+			est += tokensOf(m);
+		}
+	});
+	const sAt = (n: number) => sysOf(sysMsgs.slice(0, n)); // the system state after the first n system messages (computed only where needed)
+	const S = sAt(sysMsgs.length);
+	const Snow = S >= 0 ? S : sys ? sysEst(sys) : 0;
+	const head = entries[0]?.sourceEntry?.type === "compaction" ? entries[0].sourceEntry : null;
+	const headMs = head ? Date.parse(head.timestamp) || 0 : 0;
+	// evidence for O, the newest wins (it needs the smallest correction for system changes since)
+	const ev: { at: number; O: number; S: number; src: Scale["oSource"] }[] = [];
+	const opening = (r: { real: number; est: number } | null | undefined) => !!r && C0 * r.est <= 0.1 * r.real; // content small next to O
+	const f = branch.length ? firstRequest(branch) : head ? null : resp[0]; // the session's first request
+	if (f && opening(f)) ev.push({ at: -1, O: f.real - C0 * f.est, S: "S" in f ? f.S : sAt(f.nSys), src: "first" });
+	const cur = resp[sysAt]; // the first response sent with the current system prompt and tools
+	if (cur && (!head || cur.ts > headMs) && opening(cur)) ev.push({ at: sysAt, O: cur.real - C0 * cur.est, S, src: "first" });
+	if (head) { // the summary at the head was first carried by the last response before its entry (a run plan) or the first one after it
+		const after = resp.findIndex((r) => r.ts > headMs);
+		for (const i of after < 0 ? [resp.length - 1] : [after - 1, after]) {
+			const r = resp[i], prev = resp[i - 1];
+			if (r && r.read > 0 && r.read < 0.8 * r.real && (!prev || r.read < 0.8 * prev.real)) { ev.push({ at: i, O: r.read, S: sAt(r.nSys), src: "summary" }); break; }
+		}
 	}
-	const before: number[] = []; // estimate of blocks[0..i)
-	let acc = 0;
-	for (const b of blocks) { before.push(acc); acc += b.tokens; }
-	for (let i = blocks.length - 1; i >= 0; i--) {
-		if (blocks[i].kind !== "assistant") continue;
-		const m = blocks[i].raw ?? blocks[i].msg;
-		const u = m?.usage;
-		const real = u ? (Number(u.input) || 0) + (Number(u.cacheRead) || 0) + (Number(u.cacheWrite) || 0) : 0;
-		if (!(real > 0) || m.stopReason === "error") continue;
-		if (foreignCompactionMs && typeof m.timestamp === "number" && m.timestamp < foreignCompactionMs) return none;
-		const est = sys + before[i];
-		if (!(est > 0)) return none;
-		return { k: clamp(real / est, K_MIN, K_MAX), real, est, source: "usage" };
+	const best = ev.sort((a, b) => b.at - a.at)[0];
+	const O = best ? Math.max(0, best.O + (best.S >= 0 && S >= 0 ? R0 * (Snow - best.S) : 0)) : R0 * Snow, oSource = best?.src ?? "default";
+	// c from the newest response
+	const n = resp.length - 1;
+	if (n < 0) return { O, c: C0, real: 0, est: 0, source: "default", oSource };
+	const N = resp[n];
+	let estN = N.est;
+	const later = edits.filter((x) => x.at > N.at), cutLater = !!head && headMs > N.ts;
+	if (later.length || cutLater) {
+		// carried (a run plan): the prompt shrank, or a read stopped early; a cache miss alone (no read at all) proves nothing.
+		// Pi's own compaction is never request-local.
+		const P = resp[n - 1];
+		const carried = !(cutLater && head.details?.by !== PRODUCT) && (!P || N.real < P.real || (N.read > 0 && N.read < 0.8 * P.real));
+		if (!carried && cutLater) return { O, c: C0, real: N.real, est: 0, source: "default", oSource }; // what it carried is summarised away
+		if (!carried) for (const x of later) { const t = orig.get(x.target); if (t && t.at < N.at) estN += t.d; }
 	}
-	return none;
+	return { O, c: estN > 0 ? clamp((N.real - O) / estN, C_MIN, C_MAX) : C0, real: N.real, est: estN, source: estN > 0 ? "usage" : "default", oSource };
 }
 
 export const settings = () => ({
-	coldCap: envInt("COLD_CAP", 40_000), // cold: fold, then summarise, down to this many tokens
+	coldCap: envInt("COLD_CAP", 40_000), // cold: fold, then summarise, down to this many real tokens of content (above O: the system prompt and tools are kept anyway)
 	foldMin: envInt("FOLD_MIN", 500), // outputs below this many tokens are never folded
 	keepLines: envInt("KEEP_LINES", 8),
 	minGain: envInt("MIN_GAIN", 10_000), // legacy rule only (no prices): a summary must remove at least max(minGain, 15% of the context)
@@ -254,7 +327,7 @@ export interface RunPlan {
 	ctxBefore: number;
 	ctxAfter: number;
 	ms: number;
-	k: number; // the token scale the plan was made with (stats and notices of this run use the same one)
+	scale: Scale; // the token scale the plan was made with (stats and notices of this run use the same one)
 	persisted: boolean;
 	cutVisibleIdx?: number; // where the kept part starts among the projected non-system messages
 	cutKeptFirstMsg?: Any; // ... and that message itself (a disagreeing request view drops the cut)
@@ -272,8 +345,7 @@ export interface PlanOpts {
 	trace?: (LawTerms & { where: "summary" | "plan" })[]; // every law evaluation is pushed here (ledger)
 	reserve?: number; // Pi's compaction reserveTokens (default 16384)
 	steerIds?: Set<string>; // user entries that are mid-run steering or follow-up messages, not new user turns
-	sys: number; // estimated tokens of the system prompt (same chars/4 scale as the blocks; tool definitions are covered by k)
-	k?: number; // real tokens per estimated token (calibrate); default 1 = the estimates are taken as real
+	scale?: Scale; // real = O + c x content estimate (calibrate); default UNIT = the estimates are taken as real
 	cwd: string;
 	coldCap?: number;
 	foldMin?: number;
@@ -295,21 +367,21 @@ export interface PlanResult {
 	folds: FoldTarget[];
 	cutIdx: number | null;
 	firstKeptEntryId: string | null;
-	prefixTokens: number; // estimate units (x k = real), like summaryTokensPlanned
+	prefixTokens: number; // content estimate units (x c = real), like summaryTokensPlanned
 	summaryTokensPlanned: number;
 	sumTrigger: "cold" | "valve" | null;
-	k: number;
-	ctxTokens: number; // calibrated: k x (sys + blocks)
-	ctxAfterFolds: number; // calibrated
+	scale: Scale;
+	ctxTokens: number; // real: O + c x content
+	ctxAfterFolds: number; // real
 	userTurns: number;
 	cutVisibleIdx: number;
 	cutKeptFirstMsg: Any;
 }
 
-/** Estimated tokens before the earliest edited block (system prompt included): what stays cached through the edit. A cut edits from the start. */
-export function untouchedEst(blocks: Block[], folds: FoldTarget[], cut: boolean, sys: number): number {
+/** Estimated content before the earliest edited block: what stays cached through the edit with O (real: O + c x it). A cut edits from the start. */
+export function untouchedEst(blocks: Block[], folds: FoldTarget[], cut: boolean): number {
 	const ids = new Set(folds.map((t) => t.entryId));
-	let est = sys;
+	let est = 0;
 	if (!cut) for (const b of blocks) { if (b.entryId && ids.has(b.entryId)) break; est += b.tokens; }
 	return est;
 }
@@ -329,17 +401,21 @@ export const contentKeyOf = (content: Any): string => {
 export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
 	const s = settings();
 	const mode = o.mode ?? "cold";
-	// limits are in real tokens; the plan works in estimate units, so they are divided by k once, here
-	const k = o.k ?? 1;
+	// limits are in real tokens; the plan works in content estimate units (real = O + c x estimate), so they are converted once, here.
+	// The cold cap is the working set: content above O (offline: a cap on the whole context is out of reach once O >= cap, every cold
+	// return then folds all it may and summarises, and loses items where the same cap on content does not; research round5/affine.md).
+	// The compaction room is Pi's trigger on the whole context.
+	const { O, c } = o.scale ?? UNIT;
+	const real = (est: number) => O + c * est;
 	const room = compactionRoom(o.model, o.reserve);
-	const coldCap = Math.min(o.coldCap ?? s.coldCap, room ?? Infinity) / k;
+	const coldCap = Math.min(o.coldCap ?? s.coldCap, (room ?? Infinity) - O) / c;
 	const law: Law = o.law ?? { pr: null, g: G0, pWarm: mode === "cold" ? 0 : 1 };
 	const gate = (where: "summary" | "plan", B: number, A: number, r: number | null, call: number, T: number, Tsuf?: number): boolean => {
 		const t = lawTerms(B, A, law.pWarm, r, law.pr, law.g, call, T);
 		o.trace?.push({ where, ...t, ...(Tsuf !== undefined ? { Tsuf } : {}) });
 		return t.ok;
 	};
-	const minGain = (o.minGain ?? s.minGain) / k;
+	const minGain = o.minGain ?? s.minGain;
 	const foldMin = o.foldMin ?? s.foldMin;
 	const keepLines = o.keepLines ?? s.keepLines;
 	const relax = o.relax ?? RELAX_PREV_TURN;
@@ -349,7 +425,7 @@ export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
 	const userTurns = countUserTurns(blocks) + (o.promptPending ? 1 : 0); // the upcoming prompt is a new user turn
 	const calls = toolCallIndex(blocks);
 	const recalled = o.recalled ?? new Set<string>();
-	const ctxEst = o.sys + blocks.reduce((a, b) => a + b.tokens, 0);
+	const ctxEst = blocks.reduce((a, b) => a + b.tokens, 0); // content
 	if (mode === "warm" && !(ctxEst > coldCap)) return null; // I6: warm cache below the cold cap -> never edit
 	const trig = mode === "warm" ? "valve" : "cold";
 	const tokOverride = new Map<number, number>();
@@ -385,9 +461,9 @@ export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
 	// is an uncensored survival sample (learn.ts sample). Without it every idle return folded into the first 1-7K tokens and its sample was
 	// censored, so the learned curve never saw a return (live GLM bench). Explicit caches are exempt: the provider looks back only ~20
 	// blocks from the last breakpoint, a far head is not read either way. A cut replaces the prefix from the first message: exempt too.
-	const head = law.pr?.cls === "automatic" ? MIN_EXPECT / k : 0;
+	const head = law.pr?.cls === "automatic" ? (MIN_EXPECT - O) / c : 0; // MIN_EXPECT counts from the first token, O included
 	const start: number[] = [];
-	blocks.reduce((acc, b) => ((start[b.idx] = acc), acc + b.tokens), o.sys);
+	blocks.reduce((acc, b) => ((start[b.idx] = acc), acc + b.tokens), 0);
 	const foldable = (b: Block) => b.kind === "toolResult" && !b.edited && !!b.entryId && b.tokens > foldMin && !isRecall(b) && start[b.idx] >= head && (!o.rereadOnly || classify(b) === "rereadable");
 	const protectedTurn = (b: Block) => b.userTurn >= userTurns - PROTECT_USER_TURNS + 1;
 	const savings = () => folds.reduce((a, t) => a + t.entryTokens - t.phTokens, 0);
@@ -420,12 +496,12 @@ export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
 		}
 	}
 	let ctxAfterFolds = ctxEst - savings();
-	// what no summary can remove: the system prompt, the protected turns (after their folds) and the previous summary, which the next
-	// one carries forward; the cap is never chased below it (a context that is mostly this floor would be re-summarised for nothing)
+	// what no summary can remove (besides O): the protected turns (after their folds) and the previous summary, which the next one
+	// carries forward; the cap is never chased below it (a context that is mostly this floor would be re-summarised for nothing)
 	const prevSum = blocks[0]?.kind === "summary" ? blocks[0].tokens : 0;
-	const floor = o.sys + prevSum + blocks.reduce((a, b) => a + (protectedTurn(b) ? (tokOverride.get(b.idx) ?? b.tokens) : 0), 0);
+	const floor = prevSum + blocks.reduce((a, b) => a + (protectedTurn(b) ? (tokOverride.get(b.idx) ?? b.tokens) : 0), 0);
 	const target = Math.max(coldCap, floor + SUMMARY_FLOOR);
-	const atRoom = room !== null && k * ctxAfterFolds >= room;
+	const atRoom = room !== null && real(ctxAfterFolds) >= room;
 	const sumTrigger: "cold" | "valve" | null = ctxAfterFolds > target && (!o.noSummary || atRoom) ? trig : null;
 	let cutIdx: number | null = null;
 	let prefixTokens = 0;
@@ -444,14 +520,14 @@ export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
 			pre[i] = acc;
 			acc += tokOverride.get(i) ?? blocks[i].tokens;
 		}
-		const total = o.sys + acc;
+		const total = acc;
 		const S = (x: number) => Math.max(clamp(SUMMARY_RATIO * x, SUMMARY_FLOOR, SUMMARY_CAP), prevSum); // the next summary carries the previous one forward
 		if (cuts.length) {
 			let pick = cuts[cuts.length - 1];
 			for (const c of cuts) if (total - pre[c] + S(pre[c]) <= coldCap) { pick = c; break; }
 			// cold: the summary call must pay for itself (verdict: call = w X + out S for an uncached call); warm: it is sunk in the plan's law
-			const X = k * pre[pick], Sr = k * S(pre[pick]);
-			const gain = !law.pr ? summaryGainOk(pre[pick], S(pre[pick]), total, minGain) : mode === "warm" || gate("summary", X, Sr, null, law.pr.w * X + law.pr.out * Sr, Sr);
+			const X = c * pre[pick], Sr = c * S(pre[pick]);
+			const gain = !law.pr ? summaryGainOk(X, Sr, real(total), minGain) : mode === "warm" || gate("summary", X, Sr, null, law.pr.w * X + law.pr.out * Sr, Sr);
 			if (pre[pick] >= 2 * S(pre[pick]) && gain) {
 				cutIdx = pick;
 				prefixTokens = pre[pick];
@@ -482,13 +558,14 @@ export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
 		}
 	}
 	// the untouched prefix: everything before the earliest edited block (a cut edits from the first block on)
-	const untouched = untouchedEst(blocks, folds, cutIdx !== null, o.sys);
+	const untouched = untouchedEst(blocks, folds, cutIdx !== null);
 	const after = ctxAfterFolds - (cutIdx !== null ? prefixTokens - summaryTokensPlanned : 0);
 	const planned = folds.length > 0 || cutIdx !== null;
 	// F10: a warm rewrite must pay back; a cold plan with some chance of a warm cache is priced by expectation (no prices: cold always fires).
-	// T = A (the whole post-edit context); the suffix after the earliest edit goes to the ledger only.
-	if ((mode === "warm" || (planned && law.pr)) && !gate("plan", k * ctxEst, k * after, room, 0, k * after, k * (after - untouched))) return null;
-	return { blocks, calls, folds, cutIdx, firstKeptEntryId: cutIdx !== null ? blocks[cutIdx].entryId : null, prefixTokens, summaryTokensPlanned, sumTrigger, k, ctxTokens: k * ctxEst, ctxAfterFolds: k * ctxAfterFolds, userTurns, cutVisibleIdx, cutKeptFirstMsg };
+	// T = A (the whole post-edit context, O included, as tuned: the cheaper A - O fires warm edits earlier and loses items offline);
+	// the suffix after the earliest edit goes to the ledger only.
+	if ((mode === "warm" || (planned && law.pr)) && !gate("plan", real(ctxEst), real(after), room, 0, real(after), c * (after - untouched))) return null;
+	return { blocks, calls, folds, cutIdx, firstKeptEntryId: cutIdx !== null ? blocks[cutIdx].entryId : null, prefixTokens, summaryTokensPlanned, sumTrigger, scale: o.scale ?? UNIT, ctxTokens: real(ctxEst), ctxAfterFolds: real(ctxAfterFolds), userTurns, cutVisibleIdx, cutKeptFirstMsg };
 }
 
 const sameMsg = (a: Any, b: Any): boolean =>
