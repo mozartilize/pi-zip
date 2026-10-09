@@ -38,6 +38,7 @@ export interface NoticeData {
 	items?: NoticeItem[];
 	more?: number; // folded outputs not listed
 	first?: boolean; // the session's first notice: say once that originals are kept
+	reqTs?: number; // when the first request carrying this plan went out (ms): the renderer shows that request's real size as "after"
 }
 
 export const fmtK = (tokens: number): string => `${tokens >= 99_500 ? Math.round(tokens / 1000) : Math.round(tokens / 100) / 10}K`;
