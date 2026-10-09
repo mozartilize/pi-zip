@@ -1,14 +1,14 @@
-import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { repairPayload } from "../src/guard.ts";
-import { cacheTtlMs, detectCold, isColdByTtl, observedTier } from "../src/cache.ts";
+import { cacheTtlMs, detectCold, isColdByTtl, observedTier, payloadRetention, resolveTtl } from "../src/cache.ts";
 import { classifyRecoverability, isReadOnlyBash } from "../src/classify.ts";
 import { colorTail, fmtK, noticeText, renderNotice, splitDesc, type NoticeAction, type NoticeData } from "../src/notice.ts";
 import { clipMid, handleFor, makePlaceholder, makePlaceholderFor, outcomeHint, pickKeyLines, shortArgs } from "../src/placeholder.ts";
 import { buildBlocks, toolCallIndex } from "../src/plan.ts";
-import { A, type Any, R, U } from "./helpers.ts";
+import { A, type Any, fakeCtx, fakePi, R, U } from "./helpers.ts";
 import { branchOutputs, parseRange, recalledHandlesFromBranch, recallSections, resolveHandlesInBranch, searchOutputs, sliceRecall } from "../src/recall.ts";
 import { handleRowsOf, handleTable, INDEX_TOKENS, skeleton } from "../src/summary.ts";
 import { TOOL_FRAME_CHARS, tokensOf } from "../src/util.ts";
@@ -630,6 +630,76 @@ describe("observed TTL tier", () => {
 		}
 		expect(detectCold(model, 0, [a(5000, 5000), gap], now).ttl).toMatchObject({ ms: 3_600_000, source: "observed" });
 		expect(detectCold({ ...model, promptCache: { short: 300 } }, 0, [a(5000, 5000), gap], now).ttl).toMatchObject({ ms: 300_000, source: "declared" });
+	});
+});
+
+describe("cache retention from the provider-scoped env and the request payload (pi-tricks §3.1)", () => {
+	const ENVS = ["PI_ZIP_TTL_SECS", "PI_CACHE_RETENTION"];
+	let kept: Record<string, string | undefined> = {};
+	beforeEach(() => { kept = Object.fromEntries(ENVS.map((k) => [k, process.env[k]])); ENVS.forEach((k) => delete process.env[k]); });
+	afterEach(() => ENVS.forEach((k) => (kept[k] === undefined ? delete process.env[k] : (process.env[k] = kept[k]))));
+	const model = { provider: "relay", id: "claude-x", contextWindow: 1_000_000, promptCache: { short: 300, long: 3600 } };
+
+	test("the tier a request asked for, read from the payload Pi built", () => {
+		const cc = (ttl?: string) => ({ type: "text", text: "x", cache_control: { type: "ephemeral", ...(ttl ? { ttl } : {}) } });
+		expect(payloadRetention({ system: [cc("1h")], messages: [] })).toBe("long");
+		expect(payloadRetention({ system: [{ type: "text", text: "s" }], messages: [{ role: "user", content: [cc()] }] })).toBe("short");
+		expect(payloadRetention({ tools: [{ name: "t", cache_control: { type: "ephemeral", ttl: "5m" } }], messages: [] })).toBe("short");
+		expect(payloadRetention({ messages: [{ role: "user", content: [cc(), cc("1h")] }] })).toBe("long");
+		expect(payloadRetention({ model: "gpt", input: [], prompt_cache_retention: "24h" })).toBe("long");
+		expect(payloadRetention({ model: "gpt", input: [], prompt_cache_retention: "in_memory" })).toBe("short");
+		for (const p of [{ messages: [{ role: "user", content: "hi" }] }, {}, null, "x", undefined]) expect(payloadRetention(p)).toBeNull(); // nothing said
+	});
+
+	test("resolveTtl takes the tier it is given; without one the process env decides, as before", () => {
+		expect(resolveTtl(model, [], "long").ms).toBe(3_600_000);
+		expect(resolveTtl(model, [], "short").ms).toBe(300_000);
+		expect(resolveTtl(model, []).ms).toBe(300_000);
+		process.env.PI_CACHE_RETENTION = "long";
+		expect(resolveTtl(model, []).ms).toBe(3_600_000);
+		expect(resolveTtl(model, [], "short").ms).toBe(300_000); // a known tier beats the process env
+	});
+
+	async function returnAfter(gapS: number, registry: Any, payload?: Any) {
+		const ledger = `/tmp/pi-zip-retention-${process.pid}-${Math.random().toString(36).slice(2)}.jsonl`;
+		process.env.PI_ZIP_LEDGER = ledger;
+		try {
+			const { Zip } = await import("../src/run.ts");
+			const zip = new Zip(fakePi().pi as Any);
+			const entries = [U("u1", "one"), A("a1"), U("u2", "now")];
+			const last = { type: "message", id: "a1", message: { role: "assistant", provider: model.provider, model: model.id, stopReason: "stop", timestamp: Date.now() - gapS * 1000, content: [], usage: { input: 9000, cacheRead: 0, cacheWrite: 0 } } };
+			const { ctx } = fakeCtx(entries, { model, branch: [last], modelRegistry: registry });
+			zip.sessionStart(ctx);
+			if (payload) {
+				await zip.beforeAgentStart(ctx); // a run that sends one request with this payload ...
+				zip.providerRequest({ payload });
+				zip.messageEnd({ role: "assistant", stopReason: "stop", usage: { input: 9000, cacheRead: 0, cacheWrite: 0 } });
+				(zip as Any).lastReqMs = Date.now() - gapS * 1000; // ... gapS ago
+			}
+			await zip.beforeAgentStart(ctx);
+			return readFileSync(ledger, "utf8").trim().split("\n").map((l) => JSON.parse(l)).filter((r) => r.type === "prompt").at(-1);
+		} finally {
+			rmSync(ledger, { force: true });
+			delete process.env.PI_ZIP_LEDGER;
+		}
+	}
+
+	test("PI_CACHE_RETENTION=long in the provider's env (auth.json), not in the process: a 400 s return is still warm (1 h tier), resolved once per run", async () => {
+		let asked = 0;
+		const scoped = { getApiKeyAndHeaders: async (m: Any) => (asked++, { ok: true, apiKey: "k", env: m === model ? { PI_CACHE_RETENTION: "long" } : {} }) };
+		expect(await returnAfter(400, scoped)).toMatchObject({ cold: false, ttlMs: 3_600_000 });
+		expect(asked).toBe(1);
+		expect(await returnAfter(400, {})).toMatchObject({ cold: true, ttlMs: 300_000 }); // an older Pi without the API: the process env, as before
+		expect(await returnAfter(400, { getApiKeyAndHeaders: async () => { throw new Error("no key"); } })).toMatchObject({ cold: true, ttlMs: 300_000 });
+	});
+
+	test("the request payload wins: the provider env says long, the request carried a 5-minute cache_control, so a 400 s return is cold", async () => {
+		const scoped = { getApiKeyAndHeaders: async () => ({ ok: true, env: { PI_CACHE_RETENTION: "long" } }) };
+		const short = { system: [{ type: "text", text: "s", cache_control: { type: "ephemeral" } }], messages: [] };
+		expect(await returnAfter(400, scoped, short)).toMatchObject({ cold: true, ttlMs: 300_000 });
+		process.env.PI_CACHE_RETENTION = "short";
+		const long = { system: [{ type: "text", text: "s", cache_control: { type: "ephemeral", ttl: "1h" } }], messages: [] };
+		expect(await returnAfter(400, {}, long)).toMatchObject({ cold: false, ttlMs: 3_600_000 });
 	});
 });
 

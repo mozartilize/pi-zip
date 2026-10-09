@@ -3,7 +3,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { appendFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { detectCold, lastMessageMs, lastPrompt, modelKey, resolveTtl, ttlFor } from "./cache.ts";
+import { detectCold, lastMessageMs, lastPrompt, modelKey, payloadRetention, resolveTtl, ttlFor } from "./cache.ts";
 import { describe, lawPrices, loadStats, pWarm, record, sample, statsPath, GAP_EDGES, type Entry } from "./learn.ts";
 import { validateEdits, repairPayload } from "./guard.ts";
 import { fmtK, Stats, noticeDesc, noticeText, type NoticeAction, type NoticeData, type ZipControl } from "./notice.ts";
@@ -106,6 +106,9 @@ export class Zip implements ZipControl {
 	private nativeAsk: { compaction: Any | null; answered: boolean; until: number } | null = null;
 	// this run's away summary went in through Pi's compaction before the run: the projection just before it, for the run plan (I1)
 	private nativeRun: { key: string; cut: Cut; before: number; after: number; pre: Any[]; entryId: string } | null = null;
+	// the cache tier (PI_CACHE_RETENTION) of the current model's requests: the payload of its newest request when seen, else the
+	// provider-scoped env resolved once per run (research pi-tricks §3.1); null = nothing known, the process env decides (cache.ts)
+	private retention: { key: string; tier: "short" | "long"; src: "env" | "provider env" | "payload" } | null = null;
 
 	constructor(private pi: ExtensionAPI) {}
 
@@ -239,7 +242,7 @@ export class Zip implements ZipControl {
 		} catch {
 			return;
 		}
-		const ttl = ttlFor(ctx.model ?? this.model);
+		const ttl = ttlFor(ctx.model ?? this.model, [], this.tier(ctx.model ?? this.model));
 		this.stateLine(ctx, "on", `old tool output gets zipped once the prompt cache expires (${fmtLife(ttl / 1000).slice(1)} here) · /zip`);
 	}
 
@@ -301,6 +304,28 @@ export class Zip implements ZipControl {
 		return { text, tools };
 	}
 
+	/** The cache tier of `model`'s requests, when known (see `retention`). */
+	private tier(model?: Any): "short" | "long" | undefined {
+		const r = this.retention;
+		return r && r.key === modelKey(model ?? this.model) ? r.tier : undefined;
+	}
+	/** Once per run: PI_CACHE_RETENTION as Pi resolves it for this model's provider (the credential's env in auth.json first, then the
+	 *  process env). A tier read from this model's newest request payload is the truth about that request and stays. */
+	private async resolveRetention(ctx: Any): Promise<void> {
+		const key = modelKey(ctx?.model);
+		if (!key || (this.retention?.key === key && this.retention.src === "payload")) return;
+		let scoped: string | undefined;
+		try {
+			const r = await ctx?.modelRegistry?.getApiKeyAndHeaders?.(ctx.model);
+			const v = r?.env?.PI_CACHE_RETENTION;
+			if (typeof v === "string" && v) scoped = v;
+		} catch {}
+		const v = scoped ?? process.env.PI_CACHE_RETENTION;
+		const next = { key, tier: v === "long" ? ("long" as const) : ("short" as const), src: scoped ? ("provider env" as const) : ("env" as const) };
+		if (next.tier !== this.retention?.tier || next.key !== this.retention?.key || next.src !== this.retention?.src) this.ledger({ type: "retention", ...next });
+		this.retention = next;
+	}
+
 	/** The token scale (O, c) read from the branch: stateless, so a fresh process calibrates exactly like a long-lived one. */
 	scaleOf(ctx: Any, entries?: Any[]): Scale {
 		try {
@@ -330,7 +355,7 @@ export class Zip implements ZipControl {
 	private law(ctx: Any, pWarm: number): Law {
 		const m = ctx?.model ?? this.model;
 		const ent = this.entKey === modelKey(m) ? this.ent : undefined;
-		return { pr: lawPrices(ent?.cls, resolveTtl(m, this.branch(ctx)).ms >= 3_600_000), g: this.g, pWarm };
+		return { pr: lawPrices(ent?.cls, resolveTtl(m, this.branch(ctx), this.tier(m)).ms >= 3_600_000), g: this.g, pWarm };
 	}
 	private entKey = "";
 	private loadEnt(key: string) {
@@ -480,7 +505,8 @@ export class Zip implements ZipControl {
 		this.loadEnt(key);
 		this.branchLastMs = lastMessageMs(branch);
 		if (!this.prevKey) ({ key: this.prevKey, total: this.prevTotal } = lastPrompt(branch)); // fresh process: the session's newest response
-		const { cold, reason, ttl, pWarm: p, src, gapS, pastTtl } = detectCold(ctx.model, this.lastReqMs, branch, Date.now(), this.lastModelKey, (g, prior) => pWarm(this.ent, g, prior));
+		await this.resolveRetention(ctx);
+		const { cold, reason, ttl, pWarm: p, src, gapS, pastTtl } = detectCold(ctx.model, this.lastReqMs, branch, Date.now(), this.lastModelKey, (g, prior) => pWarm(this.ent, g, prior), this.tier(ctx.model));
 		this.cold = cold;
 		if (cold) this.summarizedWarm = false; // a cold return may summarise again
 		this.pastTtl = pastTtl;
@@ -812,7 +838,7 @@ export class Zip implements ZipControl {
 
 	/** Start the away-timer for a summary; returns the delay in ms. unref'd: it never keeps the process alive. */
 	private scheduleSummary(p: PlanResult, ctx: Any): number {
-		const ttl = ttlFor(ctx.model, this.branch(ctx));
+		const ttl = ttlFor(ctx.model, this.branch(ctx), this.tier(ctx.model));
 		const delay = Math.max(0, (this.lastReqMs || Date.now()) + AWAY_FRACTION * ttl - Date.now());
 		const gen = ++this.timerGen;
 		this.timer = setTimeout(() => void this.runAway(p, ctx, gen), delay);
@@ -1001,6 +1027,11 @@ export class Zip implements ZipControl {
 		this.lastModelKey = key;
 		this.stats.readSavedTokens += this.stats.activeSaved;
 		const p: Any = e.payload;
+		const seen = payloadRetention(p); // what this very request asked the provider for: it wins over any environment
+		if (seen && key && (seen !== this.retention?.tier || this.retention?.key !== key || this.retention?.src !== "payload")) {
+			this.retention = { key, tier: seen, src: "payload" };
+			this.ledger({ type: "retention", ...this.retention });
+		}
 		if (process.env.PI_ZIP_LEDGER && this.cold && !this.wireLedgered && p && Array.isArray(p.messages)) {
 			this.wireLedgered = true; // proof that the FIRST request after a cold return is already small (real scale: O + c x the wire's content)
 			let tok = 0;
@@ -1104,7 +1135,7 @@ export class Zip implements ZipControl {
 	card(ctx?: Any): CardData {
 		const t = this.totals(ctx);
 		const model = ctx?.model ?? this.model;
-		const key = modelKey(model), ttlS = ttlFor(model) / 1000, ent = key ? loadStats().models[key] : undefined;
+		const key = modelKey(model), ttlS = ttlFor(model, [], this.tier(model)) / 1000, ent = key ? loadStats().models[key] : undefined;
 		let lifeS = 0;
 		for (let g = 30; g <= 7200; g += 30) if (pWarm(ent, g, ttlS).p >= 0.5) lifeS = g;
 		const measured = !!ent && ent.n > 0 && pWarm(ent, Math.max(30, lifeS), ttlS).src === "learned";
@@ -1123,7 +1154,7 @@ export class Zip implements ZipControl {
 	}
 	status(ctx?: Any): string {
 		const state = this.off ? "off" : this.conflict ? `paused ("${this.conflict}" also manages context; only the request guard is on)` : "on";
-		const key = modelKey(this.model), ttl = ttlFor(this.model), ent = loadStats().models[key];
+		const key = modelKey(this.model), ttl = ttlFor(this.model, [], this.tier()), ent = loadStats().models[key];
 		const pr = lawPrices(ent?.cls, ttl >= 3_600_000);
 		const cache = !key ? "" : `\ncache ${key}: ${pr ? `${pr.cls} (from usage)` : "class unknown until the first response"}` +
 			`, ${pr ? `read ${+pr.r.toFixed(4)} / write ${+pr.w.toFixed(4)} / output ${+pr.out.toFixed(4)} x input (class ratios)` : "no prices (legacy rule)"}` +
