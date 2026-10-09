@@ -42,7 +42,7 @@ interface Bg {
 	controller: AbortController;
 }
 
-/** Resolves with the promise's value, or null as soon as the signal aborts (Esc cancels the waiting, not the work). */
+/** Resolves with the promise's value, or null as soon as the signal aborts (Esc: Pi cancels the prompt; the work goes on). */
 function waitFor<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T | null> {
 	return new Promise((resolve) => {
 		if (signal?.aborted) return resolve(null);
@@ -603,6 +603,7 @@ export class Zip implements ZipControl {
 				this.ledger({ type: "error", where: "context/run_plan", error: errText(err) });
 			}
 		}
+		if (ctx?.signal?.aborted) return undefined; // Esc (Pi cancelled the prompt): this request never goes out, so nothing is applied or announced
 		if (this.runPlan && !this.runPlan.persisted) {
 			const out = applyPlanToMessages(e.messages, this.runPlan);
 			if (out || this.runPlan.native) { // a native summary is already in the request Pi built: it still goes out with this request
@@ -620,8 +621,7 @@ export class Zip implements ZipControl {
 		return undefined;
 	}
 
-	/** A prepared summary for this cut, or null. A summary still being written is waited for (only the remainder); Esc stops the waiting, not the work. */
-	/** While the user waits for a summary, Pi's working line says what for (and that Esc skips a prepared one). */
+	/** While the user waits for a summary, Pi's working line says what for. */
 	private async working<T>(ctx: Any, text: string, p: Promise<T>): Promise<T> {
 		const ui = ctx?.mode === "tui" ? ctx?.ui : null;
 		try {
@@ -636,6 +636,8 @@ export class Zip implements ZipControl {
 		}
 	}
 
+	/** A prepared summary for this cut, or null. A summary still being written is waited for (only the remainder). Esc there cancels the
+	 *  whole prompt (Pi 1.1.0 aborts the run, research pi-tricks §3.6): the waiting stops, the summary goes on for the next try. */
 	private async takeBg(key: string | null, signal?: AbortSignal, ctx?: Any): Promise<{ cut: Cut | null; adopted: boolean }> {
 		const b = this.bg;
 		if (!b || key === null || b.key !== key) {
@@ -643,7 +645,7 @@ export class Zip implements ZipControl {
 			return { cut: null, adopted: false };
 		}
 		const w0 = performance.now();
-		const cut = b.done ?? (await this.working(ctx, `${PRODUCT}: finishing the summary it started while you were away · Esc skips it`, waitFor(b.promise, signal)));
+		const cut = b.done ?? (await this.working(ctx, `${PRODUCT}: finishing the summary it started while you were away · Esc cancels this prompt`, waitFor(b.promise, signal)));
 		this.bgWaitMs = performance.now() - w0;
 		if (cut) {
 			this.bg = null;
