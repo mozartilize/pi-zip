@@ -173,27 +173,38 @@ export interface ZipControl {
 	card?(ctx?: Any): CardData;
 	/** Show a /zip result in the transcript; false = no transcript surface here (print/json/rpc or an older Pi). */
 	show?(ctx: Any, data: NoticeData): boolean;
-	statsLine(ctx?: Any): string;
 	setOff(off: boolean): string;
 	toggleQuiet(): string;
 }
 
+const ZIP_SUBS: [string, string][] = [
+	["off", "stop folding; requests left untouched"],
+	["on", "resume folding"],
+	["quiet", "toggle the per-turn notice"],
+];
+
 export function registerZipCommand(pi: ExtensionAPI, zip: ZipControl) {
 	pi.registerCommand("zip", {
-		description: `${PRODUCT}: status | off | on | quiet`,
+		description: `${PRODUCT}: off | on | quiet`,
+		getArgumentCompletions: (prefix: string) => {
+			const p = (prefix ?? "").trim().toLowerCase();
+			const items = ZIP_SUBS.filter(([v]) => v.startsWith(p)).map(([value, description]) => ({ value, label: value, description }));
+			return items.length ? items : null;
+		},
 		handler: async (args: string, cctx: Any) => {
-			const sub = (args ?? "").trim().toLowerCase() || "status";
-			if ((sub === "status" || sub === "stats") && zip.card && zip.show) {
+			// "/zip" alone shows the card. "status" and "stats" are older spellings of the same thing: still accepted, never advertised.
+			const raw = (args ?? "").trim().toLowerCase();
+			const sub = raw === "" || raw === "stats" ? "status" : raw;
+			if (sub === "status" && zip.card && zip.show) {
 				const card = zip.card(cctx);
 				if (zip.show(cctx, { v: 2, kind: "card", card, text: zip.status(cctx), before: 0, after: 0, desc: "" })) return;
 			}
 			const text =
 				sub === "status" ? zip.status(cctx)
-				: sub === "stats" ? zip.statsLine(cctx)
 				: sub === "off" ? zip.setOff(true)
 				: sub === "on" ? zip.setOff(false)
 				: sub === "quiet" ? zip.toggleQuiet()
-				: `${PRODUCT}: unknown subcommand "${sub}" (use status | off | on | quiet)`;
+				: `${PRODUCT}: unknown subcommand "${sub}" (use /zip, or /zip off | on | quiet)`;
 			if (zip.show && (sub === "off" || sub === "on" || sub === "quiet")) {
 				const word: StateWord = sub === "quiet" ? (/notices off/.test(text) ? "quiet" : "notices on") : sub;
 				const reason = text.replace(/^pi-zip: (off|on)\.? ?/, "").replace(/^pi-zip: /, "");
