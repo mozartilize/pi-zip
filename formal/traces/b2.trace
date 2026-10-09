@@ -1,0 +1,9 @@
+# B2 (window slide), as the checker shrank it on 0.2.8: the cold return cannot summarise (the 60K turn is protected), the
+# window slides at the next prompt 60 s later and the warm run plan summarises (NR fails at req 1, witnessed by req 2)
+world explicit known ttl=300 true=300 survival=none c=1 sys=3000 window=200000 native interactive
+prompt
+say 60K
+prompt +1h
+say 100
+prompt +60s
+say 100
