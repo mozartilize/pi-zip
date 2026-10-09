@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { repairPayload } from "../src/guard.ts";
 import { cacheTtlMs, detectCold, isColdByTtl, observedTier } from "../src/cache.ts";
 import { classifyRecoverability, isReadOnlyBash } from "../src/classify.ts";
-import { fmtK, noticeText, ratioBar, renderNotice, colorDesc, type NoticeAction, type NoticeData } from "../src/notice.ts";
+import { colorTail, fmtK, noticeText, renderNotice, splitDesc, type NoticeAction, type NoticeData } from "../src/notice.ts";
 import { clipMid, handleFor, makePlaceholder, makePlaceholderFor, outcomeHint, pickKeyLines, shortArgs } from "../src/placeholder.ts";
 import { buildBlocks, toolCallIndex } from "../src/plan.ts";
 import { A, type Any, R, U } from "./helpers.ts";
@@ -544,51 +544,50 @@ describe("notices and stats", () => {
 	test("fmtK", () => expect([fmtK(84200), fmtK(31500), fmtK(182000), fmtK(41000)]).toEqual(["84.2K", "31.5K", "182K", "41K"]));
 	const fold: NoticeAction = { kind: "fold", count: 12, tokensBefore: 84200, tokensAfter: 31500, ms: 0.94 };
 	const sync: NoticeAction = { kind: "summary", count: 64, tokensBefore: 182000, tokensAfter: 41000, ms: 8400 };
-	test("exact formats; fold and summary merge into ONE line, numbers first", () => {
-		expect(noticeText([fold])).toBe("pi-zip  84.2K → 31.5K  folded 12 old outputs in 1 ms");
-		expect(noticeText([{ ...fold, ms: 1234 }])).toBe("pi-zip  84.2K → 31.5K  folded 12 old outputs in 1.2 s");
-		expect(noticeText([sync])).toBe("pi-zip  182K → 41K  summarized 64 requests · waited 8.4 s"); // waited for all of it
-		expect(noticeText([{ ...sync, ms: 41200, waitMs: 12000 }])).toBe("pi-zip  182K → 41K  summarized 64 requests in 41.2 s · waited 12.0 s"); // started while away
-		expect(noticeText([{ ...sync, ms: 41200, prepared: true }])).toBe("pi-zip  182K → 41K  summarized 64 requests in 41.2 s · ready while you were away");
+	test("exact formats; fold and summary merge into ONE line: words, numbers, then how long", () => {
+		expect(noticeText([fold])).toBe("pi-zip  zipped 12 old outputs  84.2K → 31.5K  1 ms");
+		expect(noticeText([{ ...fold, ms: 1234 }])).toBe("pi-zip  zipped 12 old outputs  84.2K → 31.5K  1.2 s");
+		expect(noticeText([sync])).toBe("pi-zip  summarized 64 requests  182K → 41K  waited 8.4 s"); // waited for all of it
+		expect(noticeText([{ ...sync, ms: 41200, waitMs: 12000 }])).toBe("pi-zip  summarized 64 requests  182K → 41K  41.2 s · waited 12.0 s"); // started while away
+		expect(noticeText([{ ...sync, ms: 41200, prepared: true }])).toBe("pi-zip  summarized 64 requests  182K → 41K  41.2 s · ready while you were away");
 		const merged = noticeText([fold, { ...sync, tokensBefore: 31500, tokensAfter: 20000 }]);
-		expect(merged).toBe("pi-zip  84.2K → 20K  folded 12 old outputs in 1 ms · summarized 64 requests · waited 8.4 s");
-		expect(noticeText([{ ...fold, count: 1 }])).toBe("pi-zip  84.2K → 31.5K  folded 1 old output in 1 ms");
+		expect(merged).toBe("pi-zip  zipped 12 old outputs · summarized 64 requests  84.2K → 20K  1 ms · waited 8.4 s");
+		expect(noticeText([{ ...fold, count: 1 }])).toBe("pi-zip  zipped 1 old output  84.2K → 31.5K  1 ms");
 	});
-	test("ratio bar: ten cells, filled by what is left, never empty", () => {
-		expect(ratioBar(74000, 43000)).toBe("▰▰▰▰▰▰▱▱▱▱");
-		expect(ratioBar(182000, 41000)).toBe("▰▰▱▱▱▱▱▱▱▱");
-		expect(ratioBar(1_290_000, 40_000)).toBe("▰▱▱▱▱▱▱▱▱▱");
+	test("old entries ('folded …') read the same way", () => {
+		expect(splitDesc("folded 12 old outputs in 6 ms")).toEqual({ verbs: ["zipped 12 old outputs"], tail: ["6 ms"] });
+		expect(splitDesc("folded 12 old outputs")).toEqual({ verbs: ["zipped 12 old outputs"], tail: [] });
+		expect(splitDesc("summarized 3 requests in 38.2 s · ready while you were away")).toEqual({ verbs: ["summarized 3 requests"], tail: ["38.2 s", "ready while you were away"] });
 	});
 	const th = { fg: (_c: string, t: string) => t };
 	const data: NoticeData = {
-		v: 2, text: "", before: 74000, after: 43000, desc: "folded 12 old outputs", why: "cache cold (away 47 min), so folding was free",
+		v: 2, text: "", before: 74000, after: 43000, desc: "zipped 12 old outputs in 6 ms", why: "away 47 min",
 		items: [{ label: "bash npm test", turn: 1, tokens: 14000, handle: "k3x9q2m7ab" }, { label: "read src/payment.ts", turn: 1, tokens: 9000, handle: "p8d2x1qa0m" }], more: 10,
 	};
-	test("collapsed: one line; narrow terminals drop the words, then the bar, never the numbers; nothing exceeds the width", () => {
-		expect(renderNotice(data, false, 120, th)).toEqual(["▸ pi-zip  74K → 43K  ▰▰▰▰▰▰▱▱▱▱  folded 12 old outputs"]);
-		expect(renderNotice(data, false, 40, th)).toEqual(["▸ pi-zip  74K → 43K  ▰▰▰▰▰▰▱▱▱▱"]);
-		expect(renderNotice(data, false, 25, th)).toEqual(["▸ pi-zip  74K → 43K"]);
-		expect(renderNotice(data, false, 12, th)).toEqual(["74K → 43K"]);
+	test("collapsed: one line; narrow terminals drop the time, then the words, never the numbers; nothing exceeds the width", () => {
+		expect(renderNotice(data, false, 120, th)).toEqual(["ƶ zipped 12 old outputs   74K → 43K   6 ms"]);
+		expect(renderNotice(data, false, 38, th)).toEqual(["ƶ zipped 12 old outputs   74K → 43K"]);
+		expect(renderNotice(data, false, 25, th)).toEqual(["ƶ 74K → 43K"]);
+		expect(renderNotice(data, false, 10, th)).toEqual(["74K → 43K"]);
 		expect(renderNotice(data, false, 5, th)).toEqual([]);
 		for (const w of [5, 12, 25, 40, 60, 80, 120]) for (const ex of [false, true]) for (const l of renderNotice({ ...data, first: true }, ex, w, th)) expect(l.length).toBeLessThanOrEqual(w);
 	});
-	test("the session's first notice says once that originals are kept; ctrl+o lists why and what", () => {
-		expect(renderNotice({ ...data, first: true }, false, 120, th)[1]).toBe("          originals are kept · the model can recall any of them");
+	test("the session's first notice says once that originals are kept; expanded lists what, then the facts", () => {
+		expect(renderNotice({ ...data, first: true }, false, 120, th)[1]).toBe("  originals are kept · the model can unzip any of them");
 		const ex = renderNotice(data, true, 120, th);
-		expect(ex[1]).toBe("          cache cold (away 47 min), so folding was free");
-		expect(ex[2]).toMatch(/^ {10}bash npm test +14K  k3x9q2m7ab$/);
-		expect(ex[3]).toMatch(/^ {10}read src\/payment\.ts +\d+K  \w{10}$/);
-		expect(ex[4]).toBe("          … 10 more");
+		expect(ex[1]).toMatch(/^ {2}bash npm test +14K   k3x9q2m7ab$/);
+		expect(ex[2]).toMatch(/^ {2}read src\/payment\.ts +\d+K   \w{10}$/);
+		expect(ex[3]).toBe("  … 10 more");
+		expect(ex[4]).toBe("  away 47 min");
 	});
-	test("colours by meaning: brand accent, old size muted, new size + kept cells success, verb text, context dim", () => {
-		const tag = { fg: (c: string, t: string) => `<${c}>${t}</${c}>` };
-		const len = (s: string) => s.replace(/<\/?\w+>/g, "").length;
-		expect(renderNotice(data, false, 120, tag, len)[0]).toBe("<accent>▸ pi-zip</accent>  <muted>74K</muted><dim> → </dim><success>43K</success>  <success>▰▰▰▰▰▰</success><dim>▱▱▱▱</dim>  <text>folded 12 old outputs</text>");
-		expect(colorDesc("folded 12 old outputs in 6 ms", tag)).toBe("<text>folded 12 old outputs</text><dim> in 6 ms</dim>");
-		expect(colorDesc("summarized 3 requests in 38.2 s · ready while you were away", tag)).toBe("<text>summarized 3 requests</text><dim> in 38.2 s</dim><dim> · </dim><dim>ready while you were away</dim>");
+	test("colours by meaning: monogram accent+bold, words muted, the size now success+bold, the rest dim", () => {
+		const tag = { fg: (c: string, t: string) => `<${c}>${t}</${c}>`, bold: (t: string) => `*${t}*` };
+		const len = (s: string) => s.replace(/<\/?\w+>|\*/g, "").length;
+		expect(renderNotice(data, false, 120, tag, len)[0]).toBe("<accent>*ƶ*</accent> <muted>zipped 12 old outputs</muted>   <dim>74K</dim><dim> → </dim><success>*43K*</success>   <dim>6 ms</dim>");
+		expect(colorTail(["38.2 s", "ready while you were away"], tag)).toBe("<dim>38.2 s</dim><dim> · </dim><dim>ready while you were away</dim>");
 		// only a wait the user really sat through gets the warning colour
-		expect(colorDesc("summarized 4 requests · waited 43.4 s", tag)).toBe("<text>summarized 4 requests</text><dim> · </dim><warning>waited 43.4 s</warning>");
-		expect(colorDesc("summarized 4 requests · waited 0.6 s", tag)).toContain("<dim>waited 0.6 s</dim>");
+		expect(colorTail(["waited 43.4 s"], tag)).toBe("<warning>waited 43.4 s</warning>");
+		expect(colorTail(["waited 0.6 s"], tag)).toBe("<dim>waited 0.6 s</dim>");
 		// monochrome: stripping colour leaves exactly the plain text
 		expect(len(renderNotice(data, false, 120, tag, len)[0])).toBe(renderNotice(data, false, 120, { fg: (_c, t) => t })[0].length);
 	});
@@ -611,8 +610,8 @@ describe("/zip status after a restart", async () => {
 		const branch = [out("a"), out("b"), out("c"), ph("a"), ph("b"), ph("c"), recall, { type: "context_edit", targetId: "x", replacement: { content: [{ type: "text", text: "someone else" }] } }, { type: "compaction", summary: "s", details: { by: "pi-zip" } }, { type: "compaction", summary: "pi", details: {} }];
 		const zip = new Zip(fakePi().pi); // a fresh process: its own counters are all 0
 		const { ctx } = fakeCtx([], { branch });
-		expect(zip.status(ctx)).toContain("this session: 3 folded outputs (~30K tokens), 1 summary, 1 recall");
+		expect(zip.status(ctx)).toContain("this session: 3 zipped (~30K tokens), 1 summary, 1 unzip");
 		expect(zip.status(ctx)).not.toContain("since pi started");
-		expect(zip.statsLine(ctx)).toContain("this session: 3 folded outputs (~30K tokens), 1 summary, 1 recall");
+		expect(zip.statsLine(ctx)).toContain("this session: 3 zipped (~30K tokens), 1 summary, 1 unzip");
 	});
 });

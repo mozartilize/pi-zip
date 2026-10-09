@@ -1,7 +1,7 @@
 // User-facing text (F15, F16): one notice line per turn, honest stats, the /zip command. Notices never enter model context.
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { type Any, PRODUCT } from "./util.ts";
-import type { CardData, StateWord } from "./ui.ts";
+import { brand, type CardData, type StateWord, SYM } from "./ui.ts";
 
 export interface NoticeAction {
 	kind: "fold" | "summary";
@@ -32,7 +32,7 @@ export interface NoticeData {
 	text: string;
 	before: number;
 	after: number;
-	desc: string; // "folded 12 old outputs · summarized 64 requests · ready while you were away"
+	desc: string; // "zipped 12 old outputs in 6 ms · summarized 64 requests in 38.2 s · ready while you were away" (older entries: "folded …")
 	why?: string; // expanded view: why now
 	items?: NoticeItem[];
 	more?: number; // folded outputs not listed
@@ -49,7 +49,7 @@ const dur = (ms: number) => (ms < 950 ? `${Math.max(1, Math.round(ms))} ms` : se
 export function noticeDesc(actions: NoticeAction[]): string {
 	return actions
 		.map((a) => {
-			if (a.kind === "fold") return `folded ${plural(a.count, "old output")} in ${dur(a.ms)}`;
+			if (a.kind === "fold") return `zipped ${plural(a.count, "old output")} in ${dur(a.ms)}`;
 			const wait = a.prepared ? 0 : (a.waitMs ?? a.ms);
 			const took = `summarized ${plural(a.count, "request")}`;
 			if (a.prepared) return `${took} in ${dur(a.ms)} · ready while you were away`;
@@ -59,15 +59,23 @@ export function noticeDesc(actions: NoticeAction[]): string {
 		.join(" · ");
 }
 
-export function noticeText(actions: NoticeAction[]): string {
-	const first = actions[0], last = actions[actions.length - 1];
-	return `${PRODUCT}  ${fmtK(first.tokensBefore)} → ${fmtK(last.tokensAfter)}  ${noticeDesc(actions)}`;
+/** The description split for the line: what happened (verbs) and how long it took / waited (tail). Reads old entries too. */
+export function splitDesc(desc: string): { verbs: string[]; tail: string[] } {
+	const verbs: string[] = [], tail: string[] = [];
+	for (const part of desc.split(" · ").filter(Boolean)) {
+		const m = /^(?:folded|zipped|summarized) (.*?)(?: in ([\d.]+ m?s))?$/.exec(part);
+		if (m) {
+			verbs.push(part.replace(/^folded /, "zipped ").replace(/ in [\d.]+ m?s$/, ""));
+			if (m[2]) tail.push(m[2]);
+		} else tail.push(part);
+	}
+	return { verbs, tail };
 }
 
-/** Ten cells, filled in proportion to what is left: length is read before any digit is. */
-export function ratioBar(before: number, after: number, cells = 10): string {
-	const f = before > 0 ? Math.min(cells, Math.max(1, Math.round((cells * after) / before))) : cells;
-	return "▰".repeat(f) + "▱".repeat(cells - f);
+export function noticeText(actions: NoticeAction[]): string {
+	const first = actions[0], last = actions[actions.length - 1];
+	const { verbs, tail } = splitDesc(noticeDesc(actions));
+	return `${PRODUCT}  ${verbs.join(" · ")}  ${fmtK(first.tokensBefore)} → ${fmtK(last.tokensAfter)}${tail.length ? "  " + tail.join(" · ") : ""}`;
 }
 
 export interface NoticeTheme {
@@ -75,48 +83,43 @@ export interface NoticeTheme {
 	bold?(text: string): string;
 }
 
-const MARK = "▸ ";
-const INDENT = " ".repeat(MARK.length + PRODUCT.length + 2);
+/** Detail lines sit under the words, after the monogram and its space. */
+const INDENT = " ".repeat(SYM.length + 1);
+const GAP = "   ";
 /** Waiting at least this long is a cost the user paid: it gets the warning colour. Shorter waits are not worth the eye. */
 const WAIT_NOTICEABLE_MS = 2000;
 
 /**
- * Colour, by meaning (theme tokens only, so dark/light/custom themes keep working; no meaning is carried by colour alone,
- * the words and the bar's shape say it all in monochrome too):
- *   accent  the brand mark: where the line comes from, scanned for, never the message
- *   muted   the old size: the past, deliberately quiet
- *   success the new size and the bar cells that remain: the one focal point of the line (what you now pay for)
- *   text    the verb phrase: what happened
- *   dim     everything that is context: arrow, separators, durations, "ready while you were away", the detail lines
+ * "ƶ zipped 12 old outputs   74K → 43K   6 ms"
+ * Colour, by meaning (theme tokens only, so dark/light/custom themes keep working; monochrome still reads):
+ *   accent  the monogram (bold): whose line it is
+ *   muted   the words: what happened
+ *   success the size now (bold): the one bright thing on the line
+ *   dim     the old size, the arrow, durations, "ready while you were away", the detail lines
  *   warning only a wait the user actually sat through (>= 2 s): the one thing pi-zip cost them
- * One saturated hue at a time per segment, at most three per line (accent, success, and warning only when it applies).
  */
-export function colorDesc(desc: string, th: NoticeTheme): string {
-	const sep = th.fg("dim", " · ");
-	return desc.split(" · ").map((part) => {
+export function colorTail(tail: string[], th: NoticeTheme): string {
+	return tail.map((part) => {
 		const waited = /^waited ([\d.]+) s$/.exec(part);
-		if (waited) return th.fg(Number(waited[1]) * 1000 >= WAIT_NOTICEABLE_MS ? "warning" : "dim", part);
-		const took = /^(.*?)( in [\d.]+ m?s)$/.exec(part);
-		if (/^(folded|summarized) /.test(part)) return took ? th.fg("text", took[1]) + th.fg("dim", took[2]) : th.fg("text", part);
-		return th.fg("dim", part);
-	}).join(sep);
+		return th.fg(waited && Number(waited[1]) * 1000 >= WAIT_NOTICEABLE_MS ? "warning" : "dim", part);
+	}).join(th.fg("dim", " · "));
 }
 
-/** Lines for the transcript. Narrow terminals drop whole segments in order (description, then bar); the numbers always stay.
+/** Lines for the transcript. Narrow terminals drop whole segments in order (tail, then words); the numbers always stay.
  *  `w` measures display width (Pi's visibleWidth in the renderer; string length in tests). Every line fits `width`. */
 export function renderNotice(d: NoticeData, expanded: boolean, width: number, th: NoticeTheme, w: (s: string) => number = (s) => s.length): string[] {
 	const b = fmtK(d.before), a = fmtK(d.after);
 	const nums = `${b} → ${a}`;
-	const bar = ratioBar(d.before, d.after);
 	const strong = (t: string) => (th.bold ? th.bold(t) : t);
-	const numsC = `${th.fg("muted", b)}${th.fg("dim", " → ")}${th.fg("success", strong(a))}`;
-	const kept = bar.replace(/▱/g, "").length;
-	const barC = th.fg("success", bar.slice(0, kept)) + th.fg("dim", bar.slice(kept));
-	const brand = th.fg("accent", MARK + PRODUCT);
+	const numsC = `${th.fg("dim", b)}${th.fg("dim", " → ")}${th.fg("success", strong(a))}`;
+	const { verbs, tail } = splitDesc(d.desc);
+	const said = verbs.join(" · "), saidC = verbs.map((v) => th.fg("muted", v)).join(th.fg("dim", " · "));
+	const tailP = tail.join(" · "), tailC = colorTail(tail, th);
+	const mark = brand(th);
 	const tries: [string, string][] = [
-		[`${MARK}${PRODUCT}  ${nums}  ${bar}  ${d.desc}`, `${brand}  ${numsC}  ${barC}  ${colorDesc(d.desc, th)}`],
-		[`${MARK}${PRODUCT}  ${nums}  ${bar}`, `${brand}  ${numsC}  ${barC}`],
-		[`${MARK}${PRODUCT}  ${nums}`, `${brand}  ${numsC}`],
+		...(said && tailP ? [[`${SYM} ${said}${GAP}${nums}${GAP}${tailP}`, `${mark} ${saidC}${GAP}${numsC}${GAP}${tailC}`] as [string, string]] : []),
+		...(said ? [[`${SYM} ${said}${GAP}${nums}`, `${mark} ${saidC}${GAP}${numsC}`] as [string, string]] : []),
+		[`${SYM} ${nums}`, `${mark} ${numsC}`],
 		[nums, numsC],
 	];
 	const head = tries.find(([plain]) => w(plain) <= width);
@@ -127,21 +130,21 @@ export function renderNotice(d: NoticeData, expanded: boolean, width: number, th
 		const ind = fit(plain);
 		if (ind !== null) out.push(th.fg("dim", ind + plain));
 	};
-	if (d.first) sub("originals are kept · the model can recall any of them");
+	if (d.first) sub("originals are kept · the model can unzip any of them");
 	if (!expanded) return out;
-	if (d.why) sub(d.why);
 	const items = d.items ?? [];
 	const lw = Math.min(32, Math.max(0, ...items.map((i) => i.label.length)));
 	for (const i of items) {
 		const label = i.label.length > lw ? i.label.slice(0, lw - 1) + "…" : i.label.padEnd(lw);
 		const size = fmtK(i.tokens).padStart(6);
-		const plain = `${label}${size}  ${i.handle}`;
+		const plain = `${label}${size}   ${i.handle}`;
 		const ind = fit(plain);
 		if (ind === null) continue;
-		// an item row: what it was (text), how big (muted), and its handle (dim: there if you need it, quiet if you don't)
-		out.push(th.fg("dim", ind) + th.fg("text", label) + th.fg("muted", size) + th.fg("dim", `  ${i.handle}`));
+		// an item row: what it was (muted, like the words above), how big and its handle (dim: there if you need it)
+		out.push(th.fg("dim", ind) + th.fg("muted", label) + th.fg("dim", size) + th.fg("dim", `   ${i.handle}`));
 	}
 	if (d.more) sub(`… ${d.more} more`);
+	if (d.why) sub(d.why);
 	return out;
 }
 
