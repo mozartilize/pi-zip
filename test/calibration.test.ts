@@ -142,6 +142,96 @@ describe("calibrate: O and c from the branch", () => {
 	});
 });
 
+describe("calibrate: per model, Pi's compaction, dropped responses", () => {
+	const as = (e: Any[], ids: string[], provider: string, model: string) => {
+		for (const x of e) if (ids.includes(x.sourceEntry.id)) Object.assign(x.sourceEntry.message, { provider, model });
+		return e;
+	};
+	const GLM = "zai/glm-like", CLA = "anthropic/claude-like";
+	const switched = () => {
+		const e = session(8);
+		provider(e, 15_000, 1.0, ["a1", "a2", "a3", "a4"]);
+		as(e, ["a1", "a2", "a3", "a4"], "zai", "glm-like");
+		provider(e, 30_000, 1.9, ["a5", "a6", "a7", "a8", "a9"]);
+		return as(e, ["a5", "a6", "a7", "a8", "a9"], "anthropic", "claude-like");
+	};
+
+	test("a model switch: only the current model's responses are evidence; the size after a deep fold stays within 5% (one scale for both: -25%)", () => {
+		const e = switched();
+		const branch = e.map((x) => ({ type: "message", id: x.sourceEntry.id, message: x.sourceEntry.message }));
+		for (const cal of [calibrate(e), calibrate(e, undefined, branch), calibrate(e, undefined, branch, CLA)]) {
+			expect(cal.oSource).toBe("model"); // the first Claude response is no opening request: O comes from the GLM O in content units
+			for (const keep of [0.5, 0.2, 0.1]) {
+				const E = keep * content(e);
+				expect(Math.abs(sizeOf(cal, E) / (30_000 + 1.9 * E) - 1)).toBeLessThan(0.05);
+			}
+		}
+		// the old model on its own is still read exactly (its first request is an opening one)
+		const glm = calibrate(e, undefined, branch, GLM);
+		expect(glm.oSource).toBe("first");
+		expect(Math.abs(glm.O - 15_000)).toBeLessThan(100);
+		expect(glm.c).toBeCloseTo(1.0, 2);
+		// right after the switch, before any response of the new model: nothing of the old one carries over
+		const before = e.slice(0, e.findIndex((x) => x.sourceEntry.id === "a5"));
+		expect(calibrate(before, undefined, [], CLA)).toMatchObject({ c: C0, source: "default", oSource: "default" });
+		expect(calibrate(before, undefined, [], CLA).O).toBeCloseTo(R0 * sysEst({ text: "x".repeat(8_000), tools: TOOLS }), 6);
+	});
+
+	test("the session's first request counts for O only if it went to the current model", () => {
+		const e = switched();
+		const branch = e.map((x) => ({ type: "message", id: x.sourceEntry.id, message: x.sourceEntry.message }));
+		// a Claude session that opened on Claude: O from its own first request
+		const own = provider(session(8), 30_000, 1.9, ["a1", "a9"]);
+		as(own, ["a1", "a9"], "anthropic", "claude-like");
+		expect(calibrate(own, undefined, own.map((x) => ({ type: "message", id: x.sourceEntry.id, message: x.sourceEntry.message })), CLA).oSource).toBe("first");
+		expect(calibrate(e, undefined, branch, CLA).oSource).not.toBe("first");
+	});
+
+	test("Pi's own compaction: only the first response after its entry can have carried it (the one before read a pi-zip valve fold, 60K)", () => {
+		const T = Date.parse("2026-10-09T04:00:00Z");
+		const comp = { sourceEntry: { id: "cmp", type: "compaction", timestamp: new Date(T).toISOString(), details: {} }, messages: [{ role: "compactionSummary", summary: "s".repeat(20_000), tokensBefore: 0, timestamp: T }] };
+		const e = [comp, at(U("k1", "kept"), T - 9_000), at(A("k0", ["c0"]), T - 8_500), R("k0r", "c0", 200_000), at(A("k2", ["c1"]), T - 8_000), R("kr", "c1", 30_000), at(A("k3"), T - 7_000), at(U("u2", "next"), T + 1_000), at(A("a1", ["c2"]), T + 2_000), R("r2", "c2", 40_000), at(A("a2"), T + 3_000)];
+		provider(e, 30_000, 2.1, ["k0", "k2"]);
+		provider(e, 30_000, 2.1, ["k3"], () => 60_000); // a valve fold of pi-zip: the read stopped at the folded output
+		provider(e, 30_000, 2.1, ["a1"], () => 30_000); // carried Pi's summary: the read stopped at the system prompt + tools
+		provider(e, 30_000, 2.1, ["a2"]);
+		const cal = calibrate(e);
+		expect(cal.oSource).toBe("summary");
+		expect(cal.O).toBe(30_000);
+		expect(cal.c).toBeCloseTo(2.1, 2);
+	});
+
+	test("/zip folded total: each fold on the scale of the model that made it, not today's c for all", async () => {
+		const { Zip } = await import("../src/run.ts");
+		const e = [SYS("s0", "x".repeat(8_000)), U("u1", "one"), A("a1", ["c1"]), R("ra", "c1", 40_000), A("a2"), U("u2", "two"), A("a3", ["c2"]), R("rb", "c2", 40_000), A("a4")];
+		provider(e, 15_000, 1, ["a1", "a2"]);
+		as(e, ["a1", "a2"], "zai", "glm-like");
+		provider(e, 30_000, 2, ["a3", "a4"]);
+		as(e, ["a3", "a4"], "anthropic", "claude-like");
+		const ph = (id: string) => ({ type: "context_edit", targetId: id, replacement: { content: [{ type: "text", text: `[folded by pi-zip · bash ls · handle ${id}]` }] } });
+		const msg = (x: Any) => ({ type: "message", id: x.sourceEntry.id, message: x.sourceEntry.message });
+		const branch = [...e.slice(0, 5).map(msg), ph("ra"), ...e.slice(5).map(msg), ph("rb")];
+		const { ctx } = fakeCtx(e, { branch, model: { provider: "anthropic", id: "claude-like", contextWindow: 1_000_000 } });
+		const m = /(\d+(?:\.\d+)?)K tokens/.exec(new Zip(fakePi().pi).statsLine(ctx));
+		expect(Number(m![1])).toBeGreaterThan(28); // ~10K chars/4 x 1 (GLM) + ~10K x 2 (Claude) = ~30K; one c for both: ~40K
+		expect(Number(m![1])).toBeLessThan(32);
+	});
+
+	test("an aborted or errored assistant message (pi-ai drops it before sending) adds nothing to the content estimate", () => {
+		const ok = session(4);
+		const withAbort = session(4);
+		const i = withAbort.findIndex((x) => x.sourceEntry.id === "a3");
+		const ab = A("ab", ["cx", "cy"]);
+		Object.assign(ab.sourceEntry.message, { stopReason: "aborted", content: [...ab.sourceEntry.message.content, { type: "text", text: "partial ".repeat(2_000) }] });
+		withAbort.splice(i, 0, ab);
+		expect(buildBlocks(withAbort).find((b) => b.entryId === "ab")!.tokens).toBe(0);
+		expect(content(withAbort)).toBe(content(ok));
+		provider(ok, 20_000, 2, ["a1", "a5"]);
+		provider(withAbort, 20_000, 2, ["a1", "a5"]);
+		expect(calibrate(withAbort).c).toBeCloseTo(calibrate(ok).c, 6);
+	});
+});
+
 describe("every limit and every number on the right scale", () => {
 	const turns = (n: number, chars: number) => Array.from({ length: n }, (_, t) => [U(`u${t}`, `q${t}`), A(`a${t}`, [`c${t}`]), R(`r${t}`, `c${t}`, chars), A(`z${t}`)]).flat();
 

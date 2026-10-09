@@ -104,6 +104,8 @@ export const editAllowed = (B: number, A: number, P: number, room: number | null
 //   c  (real - O) / content of the newest response, clamped to [C_MIN, C_MAX] (a guard for a tiny content estimate; recorded sessions
 //      span 0.7-3.9); C0 before the first response. A response followed by edits it did not carry (a warm-valve edit is persisted at
 //      turn_end and first sent with the next request: that response's prompt did not shrink) is counted with the originals.
+//   Both are per model: only responses of the model the next request goes to count. After a switch, before its first response,
+//   O = R0 x the system state and c = C0; after it, with no O evidence of its own, O = c x X, X = O / c of the previous model.
 export const C0 = 1.5;
 export const C_MIN = 0.5;
 export const C_MAX = 4;
@@ -121,42 +123,51 @@ export interface Scale {
 	real: number; // input + cacheRead + cacheWrite of the newest usable response (0 = none)
 	est: number; // estimated content that request carried
 	source: "usage" | "default"; // where c comes from
-	oSource: "summary" | "first" | "default"; // where O comes from
+	oSource: "summary" | "first" | "model" | "default"; // where O comes from ("model": another model's O in content units, X = O' / c')
 }
 /** Sizes taken as real (tests, and the ledger of a plan made without calibration). */
 export const UNIT: Scale = { O: 0, c: 1, real: 0, est: 0, source: "default", oSource: "default" };
 /** Real tokens of a context whose content is estimated at `content`. */
 export const sizeOf = (s: Pick<Scale, "O" | "c">, content: number): number => s.O + s.c * content;
 
+/** A response pi-ai drops before sending (an error or an abort): it carries no usable usage and adds nothing to later requests. */
+const dropped = (m: Any): boolean => m?.role === "assistant" && (m.stopReason === "error" || m.stopReason === "aborted");
+/** chars/4 a message adds to every later request: tokensOf, except 0 for an assistant message pi-ai drops before sending. */
+export const wireTokensOf = (m: Any): number => (dropped(m) ? 0 : tokensOf(m));
 /** Prompt size the provider reported for a response that really ran (0 = none, an error or an abort). */
 const promptOf = (m: Any): number => {
-	const u = m?.role === "assistant" && m.stopReason !== "error" && m.stopReason !== "aborted" ? m.usage : null;
+	const u = m?.role === "assistant" && !dropped(m) ? m.usage : null;
 	return u ? (Number(u.input) || 0) + (Number(u.cacheRead) || 0) + (Number(u.cacheWrite) || 0) : 0;
 };
+/** "provider/model" of a response ("" = not recorded: such a response counts for any model). */
+const respKey = (m: Any): string => (m?.provider || m?.model ? `${m.provider ?? ""}/${m.model ?? ""}` : "");
 /** chars/4 of the system state the transcript records in `msgs` (-1: none recorded). */
 function sysOf(msgs: Any[]): number {
 	const s = collapseSystem(msgs);
 	return s ? sysEst({ text: [textOf(s.content), ...Object.values<string>(s.sections ?? {})].filter((x) => x).join("\n\n"), tools: s.toolsAdded ?? [] }) : -1;
 }
-/** The session's first response on the branch: its prompt, the content before it and the system state it was sent with. */
-function firstRequest(branch: Any[]): { real: number; est: number; S: number } | null {
+/** The session's first response from model `key` on the branch: its prompt, the content before it and the system state it was sent with. */
+function firstRequest(branch: Any[], key: string): { real: number; est: number; S: number } | null {
 	const sys: Any[] = [];
 	let est = 0;
 	for (const e of branch) {
 		const m = e?.type === "message" ? e.message : e?.type === "custom_message" ? { role: "custom", content: e.content } : null;
 		if (!m) continue;
 		if (m.role === "system") { sys.push(m); continue; }
-		const real = promptOf(m);
-		if (real > 0) return { real, est, S: sysOf(sys) };
-		est += tokensOf(m);
+		const real = promptOf(m), k = respKey(m);
+		if (real > 0 && (!key || !k || k === key)) return { real, est, S: sysOf(sys) };
+		est += wireTokensOf(m);
 	}
 	return null;
 }
 
 /** O and c from the projection (`entries`) and, for the session's first request, the branch; `sys` stands in for a transcript without
- *  system messages. */
-export function calibrate(entries: Any[], sys?: SysInfo, branch: Any[] = []): Scale {
-	type Resp = { at: number; est: number; real: number; read: number; nSys: number; ts: number };
+ *  system messages. `model` = "provider/id" of the model the next request goes to (default: the newest response's): O and c are
+ *  properties of the provider's tokenizer, so only that model's responses are evidence. With none, O = R0 x the system state and
+ *  c = C0; with responses but no O evidence of its own (a model switch mid-session), O keeps the size another model measured in
+ *  content units, X = O' / c' (the system prompt and tools tokenize like the content around them): real = c (X + E). */
+export function calibrate(entries: Any[], sys?: SysInfo, branch: Any[] = [], model?: string): Scale {
+	type Resp = { at: number; est: number; real: number; read: number; nSys: number; ts: number; key: string };
 	const resp: Resp[] = [];
 	const sysMsgs: Any[] = [];
 	const edits: { at: number; target: string }[] = [];
@@ -165,12 +176,12 @@ export function calibrate(entries: Any[], sys?: SysInfo, branch: Any[] = []): Sc
 	entries.forEach((pe, at) => {
 		const src = pe.sourceEntry, msgs: Any[] = pe.messages ?? [];
 		if (src?.type === "context_edit") edits.push({ at, target: src.targetId });
-		if (src?.type === "message" && msgs.length === 1 && msgs[0] !== src.message) orig.set(src.id, { at, d: tokensOf(src.message) - tokensOf(msgs[0]) });
+		if (src?.type === "message" && msgs.length === 1 && msgs[0] !== src.message) orig.set(src.id, { at, d: wireTokensOf(src.message) - wireTokensOf(msgs[0]) });
 		for (const m of msgs) {
 			if (m?.role === "system") { sysMsgs.push(m); sysAt = resp.length; continue; }
 			const real = promptOf(m);
-			if (real > 0) resp.push({ at, est, real, read: Number(m.usage.cacheRead) || 0, nSys: sysMsgs.length, ts: Number(m.timestamp) || 0 });
-			est += tokensOf(m);
+			if (real > 0) resp.push({ at, est, real, read: Number(m.usage.cacheRead) || 0, nSys: sysMsgs.length, ts: Number(m.timestamp) || 0, key: respKey(m) });
+			est += wireTokensOf(m);
 		}
 	});
 	const sAt = (n: number) => sysOf(sysMsgs.slice(0, n)); // the system state after the first n system messages (computed only where needed)
@@ -178,37 +189,56 @@ export function calibrate(entries: Any[], sys?: SysInfo, branch: Any[] = []): Sc
 	const Snow = S >= 0 ? S : sys ? sysEst(sys) : 0;
 	const head = entries[0]?.sourceEntry?.type === "compaction" ? entries[0].sourceEntry : null;
 	const headMs = head ? Date.parse(head.timestamp) || 0 : 0;
-	// evidence for O, the newest wins (it needs the smallest correction for system changes since)
-	const ev: { at: number; O: number; S: number; src: Scale["oSource"] }[] = [];
 	const opening = (r: { real: number; est: number } | null | undefined) => !!r && C0 * r.est <= 0.1 * r.real; // content small next to O
-	const f = branch.length ? firstRequest(branch) : head ? null : resp[0]; // the session's first request
-	if (f && opening(f)) ev.push({ at: -1, O: f.real - C0 * f.est, S: "S" in f ? f.S : sAt(f.nSys), src: "first" });
-	const cur = resp[sysAt]; // the first response sent with the current system prompt and tools
-	if (cur && (!head || cur.ts > headMs) && opening(cur)) ev.push({ at: sysAt, O: cur.real - C0 * cur.est, S, src: "first" });
-	if (head) { // the summary at the head was first carried by the last response before its entry (a run plan) or the first one after it
-		const after = resp.findIndex((r) => r.ts > headMs);
-		for (const i of after < 0 ? [resp.length - 1] : [after - 1, after]) {
-			const r = resp[i], prev = resp[i - 1];
-			if (r && r.read > 0 && r.read < 0.8 * r.real && (!prev || r.read < 0.8 * prev.real)) { ev.push({ at: i, O: r.read, S: sAt(r.nSys), src: "summary" }); break; }
+
+	const fit = (want: string, transfer: boolean): Scale => {
+		const mine = (r: Resp | undefined): r is Resp => !!r && (!want || !r.key || r.key === want);
+		// evidence for O, the newest wins (it needs the smallest correction for system changes since)
+		const ev: { at: number; O: number; S: number; src: Scale["oSource"] }[] = [];
+		const f = branch.length ? firstRequest(branch, want) : head ? null : resp.find(mine); // the session's first request
+		if (f && opening(f)) ev.push({ at: -1, O: f.real - C0 * f.est, S: "S" in f ? f.S : sAt(f.nSys), src: "first" });
+		const ci = resp.findIndex((r, i) => i >= sysAt && mine(r)), cur = resp[ci]; // the first response sent with the current system prompt and tools
+		if (cur && (!head || cur.ts > headMs) && opening(cur)) ev.push({ at: ci, O: cur.real - C0 * cur.est, S, src: "first" });
+		if (head) {
+			// the summary at the head was first carried by the first response after its entry, or, for pi-zip's own summary (a run plan,
+			// request-local), by the last one before it; Pi's or another extension's compaction is never sent before its entry
+			const after = resp.findIndex((r) => r.ts > headMs), ours = head.details?.by === PRODUCT;
+			for (const i of after < 0 ? (ours ? [resp.length - 1] : []) : ours ? [after - 1, after] : [after]) {
+				const r = resp[i], prev = resp[i - 1];
+				if (mine(r) && r.read > 0 && r.read < 0.8 * r.real && (!prev || r.read < 0.8 * prev.real)) { ev.push({ at: i, O: r.read, S: sAt(r.nSys), src: "summary" }); break; }
+			}
 		}
-	}
-	const best = ev.sort((a, b) => b.at - a.at)[0];
-	const O = best ? Math.max(0, best.O + (best.S >= 0 && S >= 0 ? R0 * (Snow - best.S) : 0)) : R0 * Snow, oSource = best?.src ?? "default";
-	// c from the newest response
-	const n = resp.length - 1;
-	if (n < 0) return { O, c: C0, real: 0, est: 0, source: "default", oSource };
-	const N = resp[n];
-	let estN = N.est;
-	const later = edits.filter((x) => x.at > N.at), cutLater = !!head && headMs > N.ts;
-	if (later.length || cutLater) {
-		// carried (a run plan): the prompt shrank, or a read stopped early; a cache miss alone (no read at all) proves nothing.
-		// Pi's own compaction is never request-local.
-		const P = resp[n - 1];
-		const carried = !(cutLater && head.details?.by !== PRODUCT) && (!P || N.real < P.real || (N.read > 0 && N.read < 0.8 * P.real));
-		if (!carried && cutLater) return { O, c: C0, real: N.real, est: 0, source: "default", oSource }; // what it carried is summarised away
-		if (!carried) for (const x of later) { const t = orig.get(x.target); if (t && t.at < N.at) estN += t.d; }
-	}
-	return { O, c: estN > 0 ? clamp((N.real - O) / estN, C_MIN, C_MAX) : C0, real: N.real, est: estN, source: estN > 0 ? "usage" : "default", oSource };
+		const best = ev.sort((a, b) => b.at - a.at)[0];
+		let O = best ? Math.max(0, best.O + (best.S >= 0 && S >= 0 ? R0 * (Snow - best.S) : 0)) : R0 * Snow, oSource: Scale["oSource"] = best?.src ?? "default";
+		// c from the newest response of this model
+		let n = resp.length - 1;
+		while (n >= 0 && !mine(resp[n])) n--;
+		if (n < 0) return { O, c: C0, real: 0, est: 0, source: "default", oSource };
+		const N = resp[n];
+		let estN = N.est;
+		const later = edits.filter((x) => x.at > N.at), cutLater = !!head && headMs > N.ts;
+		if (later.length || cutLater) {
+			// carried (a run plan): the prompt shrank, or a read stopped early; a cache miss alone (no read at all) proves nothing.
+			// Pi's own compaction is never request-local.
+			let p = n - 1;
+			while (p >= 0 && !mine(resp[p])) p--;
+			const P = resp[p];
+			const carried = !(cutLater && head.details?.by !== PRODUCT) && (!P || N.real < P.real || (N.read > 0 && N.read < 0.8 * P.real));
+			if (!carried && cutLater) return { O, c: C0, real: N.real, est: 0, source: "default", oSource }; // what it carried is summarised away
+			if (!carried) for (const x of later) { const t = orig.get(x.target); if (t && t.at < N.at) estN += t.d; }
+		}
+		if (!best && transfer && estN > 0) {
+			// no O of its own: the newest other model's O in content units
+			const other = [...resp].reverse().find((r) => r.key && r.key !== want)?.key;
+			const o = other ? fit(other, false) : null;
+			if (o && o.oSource !== "default" && o.c > 0) {
+				const X = o.O / o.c, c = clamp(N.real / (X + estN), C_MIN, C_MAX);
+				return { O: c * X, c, real: N.real, est: estN, source: "usage", oSource: "model" };
+			}
+		}
+		return { O, c: estN > 0 ? clamp((N.real - O) / estN, C_MIN, C_MAX) : C0, real: N.real, est: estN, source: estN > 0 ? "usage" : "default", oSource };
+	};
+	return fit(model || [...resp].reverse().find((r) => r.key)?.key || "", true);
 }
 
 export const settings = () => ({
@@ -276,7 +306,7 @@ export function buildBlocks(contextEntries: Any[], steerIds?: Set<string>): Bloc
 			for (const c of msg.content ?? []) if (c?.type === "toolCall") issued.set(c.id, asst);
 		}
 		asstOf[blocks.length] = kind === "toolResult" ? (issued.get(msg.toolCallId) ?? asst) : asst;
-		blocks.push({ idx: blocks.length, entryId: src.id ?? null, kind, msg, raw, tokens: msgs.reduce((a, m) => a + tokensOf(m), 0), userTurn, edited, ours, age: 0 });
+		blocks.push({ idx: blocks.length, entryId: src.id ?? null, kind, msg, raw, tokens: msgs.reduce((a, m) => a + wireTokensOf(m), 0), userTurn, edited, ours, age: 0 });
 	}
 	for (const b of blocks) if (b.kind === "toolResult") b.age = asst - asstOf[b.idx];
 	return blocks;
