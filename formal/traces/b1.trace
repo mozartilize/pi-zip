@@ -1,0 +1,9 @@
+# B1 (mode inconsistency), as the checker shrank it on 0.2.8: the warm run plan summarises what the cold plan's summary
+# gate would refuse (MP fails at req 2: the summary fires at P >= 0.51, not at P = 0)
+world explicit known ttl=300 true=300 survival=none c=1 sys=3000 window=200000 native interactive
+prompt
+say 60K
+prompt +60s
+say 100
+prompt +60s
+say 100
