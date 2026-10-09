@@ -66,13 +66,13 @@ Everything else pi-zip shows uses the same one-line grammar, and only when somet
 The first one appears once per machine. A folded output keeps its place in the transcript; its tool row gets a dim mark on the right, so you can see what the model no longer sees in full:
 
 ```
- $ npm test                                                              ▸ folded
+ $ npm test                                                              ▸ pi-zip folded
 ```
 
 A recall looks like any other tool row and names what came back (ctrl+o shows the recalled text):
 
 ```
- recall bash npm test  "Expected"
+ ▸ pi-zip  recall bash npm test  "Expected"
  3 of 812 lines
 ```
 

@@ -124,7 +124,11 @@ export class Zip implements ZipControl {
 			const ph = String(e?.replacement?.content?.[0]?.text ?? "");
 			if (e?.type !== "context_edit" || !ph.startsWith(PH_MARK)) continue;
 			const h = handleFor(e.targetId);
-			const label = ph.slice(0, ph.indexOf("\n") >>> 0).split(" · ")[1];
+			// older placeholders wrote a read slice as "offset=1 limit=2000": show it the way Pi does ("path:1-2000")
+			const label = ph.slice(0, ph.indexOf("\n") >>> 0).split(" · ")[1]?.replace(/ offset=(\d+)(?: limit=(\d+))?$| limit=(\d+)$/, (_m, o, l, l2) => {
+				const st = o ? +o : 1, li = l ?? l2;
+				return `:${st}${li ? `-${st + +li - 1}` : ""}`;
+			});
 			if (label) this.labels.set(h, label);
 			const id = byId.get(e.targetId)?.message?.toolCallId;
 			if (typeof id === "string") this.foldedCalls.set(id, h);

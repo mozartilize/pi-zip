@@ -69,10 +69,10 @@ describe("zip_recall row", () => {
 	});
 	test("collapsed: one quiet line per handle; expanded: the text, capped, control characters stripped", () => {
 		// like Pi's own tool rows: the name, then WHAT comes back (the folded output's label when known, else the handle)
-		expect(recallCallLine({ handle: h, grep: "Expected" }, 120, th)).toEqual([`recall ${h}  "Expected"`]);
-		expect(recallCallLine({ handle: h, grep: "Expected" }, 120, th, undefined, (x) => (x === h ? "bash npm test" : undefined))).toEqual([`recall bash npm test  "Expected"`]);
-		expect(recallCallLine({ handle: h }, 120, { fg: (c: string, t: string) => `<${c}>${t}</${c}>`, bold: (t: string) => `*${t}*` }, undefined, () => "read src/a.ts")).toEqual(["<toolTitle>*recall*</toolTitle> <accent>read src/a.ts</accent><dim></dim>"]);
-		expect(recallCallLine({ handles: [h, "x"] }, 120, th)).toEqual(["recall 2 outputs"]);
+		expect(recallCallLine({ handle: h, grep: "Expected" }, 120, th)).toEqual([`▸ pi-zip  recall ${h}  "Expected"`]);
+		expect(recallCallLine({ handle: h, grep: "Expected" }, 120, th, undefined, (x) => (x === h ? "bash npm test" : undefined))).toEqual([`▸ pi-zip  recall bash npm test  "Expected"`]);
+		expect(recallCallLine({ handle: h }, 120, { fg: (c: string, t: string) => `<${c}>${t}</${c}>`, bold: (t: string) => `*${t}*` }, undefined, () => "read src/a.ts")).toEqual(["<accent>▸ pi-zip</accent>  <toolTitle>*recall*</toolTitle> <accent>read src/a.ts</accent><dim></dim>"]);
+		expect(recallCallLine({ handles: [h, "x"] }, 120, th)).toEqual(["▸ pi-zip  recall 2 outputs"]);
 		const secs = [{ handle: h, label: "bash npm test", turn: 1, totalLines: 812, shownLines: 1, how: "grep" as const }];
 		expect(recallResultLines(secs, "x", false, 120, th)).toEqual(["1 of 812 lines"]);
 		expect(recallResultLines([...secs, { ...secs[0], label: "read a.ts", how: "all" as const, totalLines: 9 }], "x", false, 120, th)).toEqual(["bash npm test  1 of 812 lines", "read a.ts  all 9 lines"]);
@@ -82,16 +82,20 @@ describe("zip_recall row", () => {
 		expect(ex.at(-1)).toBe("… 10 more lines (the model got them all)");
 		for (const w of [5, 20, 60]) expect(fits(recallResultLines(secs, long, true, w, th), w)).toBe(true);
 		expect(recallResultLines([{ handle: "nope", missing: true }], "", false, 80, tag)).toEqual(["<error>nope not found</error>"]);
+		// expanded: only the recalled text, not the framing the model gets (it repeats the collapsed line)
+		const framed = `[handle ${h} · read · 7089 chars · 117 lines]\n[grep: 2 matching line(s) of 117]\n31: const HALF_LIFE = 16;\n89: x\n[… 900 more chars: call zip_recall again with offset=10]`;
+		expect(recallResultLines(secs, framed, true, 120, th)).toEqual(["1 of 812 lines", "31: const HALF_LIFE = 16;", "89: x"]);
+		expect(recallResultLines(secs, `[handle ${h} · read · 7089 chars · 117 lines]\n[grep: 0 matching line(s) of 117]\n`, true, 120, th)).toEqual(["1 of 812 lines"]);
 	});
 });
 
 describe("the mark on a folded output", () => {
 	test("right-aligned on the first line when it fits, untouched otherwise", () => {
-		expect(markFirstLine(["$ npm test", "out"], "k3x9q2m7ab", 50, th)).toEqual([`$ npm test${" ".repeat(50 - 10 - 8)}▸ folded`, "out"]);
+		expect(markFirstLine(["$ npm test", "out"], "k3x9q2m7ab", 50, th)).toEqual([`$ npm test${" ".repeat(50 - 10 - 15)}▸ pi-zip folded`, "out"]);
 		// a row padded to the full width (styles closed after the padding) still gets the mark, at the same width
 		const padded = markFirstLine(["\x1b[1m$ npm test" + " ".repeat(40) + "\x1b[0m"], "k3x9q2m7ab", 50, th, { vw: (x: string) => x.replace(/\x1b\[[0-9;]*m/g, "").length, cut: (x: string) => x });
-		expect(padded[0]).toBe(`\x1b[1m$ npm test\x1b[0m${" ".repeat(50 - 10 - 8)}▸ folded`);
-		expect(markFirstLine(["$ npm test"], "k3x9q2m7ab", 19, th)).toEqual(["$ npm test"]);
+		expect(padded[0]).toBe(`\x1b[1m$ npm test\x1b[0m${" ".repeat(50 - 10 - 15)}▸ pi-zip folded`);
+		expect(markFirstLine(["$ npm test"], "k3x9q2m7ab", 26, th)).toEqual(["$ npm test"]);
 	});
 	test("wired through registerToolRenderer: wraps the built-in renderer and marks only folded calls", async () => {
 		const { default: piZip } = await import("../src/index.ts");
@@ -107,7 +111,7 @@ describe("the mark on a folded output", () => {
 		const { ctx } = fakeCtx([], { branch });
 		await f.handlers.get("session_start")({}, ctx);
 		const folded = r.renderCall({ command: "npm test" }, th, { toolCallId: "c1" });
-		expect(folded.render(60)[0]).toEndWith("▸ folded");
+		expect(folded.render(60)[0]).toEndWith("▸ pi-zip folded");
 		expect(folded.extra).toBe(7); // everything else passes through
 		expect(r.renderCall({ command: "ls" }, th, { toolCallId: "c2" }).render(60)).toEqual(["$ ls"]);
 		expect(resolver("zip_recall", () => base)).toBe(base);

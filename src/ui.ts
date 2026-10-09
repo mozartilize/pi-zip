@@ -117,12 +117,13 @@ export function recallCallLine(args: { handle?: string; handles?: string[]; grep
 	const hs = [...(typeof args?.handle === "string" ? [args.handle] : []), ...(Array.isArray(args?.handles) ? args.handles.filter((h) => typeof h === "string") : [])];
 	const what = hs.length > 1 ? `${hs.length} outputs` : hs[0] ? (labelOf(hs[0].trim()) ?? hs[0]) : "";
 	const opt = [args?.grep ? `"${args.grep}"` : "", args?.range ? `lines ${args.range}` : "", args?.offset ? `from char ${args.offset}` : ""].filter(Boolean).join(" · ");
-	const head = "recall";
+	// "▸ pi-zip" first, as on every pi-zip line (the brand mark in the accent colour), then the row in Pi's tool-row shape
+	const brand = HEAD + "  ", head = brand + "recall";
 	const plain = m.cut(`${head} ${what}${opt ? "  " + opt : ""}`, width);
 	const bold = (t: string) => (th.bold ? th.bold(t) : t);
-	if (!plain.startsWith(head + " ")) return [th.fg("toolTitle", bold(plain))];
+	if (!plain.startsWith(head + " ")) return [th.fg("accent", plain)];
 	const w = plain.slice(head.length + 1, head.length + 1 + what.length);
-	return [th.fg("toolTitle", bold(head)) + " " + th.fg("accent", w) + th.fg("dim", plain.slice(head.length + 1 + w.length))];
+	return [th.fg("accent", HEAD) + "  " + th.fg("toolTitle", bold("recall")) + " " + th.fg("accent", w) + th.fg("dim", plain.slice(head.length + 1 + w.length))];
 }
 
 export function sectionLine(s: RecallSectionInfo, many = false): string {
@@ -131,6 +132,8 @@ export function sectionLine(s: RecallSectionInfo, many = false): string {
 	const got = s.how === "all" ? `all ${total} lines` : `${s.shownLines ?? 0} of ${total} lines`;
 	return many ? `${s.label || s.handle}  ${got}` : got;
 }
+
+const RECALL_FRAME = /^\[(handle \S+( · |\]| not found)|grep( \(|: )|range: lines |chars \d+-\d+ of |… \d+ more chars: )/;
 
 /** Collapsed: what came back ("2 of 142 lines"; one line per output for a batch). Expanded: the recalled text, at most maxLines. */
 export function recallResultLines(sections: RecallSectionInfo[], text: string, expanded: boolean, width: number, th: Th, m: Measure = plainMeasure, maxLines = 40): string[] {
@@ -141,7 +144,9 @@ export function recallResultLines(sections: RecallSectionInfo[], text: string, e
 	}
 	if (!sections.length && text) out.push(th.fg("dim", m.cut(clean(text.split("\n")[0]), width)));
 	if (!expanded || !text) return out;
-	const lines = clean(text).split("\n");
+	// the model's framing lines ("[handle … · 117 lines]", "[grep: 0 matching line(s) of 117]", page notes) repeat the row above: the user sees only the text
+	const lines = clean(text).split("\n").filter((l) => !RECALL_FRAME.test(l));
+	if (!lines.some((l) => l.trim())) return out;
 	for (const l of lines.slice(0, maxLines)) out.push(th.fg("toolOutput", m.cut(l, width)));
 	if (lines.length > maxLines) out.push(th.fg("dim", m.cut(`… ${lines.length - maxLines} more lines (the model got them all)`, width)));
 	return out;
@@ -149,10 +154,10 @@ export function recallResultLines(sections: RecallSectionInfo[], text: string, e
 
 // ---- the mark on a folded output ---------------------------------------------------------------------------------------
 
-/** Right-aligns "▸ folded" on the first line of a tool call row, if it fits; otherwise leaves the row alone. */
+/** Right-aligns "▸ pi-zip folded" on the first line of a tool call row, if it fits; otherwise leaves the row alone. */
 export function markFirstLine(lines: string[], handle: string, width: number, th: Th, m: Measure = plainMeasure): string[] {
 	if (!lines.length) return lines;
-	const mark = `${MARK}folded`; // the handle is in the notice (ctrl+o) and in the model's view; here it would only be noise
+	const mark = `${HEAD} folded`; // whose mark it is, quietly; the handle is in the notice (ctrl+o) and in the model's view; here it would only be noise
 	// renderers often pad a row to the full width (and may close styles after the padding): drop the padding, keep the codes
 	const first = lines[0].replace(/ +((?:\x1b\[[0-9;]*m)*)$/, "$1");
 	const gap = width - m.vw(first) - m.vw(mark);

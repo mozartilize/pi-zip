@@ -532,6 +532,14 @@ describe("observed TTL tier", () => {
 	});
 });
 
+test("a read slice is written the way Pi's read row writes it", async () => {
+	const { shortArgs } = await import("../src/placeholder.ts");
+	expect(shortArgs({ path: "src/a.ts" })).toBe("src/a.ts");
+	expect(shortArgs({ path: "src/a.ts", offset: 1, limit: 2000 })).toBe("src/a.ts:1-2000");
+	expect(shortArgs({ path: "src/a.ts", offset: 50 })).toBe("src/a.ts:50");
+	expect(shortArgs({ path: "src/a.ts", limit: 20 })).toBe("src/a.ts:1-20");
+});
+
 describe("notices and stats", () => {
 	test("fmtK", () => expect([fmtK(84200), fmtK(31500), fmtK(182000), fmtK(41000)]).toEqual(["84.2K", "31.5K", "182K", "41K"]));
 	const fold: NoticeAction = { kind: "fold", count: 12, tokensBefore: 84200, tokensAfter: 31500, ms: 0.94 };
