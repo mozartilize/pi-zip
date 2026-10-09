@@ -38,7 +38,7 @@ export function checkEdits(blocks: Block[], userTurns: number, folds: FoldTarget
 	const live = folds.filter((t) => byId.has(t.entryId));
 	const cutBlock = cut ? byId.get(cut.firstKeptEntryId) : undefined;
 	if (cut && !cutBlock) return `cut target ${cut.firstKeptEntryId} is not in the projection`;
-	return validateEdits(blocks, { folds: new Map(live.map((t) => [byId.get(t.entryId)!.idx, t.ph])), recover: new Map(live.map((t) => [byId.get(t.entryId)!.idx, t.recover])), cut: cutBlock ? cutBlock.idx : null }, userTurns);
+	return validateEdits(blocks, { folds: new Map(live.map((t) => [byId.get(t.entryId)!.idx, t.ph])), recover: new Map(live.map((t) => [byId.get(t.entryId)!.idx, t.recover])), cut: cutBlock ? cutBlock.idx : null, ahead: !!cut?.ahead }, userTurns);
 }
 
 /** A summary being prepared (or finished) while the user is away. It has its own AbortController: no run owns it. */
@@ -816,7 +816,7 @@ export class Zip implements ZipControl {
 			source, folds: onPre ? rebaseFolds(folds, p!.cutVisibleIdx) : folds, cut, native: native ?? undefined, ctxBefore, ctxAfter, ms: foldMs, scale: cal, persisted: false,
 			waitMs: cut ? (adopted ? this.bgWaitMs : cut.ms) : 0, cutVisibleIdx: p?.cutVisibleIdx ?? -1, cutKeptFirstMsg: p?.cutKeptFirstMsg, untouched: p ? sizeOf(cal, untouchedEst(p.blocks, folds, !!(cut ?? native))) : sizeOf(cal, 0),
 		};
-		this.ledger({ type: "cold_plan", trigger, source, folds: folds.length, summary: !!(cut ?? native), ...(native ? { via: "native", onPre } : {}), ...this.calOf(cal), ctxBefore: Math.round(ctxBefore), ctxAfter: Math.round(ctxAfter), ms: Math.round(foldMs), ...(cut ? { summaryMs: cut.ms, llmOk: cut.llmOk, waitedMs: Math.round(adopted ? this.bgWaitMs : cut.ms), ...this.usageOf(cut) } : {}) });
+		this.ledger({ type: "cold_plan", trigger, source, folds: folds.length, summary: !!(cut ?? native), ...(p?.ahead ? { ahead: true } : {}), ...(native ? { via: "native", onPre } : {}), ...this.calOf(cal), ctxBefore: Math.round(ctxBefore), ctxAfter: Math.round(ctxAfter), ms: Math.round(foldMs), ...(cut ? { summaryMs: cut.ms, llmOk: cut.llmOk, waitedMs: Math.round(adopted ? this.bgWaitMs : cut.ms), ...this.usageOf(cut) } : {}) });
 	}
 
 	/** Ledger form of a calibration; ctxBefore/ctxAfter next to it are already real (O + c x estimate). */
@@ -853,7 +853,7 @@ export class Zip implements ZipControl {
 			} else {
 				this.discardBg();
 			}
-			this.ledger({ type: "settle_plan", folds: p.folds.length, summary: p.cutIdx !== null, timerMs: scheduledMs, ...this.calOf(cal), ctxBefore: Math.round(p.ctxTokens), ms: Math.round(performance.now() - t0) });
+			this.ledger({ type: "settle_plan", folds: p.folds.length, summary: p.cutIdx !== null, ...(p.ahead ? { ahead: true } : {}), timerMs: scheduledMs, ...this.calOf(cal), ctxBefore: Math.round(p.ctxTokens), ms: Math.round(performance.now() - t0) });
 			if (!p.folds.length && p.cutIdx === null) return undefined;
 			// ids only: placeholders and summary text are recomputed (they are pure functions of the session), never stored a second time
 			const data = { policy: PRODUCT, ts: Date.now(), targets: p.folds.map((t) => t.entryId), cutKey: p.firstKeptEntryId };

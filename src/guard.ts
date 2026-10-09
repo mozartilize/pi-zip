@@ -1,5 +1,5 @@
 // Guard (F13, I5): validate an edit set before committing it, and repair orphan tool results in the outgoing payload.
-import { RELAX_PREV_TURN, settings, type Block } from "./plan.ts";
+import { finalAnswerIdx, RELAX_PREV_TURN, settings, type Block } from "./plan.ts";
 import type { Any } from "./util.ts";
 
 const PROTECT_USER_TURNS = 2;
@@ -10,6 +10,7 @@ export interface EditSet {
 	recover?: Map<number, string | undefined>; // block idx -> "rereadable" | "nonrereadable" (needed for folds in the previous user turn)
 	relax?: boolean; // default RELAX_PREV_TURN
 	inturnAge?: number; // default settings().inturnAge: an output (any class) at least this many assistant requests old may fold in a protected turn (0 = never)
+	ahead?: boolean; // a lookahead cut (plan.ts LOOKAHEAD): it may lie inside the previous user turn, never past that turn's final answer
 }
 
 /**
@@ -63,7 +64,7 @@ export function validateEdits(blocks: Block[], plan: EditSet, userTurns: number)
 	}
 	if (plan.cut !== null) {
 		if (plan.cut < 1 || plan.cut >= blocks.length) return `bad cut ${plan.cut}`;
-		if (limit >= 0 && plan.cut > limit) return `cut ${plan.cut} inside the last ${PROTECT_USER_TURNS} user turns`;
+		if (limit >= 0 && plan.cut > limit && !(plan.ahead && plan.cut <= finalAnswerIdx(blocks, userTurns - 1))) return `cut ${plan.cut} inside the last ${PROTECT_USER_TURNS} user turns`;
 		const kb = blocks[plan.cut];
 		if (!kb.entryId || (kb.kind !== "user" && kb.kind !== "assistant")) return `cut ${plan.cut} is not at a user/assistant message`;
 		// only what the cut itself would create is our problem; a session that was already odd stays as odd as it was
