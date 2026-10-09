@@ -239,7 +239,8 @@ describe("F12 summary prepared while the user is away (timer at 0.8 x TTL)", () 
 
 	test("a summary still being written when the cold user returns: only the remainder is waited for, and nothing is built twice", async () => {
 		const st = { calls: 0, delay: 250 };
-		const r = await rig(done, COLD_TS(), { modelRegistry: { complete: mkComplete(st) } });
+		const working: (string | undefined)[] = [];
+		const r = await rig(done, COLD_TS(), { modelRegistry: { complete: mkComplete(st) }, ui: { notify: () => {}, setWorkingMessage: (t?: string) => working.push(t) } });
 		const settled = await settle(r);
 		await sleep(150); // timer fired at ~80 ms; the call needs 250 ms
 		expect(st.calls).toBe(1);
@@ -248,9 +249,11 @@ describe("F12 summary prepared while the user is away (timer at 0.8 x TTL)", () 
 		expect(Date.now() - t0).toBeLessThan(250); // less than a full call
 		expect(req.messages[0].role).toBe("compactionSummary");
 		expect(st.calls).toBe(1);
+		// Pi's working line while the user waits, then cleared. In Pi 1.1.0 Esc there aborts the whole prompt: the line says so
+		expect(working).toEqual(["pi-zip: finishing the summary it started while you were away · Esc cancels this prompt", undefined]);
 	});
 
-	test("Esc while waiting stops the waiting, not the work: the request goes on without the cut and the summary stays usable", async () => {
+	test("Esc while waiting (Pi cancels the prompt): pi-zip stops waiting at once, adds no cut, and the summary goes on for the next try", async () => {
 		const st = { calls: 0, delay: 300, signals: [] as Any[] };
 		const r = await rig(done, COLD_TS(), { modelRegistry: { complete: mkComplete(st) } });
 		const settled = await settle(r);
@@ -261,9 +264,36 @@ describe("F12 summary prepared while the user is away (timer at 0.8 x TTL)", () 
 		const t0 = Date.now();
 		const req = await comeBack(r, settled, COLD_TS());
 		expect(Date.now() - t0).toBeLessThan(250);
-		expect(req === undefined || req.messages[0].role !== "compactionSummary").toBe(true); // folds only; no summary yet
+		expect(req).toBeUndefined(); // the request never goes out: nothing is applied ...
+		expect(r.notes).toEqual([]); // ... nor announced
+		expect(await r.fire("turn_end", { ...turnEnd([...back, A("a6")], "a6"), message: { role: "assistant", stopReason: "aborted", usage: {} } })).toBeUndefined(); // ... nor persisted
 		expect(st.calls).toBe(1);
 		expect(st.signals[0]?.aborted).toBe(false); // the background call has its own controller: Esc did not cancel it
+		// the next try uses the summary that went on being written
+		await sleep(350);
+		(r.ctx as Any).signal = undefined;
+		const again = await comeBack(r, settled, COLD_TS());
+		expect(again.messages[0].role).toBe("compactionSummary");
+		expect(st.calls).toBe(1);
+	});
+
+	test("Esc while waiting, with a fold in the kept part: that fold is not applied, announced or persisted either (the request never went out)", async () => {
+		const done2 = [U("u1", "one"), A("a1", ["c1"]), R("r1", "c1", 44_000), AX("a2", 120_000), U("u2", "two"), A("a3", ["c3"]), R("r3", "c3", 44_000), AX("a4", 120_000), U("u3", "three"), A("a5", ["c5"]), R("r5", "c5", 30_000), A("a5e")];
+		const back2 = [...done2, U("u4", "back")];
+		const st = { calls: 0, delay: 300 };
+		const r = await rig(done2, COLD_TS(), { modelRegistry: { complete: mkComplete(st) } });
+		const settled = await r.fire("agent_before_settle", { context: { contextEntries: done2 }, entries: [] });
+		await sleep(150);
+		const esc = new AbortController();
+		(r.ctx as Any).signal = esc.signal;
+		setTimeout(() => esc.abort(), 30);
+		r.ctx.sessionManager.getBranch = () => [...branchOf(done2, COLD_TS()), settled.entries.at(-1)];
+		r.ctx.sessionManager.buildSessionProjection = () => ({ entries: back2 });
+		await r.fire("before_agent_start", {});
+		expect(await r.fire("context_with_system", { messages: flat(back2) })).toBeUndefined(); // the relax fold of r5 stays out
+		expect(r.notes).toEqual([]);
+		expect(await r.fire("turn_end", { ...turnEnd([...back2, A("a6")], "a6"), message: { role: "assistant", stopReason: "aborted", usage: {} } })).toBeUndefined();
+		expect(st.calls).toBe(1);
 	});
 
 	test("print/json mode (no UI): settle does nothing and starts nothing; a cold return that needs a summary computes it then", async () => {
