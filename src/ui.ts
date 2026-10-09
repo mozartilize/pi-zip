@@ -132,6 +132,8 @@ export function sectionLine(s: RecallSectionInfo, many = false): string {
 	return many ? `${s.label || s.handle}  ${got}` : got;
 }
 
+const RECALL_FRAME = /^\[(handle \S+( · |\]| not found)|grep( \(|: )|range: lines |chars \d+-\d+ of |… \d+ more chars: )/;
+
 /** Collapsed: what came back ("2 of 142 lines"; one line per output for a batch). Expanded: the recalled text, at most maxLines. */
 export function recallResultLines(sections: RecallSectionInfo[], text: string, expanded: boolean, width: number, th: Th, m: Measure = plainMeasure, maxLines = 40): string[] {
 	const out: string[] = [];
@@ -141,7 +143,9 @@ export function recallResultLines(sections: RecallSectionInfo[], text: string, e
 	}
 	if (!sections.length && text) out.push(th.fg("dim", m.cut(clean(text.split("\n")[0]), width)));
 	if (!expanded || !text) return out;
-	const lines = clean(text).split("\n");
+	// the model's framing lines ("[handle … · 117 lines]", "[grep: 0 matching line(s) of 117]", page notes) repeat the row above: the user sees only the text
+	const lines = clean(text).split("\n").filter((l) => !RECALL_FRAME.test(l));
+	if (!lines.some((l) => l.trim())) return out;
 	for (const l of lines.slice(0, maxLines)) out.push(th.fg("toolOutput", m.cut(l, width)));
 	if (lines.length > maxLines) out.push(th.fg("dim", m.cut(`… ${lines.length - maxLines} more lines (the model got them all)`, width)));
 	return out;

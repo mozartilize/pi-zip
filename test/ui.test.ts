@@ -82,6 +82,10 @@ describe("zip_recall row", () => {
 		expect(ex.at(-1)).toBe("… 10 more lines (the model got them all)");
 		for (const w of [5, 20, 60]) expect(fits(recallResultLines(secs, long, true, w, th), w)).toBe(true);
 		expect(recallResultLines([{ handle: "nope", missing: true }], "", false, 80, tag)).toEqual(["<error>nope not found</error>"]);
+		// expanded: only the recalled text, not the framing the model gets (it repeats the collapsed line)
+		const framed = `[handle ${h} · read · 7089 chars · 117 lines]\n[grep: 2 matching line(s) of 117]\n31: const HALF_LIFE = 16;\n89: x\n[… 900 more chars: call zip_recall again with offset=10]`;
+		expect(recallResultLines(secs, framed, true, 120, th)).toEqual(["1 of 812 lines", "31: const HALF_LIFE = 16;", "89: x"]);
+		expect(recallResultLines(secs, `[handle ${h} · read · 7089 chars · 117 lines]\n[grep: 0 matching line(s) of 117]\n`, true, 120, th)).toEqual(["1 of 812 lines"]);
 	});
 });
 
