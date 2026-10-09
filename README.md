@@ -35,57 +35,59 @@ Known limits:
 
 ## What you see
 
-At most one line per turn, at the top of the turn, only when the context was folded or summarized. The numbers come first, and the bar shows how much is left:
+One mark, ƶ, and three words: **zipped**, **unzip**, **summarized**. Only the new context size is bright. At most one line per turn, at the top of the turn, only when the context was zipped or summarized:
 
 ```
-▸ pi-zip  74K → 43K  ▰▰▰▰▰▰▱▱▱▱  folded 12 old outputs in 6 ms
-          originals are kept · the model can recall any of them
-▸ pi-zip  182K → 41K  ▰▰▱▱▱▱▱▱▱▱  summarized 64 requests in 38.2 s · ready while you were away
+ƶ zipped 12 old outputs   74K → 43K   6 ms
+  originals are kept · the model can unzip any of them
+ƶ summarized 64 requests   182K → 41K   38.2 s · ready while you were away
 ```
 
-The second line appears once per session. Click the notice (or expand tool output with ctrl+o) to see why it happened now and what was folded:
+The second line appears once per session. A summary that made you wait says so (`waited 8.4 s`, highlighted from 2 s on). Click the line (or expand tool output with ctrl+o) to see what was zipped and why now:
 
 ```
-▸ pi-zip  74K → 43K  ▰▰▰▰▰▰▱▱▱▱  folded 12 old outputs in 6 ms
-          away 47 min
-          bash npm test         14K  k3x9q2m7ab
-          read src/payment.ts    9K  p8d2x1qa0m
-          … 10 more
+ƶ zipped 12 old outputs   74K → 43K   6 ms
+  bash npm test         14K   k3x9q2m7ab
+  read src/payment.ts  9.1K   p8d2x1qa0m
+  … 10 more
+  away 47 min
 ```
 
-These lines are saved in the session, so they are still there after a restart, but they are never sent to the model. On narrow terminals the words go first, then the bar; the numbers always stay. A summary still shows up as Pi's own `[compaction]` block as well; the pi-zip line next to it tells you who made it. The pi-zip numbers are real tokens, the same scale as Pi's context meter (the meter adds the newest reply's output on top); the `Compacted from N tokens` figure in Pi's block is Pi's own estimate taken when the entry is saved, so it will not match.
+These lines are saved in the session, so they are still there after a restart, but they are never sent to the model. On narrow terminals the time goes first, then the words; the numbers always stay. A summary still shows up as Pi's own `[compaction]` block as well; the ƶ line next to it tells you who made it. The pi-zip numbers are real tokens, the same scale as Pi's context meter (the meter adds the newest reply's output on top); the `Compacted from N tokens` figure in Pi's block is Pi's own estimate taken when the entry is saved, so it will not match.
 
-Everything else pi-zip shows uses the same one-line grammar, and only when something changed:
-
-```
-▸ pi-zip  on  folds old tool output after the prompt cache expires (5 min here) · nothing to set up · /zip for status
-▸ pi-zip  reread-only  a tool allowlist hides zip_recall · only re-readable outputs fold · allow zip_recall to fold more
-▸ pi-zip  paused  billion-context also manages context, so pi-zip only guards requests · to use pi-zip: pi remove the other one
-```
-
-The first one appears once per machine. A folded output keeps its place in the transcript; its tool row gets a dim mark on the right, so you can see what the model no longer sees in full:
+A zipped output keeps its place in the transcript; its tool row gets a dim mark, so you can see what the model no longer sees in full:
 
 ```
- $ npm test                                                              ▸ pi-zip folded
+ $ npm test  ƶ zipped
+ read src/payment.ts  ƶ zipped
 ```
 
-A recall looks like any other tool row and names what came back (ctrl+o shows the recalled text):
+When the model fetches an original back, it looks like any other tool row and names what came back (ctrl+o shows the text):
 
 ```
- ▸ pi-zip  recall bash npm test  "Expected"
+ ƶ unzip bash npm test  /Expected/
  3 of 812 lines
 ```
 
-While a summary started in the background is being finished, Pi's working line says so (Esc skips the wait). `/zip` prints a small card into the transcript:
+Everything else uses the same grammar, and only when something changed:
 
 ```
-▸ pi-zip  on
+ƶ pi-zip  on  old tool output gets zipped once the prompt cache expires (5 min here) · /zip
+ƶ pi-zip  reread-only  a tool allowlist hides zip_recall · only re-readable outputs fold · allow zip_recall to fold more
+ƶ pi-zip  paused  billion-context also manages context, so pi-zip only guards requests · to use pi-zip: pi remove the other one
+```
+
+The first one appears once per machine. While a summary started in the background is being finished, Pi's working line says so (Esc skips the wait). `/zip` prints a small card into the transcript:
+
+```
+ƶ pi-zip  on
   cache    anthropic/claude-sonnet-5-5 · explicit · lives ~5 min (declared)
   alive    ██████▁▁▁▁▁▁▁▁▁▁  30 s → 2 h
-  session  56 folds ~310K  ·  2 summaries $0.41  ·  3 recalls
-  last     10:50  folded 12 old outputs in 6 ms · away 47 min
+  session  56 zipped ~310K  ·  2 summaries $0.41  ·  3 unzips
   mode     full (zip_recall available)
 ```
+
+ƶ (U+01B6) is a plain Latin letter, one column wide everywhere, CJK terminals included. Most coding fonts have it; where one does not (Hack, Source Code Pro), the terminal draws it from a fallback font.
 
 `alive` is what pi-zip currently believes about the cache: how likely it is to be still warm after 30 s, 1 min, … 2 h away, learned from the provider's replies (see below). Notices state facts (how long you were away), not guesses: whether the cache really had expired is read from the provider's reply afterwards and goes into this curve, so a wrong guess is not repeated.
 
@@ -127,7 +129,7 @@ key lines kept (original line numbers; up to 8):
 Original kept byte for byte, recallable even after summaries or compaction: zip_recall("k3f9a0x1qz") (optional grep/range) is instant, free, no side effects; prefer it to re-running or re-reading (output may differ). Do not guess its content.
 ```
 
-Placeholders are written once, when the fold is saved: sessions folded by an earlier version keep their old placeholder text unchanged. Summaries list each folded output with its handle, turn and outcome in the same way. A summary of an earlier summary merges it section by section (requests, files, commands, other calls, errors, handle table, handle index) instead of clipping its text: items are deduplicated, the oldest are dropped first under a per-section budget with a count of what was left out, and the previous narrative survives as a short tail excerpt. Pi's own free-text compaction summaries are carried as a head-and-tail excerpt.
+Placeholders are written once, when the fold is saved: sessions folded by an earlier version keep their old placeholder text unchanged. Summaries list each folded output with its handle, turn and outcome in the same way, and say at the top that the 10-character code next to a command, file or call is its handle and that what an output said is to be recalled rather than re-run or re-read. A summary of an earlier summary merges it section by section (requests, files, commands, other calls, errors, handle table, handle index) instead of clipping its text: items are deduplicated, the oldest are dropped first under a per-section budget with a count of what was left out, and the previous narrative survives as a short tail excerpt. Pi's own free-text compaction summaries are carried as a head-and-tail excerpt.
 
 The model recalls by itself when it needs the content:
 
@@ -135,9 +137,10 @@ The model recalls by itself when it needs the content:
 zip_recall({ handles: ["k3f9a0x1qz", "m2b7c4d8ww"] })
 zip_recall({ handle: "k3f9a0x1qz", grep: "ERROR|FAIL" })
 zip_recall({ handle: "k3f9a0x1qz", range: "120-240" })
+zip_recall({ grep: "ECONNREFUSED" })     // no handle: searches every earlier tool output
 ```
 
-Recall is batched, exact, and also works for outputs from before a compaction or a pi-zip summary (summaries carry a handle table and a budgeted index of older handles). Output comes back in pages of 20,000 characters; the page says how to continue:
+Recall is batched, exact, and also works for outputs from before a compaction or a pi-zip summary (summaries carry a handle table and a budgeted index of older handles). Each recalled section is headed by the handle and the command or path that produced it, so a look-alike output (the same command run again, another slice of the same file) is easy to spot. Without a handle, `grep` searches every earlier tool output of the session (zip_recall results excepted, outputs from before a compaction included), newest output first, each match under its output's handle and command: this also reaches an output whose handle a long summary no longer lists. Output comes back in pages of 20,000 characters (8,000 for a search without a handle; a later page of a search covers the same outputs as its first page, so new output arriving in between does not shift it); the page says how to continue:
 
 ```
 zip_recall({ handle: "k3f9a0x1qz", offset: 20000 })               // next page, by characters

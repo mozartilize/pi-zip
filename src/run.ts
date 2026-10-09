@@ -146,7 +146,7 @@ export class Zip implements ZipControl {
 		}
 	}
 
-	/** A state change as one transcript line ("▸ pi-zip  paused  …"); each word once per session unless always. */
+	/** A state change as one transcript line ("ƶ pi-zip  paused  …"); each word once per session unless always. */
 	stateLine(ctx: Any, word: StateWord, reason: string, once = true) {
 		const text = `${PRODUCT}  ${word}  ${reason}`;
 		if (ctx?.mode !== "tui" && word !== "paused") return; // print/json/rpc (sub-agents): no transcript to keep it in
@@ -170,7 +170,7 @@ export class Zip implements ZipControl {
 			return;
 		}
 		const ttl = ttlFor(ctx.model ?? this.model);
-		this.stateLine(ctx, "on", `folds old tool output after the prompt cache expires (${fmtLife(ttl / 1000).slice(1)} here) · nothing to set up · /zip for status`);
+		this.stateLine(ctx, "on", `old tool output gets zipped once the prompt cache expires (${fmtLife(ttl / 1000).slice(1)} here) · /zip`);
 	}
 
 	ledger(rec: Record<string, unknown>) {
@@ -805,7 +805,7 @@ export class Zip implements ZipControl {
 	private sessionTotals(ctx: Any): string {
 		const { folds, folded, summaries, recalls, usd } = this.totals(ctx);
 		const n = (x: number, one: string, many: string) => `${x} ${x === 1 ? one : many}`;
-		return `this session: ${n(folds, "folded output", "folded outputs")} (~${fmtK(folded)} tokens), ${n(summaries, "summary", "summaries")}${usd > 0 ? ` (summary calls $${usd.toFixed(4)})` : ""}, ${n(recalls, "recall", "recalls")}`;
+		return `this session: ${folds} zipped (~${fmtK(folded)} tokens), ${n(summaries, "summary", "summaries")}${usd > 0 ? ` (summary calls $${usd.toFixed(4)})` : ""}, ${n(recalls, "unzip", "unzips")}`;
 	}
 	/** The /zip status card (rendered by ui.ts renderCard). */
 	card(ctx?: Any): CardData {

@@ -52,7 +52,7 @@ export default function piZip(pi: ExtensionAPI) {
 			};
 		});
 		zip.entryRenderer = typeof pi.registerEntryRenderer === "function";
-		// a folded output keeps its place in the transcript; its call row gets a dim "▸ folded · <handle>" on the right
+		// a folded output keeps its place in the transcript; its call row gets "ƶ zipped" right after its own text
 		pi.registerToolRenderer?.((toolName: string, next: () => Any) => {
 			const base = next();
 			if (toolName === RECALL_TOOL || typeof base?.renderCall !== "function") return base;
