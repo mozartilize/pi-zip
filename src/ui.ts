@@ -1,6 +1,8 @@
 // Transcript surfaces (pure, testable): the status card, state lines, the zip_recall row and the fold mark on a folded output.
-// One visual grammar everywhere: "▸ pi-zip" in the accent colour, numbers in the text colour, everything else dim, no boxes;
-// collapsed = the conclusion, ctrl+o = the detail. Every returned line fits the given width.
+// One visual grammar everywhere: the monogram ƶ (bold, accent) says whose line it is, the words zip / zipped / unzip say what
+// happened, the one bright thing is the size now; everything else is dim, no boxes, no other symbols.
+// Collapsed = the conclusion, click or ctrl+o = the detail. Every returned line fits the given width.
+// ƶ (U+01B6) is a Latin letter: East Asian width N, so one column in every terminal and locale; fonts without it fall back.
 import { PRODUCT } from "./util.ts";
 
 export interface Th {
@@ -22,8 +24,9 @@ export function setMeasure(m: Measure) {
 	measure = m;
 }
 
-export const MARK = "▸ ";
-const HEAD = MARK + PRODUCT;
+/** The pi-zip monogram: z for zip, the stroke is the slider. */
+export const SYM = "ƶ";
+export const brand = (th: Th): string => th.fg("accent", th.bold ? th.bold(SYM) : SYM);
 const LABEL_W = 9;
 
 /** Plain text without control characters (tabs become two spaces): recalled output goes into the TUI as text, never as escape codes. */
@@ -34,14 +37,14 @@ export const clean = (s: string): string => s.replace(/\t/g, "  ").replace(/\x1b
 export type StateWord = "on" | "off" | "paused" | "reread-only" | "quiet" | "notices on" | "cache";
 const WARN = new Set<StateWord>(["off", "paused", "reread-only"]);
 
-/** "▸ pi-zip  paused  billion-context also manages context · run: pi remove npm:billion-context" */
+/** "ƶ pi-zip  paused  billion-context also manages context · run: pi remove npm:billion-context" */
 export function renderState(word: StateWord, reason: string, width: number, th: Th, m: Measure = plainMeasure): string[] {
-	const wordC = th.fg(WARN.has(word) ? "warning" : "accent", word);
-	const base = `${HEAD}  ${word}`;
+	const wordC = th.fg(WARN.has(word) ? "warning" : word === "on" ? "success" : "muted", word);
+	const base = `${SYM} ${PRODUCT}  ${word}`;
 	if (m.vw(base) > width) return m.vw(word) <= width ? [wordC] : [];
 	const room = width - m.vw(base) - 2;
 	const r = reason && room >= 12 ? m.cut(reason, room) : "";
-	return [`${th.fg("accent", HEAD)}  ${wordC}${r ? "  " + th.fg("dim", r) : ""}`];
+	return [`${brand(th)} ${th.fg("muted", PRODUCT)}  ${wordC}${r ? "  " + th.fg("dim", r) : ""}`];
 }
 
 // ---- status card ------------------------------------------------------------------------------------------------------
@@ -79,7 +82,7 @@ export function cardText(c: CardData): string[] {
 	if (c.model) rows.push(["cache", [c.model, c.cls ?? "class unknown until the first reply", c.life ? `lives ${c.life}` : ""].filter(Boolean).join(" · ")]);
 	if (c.alive?.length) rows.push(["alive", `${sparkline(c.alive)}  30 s → 2 h`]);
 	const n = (x: number, one: string, many = one + "s") => `${x} ${x === 1 ? one : many}`;
-	rows.push(["session", `${n(c.folds, "fold")} ~${c.foldedTokens}  ·  ${n(c.summaries, "summary", "summaries")}${c.summaryUsd > 0 ? ` $${c.summaryUsd.toFixed(2)}` : ""}  ·  ${n(c.recalls, "recall")}`]);
+	rows.push(["session", `${c.folds} zipped ~${c.foldedTokens}  ·  ${n(c.summaries, "summary", "summaries")}${c.summaryUsd > 0 ? ` $${c.summaryUsd.toFixed(2)}` : ""}  ·  ${n(c.recalls, "unzip")}`]);
 	if (c.last) rows.push(["last", c.last]);
 	const mode = c.state === "reread-only" ? "reread-only (zip_recall hidden by a tool allowlist)" : "full (zip_recall available)";
 	rows.push(["mode", `${mode}${c.quiet ? " · notices off" : ""}`]);
@@ -88,7 +91,7 @@ export function cardText(c: CardData): string[] {
 
 export function renderCard(c: CardData, width: number, th: Th, m: Measure = plainMeasure): string[] {
 	const out = renderState(c.state, c.stateNote ?? "", width, th, m);
-	const indent = "  ";
+	const indent = "  "; // under the words after the monogram
 	for (const row of cardText(c)) {
 		const line = m.cut(indent + row, width);
 		if (!line) continue;
@@ -111,19 +114,19 @@ export interface RecallSectionInfo {
 	missing?: boolean;
 }
 
-/** "recall read src/learn.ts  "HALF_LIFE"": the same shape as Pi's own tool rows (bold name, accent argument); the argument says
- *  WHAT comes back (the folded output's label), not its handle. `labelOf` maps a handle to that label when it is known. */
+/** "ƶ unzip src/learn.ts:1-2000  /HALF_LIFE/": the same shape as Pi's own tool rows (bold name, accent argument) after the monogram;
+ *  the argument says WHAT comes back (the folded output's label), not its handle. `labelOf` maps a handle to that label when known. */
 export function recallCallLine(args: { handle?: string; handles?: string[]; grep?: string; range?: string; offset?: number }, width: number, th: Th, m: Measure = plainMeasure, labelOf: (h: string) => string | undefined = () => undefined): string[] {
 	const hs = [...(typeof args?.handle === "string" ? [args.handle] : []), ...(Array.isArray(args?.handles) ? args.handles.filter((h) => typeof h === "string") : [])];
-	const what = hs.length > 1 ? `${hs.length} outputs` : hs[0] ? (labelOf(hs[0].trim()) ?? hs[0]) : "";
-	const opt = [args?.grep ? `"${args.grep}"` : "", args?.range ? `lines ${args.range}` : "", args?.offset ? `from char ${args.offset}` : ""].filter(Boolean).join(" · ");
-	// "▸ pi-zip" first, as on every pi-zip line (the brand mark in the accent colour), then the row in Pi's tool-row shape
-	const brand = HEAD + "  ", head = brand + "recall";
+	const label = (h: string) => (labelOf(h.trim()) ?? h).replace(/^read /, ""); // "read src/a.ts" reads as "unzip src/a.ts"
+	const what = hs.length > 1 ? `${hs.length} outputs` : hs[0] ? label(hs[0]) : args?.grep ? "all outputs" : ""; // grep without a handle searches every output
+	const opt = [args?.grep ? `/${args.grep}/` : "", args?.range ? `lines ${args.range}` : "", args?.offset ? `from char ${args.offset}` : ""].filter(Boolean).join(" · ");
+	const head = `${SYM} unzip`;
 	const plain = m.cut(`${head} ${what}${opt ? "  " + opt : ""}`, width);
 	const bold = (t: string) => (th.bold ? th.bold(t) : t);
-	if (!plain.startsWith(head + " ")) return [th.fg("accent", plain)];
+	if (!plain.startsWith(head + " ")) return [th.fg("dim", plain)];
 	const w = plain.slice(head.length + 1, head.length + 1 + what.length);
-	return [th.fg("accent", HEAD) + "  " + th.fg("toolTitle", bold("recall")) + " " + th.fg("accent", w) + th.fg("dim", plain.slice(head.length + 1 + w.length))];
+	return [brand(th) + " " + th.fg("toolTitle", bold("unzip")) + " " + th.fg("accent", w) + th.fg("dim", plain.slice(head.length + 1 + w.length))];
 }
 
 export function sectionLine(s: RecallSectionInfo, many = false): string {
@@ -133,7 +136,7 @@ export function sectionLine(s: RecallSectionInfo, many = false): string {
 	return many ? `${s.label || s.handle}  ${got}` : got;
 }
 
-const RECALL_FRAME = /^\[(handle \S+( · |\]| not found)|grep( \(|: )|range: lines |chars \d+-\d+ of |… \d+ more chars: )/;
+const RECALL_FRAME = /^\[(handle \S+( · |\]| not found)|grep( \(|: | over )|range: lines |chars \d+-\d+ of |… \d+ more chars: )/;
 
 /** Collapsed: what came back ("2 of 142 lines"; one line per output for a batch). Expanded: the recalled text, at most maxLines. */
 export function recallResultLines(sections: RecallSectionInfo[], text: string, expanded: boolean, width: number, th: Th, m: Measure = plainMeasure, maxLines = 40): string[] {
@@ -154,13 +157,14 @@ export function recallResultLines(sections: RecallSectionInfo[], text: string, e
 
 // ---- the mark on a folded output ---------------------------------------------------------------------------------------
 
-/** Right-aligns "▸ pi-zip folded" on the first line of a tool call row, if it fits; otherwise leaves the row alone. */
+/** "$ npm test  ƶ zipped": the mark follows the call row's own text, if it fits; otherwise the row is left alone. */
 export function markFirstLine(lines: string[], handle: string, width: number, th: Th, m: Measure = plainMeasure): string[] {
 	if (!lines.length) return lines;
-	const mark = `${HEAD} folded`; // whose mark it is, quietly; the handle is in the notice (ctrl+o) and in the model's view; here it would only be noise
+	// the handle is in the notice (click / ctrl+o) and in the model's view; here it would only be noise
 	// renderers often pad a row to the full width (and may close styles after the padding): drop the padding, keep the codes
 	const first = lines[0].replace(/ +((?:\x1b\[[0-9;]*m)*)$/, "$1");
-	const gap = width - m.vw(first) - m.vw(mark);
-	if (gap < 2) return lines;
-	return [first + " ".repeat(gap) + th.fg("dim", mark), ...lines.slice(1)];
+	const markW = 2 + m.vw(`${SYM} zipped`);
+	if (m.vw(first) + markW > width) return lines;
+	const pad = width - m.vw(first) - markW; // keep the row as wide as it was (Pi pads rows to the full width)
+	return [first + "  " + brand(th) + th.fg("dim", " zipped") + " ".repeat(pad), ...lines.slice(1)];
 }
