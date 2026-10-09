@@ -127,7 +127,7 @@ key lines kept (original line numbers; up to 8):
 Original kept byte for byte, recallable even after summaries or compaction: zip_recall("k3f9a0x1qz") (optional grep/range) is instant, free, no side effects; prefer it to re-running or re-reading (output may differ). Do not guess its content.
 ```
 
-Placeholders are written once, when the fold is saved: sessions folded by an earlier version keep their old placeholder text unchanged. Summaries list each folded output with its handle, turn and outcome in the same way. A summary of an earlier summary merges it section by section (requests, files, commands, other calls, errors, handle table, handle index) instead of clipping its text: items are deduplicated, the oldest are dropped first under a per-section budget with a count of what was left out, and the previous narrative survives as a short tail excerpt. Pi's own free-text compaction summaries are carried as a head-and-tail excerpt.
+Placeholders are written once, when the fold is saved: sessions folded by an earlier version keep their old placeholder text unchanged. Summaries list each folded output with its handle, turn and outcome in the same way, and say at the top that the 10-character code next to a command, file or call is its handle and that what an output said is to be recalled rather than re-run or re-read. A summary of an earlier summary merges it section by section (requests, files, commands, other calls, errors, handle table, handle index) instead of clipping its text: items are deduplicated, the oldest are dropped first under a per-section budget with a count of what was left out, and the previous narrative survives as a short tail excerpt. Pi's own free-text compaction summaries are carried as a head-and-tail excerpt.
 
 The model recalls by itself when it needs the content:
 
@@ -135,9 +135,10 @@ The model recalls by itself when it needs the content:
 zip_recall({ handles: ["k3f9a0x1qz", "m2b7c4d8ww"] })
 zip_recall({ handle: "k3f9a0x1qz", grep: "ERROR|FAIL" })
 zip_recall({ handle: "k3f9a0x1qz", range: "120-240" })
+zip_recall({ grep: "ECONNREFUSED" })     // no handle: searches every earlier tool output
 ```
 
-Recall is batched, exact, and also works for outputs from before a compaction or a pi-zip summary (summaries carry a handle table and a budgeted index of older handles). Output comes back in pages of 20,000 characters; the page says how to continue:
+Recall is batched, exact, and also works for outputs from before a compaction or a pi-zip summary (summaries carry a handle table and a budgeted index of older handles). Each recalled section is headed by the handle and the command or path that produced it, so a look-alike output (the same command run again, another slice of the same file) is easy to spot. Without a handle, `grep` searches every earlier tool output of the session (zip_recall results excepted, outputs from before a compaction included), newest output first, each match under its output's handle and command: this also reaches an output whose handle a long summary no longer lists. Output comes back in pages of 20,000 characters; the page says how to continue:
 
 ```
 zip_recall({ handle: "k3f9a0x1qz", offset: 20000 })               // next page, by characters
