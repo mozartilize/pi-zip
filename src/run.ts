@@ -234,7 +234,16 @@ export class Zip implements ZipControl {
 	/** The token scale (O, c) read from the branch: stateless, so a fresh process calibrates exactly like a long-lived one. */
 	scaleOf(ctx: Any, entries?: Any[]): Scale {
 		try {
-			return calibrate(entries ?? ((ctx.sessionManager.buildSessionProjection() as Any)?.entries ?? []), this.sysInfo(ctx), this.branch(ctx));
+			return calibrate(entries ?? ((ctx.sessionManager.buildSessionProjection() as Any)?.entries ?? []), this.sysInfo(ctx), this.branch(ctx), ctx?.model ? modelKey(ctx.model) : undefined);
+		} catch {
+			return UNIT;
+		}
+	}
+
+	/** The token scale of model `key` ("provider/id"), read from the branch. */
+	private scaleAt(ctx: Any, entries: Any[] | undefined, key: string): Scale {
+		try {
+			return calibrate(entries ?? [], this.sysInfo(ctx), this.branch(ctx), key);
 		} catch {
 			return UNIT;
 		}
@@ -784,13 +793,15 @@ export class Zip implements ZipControl {
 	private totals(ctx: Any) {
 		const branch = ctx ? this.branch(ctx) : [];
 		const byId = new Map(branch.map((e: Any) => [e?.id, e]));
-		let folds = 0, folded = 0, summaries = 0, recalls = 0, usd = 0;
+		let folds = 0, summaries = 0, recalls = 0, usd = 0, key = "";
 		let last: Any = null;
+		const byModel = new Map<string, number>(); // chars/4 folded, by the model of the newest response before the fold (the one that planned it)
 		for (const e of branch) {
 			const ph = String(e?.replacement?.content?.[0]?.text ?? "");
+			if (e?.type === "message" && e.message?.role === "assistant" && (e.message.provider || e.message.model)) key = `${e.message.provider ?? ""}/${e.message.model ?? ""}`;
 			if (e?.type === "context_edit" && ph.startsWith(PH_MARK)) {
 				folds++;
-				folded += Math.max(0, textOf(byId.get(e.targetId)?.message?.content).length - ph.length) / 4;
+				byModel.set(key, (byModel.get(key) ?? 0) + Math.max(0, textOf(byId.get(e.targetId)?.message?.content).length - ph.length) / 4);
 			} else if (e?.type === "compaction" && e.details?.by === PRODUCT) {
 				summaries++;
 				usd += Number(e.usage?.cost?.total) || 0;
@@ -798,8 +809,13 @@ export class Zip implements ZipControl {
 			else if (e?.type === "custom" && e.customType === NOTICE_CUSTOM && e.data?.v === 2 && !e.data?.kind) last = e;
 			else if (e?.type === "message" && e.message?.role === "toolResult" && e.message?.toolName === RECALL_TOOL) recalls++;
 		}
-		// chars/4 of the folded text, on the provider's scale: x c of this session (folded outputs are content)
-		return { folds, folded: folds ? this.scaleOf(ctx).c * folded : 0, summaries, recalls, usd, last };
+		// chars/4 of the folded text, on the provider's scale: x c of the model that folded it (folded outputs are content)
+		let folded = 0;
+		if (folds) {
+			const entries = byModel.size > 1 ? ((ctx.sessionManager.buildSessionProjection() as Any)?.entries ?? []) : undefined;
+			for (const [k, v] of byModel) folded += v * (byModel.size > 1 && k ? this.scaleAt(ctx, entries, k) : this.scaleOf(ctx)).c;
+		}
+		return { folds, folded, summaries, recalls, usd, last };
 	}
 	/** What this session carries: folds and summaries persisted in its file (they survive restarts) and the recalls in its branch. */
 	private sessionTotals(ctx: Any): string {
