@@ -81,13 +81,15 @@ The first one appears once per machine. While a summary started in the backgroun
 
 ```
 ƶ pi-zip  on
-  cache    anthropic/claude-sonnet-5-5 · expires after ~5 min idle
+  model    anthropic/claude-sonnet-5-5
+  cache    ██████████████▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁  expires after ~5 min idle
+  away         1m       5m    15m     1h  2h
   session  56 zipped ~310K  ·  2 summaries $0.41  ·  3 unzips
 ```
 
 ƶ (U+01B6) is a plain Latin letter, one column wide everywhere, CJK terminals included. Most coding fonts have it; where one does not (Hack, Source Code Pro), the terminal draws it from a fallback font.
 
-`expires after ~5 min idle` is the one thing worth knowing: come back sooner and pi-zip touches nothing; come back later and the old outputs get zipped, at no extra cost. It starts from the model's declared cache lifetime and turns into `(measured)` once the provider's own replies have shown how long its cache really lasts (see below). Notices state facts (how long you were away), not guesses: whether the cache really had expired is read from the provider's reply afterwards, so a wrong guess is not repeated.
+`expires after ~5 min idle` is the one thing worth knowing: come back sooner and pi-zip touches nothing; come back later and the old outputs get zipped, at no extra cost. The chart draws the same fact: across (`away`) is how long you were gone, from 30 s to 2 h on a log scale; up (`cache`) is how likely the cache still holds your conversation then. Bars in the accent colour are still there, dim ones are gone. It starts from the model's declared cache lifetime (a cliff at 5 min for Claude) and turns into `(measured)` once the provider's own replies have shown how long its cache really lasts (see below); a cache that fades out slowly draws a slope. In a narrow terminal the chart is left out and the sentence stays. Notices state facts (how long you were away), not guesses: whether the cache really had expired is read from the provider's reply afterwards, so a wrong guess is not repeated.
 
 ## The three rules
 
@@ -107,7 +109,7 @@ The cold cap is kept below Pi's own compaction trigger (window minus `compaction
 
 | Command | Effect |
 |---|---|
-| `/zip` or `/zip status` | the card above: state, cache class and lifetime, learned survival, this session's folds, summaries and recalls (counted from the session, so a restart does not reset them) |
+| `/zip` or `/zip status` | the card above: state, how long the cache survives you being away (chart and sentence), this session's folds, summaries and recalls (counted from the session, so a restart does not reset them) |
 | `/zip off` | strict no-op: no folds, no summaries, requests left untouched (earlier folds stay recallable) |
 | `/zip on` | resume |
 | `/zip quiet` | toggle the per-turn notice (folding continues) |
