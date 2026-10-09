@@ -379,6 +379,25 @@ export class Zip implements ZipControl {
 		});
 	}
 
+	/** Ledger only (research pi-tricks §3.5): entries another context manager wrote into this branch, each logged once: a context_edit
+	 *  that is neither pi-zip's placeholder nor Pi's own omission (null), or a compaction an extension other than pi-zip supplied.
+	 *  Nothing is decided from it. */
+	private foreignSeen = new Set<string>();
+	private logForeign(ctx: Any, where: string) {
+		if (!process.env.PI_ZIP_LEDGER || this.off) return; // the ledger is the only reader
+		for (const e of this.branch(ctx)) {
+			if (typeof e?.id !== "string" || this.foreignSeen.has(e.id)) continue;
+			let rec: Record<string, unknown> | null = null;
+			if (e.type === "context_edit" && e.replacement != null) {
+				const text = textOf(e.replacement.content);
+				if (!text.startsWith(PH_MARK)) rec = { kind: "context_edit", targetId: e.targetId ?? null, chars: text.length, head: text.slice(0, 60) };
+			} else if (e.type === "compaction" && e.fromHook && e.details?.by !== PRODUCT) rec = { kind: "compaction", by: e.details?.by ?? null, firstKeptEntryId: e.firstKeptEntryId ?? null, chars: String(e.summary ?? "").length };
+			if (!rec) continue;
+			this.foreignSeen.add(e.id);
+			this.ledger({ type: "foreign_edit", where, id: e.id, ...rec });
+		}
+	}
+
 	private detectConflict(ctx: Any) {
 		let found: string | null = null;
 		try {
@@ -504,6 +523,7 @@ export class Zip implements ZipControl {
 		this.bgWaitMs = 0;
 		this.wireLedgered = false;
 		this.runUserSeen = 0;
+		this.logForeign(ctx, "run");
 		if (!this.active()) return;
 		this.detectConflict(ctx);
 		if (!this.active()) return;
@@ -936,6 +956,7 @@ export class Zip implements ZipControl {
 	}
 
 	async turnEnd(e: Any, ctx: Any): Promise<Any> {
+		this.logForeign(ctx, "turn_end");
 		if (!this.active()) return undefined;
 		try {
 			const fresh = this.collectSteer(e); // marked before anything is validated: a steering message is part of its turn

@@ -894,6 +894,43 @@ describe("coexistence (F14)", () => {
 });
 
 // =============================================================================================================
+describe("foreign context editors are logged, never acted on (pi-tricks §3.5)", () => {
+	test("another extension's context_edit or compaction goes to the ledger once; pi-zip's own entries and Pi's omissions do not; plans are unchanged", async () => {
+		const entries = [U("u1", "one"), A("a1", ["c1"]), R("r1", "c1"), A("a2"), U("u2", "two"), A("a3", ["c2"]), R("r2", "c2"), A("a4"), U("u3", "back")];
+		const msg = (x: Any) => ({ type: "message", id: x.sourceEntry.id, message: { ...x.sourceEntry.message, timestamp: COLD_TS() } });
+		const branch = [
+			...entries.map(msg),
+			{ type: "context_edit", id: "e-ours", targetId: "r1", replacement: { content: [{ type: "text", text: "[folded by pi-zip · bash ls · handle x]" }] } },
+			{ type: "context_edit", id: "e-pi", targetId: "a2", replacement: null }, // Pi's own recovery omission
+			{ type: "context_edit", id: "e-other", targetId: "r2", replacement: { content: [{ type: "text", text: "[pruned by another manager]" }] } },
+			{ type: "compaction", id: "c-ours", summary: "s", firstKeptEntryId: "u2", fromHook: true, details: { by: "pi-zip" } },
+			{ type: "compaction", id: "c-pi", summary: "Pi's own", firstKeptEntryId: "u2", fromHook: false, details: {} },
+			{ type: "compaction", id: "c-other", summary: "theirs", firstKeptEntryId: "u2", fromHook: true, details: { by: "bc" } },
+		];
+		const run = async (ledger?: string) => {
+			if (ledger) process.env.PI_ZIP_LEDGER = ledger;
+			else delete process.env.PI_ZIP_LEDGER;
+			const r = await rig(entries, COLD_TS(), { branch });
+			await r.fire("before_agent_start", {});
+			const req = await r.fire("context_with_system", { messages: flat(entries) });
+			const te = await r.fire("turn_end", turnEnd([...entries, A("a5")], "a5"));
+			await r.fire("before_agent_start", {}); // a second run: nothing is logged twice
+			return { req, te };
+		};
+		const ledger = `/tmp/pi-zip-foreign-${process.pid}.jsonl`;
+		rmSync(ledger, { force: true });
+		const logged = await run(ledger);
+		const rows = (await Bun.file(ledger).text()).trim().split("\n").map((l) => JSON.parse(l)).filter((x) => x.type === "foreign_edit");
+		expect(rows.map((x: Any) => [x.id, x.kind, x.where])).toEqual([["e-other", "context_edit", "run"], ["c-other", "compaction", "run"]]);
+		expect(rows[0]).toMatchObject({ targetId: "r2", head: "[pruned by another manager]" });
+		expect(rows[1]).toMatchObject({ by: "bc", firstKeptEntryId: "u2" });
+		const silent = await run(undefined);
+		expect(JSON.stringify(logged)).toBe(JSON.stringify(silent)); // behaviour unchanged: the same request and the same entries
+		rmSync(ledger, { force: true });
+	});
+});
+
+// =============================================================================================================
 describe("in-turn folds through the real extension: one user message, 60 tool calls", () => {
 	beforeEach(() => { process.env.PI_ZIP_INTURN_AGE = "20"; }); // the mechanics at age 20 (default 60: a 61-request turn would fold only r1)
 	const MUT = [3, 10, 50];
