@@ -262,6 +262,8 @@ export interface RunPlan {
 	applied?: Set<string>; // entry ids whose fold the latest request view actually carried (what turn_end must persist, no more)
 	cutTs?: number; // timestamp of the request-local summary message: one value per run, so every request of the run is identical
 	untouched?: number; // real tokens before the earliest edited block: what the first request carrying the plan can still read from the cache
+	waitMs?: number; // how long the user waited for this plan's summary (0: none, or it was ready)
+	noticed?: boolean; // its notice is already in the transcript (shown when the first request carrying it went out)
 }
 
 export interface PlanOpts {

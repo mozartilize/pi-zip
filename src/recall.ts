@@ -169,6 +169,7 @@ export function recalledHandlesFromBranch(branch: Any[]): Set<string> {
 
 export interface RecallHooks {
 	onRecall(handles: string[], chars: number, entryIds: (string | null)[]): void;
+	labelOf?(handle: string): string | undefined; // "read src/learn.ts" for a handle folded in this branch
 }
 
 export function registerRecallTool(pi: ExtensionAPI, hooks: RecallHooks) {
@@ -195,7 +196,7 @@ export function registerRecallTool(pi: ExtensionAPI, hooks: RecallHooks) {
 			required: [],
 		} as Any,
 		renderCall(args: Any, theme: Any) {
-			return lines((w) => recallCallLine(args ?? {}, w, theme, measure));
+			return lines((w) => recallCallLine(args ?? {}, w, theme, measure, (h) => hooks.labelOf?.(h)));
 		},
 		renderResult(result: Any, options: Any, theme: Any) {
 			const text = textOf(result?.content);

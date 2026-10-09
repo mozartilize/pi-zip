@@ -127,19 +127,19 @@ export function renderNotice(d: NoticeData, expanded: boolean, width: number, th
 		const ind = fit(plain);
 		if (ind !== null) out.push(th.fg("dim", ind + plain));
 	};
-	if (d.first) sub("originals are kept; the model can recall any of them with zip_recall");
+	if (d.first) sub("originals are kept · the model can recall any of them");
 	if (!expanded) return out;
 	if (d.why) sub(d.why);
 	const items = d.items ?? [];
-	const lw = Math.min(28, Math.max(0, ...items.map((i) => i.label.length)));
+	const lw = Math.min(32, Math.max(0, ...items.map((i) => i.label.length)));
 	for (const i of items) {
 		const label = i.label.length > lw ? i.label.slice(0, lw - 1) + "…" : i.label.padEnd(lw);
-		const turn = (i.turn ? `turn ${i.turn}` : "").padEnd(8), size = fmtK(i.tokens).padStart(6);
-		const plain = `${label}  ${turn}${size}  ${i.handle}`;
+		const size = fmtK(i.tokens).padStart(6);
+		const plain = `${label}${size}  ${i.handle}`;
 		const ind = fit(plain);
 		if (ind === null) continue;
-		// an item row: what it was (text), where (dim), how big (muted), and the handle zip_recall takes (code colour: copyable)
-		out.push(th.fg("dim", ind) + th.fg("text", label) + th.fg("dim", `  ${turn}`) + th.fg("muted", size) + "  " + th.fg("mdCode", i.handle));
+		// an item row: what it was (text), how big (muted), and its handle (dim: there if you need it, quiet if you don't)
+		out.push(th.fg("dim", ind) + th.fg("text", label) + th.fg("muted", size) + th.fg("dim", `  ${i.handle}`));
 	}
 	if (d.more) sub(`… ${d.more} more`);
 	return out;
