@@ -90,6 +90,15 @@ describe("handles and placeholders", () => {
 		const blocks = buildBlocks([U("u1", "x"), A("a1", ["c1"]), R("r1", "c1", 9000), A("a2")]);
 		expect(skeleton(blocks, null).text).toMatch(/`ls` -> exit 0 \(turn 1, [0-9a-z]{10}\)/);
 	});
+	test("the summary header says the codes are recall handles and that recalling beats re-running or re-reading", () => {
+		const text = skeleton(buildBlocks([U("u1", "x"), A("a1", ["c1"]), R("r1", "c1", 9000), A("a2")]), null).text;
+		const head = text.split("\n")[1];
+		expect(head).toMatch(/^Covers \d+ earlier messages\. Their tool outputs are no longer in your context but are kept exactly/);
+		expect(head).toContain("is its handle");
+		expect(head).toContain(`${zipRecallName} it (grep/range for a part; grep alone searches every earlier output) rather than re-running or re-reading`);
+		const again = skeleton(buildBlocks([{ sourceEntry: { id: "s", type: "compaction" }, messages: [{ role: "compactionSummary", summary: text }] }, U("u2", "y")]).slice(1), text).text;
+		expect(again.split("\n").filter((l) => l.startsWith("Covers "))).toHaveLength(1); // carried forward, the header is not taken for content
+	});
 	test("summary lists the handle of every result, small ones included, and each resolves with recall", () => {
 		const tcall = (id: string, calls: Any[]) => {
 			const m = { role: "assistant", content: calls.map(([cid, name, args]) => ({ type: "toolCall", id: cid, name, arguments: args })) };
