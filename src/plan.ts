@@ -448,7 +448,7 @@ export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
 		if (tokOverride.has(b.idx) || recalled.has(handleFor(b.entryId!))) return false; // F4: never refold what the model recalled
 		const ph = makePlaceholderFor(b, calls, keepLines, !!o.rereadOnly);
 		if (ph === null) return false;
-		const phTok = tok4(ph);
+		const phTok = tokensOf({ ...b.msg, content: [{ type: "text", text: ph }] }); // the folded message: its id and framing stay
 		if (!(phTok < 0.9 * b.tokens)) return false;
 		tokOverride.set(b.idx, phTok);
 		const call = calls.get(b.msg.toolCallId);

@@ -38,10 +38,10 @@ describe("verdict section 8 tests", () => {
 	test("4. in-turn audit template (106K -> 53K at request 57, in-turn outputs): with INTURN_AGE 60 the plan is empty", () => {
 		delete process.env.PI_ZIP_INTURN_AGE;
 		expect(settings().inturnAge).toBe(60);
-		const s = longTurn(56, { chars: 11_500 }); // ~1.9K tokens per output, ~106K in one user turn
+		const s = longTurn(56, { chars: 11_500 }); // ~1.9K tokens per output (+ ~60 of tool-call id and framing per round), ~110K in one user turn
 		const o = { cwd: ".", promptPending: false, model: { contextWindow: 1_000_000 }, law: { pr: ANTH, g: 2_400, pWarm: 1 } as Law };
 		const ctx = planContext(s, { ...o, mode: "cold" })!;
-		expect(Math.abs(ctx.ctxTokens - 106_000)).toBeLessThan(2_000);
+		expect(Math.abs(ctx.ctxTokens - 109_500)).toBeLessThan(2_000);
 		expect(ctx.folds).toHaveLength(0);
 		expect(planContext(s, { ...o, mode: "warm" })).toBeNull();
 		expect(planContext(s, { ...o, mode: "warm", inturnAge: 20 })!.folds.length).toBeGreaterThan(0); // the old age 20 did fold here
@@ -253,7 +253,7 @@ describe("final model (research round 5, final-model.md section 8 tests 1-5)", (
 
 	test("3. T = A: with A ~ 40K, g = 2.4K and the explicit class ratios the first warm fire is at D ~ sqrt(2 g kappa A) ~ 47K, not ~ 30K", () => {
 		const pr = lawPrices("explicit", false)!;
-		const prose = [U("up", "talk"), AX("x0", 140_000)]; // ~35K tokens nothing can fold, BEFORE the outputs: the suffix after the first fold is small
+		const prose = [U("up", "talk"), AX("x0", 112_000)]; // ~28K tokens nothing can fold, BEFORE the outputs: the suffix after the first fold is small
 		const outs = (n: number) => Array.from({ length: n }, (_, t) => [U(`u${t}`, `q${t}`), A(`a${t}`, [`c${t}`]), R(`r${t}`, `c${t}`, 4_000), A(`z${t}`)]).flat();
 		const tail = [U("uP", "prev"), A("aP"), U("uN", "now")];
 		let first: Any = null, before: Any = null;
@@ -269,7 +269,7 @@ describe("final model (research round 5, final-model.md section 8 tests 1-5)", (
 		expect(first.B - first.A).toBeGreaterThanOrEqual(eoq);
 		expect(before.B - before.A).toBeLessThan(eoq);
 		expect(Math.abs(first.B - first.A - 47_000)).toBeLessThan(3_000);
-		expect(first.Tsuf).toBeLessThan(0.25 * first.A); // the suffix rule would have fired long before:
+		expect(first.Tsuf).toBeLessThan(0.3 * first.A); // the suffix rule would have fired long before:
 		expect(editAllowed(before.B, before.A, 1, null, pr, 2_400, 0, before.Tsuf)).toBe(true);
 	});
 
