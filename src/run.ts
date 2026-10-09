@@ -12,7 +12,7 @@ import { handleFor, PH_MARK, RECALL_TOOL } from "./placeholder.ts";
 import { recalledHandlesFromBranch } from "./recall.ts";
 import { buildCut } from "./summary.ts";
 import { type Any, PRODUCT, textOf, tok4 } from "./util.ts";
-import { fmtLife, type CardData, type StateWord } from "./ui.ts";
+import { CHART_COLS, chartGap, fmtLife, type CardData, type StateWord } from "./ui.ts";
 
 export const PLAN_CUSTOM = "pi-zip/plan";
 export const STATE_CUSTOM = "pi-zip/state";
@@ -834,13 +834,14 @@ export class Zip implements ZipControl {
 		for (let g = 30; g <= 7200; g += 30) if (pWarm(ent, g, ttlS).p >= 0.5) lifeS = g;
 		const measured = !!ent && ent.n > 0 && pWarm(ent, Math.max(30, lifeS), ttlS).src === "learned";
 		const life = key ? (lifeS >= 7200 ? "2 h+" : fmtLife(lifeS || ttlS)) : undefined;
+		const alive = key ? Array.from({ length: CHART_COLS }, (_, i) => pWarm(ent, chartGap(i), ttlS).p) : undefined;
 		const ts = t.last?.timestamp ? new Date(t.last.timestamp) : null;
 		const hhmm = ts && !Number.isNaN(ts.getTime()) ? `${String(ts.getHours()).padStart(2, "0")}:${String(ts.getMinutes()).padStart(2, "0")}  ` : "";
 		const last = t.last ? `${hhmm}${t.last.data.desc}${t.last.data.why ? " · " + t.last.data.why : ""}` : undefined;
 		const state = this.off ? "off" : this.conflict ? "paused" : this.recallOk ? "on" : "reread-only";
 		return {
 			state, stateNote: state === "paused" ? `${this.conflict} also manages context` : state === "off" ? "/zip on to resume" : state === "reread-only" ? "a tool allowlist hides zip_recall · only re-readable outputs fold" : undefined,
-			model: key || undefined, life, measured, folds: t.folds, foldedTokens: fmtK(t.folded), summaries: t.summaries, summaryUsd: t.usd, recalls: t.recalls, last, quiet: this.quiet,
+			model: key || undefined, life, measured, alive, folds: t.folds, foldedTokens: fmtK(t.folded), summaries: t.summaries, summaryUsd: t.usd, recalls: t.recalls, last, quiet: this.quiet,
 		};
 	}
 	status(ctx?: Any): string {

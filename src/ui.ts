@@ -55,6 +55,7 @@ export interface CardData {
 	model?: string; // provider/id
 	life?: string; // "~5 min" | "~1 h" | "2 h+": how long the cache outlives the last reply
 	measured?: boolean; // life comes from this provider's own replies, not the declared TTL
+	alive?: number[]; // P(cache still there) after being away chartGap(i), one per chart column
 	folds: number;
 	foldedTokens: string; // "310K"
 	summaries: number;
@@ -71,10 +72,34 @@ export function fmtLife(s: number): string {
 	return `~${+(s / 3600).toFixed(1)} h`;
 }
 
+/** The cache chart: one column per time away, log-spaced from 30 s to 2 h. The row labels are the axes ("cache" up, "away" across),
+ *  so it reads like any chart; the bars still there are in the accent colour, the dead ones dim. */
+export const CHART_COLS = 32;
+const CHART_T0 = 30, CHART_T1 = 7200;
+export const chartGap = (i: number): number => CHART_T0 * (CHART_T1 / CHART_T0) ** (i / (CHART_COLS - 1));
+const chartCol = (s: number): number => Math.round(((CHART_COLS - 1) * Math.log(s / CHART_T0)) / Math.log(CHART_T1 / CHART_T0));
+const BARS = "▁▂▃▄▅▆▇█";
+const TICKS: [number, string][] = [[60, "1m"], [300, "5m"], [900, "15m"], [3600, "1h"], [7200, "2h"]];
+const bar = (p: number): string => BARS[Math.max(0, Math.min(7, Math.round(p * 7)))];
+const ALIVE = 0.5; // a bar at or above this is drawn as still there
+
+/** "1m      5m      15m      1h  2h": tick labels start at their column. */
+export function chartAxis(): string {
+	const s = Array<string>(CHART_COLS + 2).fill(" ");
+	for (const [t, lab] of TICKS) {
+		const c = Math.min(chartCol(t), CHART_COLS - lab.length + 1);
+		if (s.slice(Math.max(0, c - 1), c + lab.length + 1).every((x) => x === " ")) s.splice(c, lab.length, ...lab);
+	}
+	return s.join("").trimEnd();
+}
+
+const lifeText = (c: CardData): string => (c.life ? `expires after ${c.life} idle${c.measured ? " (measured)" : ""}` : "");
+
 export function cardText(c: CardData): string[] {
 	const rows: [string, string][] = [];
-	// Plain words only: one fact the user can act on ("come back within ~5 min and nothing is touched"), no classes, no curves.
-	if (c.model) rows.push(["cache", `${c.model}${c.life ? ` · expires after ${c.life} idle${c.measured ? " (measured)" : ""}` : ""}`]);
+	// One fact the user can act on ("come back within ~5 min and nothing is touched"), drawn and said: no classes, no jargon.
+	if (c.model && c.alive?.length) rows.push(["model", c.model], ["cache", `${c.alive.map(bar).join("")}  ${lifeText(c)}`.trimEnd()], ["away", chartAxis()]);
+	else if (c.model) rows.push(["cache", `${c.model}${c.life ? ` · ${lifeText(c)}` : ""}`]);
 	const n = (x: number, one: string, many = one + "s") => `${x} ${x === 1 ? one : many}`;
 	rows.push(["session", `${c.folds} zipped ~${c.foldedTokens}  ·  ${n(c.summaries, "summary", "summaries")}${c.summaryUsd > 0 ? ` $${c.summaryUsd.toFixed(2)}` : ""}  ·  ${n(c.recalls, "unzip")}`]);
 	if (c.last) rows.push(["last", c.last]);
@@ -85,12 +110,32 @@ export function cardText(c: CardData): string[] {
 export function renderCard(c: CardData, width: number, th: Th, m: Measure = plainMeasure): string[] {
 	const out = renderState(c.state, c.stateNote ?? "", width, th, m);
 	const indent = "  "; // under the words after the monogram
+	// Too narrow for the chart and its axis: the sentence alone says the same thing.
+	if (c.alive?.length && width < indent.length + LABEL_W + Math.max(c.alive.length, chartAxis().length)) c = { ...c, alive: undefined };
+	let under = "";
 	for (const row of cardText(c)) {
+		if (under && !row.startsWith("away ")) out.push(under), (under = "");
+		if (c.alive?.length && row.startsWith("cache ")) {
+			const runs: string[] = [];
+			for (let i = 0; i < c.alive.length; ) {
+				const on = c.alive[i] >= ALIVE;
+				let j = i;
+				while (j < c.alive.length && c.alive[j] >= ALIVE === on) j++;
+				runs.push(th.fg(on ? "accent" : "dim", c.alive.slice(i, j).map(bar).join("")));
+				i = j;
+			}
+			// The sentence goes beside the bars when it fits there whole, else on its own line under the axis: never cut mid-fact.
+			const say = lifeText(c), beside = m.vw(say) <= width - indent.length - LABEL_W - c.alive.length - 2;
+			out.push(th.fg("dim", (indent + "cache").padEnd(indent.length + LABEL_W)) + runs.join("") + (say && beside ? "  " + th.fg("dim", say) : ""));
+			if (say && !beside) under = th.fg("dim", m.cut(" ".repeat(indent.length + LABEL_W) + say, width));
+			continue;
+		}
 		const line = m.cut(indent + row, width);
 		if (!line) continue;
 		const k = line.slice(0, indent.length + LABEL_W), v = line.slice(indent.length + LABEL_W);
 		out.push(th.fg("dim", k) + (row.startsWith("session") ? th.fg("text", v) : th.fg("dim", v)));
 	}
+	if (under) out.push(under);
 	return out;
 }
 
