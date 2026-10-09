@@ -7,7 +7,7 @@ import { detectCold, lastMessageMs, lastPrompt, modelKey, resolveTtl, ttlFor } f
 import { describe, lawPrices, loadStats, pWarm, record, sample, statsPath, GAP_EDGES, type Entry } from "./learn.ts";
 import { validateEdits, repairPayload } from "./guard.ts";
 import { fmtK, Stats, noticeDesc, noticeText, type NoticeAction, type NoticeData, type ZipControl } from "./notice.ts";
-import { applyPlanToMessages, buildBlocks, calibrate, countUserTurns, G0, planContext, reserveTokensFor, sizeOf, untouchedEst, UNIT, type Block, type Cut, type FoldTarget, type Law, type PlanOpts, type PlanResult, type RunPlan, type Scale, type SysInfo } from "./plan.ts";
+import { applyPlanToMessages, buildBlocks, calibrate, countUserTurns, G0, keepRecentTokensFor, piCanCompact, planContext, rebaseFolds, reserveTokensFor, sizeOf, spliceNative, untouchedEst, UNIT, type Block, type Cut, type FoldTarget, type Law, type PlanOpts, type PlanResult, type RunPlan, type Scale, type SysInfo } from "./plan.ts";
 import { handleFor, PH_MARK, RECALL_TOOL } from "./placeholder.ts";
 import { recalledHandlesFromBranch } from "./recall.ts";
 import { buildCut } from "./summary.ts";
@@ -53,6 +53,16 @@ function waitFor<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T | null
 
 const errText = (err: unknown) => (err instanceof Error ? (err.stack ?? err.message) : String(err));
 
+/** How long pi-zip waits for Pi to report its own compaction (it takes milliseconds: the summary is ready); a safety net only. */
+const NATIVE_TIMEOUT_MS = 30_000;
+
+/** The prompt Pi appends right after before_agent_start, as a projected entry without an id: the plan made before it counts its size. */
+function pendingPrompt(e: Any): Any | null {
+	if (typeof e?.prompt !== "string") return null;
+	const m = { role: "user", content: [{ type: "text", text: e.prompt }, ...(Array.isArray(e.images) ? e.images : [])], timestamp: Date.now() };
+	return { sourceEntry: { type: "message", message: m }, messages: [m] };
+}
+
 export class Zip implements ZipControl {
 	off = false;
 	quiet = false;
@@ -91,6 +101,10 @@ export class Zip implements ZipControl {
 	private nextEdit: number | null = null; // the next request is the first to carry a new edit: its untouched prefix (real tokens)
 	private pending: { gapS: number; expect: number; edited: boolean; key: string } | null = null;
 	private justEdited = false; // the newest response answered a request that first carried an edit: the next request gets no warm edit
+	// pi-zip's own ctx.compact() in flight: the only compaction session_before_compact answers (compaction null = cancel a late ask)
+	private nativeAsk: { compaction: Any | null; answered: boolean; until: number } | null = null;
+	// this run's away summary went in through Pi's compaction before the run: the projection just before it, for the run plan (I1)
+	private nativeRun: { key: string; cut: Cut; before: number; after: number; pre: Any[]; entryId: string } | null = null;
 
 	constructor(private pi: ExtensionAPI) {}
 
@@ -318,7 +332,7 @@ export class Zip implements ZipControl {
 		this.bg = null;
 	}
 
-	beforeAgentStart(ctx: Any) {
+	async beforeAgentStart(ctx: Any, e?: Any): Promise<void> {
 		this.cancelTimer(); // the user is back: nothing is started behind their back any more
 		this.model = ctx?.model;
 		this.cold = false;
@@ -326,6 +340,7 @@ export class Zip implements ZipControl {
 		this.runChecked = true;
 		this.runEdits = false;
 		this.runPlan = null;
+		this.nativeRun = null;
 		this.settleIds = [];
 		this.bgWaitMs = 0;
 		this.wireLedgered = false;
@@ -361,6 +376,104 @@ export class Zip implements ZipControl {
 			this.ttlNoticed = true; // once per session
 			if (!this.quiet) this.stateLine(ctx, "cache", ttl.note.replace(`${PRODUCT} · `, ""));
 		}
+		if (cold && this.bg?.done) {
+			try {
+				await this.nativeSummary(ctx, e);
+			} catch (err) {
+				this.nativeAsk = null;
+				this.ledger({ type: "error", where: "native_summary", error: errText(err) });
+			}
+		}
+	}
+
+	/** session_before_compact: answers ONLY the compaction pi-zip itself asked for a moment ago (nativeAsk): its own summary and its own
+	 *  tokensBefore. Pi's threshold and overflow compactions, /compact and other extensions' compactions get undefined and run untouched. */
+	sessionBeforeCompact(): Any {
+		const a = this.nativeAsk;
+		if (!a || a.answered || Date.now() > a.until) return undefined;
+		a.answered = true;
+		return a.compaction ? { compaction: a.compaction } : { cancel: true };
+	}
+
+	/** Why Pi's own compaction cannot take this summary now (null: it can). Each reason keeps today's path: the run plan carries the summary
+	 *  request-locally and turn_end persists it as a draft. */
+	private nativeGate(ctx: Any, branch: Any[], pre: Any[]): string | null {
+		if (typeof ctx?.compact !== "function") return "no ctx.compact";
+		let idle = false;
+		try {
+			idle = ctx.isIdle?.() === true; // compact() aborts whatever runs first: only ever called while Pi is idle (it is, here, in 1.1.0)
+		} catch {}
+		if (!idle) return "not idle";
+		if (branch[branch.length - 1]?.type === "compaction") return "already compacted";
+		let settings: Any;
+		try {
+			settings = this.pi.getSettings?.();
+		} catch {}
+		if (!piCanCompact(pre, keepRecentTokensFor(settings, ctx?.model))) return "nothing to compact";
+		return null;
+	}
+
+	/**
+	 * A summary prepared while the user was away goes into the session through Pi's own compaction, before the run (research pi-tricks
+	 * §1b, variant 1): ctx.compact() with session_before_compact answering pi-zip's summary and pi-zip's own tokensBefore (the notice's
+	 * "before", provider scale), so Pi's "[compaction] Compacted from N tokens" shows that number. It takes milliseconds: the summary is
+	 * done. The run plan is then made on the projection as it was before the compaction, so the run's first request carries the same
+	 * bytes as the draft path would have sent; any gate that fails keeps the draft path.
+	 */
+	private async nativeSummary(ctx: Any, e: Any): Promise<void> {
+		const b = this.bg;
+		if (!b?.done || !b.key) return;
+		const branch = this.branch(ctx);
+		const pre = ((ctx.sessionManager.buildSessionProjection() as Any)?.entries ?? []) as Any[];
+		const skip = (reason: string) => this.ledger({ type: "native_skip", reason });
+		// the plan the first request will make: the same one, with the prompt Pi is about to append
+		const pending = pendingPrompt(e);
+		const entries = pending ? [...pre, pending] : pre;
+		const { o } = this.opts(ctx, !pending, "cold", entries, this.pWarm);
+		o.pastTtl = this.pastTtl;
+		const p = planContext(entries, o);
+		if (!p || p.cutIdx === null || p.firstKeptEntryId !== b.key) return skip("the summary does not fit this plan");
+		const cut = b.done;
+		if (checkEdits(p.blocks, p.userTurns, p.folds, cut)) return skip("guard");
+		const gate = this.nativeGate(ctx, branch, pre);
+		if (gate) return skip(gate);
+		const before = Math.round(p.ctxTokens);
+		const compaction = { summary: cut.text, firstKeptEntryId: cut.firstKeptEntryId, tokensBefore: before, details: { by: PRODUCT, via: "native", trigger: cut.trigger }, usage: cut.usage };
+		this.nativeAsk = { compaction, answered: false, until: Infinity };
+		const t0 = performance.now();
+		const res = await new Promise<{ ok: boolean; err?: string }>((resolve) => {
+			const timer = setTimeout(() => resolve({ ok: false, err: "timeout" }), NATIVE_TIMEOUT_MS);
+			timer.unref?.();
+			const done = (r: { ok: boolean; err?: string }) => (clearTimeout(timer), resolve(r));
+			try {
+				ctx.compact({ onComplete: () => done({ ok: true }), onError: (err: Any) => done({ ok: false, err: err instanceof Error ? err.message : String(err) }) });
+			} catch (err) {
+				done({ ok: false, err: errText(err) });
+			}
+		});
+		const answered = !!this.nativeAsk?.answered;
+		// a timeout before Pi asked: if it asks later after all, that compaction is cancelled (never Pi's own summary on pi-zip's behalf)
+		this.nativeAsk = res.err === "timeout" && !answered ? { compaction: null, answered: false, until: Date.now() + 60_000 } : null;
+		const ms = Math.round(performance.now() - t0);
+		const after = this.branch(ctx);
+		let entry: Any = null;
+		for (let i = after.length - 1; i >= 0 && !entry; i--) if (after[i]?.type === "compaction" && after[i].details?.via === "native" && after[i].summary === cut.text) entry = after[i];
+		if (!entry?.id) {
+			this.ledger({ type: "native_fail", ms, answered, error: res.err ?? "no compaction entry" });
+			return; // the draft path: the run plan adopts the prepared summary as before
+		}
+		this.bg = null; // adopted by Pi's compaction
+		this.summarizedWarm = true; // one summary per warm stretch, as for a draft (commit)
+		// the summary is in the session from now on, whatever the run does: book it here (commit() does not book it again)
+		const cutSaved = Math.round(p.scale.c * (cut.prefixTokens - cut.summaryTokens));
+		this.nativeRun = { key: b.key, cut, before, after: Math.round(p.ctxAfterFolds - cutSaved), pre, entryId: entry.id };
+		const s = this.stats;
+		s.summaries++;
+		s.summarizedTokens += cutSaved;
+		s.summaryUsd += cut.costUsd;
+		s.activeSaved += cutSaved;
+		s.writeSavedTokens += cutSaved;
+		this.ledger({ type: "summary", via: "native", trigger: cut.trigger, source: "settle", count: cut.count, tokensBefore: before, prefixTokens: Math.round(p.scale.c * cut.prefixTokens), summaryTokens: Math.round(p.scale.c * cut.summaryTokens), ms: cut.ms, compactMs: ms, waitedMs: 0, llmOk: cut.llmOk, llmError: cut.llmError, costUsd: cut.costUsd, ...this.usageOf(cut) });
 	}
 
 	private cancelTimer() {
@@ -399,16 +512,16 @@ export class Zip implements ZipControl {
 		}
 		if (this.runPlan && !this.runPlan.persisted) {
 			const out = applyPlanToMessages(e.messages, this.runPlan);
-			if (out) {
+			if (out || this.runPlan.native) { // a native summary is already in the request Pi built: it still goes out with this request
 				if (!this.runPlan.sent) this.nextEdit = this.runPlan.untouched ?? 0;
 				this.runPlan.sent = true;
-				this.runPlan.applied = out.applied;
+				const applied = (this.runPlan.applied = out?.applied ?? this.runPlan.applied ?? new Set<string>());
 				if (!this.runPlan.noticed) { // say it where it happens: at the top of the turn, before the model answers
 					this.runPlan.noticed = true;
-					const live = this.runPlan.folds.filter((t) => out.applied.has(t.entryId));
-					this.noticeFor(ctx, this.runPlan, live, this.runPlan.cut, this.runPlan.ctxBefore, 0);
+					const live = this.runPlan.folds.filter((t) => applied.has(t.entryId));
+					this.noticeFor(ctx, this.runPlan, live, this.runPlan.cut ?? this.runPlan.native ?? null, this.runPlan.ctxBefore, 0);
 				}
-				return { messages: out.messages };
+				return out ? { messages: out.messages } : undefined;
 			}
 		}
 		return undefined;
@@ -451,17 +564,34 @@ export class Zip implements ZipControl {
 	/** ONE plan per edit run: computed at the first request (the new prompt is in the session), applied to every request until turn_end persists the same set. */
 	private async computeRunPlan(ctx: Any) {
 		const t0 = performance.now();
-		const entries = ((ctx.sessionManager.buildSessionProjection() as Any)?.entries ?? []) as Any[];
+		const now = ((ctx.sessionManager.buildSessionProjection() as Any)?.entries ?? []) as Any[];
+		// a summary that went in through Pi's compaction before the run (nativeSummary): plan on the projection as it was right before
+		// it, plus what came after, so folds, scale and placeholders are exactly what the draft path computes (the run's first request
+		// carries the same bytes); the request Pi builds already starts with the summary
+		const nat = this.nativeRun;
+		this.nativeRun = null;
+		const spliced = nat ? spliceNative(nat.pre, now, nat.entryId) : null;
 		if (!this.cold && this.justEdited) { // no warm edit on the request right after an edited one (no back-to-back warm rewrites)
 			this.ledger({ type: "b2b_skip", where: "run" });
 			this.discardBg();
 			return;
 		}
-		const { o, cal } = this.opts(ctx, false, this.cold ? "cold" : "warm", entries, this.pWarm);
-		o.pastTtl = this.pastTtl;
-		const p = planContext(entries, o);
+		const plan = (entries: Any[]) => {
+			const { o, cal } = this.opts(ctx, false, this.cold ? "cold" : "warm", entries, this.pWarm);
+			o.pastTtl = this.pastTtl;
+			return { o, cal, p: planContext(entries, o) };
+		};
+		let { o, cal, p } = plan(spliced ?? now);
+		const onPre = !!nat && !!spliced && !!p && p.cutIdx !== null && p.firstKeptEntryId === nat.key;
+		if (nat && !onPre) {
+			// the summary is in the session, but this plan would not cut there (the prompt, or what came with it, changed the plan): plan on
+			// the session as it is now, with the summary at its head
+			this.ledger({ type: "native_mismatch", planned: p?.firstKeptEntryId ?? null, compacted: nat.key });
+			({ o, cal, p } = plan(now));
+		}
 		this.lawLedger("run", o);
-		if (!p) {
+		const native = nat?.cut ?? null;
+		if (!p && !native) {
 			this.discardBg(); // the law does not fire (warm below the cap or a rewrite that does not pay back; a likely-warm cold return): a prepared summary does not pay back
 			return;
 		}
@@ -469,30 +599,41 @@ export class Zip implements ZipControl {
 		const trigger = this.cold ? "cold" : "valve";
 		let folds: FoldTarget[] = p?.folds ?? [];
 		let cut: Cut | null = null;
-		let adopted = false;
-		if (p && p.cutIdx !== null) {
+		let adopted = !!native; // Pi's compaction took the prepared summary
+		if (!native && p && p.cutIdx !== null) {
 			const got = await this.takeBg(p.firstKeptEntryId, ctx.signal, ctx);
 			cut = got.cut;
 			adopted = got.adopted;
-		} else {
+		} else if (!native) {
 			this.discardBg();
 		}
 		const sameSet = this.settleIds.length === folds.length && this.settleIds.every((id) => folds.some((u) => u.entryId === id));
 		const source: RunPlan["source"] = !this.cold ? "valve" : adopted || (this.settleIds.length > 0 && sameSet) ? "settle" : "runstart";
 		const foldMs = performance.now() - t0;
-		if (!cut && p && p.cutIdx !== null && !ctx.signal?.aborted) cut = await this.working(ctx, `${PRODUCT}: writing a summary (folding alone cannot make the context small enough)`, buildCut(p, ctx)); // produced now, before the first request: the user waits
+		if (!cut && !native && p && p.cutIdx !== null && !ctx.signal?.aborted) cut = await this.working(ctx, `${PRODUCT}: writing a summary (folding alone cannot make the context small enough)`, buildCut(p, ctx)); // produced now, before the first request: the user waits
 		// a plan that cannot be persisted must never be sent: the request view would differ from what turn_end can write (I1)
 		if (p) {
-			const invalid = checkEdits(p.blocks, p.userTurns, folds, cut);
+			const invalid = checkEdits(p.blocks, p.userTurns, folds, cut ?? (onPre ? native : null));
 			if (invalid) {
-				this.ledger({ type: "guard_drop", where: "run_plan", reason: invalid, folds: folds.length, summary: !!cut });
-				if (cut && checkEdits(p.blocks, p.userTurns, folds, null) === null) cut = null;
+				this.ledger({ type: "guard_drop", where: "run_plan", reason: invalid, folds: folds.length, summary: !!(cut ?? native) });
+				if (native) folds = []; // the summary is in the session already: only the folds can be dropped
+				else if (cut && checkEdits(p.blocks, p.userTurns, folds, null) === null) cut = null;
 				else { folds = []; cut = null; }
 			}
 		}
-		const ctxAfter = cut ? (p?.ctxAfterFolds ?? 0) - cal.c * (cut.prefixTokens - cut.summaryTokens) : (p?.ctxAfterFolds ?? 0);
-		this.runPlan = { source, folds, cut, ctxBefore: p?.ctxTokens ?? 0, ctxAfter, ms: foldMs, scale: cal, persisted: false, waitMs: cut ? (adopted ? this.bgWaitMs : cut.ms) : 0, cutVisibleIdx: p?.cutVisibleIdx ?? -1, cutKeptFirstMsg: p?.cutKeptFirstMsg, untouched: p ? sizeOf(cal, untouchedEst(p.blocks, folds, !!cut)) : 0 };
-		this.ledger({ type: "cold_plan", trigger, source, folds: folds.length, summary: !!cut, ...this.calOf(cal), ctxBefore: Math.round(this.runPlan.ctxBefore), ctxAfter: Math.round(ctxAfter), ms: Math.round(foldMs), ...(cut ? { summaryMs: cut.ms, llmOk: cut.llmOk, waitedMs: Math.round(adopted ? this.bgWaitMs : cut.ms), ...this.usageOf(cut) } : {}) });
+		const sum = cut ?? (onPre ? native : null); // a summary this plan's sizes do not count yet
+		let ctxBefore = p?.ctxTokens ?? 0;
+		let ctxAfter = (p?.ctxAfterFolds ?? 0) - (sum ? cal.c * (sum.prefixTokens - sum.summaryTokens) : 0);
+		if (nat) {
+			// the notice's "before" is the number Pi's [compaction] block shows (computed with the prompt before Pi appended it)
+			ctxAfter = p ? ctxAfter + (onPre ? nat.before - ctxBefore : 0) : nat.after;
+			ctxBefore = nat.before;
+		}
+		this.runPlan = {
+			source, folds: onPre ? rebaseFolds(folds, p!.cutVisibleIdx) : folds, cut, native: native ?? undefined, ctxBefore, ctxAfter, ms: foldMs, scale: cal, persisted: false,
+			waitMs: cut ? (adopted ? this.bgWaitMs : cut.ms) : 0, cutVisibleIdx: p?.cutVisibleIdx ?? -1, cutKeptFirstMsg: p?.cutKeptFirstMsg, untouched: p ? sizeOf(cal, untouchedEst(p.blocks, folds, !!(cut ?? native))) : sizeOf(cal, 0),
+		};
+		this.ledger({ type: "cold_plan", trigger, source, folds: folds.length, summary: !!(cut ?? native), ...(native ? { via: "native", onPre } : {}), ...this.calOf(cal), ctxBefore: Math.round(ctxBefore), ctxAfter: Math.round(ctxAfter), ms: Math.round(foldMs), ...(cut ? { summaryMs: cut.ms, llmOk: cut.llmOk, waitedMs: Math.round(adopted ? this.bgWaitMs : cut.ms), ...this.usageOf(cut) } : {}) });
 	}
 
 	/** Ledger form of a calibration; ctxBefore/ctxAfter next to it are already real (O + c x estimate). */

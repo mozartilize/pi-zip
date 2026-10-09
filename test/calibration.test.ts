@@ -201,6 +201,31 @@ describe("calibrate: per model, Pi's compaction, dropped responses", () => {
 		expect(cal.c).toBeCloseTo(2.1, 2);
 	});
 
+	test("a pi-zip summary that went in through Pi's compaction (via native) is carried after its entry, like Pi's own: the response before it is not O", () => {
+		const T = Date.parse("2026-10-09T04:00:00Z");
+		const comp = { sourceEntry: { id: "cmp", type: "compaction", timestamp: new Date(T).toISOString(), details: { by: "pi-zip", via: "native", trigger: "cold" } }, messages: [{ role: "compactionSummary", summary: "s".repeat(20_000), tokensBefore: 0, timestamp: T }] };
+		const e = [comp, at(U("k1", "kept"), T - 9_000), at(A("k0", ["c0"]), T - 8_500), R("k0r", "c0", 200_000), at(A("k2", ["c1"]), T - 8_000), R("kr", "c1", 30_000), at(A("k3"), T - 7_000), at(U("u2", "next"), T + 1_000), at(A("a1", ["c2"]), T + 2_000), R("r2", "c2", 40_000), at(A("a2"), T + 3_000)];
+		provider(e, 30_000, 2.1, ["k0", "k2"]);
+		provider(e, 30_000, 2.1, ["k3"], () => 60_000); // before the user went away: a read that stopped at a valve fold
+		provider(e, 30_000, 2.1, ["a1"], () => 30_000); // the run's first request carried the summary: the read stopped at the system prompt + tools
+		provider(e, 30_000, 2.1, ["a2"]);
+		const cal = calibrate(e);
+		expect(cal.oSource).toBe("summary");
+		expect(cal.O).toBe(30_000); // a request-local pi-zip summary would have taken k3's 60K read
+		expect(cal.c).toBeCloseTo(2.1, 2);
+	});
+
+	test("a native pi-zip compaction after the newest response: that response's content is summarised away, so c is C0 until the next one (as for Pi's own)", () => {
+		const T = Date.parse("2026-10-09T04:00:00Z");
+		const comp = { sourceEntry: { id: "cmp", type: "compaction", timestamp: new Date(T).toISOString(), details: { by: "pi-zip", via: "native" } }, messages: [{ role: "compactionSummary", summary: "s".repeat(20_000), tokensBefore: 0, timestamp: T }] };
+		const e = [comp, at(U("k1", "kept"), T - 9_000), at(A("k2"), T - 8_000)];
+		provider(e, 30_000, 2.2, ["k2"], () => 0);
+		expect(calibrate(e)).toMatchObject({ c: C0, source: "default" });
+		// the same entry persisted as a draft (request-local first) may have been carried by that response: its usage counts
+		const local = [{ ...comp, sourceEntry: { ...comp.sourceEntry, details: { by: "pi-zip" } } }, ...e.slice(1)];
+		expect(calibrate(local).source).toBe("usage");
+	});
+
 	test("/zip folded total: each fold on the scale of the model that made it, not today's c for all", async () => {
 		const { Zip } = await import("../src/run.ts");
 		const e = [SYS("s0", "x".repeat(8_000)), U("u1", "one"), A("a1", ["c1"]), R("ra", "c1", 40_000), A("a2"), U("u2", "two"), A("a3", ["c2"]), R("rb", "c2", 40_000), A("a4")];

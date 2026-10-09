@@ -1,5 +1,5 @@
 // One group per invariant of design §6 (I1-I6), driven through the real extension with a fake Pi.
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import { rmSync } from "node:fs";
 import { repairPayload, validateEdits } from "../src/guard.ts";
 import { record } from "../src/learn.ts";
@@ -159,6 +159,8 @@ describe("F12 summary prepared while the user is away (timer at 0.8 x TTL)", () 
 		return r.fire("context_with_system", { messages: flat(back) });
 	};
 	beforeEach(() => { process.env.PI_ZIP_COLD_CAP = "6000"; process.env.PI_ZIP_TTL_SECS = "0.1"; });
+	// the summary loads Pi's serializer lazily; cold, that import alone outlasts the 120 ms these tests leave the away timer
+	beforeAll(async () => { await import("@earendil-works/pi-coding-agent"); });
 
 	test("settle only plans: no model call yet; the timer builds the summary at 0.8 x TTL; the next cold return adopts it with no second call", async () => {
 		const st = { calls: 0 };
@@ -282,6 +284,96 @@ describe("F12 summary prepared while the user is away (timer at 0.8 x TTL)", () 
 		await r.handlers.get("cmd:zip").handler("off", r.ctx);
 		await sleep(200);
 		expect(st.calls).toBe(0);
+	});
+
+	// ---- the prepared summary goes in through Pi's own compaction (pi-tricks §1b, variant 1) -------------------------------
+	/** The cold return as Pi runs it: before_agent_start sees the session WITHOUT the prompt (Pi appends it after the hook), then the
+	 *  first request. `pi` fakes Pi's side: ctx.compact (asks session_before_compact, appends the entry, projects it), isIdle, settings. */
+	const comeBackNative = async (r: Any, settled: Any, o: { idle?: boolean; compact?: "ok" | "error" | "none"; tail?: Any[] } = {}) => {
+		const st = { compactCalls: 0, answer: undefined as Any };
+		let branch: Any[] = [...branchOf(done, COLD_TS()), ...(settled?.entries?.length ? [settled.entries.at(-1)] : []), ...(o.tail ?? [])];
+		let comp: Any = null;
+		r.ctx.sessionManager.getBranch = () => branch;
+		r.ctx.sessionManager.buildSessionProjection = () => ({ entries: done });
+		r.ctx.isIdle = () => o.idle !== false;
+		if (o.compact !== "none") {
+			r.ctx.compact = (opts: Any) => {
+				st.compactCalls++;
+				queueMicrotask(async () => {
+					if (o.compact === "error") return opts?.onError?.(new Error("Compaction failed: provider refused"));
+					st.answer = await r.handlers.get("session_before_compact")?.({ type: "session_before_compact", reason: "manual" }, r.ctx);
+					const c = st.answer?.compaction;
+					if (!c) return opts?.onError?.(new Error("Compaction cancelled"));
+					comp = { type: "compaction", id: "comp", summary: c.summary, firstKeptEntryId: c.firstKeptEntryId, tokensBefore: c.tokensBefore, details: c.details, fromHook: true };
+					branch = [...branch, comp];
+					opts?.onComplete?.({ ...c });
+				});
+			};
+		}
+		await r.fire("before_agent_start", { prompt: "back" });
+		// Pi appends the prompt, then builds the first request from the session
+		const view = comp ? project(back, [comp]) : back;
+		r.ctx.sessionManager.buildSessionProjection = () => ({ entries: view });
+		branch = [...branch, { type: "message", id: "u4", message: back.at(-1).sourceEntry.message }];
+		const req = await r.fire("context_with_system", { messages: flat(view) });
+		return { ...st, req, comp, view };
+	};
+
+	test("a summary prepared while away goes in through Pi's compaction before the run, with pi-zip's own before; the run sends it as Pi projects it", async () => {
+		const st = { calls: 0 };
+		const r = await rig(done, COLD_TS(), { modelRegistry: { complete: mkComplete(st) } }, { registerEntryRenderer: () => {} });
+		const settled = await settle(r);
+		await sleep(200);
+		const n = await comeBackNative(r, settled);
+		expect(st.calls).toBe(1); // written once, while away
+		expect(n.compactCalls).toBe(1);
+		expect(n.answer.compaction).toMatchObject({ firstKeptEntryId: "u3", details: { by: "pi-zip", via: "native", trigger: "cold" } });
+		expect(n.answer.compaction.summary).toContain("[summary of earlier conversation by pi-zip]");
+		expect(n.answer.compaction.usage).toMatchObject({ input: 11, output: 22 }); // Pi books the summary call's cost on its block
+		expect(n.req).toBeUndefined(); // nothing left to do locally: the request Pi built already starts with the summary
+		await sleep(5);
+		const notice = r.appended.filter((x: Any) => x.customType === "pi-zip/notice").at(-1).data;
+		expect(notice.before).toBe(n.answer.compaction.tokensBefore); // Pi's "Compacted from N tokens" is the notice's before
+		expect(notice.desc).toMatch(/^summarized 2 requests in [\d.]+ m?s · ready while you were away$/);
+		// turn_end persists no second compaction; another compaction (Pi's own threshold one) is not answered
+		const te = await r.fire("turn_end", turnEnd([...n.view, A("a6")], "a6"));
+		expect(te?.entries?.some((e: Any) => e.type === "compaction") ?? false).toBe(false);
+		expect(await r.handlers.get("session_before_compact")({ type: "session_before_compact", reason: "threshold" }, r.ctx)).toBeUndefined();
+	});
+
+	test("every gate keeps today's path: not idle, the branch already ends in a compaction, nothing for Pi to compact, no ctx.compact, a failed compaction", async () => {
+		const foreignComp = { type: "compaction", id: "pc", summary: "Pi's own", firstKeptEntryId: "u3", details: {}, fromHook: false };
+		const cases: Array<[string, Any, Any]> = [
+			["not idle", { idle: false }, {}],
+			["already compacted", { tail: [foreignComp] }, {}],
+			["nothing to compact", {}, { getSettings: () => ({ compaction: { keepRecentTokens: 10_000_000 } }) }],
+			["no ctx.compact (older Pi)", { compact: "none" }, {}],
+			["compaction failed", { compact: "error" }, {}],
+		];
+		for (const [name, o, piExtra] of cases) {
+			const st = { calls: 0 };
+			const r = await rig(done, COLD_TS(), { modelRegistry: { complete: mkComplete(st) } }, piExtra);
+			const settled = await settle(r);
+			await sleep(200);
+			const n = await comeBackNative(r, settled, o);
+			expect([name, n.compactCalls]).toEqual([name, name === "compaction failed" ? 1 : 0]);
+			expect([name, n.comp]).toEqual([name, null]);
+			expect([name, n.req?.messages?.[0]?.role]).toEqual([name, "compactionSummary"]); // the request carries it request-locally, as before
+			expect([name, st.calls]).toEqual([name, 1]); // the prepared summary is still the one used
+			const te = await r.fire("turn_end", turnEnd([...back, A("a6")], "a6"));
+			expect([name, te.entries.filter((e: Any) => e.type === "compaction").length]).toEqual([name, 1]); // ... and turn_end persists it
+		}
+	});
+
+	test("a summary still being written at the return is not pushed through Pi's compaction: the remainder is waited for, as before", async () => {
+		const st = { calls: 0, delay: 250 };
+		const r = await rig(done, COLD_TS(), { modelRegistry: { complete: mkComplete(st) } });
+		const settled = await settle(r);
+		await sleep(150);
+		const n = await comeBackNative(r, settled);
+		expect(n.compactCalls).toBe(0);
+		expect(n.req.messages[0].role).toBe("compactionSummary");
+		expect(st.calls).toBe(1);
 	});
 });
 
