@@ -121,6 +121,24 @@ describe("I1 byte stability: every request of a run sends the same prefix, and i
 		expect(norm(flat(project(all, te.entries)).slice(0, req1.messages.length))).toBe(norm(req1.messages));
 		expect(r.notes[0]).toMatch(/summarized 2 requests .* waited [\d.]+ s/);
 	});
+
+	test("a summary and folds in one batch: the compaction draft comes first (Pi takes its tokensBefore before any fold makes the usage stale)", async () => {
+		process.env.PI_ZIP_COLD_CAP = "6000";
+		// the cut lands at u3; the previous turn's re-readable output r5 (ls) folds by relax, in the kept part
+		const big = [U("u1", "one"), A("a1", ["c1"]), R("r1", "c1", 44_000), AX("a2", 120_000), U("u2", "two"), A("a3", ["c3"]), R("r3", "c3", 44_000), AX("a4", 120_000), U("u3", "three"), A("a5", ["c5"]), R("r5", "c5", 30_000), A("a5e"), U("u4", "back")];
+		const complete = async () => ({ stopReason: "stop", content: [{ type: "text", text: "## Decisions\nnarrative" }], usage: { cost: { total: 0.01 } } });
+		const r = await rig(big, COLD_TS(), { modelRegistry: { complete } });
+		await r.fire("before_agent_start", {});
+		const req1 = await r.fire("context_with_system", { messages: flat(big) });
+		expect(req1.messages[0].role).toBe("compactionSummary");
+		const all = [...big, A("a6")];
+		const te = await r.fire("turn_end", turnEnd(all, "a6"));
+		expect(te.entries.map((e: Any) => e.type)).toEqual(["compaction", "context_edit"]);
+		expect(te.entries[0].firstKeptEntryId).toBe("u3");
+		expect(te.entries[1].targetId).toBe("r5");
+		// the order changes nothing in what the session projects
+		expect(norm(flat(project(all, te.entries)).slice(0, req1.messages.length))).toBe(norm(req1.messages));
+	});
 });
 
 describe("F12 summary prepared while the user is away (timer at 0.8 x TTL)", () => {

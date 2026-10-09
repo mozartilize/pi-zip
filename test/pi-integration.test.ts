@@ -6,6 +6,10 @@ import { fileURLToPath } from "node:url";
 import { collapseSystemMessages, getCurrentSystemMessage, normalizeContext, resolveTranscript } from "@earendil-works/pi-ai";
 import { collapseSystem } from "../src/plan.ts";
 import type { Any } from "./helpers.ts";
+// Pi's own draft application (AgentSession._applyBoundaryDrafts uses no instance state): the order of the drafts and the
+// tokensBefore Pi writes for a compaction draft are Pi's, not a re-implementation
+import { AgentSession } from "../node_modules/@earendil-works/pi-coding-agent/dist/core/agent-session.js";
+import { estimateProjectedContextTokens } from "../node_modules/@earendil-works/pi-coding-agent/dist/core/compaction/compaction.js";
 
 const CWD = "/tmp/pi-zip-integration";
 const T0 = Date.now() - 3 * 3_600_000; // every message is hours old: the cache is cold
@@ -76,13 +80,7 @@ async function rig(setup: (sm: SessionManager) => void = populate) {
 		apply(sm, out.entries as Any[]);
 		return out.entries as Any[];
 	};
-	const apply = (manager: SessionManager, drafts: Any[]) => {
-		for (const d of drafts) {
-			if (d.type === "custom") manager.appendCustomEntry(d.customType, d.data);
-			else if (d.type === "context_edit") manager.appendContextEdit(d.targetId, d.replacement);
-			else if (d.type === "compaction") manager.appendCompaction(d.summary, d.firstKeptEntryId, 0, d.details, true, d.usage);
-		}
-	};
+	const apply = (manager: SessionManager, drafts: Any[]) => (AgentSession.prototype as Any)._applyBoundaryDrafts.call({}, manager, drafts) as Any[];
 	await runner.emit({ type: "session_start", reason: "startup" } as Any);
 	await runner.emitBeforeAgentStart("next request", undefined, { cwd: CWD } as Any);
 	return { sm, runner, request, turnEnd, narrativeCalls, projectionMessages };
@@ -144,6 +142,24 @@ describe("real Pi: the request view is identical before and after turn_end persi
 			expect(llm(req2.slice(0, req1.length), mid)).toBe(llm(req1, mid));
 			expect(llm(req3, mid)).toBe(llm(req2, mid));
 		}
+	});
+
+	test("a summary and a fold persisted together: Pi's 'Compacted from N' is its usage-based size before the edits, not chars/4 of a half-applied batch", async () => {
+		const r = await rig((sm) => populate(sm, 6000));
+		sendPrompt(r.sm, "next request");
+		const req1 = await r.request();
+		expect(req1.some((m) => m.role === "compactionSummary")).toBe(true);
+		// the response that carried the plan reports a real prompt size; the turn's tool result follows it
+		const real = { ...usage, input: 40_000, totalTokens: 40_050 };
+		const a = r.sm.appendMessage({ ...asst([call("c8")], "toolUse", 10_000_001), usage: real });
+		r.sm.appendMessage(result("c8", "y".repeat(4_000), 10_000_002));
+		const piBefore = estimateProjectedContextTokens(r.sm.buildSessionProjection(), r.sm.getBranch()).tokens; // what Pi reads before any draft
+		expect(piBefore).toBe(40_050 + Math.ceil(4_000 / 4)); // usage + the trailing tool result at chars/4
+		const drafts = await r.turnEnd(a, { ...asst([call("c8")], "toolUse"), usage: real });
+		expect(drafts.map((d: Any) => d.type)).toEqual(["compaction", ...drafts.slice(1).map(() => "context_edit")]);
+		expect(drafts.length).toBeGreaterThan(1); // a fold in the kept part rides along
+		const comp = r.sm.getBranch().find((e: Any) => e.type === "compaction") as Any;
+		expect(comp.tokensBefore).toBe(piBefore);
 	});
 
 	test("our replayed system message equals pi-ai's getCurrentSystemMessage", async () => {
