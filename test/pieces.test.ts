@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { repairPayload } from "../src/guard.ts";
 import { cacheTtlMs, detectCold, isColdByTtl, observedTier } from "../src/cache.ts";
 import { classifyRecoverability, isReadOnlyBash } from "../src/classify.ts";
-import { fmtK, noticeText, ratioBar, renderNotice, type NoticeAction, type NoticeData } from "../src/notice.ts";
+import { fmtK, noticeText, ratioBar, renderNotice, colorDesc, type NoticeAction, type NoticeData } from "../src/notice.ts";
 import { clipMid, handleFor, makePlaceholder, makePlaceholderFor, outcomeHint, pickKeyLines, shortArgs } from "../src/placeholder.ts";
 import { buildBlocks, toolCallIndex } from "../src/plan.ts";
 import { A, type Any, R, U } from "./helpers.ts";
@@ -572,9 +572,17 @@ describe("notices and stats", () => {
 		expect(ex[3]).toContain("read src/payment.ts  turn 1");
 		expect(ex[4]).toBe("          … 10 more");
 	});
-	test("colours: product accent, numbers text, bar and words dim", () => {
+	test("colours by meaning: brand accent, old size muted, new size + kept cells success, verb text, context dim", () => {
 		const tag = { fg: (c: string, t: string) => `<${c}>${t}</${c}>` };
-		expect(renderNotice(data, false, 120, tag, (s) => s.replace(/<\/?\w+>/g, "").length)[0]).toBe("<accent>▸ pi-zip</accent>  <text>74K → 43K</text>  <dim>▰▰▰▰▰▰▱▱▱▱</dim>  <dim>folded 12 old outputs</dim>");
+		const len = (s: string) => s.replace(/<\/?\w+>/g, "").length;
+		expect(renderNotice(data, false, 120, tag, len)[0]).toBe("<accent>▸ pi-zip</accent>  <muted>74K</muted><dim> → </dim><success>43K</success>  <success>▰▰▰▰▰▰</success><dim>▱▱▱▱</dim>  <text>folded 12 old outputs</text>");
+		expect(colorDesc("folded 12 old outputs in 6 ms", tag)).toBe("<text>folded 12 old outputs</text><dim> in 6 ms</dim>");
+		expect(colorDesc("summarized 3 requests in 38.2 s · ready while you were away", tag)).toBe("<text>summarized 3 requests</text><dim> in 38.2 s</dim><dim> · </dim><dim>ready while you were away</dim>");
+		// only a wait the user really sat through gets the warning colour
+		expect(colorDesc("summarized 4 requests · waited 43.4 s", tag)).toBe("<text>summarized 4 requests</text><dim> · </dim><warning>waited 43.4 s</warning>");
+		expect(colorDesc("summarized 4 requests · waited 0.6 s", tag)).toContain("<dim>waited 0.6 s</dim>");
+		// monochrome: stripping colour leaves exactly the plain text
+		expect(len(renderNotice(data, false, 120, tag, len)[0])).toBe(renderNotice(data, false, 120, { fg: (_c, t) => t })[0].length);
 	});
 });
 

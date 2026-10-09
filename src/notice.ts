@@ -72,29 +72,60 @@ export function ratioBar(before: number, after: number, cells = 10): string {
 
 export interface NoticeTheme {
 	fg(color: string, text: string): string;
+	bold?(text: string): string;
 }
 
 const MARK = "▸ ";
 const INDENT = " ".repeat(MARK.length + PRODUCT.length + 2);
+/** Waiting at least this long is a cost the user paid: it gets the warning colour. Shorter waits are not worth the eye. */
+const WAIT_NOTICEABLE_MS = 2000;
+
+/**
+ * Colour, by meaning (theme tokens only, so dark/light/custom themes keep working; no meaning is carried by colour alone,
+ * the words and the bar's shape say it all in monochrome too):
+ *   accent  the brand mark: where the line comes from, scanned for, never the message
+ *   muted   the old size: the past, deliberately quiet
+ *   success the new size and the bar cells that remain: the one focal point of the line (what you now pay for)
+ *   text    the verb phrase: what happened
+ *   dim     everything that is context: arrow, separators, durations, "ready while you were away", the detail lines
+ *   warning only a wait the user actually sat through (>= 2 s): the one thing pi-zip cost them
+ * One saturated hue at a time per segment, at most three per line (accent, success, and warning only when it applies).
+ */
+export function colorDesc(desc: string, th: NoticeTheme): string {
+	const sep = th.fg("dim", " · ");
+	return desc.split(" · ").map((part) => {
+		const waited = /^waited ([\d.]+) s$/.exec(part);
+		if (waited) return th.fg(Number(waited[1]) * 1000 >= WAIT_NOTICEABLE_MS ? "warning" : "dim", part);
+		const took = /^(.*?)( in [\d.]+ m?s)$/.exec(part);
+		if (/^(folded|summarized) /.test(part)) return took ? th.fg("text", took[1]) + th.fg("dim", took[2]) : th.fg("text", part);
+		return th.fg("dim", part);
+	}).join(sep);
+}
 
 /** Lines for the transcript. Narrow terminals drop whole segments in order (description, then bar); the numbers always stay.
  *  `w` measures display width (Pi's visibleWidth in the renderer; string length in tests). Every line fits `width`. */
 export function renderNotice(d: NoticeData, expanded: boolean, width: number, th: NoticeTheme, w: (s: string) => number = (s) => s.length): string[] {
-	const nums = `${fmtK(d.before)} → ${fmtK(d.after)}`;
+	const b = fmtK(d.before), a = fmtK(d.after);
+	const nums = `${b} → ${a}`;
 	const bar = ratioBar(d.before, d.after);
+	const strong = (t: string) => (th.bold ? th.bold(t) : t);
+	const numsC = `${th.fg("muted", b)}${th.fg("dim", " → ")}${th.fg("success", strong(a))}`;
+	const kept = bar.replace(/▱/g, "").length;
+	const barC = th.fg("success", bar.slice(0, kept)) + th.fg("dim", bar.slice(kept));
+	const brand = th.fg("accent", MARK + PRODUCT);
 	const tries: [string, string][] = [
-		[`${MARK}${PRODUCT}  ${nums}  ${bar}  ${d.desc}`, `${th.fg("accent", MARK + PRODUCT)}  ${th.fg("text", nums)}  ${th.fg("dim", bar)}  ${th.fg("dim", d.desc)}`],
-		[`${MARK}${PRODUCT}  ${nums}  ${bar}`, `${th.fg("accent", MARK + PRODUCT)}  ${th.fg("text", nums)}  ${th.fg("dim", bar)}`],
-		[`${MARK}${PRODUCT}  ${nums}`, `${th.fg("accent", MARK + PRODUCT)}  ${th.fg("text", nums)}`],
-		[nums, th.fg("text", nums)],
+		[`${MARK}${PRODUCT}  ${nums}  ${bar}  ${d.desc}`, `${brand}  ${numsC}  ${barC}  ${colorDesc(d.desc, th)}`],
+		[`${MARK}${PRODUCT}  ${nums}  ${bar}`, `${brand}  ${numsC}  ${barC}`],
+		[`${MARK}${PRODUCT}  ${nums}`, `${brand}  ${numsC}`],
+		[nums, numsC],
 	];
 	const head = tries.find(([plain]) => w(plain) <= width);
 	if (!head) return [];
 	const out = [head[1]];
+	const fit = (plain: string) => (w(INDENT + plain) <= width ? INDENT : w(plain) <= width ? "" : null);
 	const sub = (plain: string) => {
-		const line = INDENT + plain;
-		if (w(line) <= width) out.push(th.fg("dim", line));
-		else if (w(plain) <= width) out.push(th.fg("dim", plain));
+		const ind = fit(plain);
+		if (ind !== null) out.push(th.fg("dim", ind + plain));
 	};
 	if (d.first) sub("originals are kept; the model can recall any of them with zip_recall");
 	if (!expanded) return out;
@@ -103,7 +134,12 @@ export function renderNotice(d: NoticeData, expanded: boolean, width: number, th
 	const lw = Math.min(28, Math.max(0, ...items.map((i) => i.label.length)));
 	for (const i of items) {
 		const label = i.label.length > lw ? i.label.slice(0, lw - 1) + "…" : i.label.padEnd(lw);
-		sub(`${label}  ${(i.turn ? `turn ${i.turn}` : "").padEnd(8)}${fmtK(i.tokens).padStart(6)}  ${i.handle}`);
+		const turn = (i.turn ? `turn ${i.turn}` : "").padEnd(8), size = fmtK(i.tokens).padStart(6);
+		const plain = `${label}  ${turn}${size}  ${i.handle}`;
+		const ind = fit(plain);
+		if (ind === null) continue;
+		// an item row: what it was (text), where (dim), how big (muted), and the handle zip_recall takes (code colour: copyable)
+		out.push(th.fg("dim", ind) + th.fg("text", label) + th.fg("dim", `  ${turn}`) + th.fg("muted", size) + "  " + th.fg("mdCode", i.handle));
 	}
 	if (d.more) sub(`… ${d.more} more`);
 	return out;
