@@ -3,7 +3,7 @@ import { rmSync, existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { recallSections, resolveHandlesInBranch } from "../src/recall.ts";
 import { handleFor } from "../src/placeholder.ts";
-import { cardText, fmtLife, markFirstLine, recallCallLine, recallResultLines, renderCard, renderState, type CardData } from "../src/ui.ts";
+import { CHART_COLS, cardText, chartAxis, chartGap, fmtLife, markFirstLine, recallCallLine, recallResultLines, renderCard, renderState, type CardData } from "../src/ui.ts";
 import { fakeCtx, fakePi } from "./helpers.ts";
 
 type Any = any;
@@ -46,6 +46,26 @@ describe("status card", () => {
 		const l = renderCard(card, 200, tag);
 		expect(l.filter((x) => x.includes("<text>"))).toHaveLength(1);
 		expect(renderCard({ ...card, state: "reread-only", stateNote: "a tool allowlist hides zip_recall" }, 200, tag)[0]).toContain("<warning>reread-only</warning>");
+	});
+	test("the cache chart: labels are the axes, live bars in the accent colour, ticks under their columns, the sentence never cut", () => {
+		const claude = Array.from({ length: CHART_COLS }, (_, i) => (chartGap(i) <= 300 ? 1 : 0));
+		const c: CardData = { ...card, model: "anthropic/claude-sonnet-5-5", alive: claude, life: "~5 min", measured: false };
+		const t = cardText(c);
+		expect(t.slice(0, 3).map((r) => r.slice(0, 9))).toEqual(["model    ", "cache    ", "away     "]);
+		expect(t[1]).toBe(`cache    ${"\u2588".repeat(14)}${"\u2581".repeat(18)}  expires after ~5 min idle`);
+		// the 5m tick starts at the column where the bars drop, the 2h tick ends at the last column
+		expect(t[2].indexOf("5m")).toBe(9 + 13);
+		expect(t[2].indexOf("2h")).toBe(9 + CHART_COLS - 1);
+		expect(chartAxis().trim().split(/\s+/)).toEqual(["1m", "5m", "15m", "1h", "2h"]);
+		const l = renderCard(c, 120, tag);
+		expect(l[2]).toContain(`<accent>${"\u2588".repeat(14)}</accent><dim>${"\u2581".repeat(18)}</dim>`);
+		for (const w of [10, 30, 43, 46, 60, 80, 120]) expect(fits(renderCard(c, w, tag), w, plainW)).toBe(true);
+		// medium width: the sentence moves under the axis whole; narrow: no chart, the plain row
+		const mid = renderCard({ ...c, measured: true }, 60, th);
+		expect(mid[3]).toStartWith("  away         1m");
+		expect(mid[4]).toBe("           expires after ~5 min idle (measured)");
+		expect(renderCard(c, 40, th)[1]).toStartWith("  cache    anthropic/claude-sonnet-5-5");
+		expect(renderCard(c, 40, th).filter((x) => /^  (model|away) /.test(x))).toEqual([]); // no model or away row without the chart
 	});
 	test("fmtLife", () => expect([fmtLife(45), fmtLife(300), fmtLife(3600), fmtLife(9000)]).toEqual(["~45 s", "~5 min", "~1 h", "~2.5 h"]));
 });
@@ -141,7 +161,10 @@ describe("transcript wiring", () => {
 		expect(kept.map((x: Any) => x.data.kind)).toEqual(["card", "state", "state", "state"]);
 		const c = render(kept[0]);
 		expect(c[0]).toBe("ƶ pi-zip  on");
-		expect(c.join("\n")).toContain("cache    p/m · expires after ~5 min idle");
+		expect(c.join("\n")).toContain("model    p/m");
+		// the declared 5-min TTL, nothing learned yet: bars up to the 5m tick, then dead
+		expect(c.join("\n")).toContain(`cache    ${"\u2588".repeat(14)}${"\u2581".repeat(18)}  expires after ~5 min idle`);
+		expect(c.join("\n")).toContain("away         1m       5m");
 		expect(c.join("\n")).toContain("session  0 zipped ~0K");
 		expect(render(kept[1])[0]).toStartWith("ƶ pi-zip  off  Nothing is folded");
 		expect(render(kept[2])[0]).toBe("ƶ pi-zip  on  folding resumes");
