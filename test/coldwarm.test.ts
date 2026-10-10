@@ -33,11 +33,13 @@ describe("F2: a cold plan looks one user turn ahead", () => {
 		expect(p.ahead).toBe(true);
 		// the first cut that reaches the cap, inside the previous user turn: its prompt and early work are summarised; the answer the
 		// user saw, the new prompt and everything after stay verbatim
-		expect(p.firstKeptEntryId).toBe("w3");
+		// (the whole plan's law prices the summary call: the first cut, w3, reads too much for the saving, the next one pays)
+		expect(p.firstKeptEntryId).toBe("w4");
 		const kept = p.blocks.slice(p.cutIdx!).map((b) => b.entryId);
-		expect(kept).toEqual(["w3", "w4", "fin", "u3"]);
-		// with F1 the lookahead prices the valve's summary like the valve would: refused there, not written now either
-		expect(planContext(slid, { ...o, lookahead: true, warmSummaryGate: true })?.cutIdx ?? null).toBeNull();
+		expect(kept).toEqual(["w4", "fin", "u3"]);
+		// with F1 the lookahead prices the valve's summary like the valve would: the minimal cut is refused there (and not written now
+		// either), the deeper cut the valve would write at the next prompt pays, and is the one written now
+		expect(planContext(slid, { ...o, lookahead: true, warmSummaryGate: true })?.firstKeptEntryId).toBe("w4");
 	});
 	test("the settle view (prompt pending) plans the same cut as the run-start view (I1: the prepared summary is adopted)", () => {
 		const o = { ...base, mode: "cold" as const, law: law(0, 500), lookahead: true };
@@ -66,7 +68,12 @@ describe("F2: a cold plan looks one user turn ahead", () => {
 describe("F1: a warm summary passes the summary gate too", () => {
 	test("a summary the gate refuses is not written warm either", () => {
 		const o = { ...base, mode: "warm" as const, coldCap: 20_000, law: law(1, 500), trace: [] as Any[] };
-		expect(planContext(older, o)!.cutIdx).not.toBeNull(); // the valve skipped the gate
+		// without F1 the valve skipped the summary gate; the whole plan's law prices the call too (TRIAGE (a) 2), so a summary whose call
+		// does not pay is refused there instead
+		const f0 = { ...o, trace: [] as Any[] };
+		expect(planContext(older, f0)?.cutIdx ?? null).toBeNull();
+		expect(f0.trace.some((t: Any) => t.where === "plan" && !t.ok)).toBe(true);
+		expect(f0.trace.some((t: Any) => t.where === "summary")).toBe(false);
 		const f1 = { ...o, warmSummaryGate: true, trace: [] as Any[] };
 		expect(planContext(older, f1)?.cutIdx ?? null).toBeNull();
 		expect(f1.trace.some((t: Any) => t.where === "summary" && !t.ok)).toBe(true);

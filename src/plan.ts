@@ -550,6 +550,7 @@ export interface PlanOpts {
 	narrativePrice?: boolean; // F3, default NARRATIVE_PRICE
 	slide?: number; // internal (F2): plan as if this many more user turns had started (the protected window slid)
 	valveB?: number; // internal (F2): the real context the slid warm plan's law sees (the cold plan's folds already applied)
+	warmStyle?: boolean; // internal: a cold plan at 0 < P(warm) < 0.5 that the law refused is planned once more the way a warm plan is (no relax folds unless pastTtl, the summary gated)
 }
 
 export interface PlanResult {
@@ -604,6 +605,7 @@ export const contentKeyOf = (content: Any): string => {
 export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
 	const s = settings();
 	const mode = o.mode ?? "cold";
+	const warmLike = mode === "warm" || o.warmStyle === true; // plans the way a warm plan does (the label of the trigger stays the mode's)
 	// limits are in real tokens; the plan works in content estimate units (real = O + c x estimate), so they are converted once, here.
 	// The cold cap is on the whole context, but leaves at least half of itself for the conversation above O (coldTarget): a cap the
 	// fixed prefix alone fills is out of reach, and every cold return then folds all it may and summarises. The compaction room is
@@ -626,11 +628,11 @@ export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
 	const blocks = buildBlocks(entries, o.steerIds);
 	if (!blocks.length) return null;
 	const userTurns = countUserTurns(blocks) + (o.promptPending ? 1 : 0) + (o.slide ?? 0); // the upcoming prompt is a new user turn
-	const f1 = o.warmSummaryGate ?? WARM_SUMMARY_GATE, f2 = mode === "cold" && (o.lookahead ?? LOOKAHEAD), f3 = o.narrativePrice ?? NARRATIVE_PRICE;
+	const f1 = o.warmSummaryGate ?? WARM_SUMMARY_GATE, f2 = mode === "cold" && !o.warmStyle && (o.lookahead ?? LOOKAHEAD), f3 = o.narrativePrice ?? NARRATIVE_PRICE;
 	const calls = toolCallIndex(blocks);
 	const recalled = o.recalled ?? new Set<string>();
 	const ctxEst = blocks.reduce((a, b) => a + b.tokens, 0); // content
-	if (mode === "warm" && !(ctxEst > coldCap)) return null; // I6: warm cache below the cold cap -> never edit
+	if (warmLike && !(ctxEst > coldCap)) return null; // I6: warm cache below the cold cap -> never edit
 	const trig = mode === "warm" ? "valve" : "cold";
 	const tokOverride = new Map<number, number>();
 	const folds: FoldTarget[] = [];
@@ -679,7 +681,7 @@ export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
 	const savings = () => folds.reduce((a, t) => a + t.entryTokens - t.phTokens, 0);
 	const cands = blocks.filter((b) => foldable(b) && !protectedTurn(b));
 	for (const b of cands) addFold(b, trig);
-	if (relax && (mode === "cold" || o.pastTtl === true)) {
+	if (relax && ((mode === "cold" && !o.warmStyle) || o.pastTtl === true)) {
 		// the protected window = the new prompt + the previous user turn; that turn's big reads are what makes a cold return
 		// expensive. Rereadable ones can be recalled exactly: fold them biggest-first until the cap; never the latest turn's own.
 		// Cold plans, and warm plans at a return after the declared TTL; any other warm plan keeps the previous user turn visible.
@@ -720,8 +722,18 @@ export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
 	const minCut = blocks[0].kind === "summary" ? 2 : 1; // never re-summarise a prefix that is only the previous summary
 	const pre: number[] = [];
 	const S = (x: number) => Math.max(clamp(SUMMARY_RATIO * x, SUMMARY_FLOOR, SUMMARY_CAP), prevSum); // the next summary carries the previous one forward
+	// Block index of every fold: the folds a cut voids are those before it
+	const foldAt = folds.map((t) => blocks.findIndex((b) => b.entryId === t.entryId));
+	/** The whole plan's law (F10): B is the context as it is (or as the slid valve saw it), A what the plan leaves, `call` the summary call
+	 *  a cut makes; `untouched` is the content before the earliest edit (ledger only). A cold plan with some chance of a warm cache is
+	 *  priced by expectation (no prices: a cold plan always fires). T = A (the whole post-edit context, O included, as tuned: the cheaper
+	 *  A - O fires warm edits earlier and loses items offline). */
+	const planGate = (after: number, untouched: number, call: number, planned: boolean): boolean =>
+		!(warmLike || (planned && law.pr)) || gate("plan", Math.max(o.valveB ?? real(ctxEst), real(after)), real(after), room, call, real(after), c * (after - untouched));
 	/** The cut for cut points minCut..maxCut: the first that brings the context to the cap, else the deepest; gated = the summary law
-	 *  (no prices: the legacy gain rule) must pass. Applies it (folds in the prefix are void) and returns true, or changes nothing. */
+	 *  (no prices: the legacy gain rule) must pass. When the minimal cut's summary or the whole plan with it is refused, the deeper cuts
+	 *  are tried in turn (the gain grows as D^2, the call only with the prefix read). The whole plan's law prices the summary call too.
+	 *  Applies the first cut both laws accept (folds in the prefix are void) and returns true, or changes nothing. */
 	const summarise = (maxCut: number, gated: boolean): boolean => {
 		const cuts: number[] = [];
 		for (let i = minCut; i < blocks.length && i <= maxCut; i++) if (blocks[i].entryId && (blocks[i].kind === "user" || blocks[i].kind === "assistant")) cuts.push(i);
@@ -732,27 +744,30 @@ export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
 			acc += tokOverride.get(i) ?? blocks[i].tokens;
 		}
 		const total = acc;
-		let pick = cuts[cuts.length - 1];
-		for (const c of cuts) if (total - pre[c] + S(pre[c]) <= coldCap) { pick = c; break; }
-		const X = c * pre[pick], Sr = c * S(pre[pick]);
-		if (gated) {
-			// the summary call must pay for itself, cold or warm (F1, WARM_SUMMARY_GATE; before, a warm plan skipped the gate). The call is
-			// the narrative call summary.ts makes (F3, NARRATIVE_PRICE): uncached input of the prefix without the previous summary, which it
-			// never reads, + output of at most the narrative budget; without F3 the verdict's w X + out S (the carried summary as output)
+		let first = cuts.length - 1;
+		for (let k = 0; k < cuts.length; k++) if (total - pre[cuts[k]] + S(pre[cuts[k]]) <= coldCap) { first = k; break; }
+		for (const pick of cuts.slice(first)) {
+			const X = c * pre[pick], Sr = c * S(pre[pick]);
+			// the call is the narrative call summary.ts makes (F3, NARRATIVE_PRICE): uncached input of the prefix without the previous
+			// summary, which it never reads, + output of at most the narrative budget; without F3 the verdict's w X + out S (the carried
+			// summary as output)
 			const call = !law.pr ? 0 : f3 ? law.pr.input * c * Math.max(pre[pick] - prevSum, 0) + law.pr.out * c * Math.min(S(pre[pick]), NARRATIVE_MAX) : law.pr.w * X + law.pr.out * Sr;
-			const ok = !law.pr ? summaryGainOk(X, Sr, real(total), minGain) : (mode === "warm" && !f1) || gate("summary", X, Sr, null, call, Sr);
-			if (!ok) return false;
+			if (gated) {
+				// the summary call must pay for itself, cold or warm (F1, WARM_SUMMARY_GATE; before, a warm plan skipped the gate)
+				const ok = !law.pr ? summaryGainOk(X, Sr, real(total), minGain) : (warmLike && !f1) || gate("summary", X, Sr, null, call, Sr);
+				if (!ok) continue;
+			}
+			if (!(pre[pick] >= 2 * S(pre[pick]))) continue;
+			// what the plan leaves: the context with its folds (those inside the prefix too: the prefix is measured as folded, `pre`) minus
+			// what the summary replaces plus the summary. (Counting the voided folds' savings back, as before, overstated it by them.)
+			if (!planGate(ctxAfterFolds - (pre[pick] - S(pre[pick])), 0, call, true)) continue;
+			cutIdx = pick;
+			prefixTokens = pre[pick];
+			summaryTokensPlanned = S(pre[pick]);
+			for (let i = folds.length - 1; i >= 0; i--) if (foldAt[i] < pick) { tokOverride.delete(foldAt[i]); folds.splice(i, 1); foldAt.splice(i, 1); } // the prefix is replaced: its folds are void
+			return true;
 		}
-		if (!(pre[pick] >= 2 * S(pre[pick]))) return false;
-		cutIdx = pick;
-		prefixTokens = pre[pick];
-		summaryTokensPlanned = S(pre[pick]);
-		for (let i = folds.length - 1; i >= 0; i--) {
-			const bi = blocks.findIndex((b) => b.entryId === folds[i].entryId);
-			if (bi < pick) { tokOverride.delete(bi); folds.splice(i, 1); } // the prefix is replaced: its folds are void
-		}
-		ctxAfterFolds = ctxEst - savings();
-		return true;
+		return false;
 	};
 	if (sumTrigger) {
 		const limit = blocks.findIndex((b) => protectedTurn(b));
@@ -787,10 +802,13 @@ export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
 	const untouched = untouchedEst(blocks, folds, cutIdx !== null);
 	const after = ctxAfterFolds - (cutIdx !== null ? prefixTokens - summaryTokensPlanned : 0);
 	const planned = folds.length > 0 || cutIdx !== null;
-	// F10: a warm rewrite must pay back; a cold plan with some chance of a warm cache is priced by expectation (no prices: cold always fires).
-	// T = A (the whole post-edit context, O included, as tuned: the cheaper A - O fires warm edits earlier and loses items offline);
-	// the suffix after the earliest edit goes to the ledger only.
-	if ((mode === "warm" || (planned && law.pr)) && !gate("plan", Math.max(o.valveB ?? real(ctxEst), real(after)), real(after), room, 0, real(after), c * (after - untouched))) return null;
+	// a plan with a cut passed the whole plan's law with its call inside summarise; folds only (no summary wanted, or none the laws
+	// accepted: the deeper cuts and the cut-free plan both stand) is judged here
+	if (cutIdx === null && !planGate(after, untouched, 0, planned)) {
+		// a cold plan with some chance of a warm cache: the plan a warm cache would make may pay where this one does not
+		if (mode === "cold" && !o.warmStyle && law.pr && law.pWarm > 0 && law.pWarm < 0.5) return planContext(entries, { ...o, warmStyle: true });
+		return null;
+	}
 	return { blocks, calls, folds, cutIdx, firstKeptEntryId: cutIdx !== null ? blocks[cutIdx].entryId : null, prefixTokens, summaryTokensPlanned, sumTrigger: cutIdx !== null ? (sumTrigger ?? trig) : sumTrigger, scale: o.scale ?? UNIT, ctxTokens: real(ctxEst), ctxAfterFolds: real(ctxAfterFolds), userTurns, cutVisibleIdx, cutKeptFirstMsg, ...(o.fileRecall ? { fileRecall: o.fileRecall } : {}), ...(ahead ? { ahead } : {}) };
 }
 
