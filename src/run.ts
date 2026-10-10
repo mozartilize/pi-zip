@@ -490,7 +490,8 @@ export class Zip implements ZipControl {
 			const p = planContext(entries, o);
 			if (!p || p.cutIdx === null) return;
 			const at = lastMessageMs(branch);
-			// only a timer that is still in the future: a session left longer than that is a cold return, and the run plan of its next
+			// only while the cache the session left is not yet dead (a restart between the 0.8 mark and the TTL starts the call at once, as
+			// the live process's timer would have already): a session left longer than that returns cold, and the run plan of its next
 			// prompt handles it. Opening or /resuming an old session to browse it must not start a paid summary call.
 			const delayMs = this.scheduleSummary(p, ctx, at || undefined, true);
 			this.ledger({ type: "away_resumed", timerMs: delayMs, lastRequestMs: at });
@@ -1024,9 +1025,10 @@ export class Zip implements ZipControl {
 		}
 	}
 
-	/** Start the away-timer for a summary; returns the delay in ms (-1: `future` was asked for and the moment has passed, nothing is armed).
-	 *  unref'd: it never keeps the process alive. */
-	private scheduleSummary(p: PlanResult, ctx: Any, lastMs?: number, future = false): number {
+	/** Start the away-timer for a summary; returns the delay in ms (-1: `alive` was asked for and the cache is already dead, nothing is armed).
+	 *  `alive` (a resumed process): arm only while the last request's cache has not expired yet (now < last + TTL; the delay is 0 from the
+	 *  0.8 mark on, where the live process's timer would already have fired). unref'd: it never keeps the process alive. */
+	private scheduleSummary(p: PlanResult, ctx: Any, lastMs?: number, alive = false): number {
 		const ttl = ttlFor(ctx.model, this.branch(ctx), this.tier(ctx.model));
 		const last = lastMs ?? (this.lastReqMs || Date.now());
 		const warm = this.idleWarming() ? warmingDelayMs(ttl) : undefined;
@@ -1035,7 +1037,7 @@ export class Zip implements ZipControl {
 			// written now would be thrown away at a warm return, so it waits for Pi's decision (cacheWarmingDecision); should none come
 			// (Pi is not warming this request after all), it starts just after the decision was due
 			const due = last + warm + warmingMargin(ttl) - Date.now();
-			if (future && due <= 0) return -1;
+			if (alive && Date.now() >= last + ttl) return -1;
 			this.awaySig = this.contextSig(ctx);
 			this.awayPlan = { p, ctx };
 			const delay = Math.max(0, due);
@@ -1043,7 +1045,7 @@ export class Zip implements ZipControl {
 			return Math.round(delay);
 		}
 		const due = last + AWAY_FRACTION * ttl - Date.now();
-		if (future && due <= 0) return -1;
+		if (alive && Date.now() >= last + ttl) return -1;
 		this.awaySig = this.contextSig(ctx);
 		const delay = Math.max(0, due);
 		this.armAway(delay, () => void this.runAway(p, ctx));
