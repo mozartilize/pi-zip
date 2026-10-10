@@ -408,3 +408,166 @@ call to remove about 7K of 126K.
 * NR is a visible residual (142): outputs the cold return had to protect are folded by a warm rewrite one prompt later. On the 398 bench sessions the old hold would have
   avoided about 6.3M warm-rewrite tokens at a higher total cost; the replay above does not measure that class on the final source.
 * The replay's cost and wait are estimates (a model of latency, class prices, synthetic summaries); no confidence interval.
+
+## Round 3: N6, restart speed, driven runs, the native path (3d96bee, 2cda8e1, 007d1d1)
+
+### Results
+
+`pz-formal check --src SRC --suite standard --random 3000 --seed 1 --workers 26 --shrink 40` (33,340 traces, 285,363 requests) and
+`--suite none --random 15000 --seed 7` (15,000 traces, 553,441 requests). "Before" is a2885b1 (its src is 75c7a6c's: the suite column is the
+run of the table above, whose per-trace verdicts were kept; seed 7 was run again on a2885b1 this round). 2cda8e1 and HEAD (007d1d1) give
+identical counts on both runs.
+
+| property | suite before | suite after | seed 7 before | seed 7 after |
+|---|---|---|---|---|
+| A1, I1, PW, B2B, WB, LW, G, W | 0 | 0 | 0 | 0 |
+| A2 / A2r | 3 / 3 | **4 / 4** | 20 / 20 | **22 / 22** |
+| A3 | 23 | 23 | 94 | 94 |
+| RD / RDr | 0 / 0 | 0 / 0 | 5 / 5 | **2 / 2** |
+| RC | 0 | 0 | 1 | 1 |
+| MP / MPr | 1 / 1 | **0 / 0** | 11 / 4 | **0 / 0** |
+| NR | 142 | 141 | 336 | 338 |
+| NT | 0 | 0 | **2** | **0** |
+| TR | 2 | **1** | 11 | **5** |
+| GC | 0 | 0 | 1 | 1 |
+| MH | 2 | 2 | 7 | 7 |
+
+The new A2 traces (1 on the suite, 2 on seed 7; per-trace verdicts compared) all have a model switch, and the runs split exactly there:
+before, the cold return after the switch wrote a summary the planner believed paid (the N6 class); after, it folds only (example: 36.7K +
+a paid summary before, 49.7K with folds alone after). Later in the same trace, a warm decision in that now-larger context lands in the
+existing class "pays by the planner's estimate of B and A, not by the request's real size (calibration)" (P2-3, deferred above: planner A
+92.5K vs a real 97.3K). They are not decisions made with the carried-over scale. NR +2 on seed 7 is the same kind of shift: the trace
+continues differently after a switch.
+
+Tests at 007d1d1: `bun test` 455 pass, 0 fail; tsc clean; `bun run build-check` clean; `cargo test --release` in `formal/`: 10 unit + 1 bridge +
+**23 mutants pass, 0 ignored** (`nt_no_thrash` is a real test now).
+
+### N6: root cause and fix (3d96bee)
+
+Neither of the two candidates the review named. **The plan gate is not skipped**: both gates run (summary step and whole-plan step with the
+call, K < 0 at P = 0). **The call is priced correctly**: summary.ts `narrative` sends Pi's `serializeConversation`, which cuts every tool result
+to 2,000 chars. The bridge's narrative read 17.3K real tokens where the planner priced 15K. Pricing the unfolded originals, which I tried
+first, would overcharge by about 10x. The defect was **the sizes after the switch**. The first cold return to a new model is planned with
+O = R0 x system and c = C0 = 1.5 until that model's first response, although the session has measured c (1.7 in the worlds where N6
+appears). Every believed size was 10-13% low: believed context 376K for a real 416K, and the planner's believed context sat below the real
+floor of the protected turns. So the summary decision was made on wrong sizes, and NT compares exactly that believed context to the real
+floor. On the real sizes, the shrunk N6 summary removes 41K of 417K (not "almost nothing") and pays by about 18% over its call.
+
+Fix: `calibrate` carries over the newest same-provider model's O and c until the new model's first response. Same provider means the same
+tokenizer (opus to sonnet, say). Another provider keeps the defaults as before. NT is 0 on both runs, MP 0, TR down.
+
+The N6 rule ("never start a summary that cannot pay for its own call") was already in place as the summary gate plus the whole-plan gate on
+every trigger (cold, valve, lookahead through `summarise`). The fix makes the sizes they judge real ones. I did not add a safety margin to
+the gates: it would move MP and the warm valve, and the margin seen on the N6 traces (5-18%) is within the estimate error the README states.
+
+Tests:
+* `test/calibration.test.ts`, "a switch to a model of the SAME provider ...": on a2885b1, c is 1.5 where the session measured 1.9.
+* `formal/tests/mutants.rs nt_no_thrash` on `traces/n6-switch.trace`, the shrunk counterexample of the seed-7 run. The mutant
+  (`sameProviderScale` disabled) is a2885b1's behaviour and fails NT; the src passes.
+* `pz-formal gen --seed S --index N` prints one random trace (to replay a verdict's `n` without the shrinker).
+
+### Restart speed (2cda8e1)
+
+A reopened session whose cache is dead (`resumeAway` gets -1) and whose cold plan would summarise listens with `ctx.ui.onTerminalInput`
+(only with a UI that has it). The handler never consumes or alters the data. Terminal reports are ignored: focus, CPR, cell size, DA, kitty
+flags, DECRPM, SGR mouse, OSC/DCS/APC (`util.ts isKeystroke`). At the first real key it unsubscribes, plans the cold return again on the
+session as it is, and starts the summary through the away timer's `startBg`. The prompt adopts it through `takeBg` (no second call; the
+notice shows the remaining wait). The listener is also removed at shutdown and at any prompt; without a UI it is never armed.
+
+Real TUI check: pi 1.1.0 in tmux, a mock Anthropic provider whose summary call takes 40 s, the session reopened 70 min after its last
+response, the first key typed, the prompt entered after a delay. Typing was not disturbed: the editor showed "hello" and the working line
+read "finishing the summary it started while you were away".
+
+| first key -> Enter | wait before the first request, a2885b1 | 2cda8e1 | removed |
+|---|---|---|---|
+| 10 s | 40.0 s | 30.0 s ("waited 30.0 s") | 10 s (25%) |
+| 30 s | 40.1 s | 10.0 s ("waited 10.0 s") | 30 s (75%) |
+
+One summary call in every run. The head start removes exactly the typing time, up to the call's length. The formal bridge has no keystrokes,
+so A3 does not move; the gap A3 shows for restarts after the cache died (+14, P1-1) is what this closes in a live TUI.
+
+### Item 3 (cut inside the protected last turn): not shipped, design note
+
+Judged unsafe for 0.3.0, for these reasons:
+* It breaks a stated promise in four places at once: the guard (`guard.ts validateEdits`: a cut inside the last 2 user turns is refused
+  except F2's `ahead`), PW in the spec, README rule 3 ("the current user turn and the previous one are protected"), and the summary itself.
+  `skeleton` quotes users and lists the commands of the prefix, but a split turn's open work (tool calls still referenced by the tail,
+  todos of this very run) would move into a 300-4,000-token narrative written by a separate call while the model is mid-task.
+* The quality cost is unmeasured. The nearest measured precedent, F2 (a cut inside the previous turn, up to its final answer), cost +1-4
+  lost items for 1-2% of cost in the simulator and is shipped off.
+* The checker would need PW and NT restated, LW's `ahead` path extended, and a full rerun. Item 3 also asked for kept sizes on the user's
+  3 sessions through `formal/replay/replay.ts`. TRIAGE does not name those files, I did not pick private sessions by guess, and with no
+  implementation there is no "after" to report.
+
+Item 5's turn boundary (below) already removes the case the 518K -> 273K session showed on 0.3.0's input: there the "last user turn" was
+every run since 16:19, driven by extension messages. With driven runs ending the protected tail, the tail is the latest run.
+
+Design, for after 0.3.0, reusing F2's machinery:
+1. Trigger: a cold plan whose floor (the protected turns after folds) alone exceeds K x the cold target (K about 3).
+2. Cut: `summarise(maxCut)` with maxCut up to the newest cut point such that:
+   * the latest user message (or run starter) and everything after it stay verbatim;
+   * the kept tail stays within the cold target;
+   * the cut is at an assistant message whose tool calls are all answered after it (so no `orphanResult` / unanswered `toolUse` across
+     the boundary; an unfinished tool call at the end of the branch stays in the tail);
+   * it is marked like `ahead` (`split`) for the guard and PW.
+3. Summary: Pi's split-turn form (`isSplitTurn`, turn prefix summary). The skeleton quotes the turn's prompt verbatim even though the prompt
+   is in the kept tail, and the narrative is asked for the open work of the turn.
+4. Gate: unchanged. The summary gate and the whole-plan gate with the call are the floor.
+5. Tests: a 250K single-turn tail (cut lands in the turn, tail <= target, prompt verbatim); a tail ending in an unfinished tool call (the
+   call and its missing result stay, the guard accepts it); the guard rejects a split that orphans a result. Then replay kept sizes before
+   and after on named sessions.
+
+### Item 4: the native outcome, and why the 518K summary went the draft path (007d1d1)
+
+(a) Every summary notice's data records `native` ("ok", or the skip/off reason: "not idle", "no ctx.compact", "nothing to compact", "Pi's
+compaction failed: ...", "... another handler at work", "summary not finished when the prompt came", "run started by an extension's
+message ...") plus `nativeMs` and `nativeAskMs` when `compact()` ran. Only for run-plan summaries, not valve summaries. No new UI text.
+Test: `invariants.test.ts` "item 4(a)".
+
+(b) "Another handler at work" is now measured as askMs (handlers before ours) plus the time from our answer to the entry's own append
+(`Date.parse(entry.timestamp)`), never Pi's work after the append. Test "item 4(b)": with 600 ms of post-append work, the old measure ended
+the native path ("took 608 ms") and the new one keeps it. A handler that is really slow (400 ms before ours) still ends it.
+
+**The suspected cause is not confirmed by measurement.** Pi's post-append work is small even on large branches:
+* `buildSessionProjection` + token estimate: 16 / 28 ms on a 47 MB, 12,680-entry private session (read-only, aggregates only).
+* The whole `ctx.compact()` in a real pi 1.1.0 TUI on a 747K-token, 6 MB synthetic branch: 8 ms, `askMs` 3 ms.
+
+So on the user's 518K session the 250 ms was most likely spent in a handler. Item 6's `compaction-refusal-fallback.ts` fits that
+(it runs Pi's own compact()). The fix is still right, but on the evidence it is not what turned native off there.
+
+(c) "The summary does not fit this plan" now says which: "the plan at the prompt has no cut" or "... cuts elsewhere". I did not reproduce it
+on this case. The draft path adopted the same prepared summary (one call), which needs the same cut key, so a key mismatch was not the
+reason there.
+
+### Item 5: runs an extension's message starts (P0, 007d1d1)
+
+Pi's `sendCustomMessage(triggerTurn)` -> `_runAgentPrompt` emits `agent_start` but never `before_agent_start`.
+* pi-zip now handles `agent_start`. When no `before_agent_start` preceded it, it runs the same start of run (`beginRun`): cancel the away
+  timer and the key listener, `detectCold`, `runChecked = false`, retention, settle targets, adopt the prepared summary through the run plan.
+* It never calls `ctx.compact()` there (it would abort the run); the notice records that reason.
+* The run's first `context_with_system` awaits that start.
+* There is no `COLD_CUSTOM` entry in rc030 (it went with the hold in 62a77a2), so nothing to write.
+
+Protected tail: `TURN_START_ROLES` already had "custom", but only `piCanCompact` uses it. The planner counts turns in `buildBlocks`, which
+counted user messages only, so every driven run belonged to the last typed prompt's turn. Now a custom message that follows a final answer
+starts a turn. One that arrives mid-run (after a tool result) does not, and a prompt that directly follows its own starter is the same turn.
+
+The formal bridge now fires `agent_start` after `before_agent_start`, as Pi does; the counts above include it.
+
+Tests (all fail on 2cda8e1 except the double-start guard):
+* `pi-integration.test.ts` "item 5": a driven run after > TTL gets the cold plan; a prepared summary is adopted with `compactCalls` 0; a
+  prompt followed by `agent_start` starts once; a warm driven run plans as a warm prompt does.
+* `plan.test.ts` "driven runs": turn numbering; six driven runs after one prompt are summarised up to the latest run (old: no cut at all).
+
+### Item 6: a marker for other compaction handlers (007d1d1)
+
+pi-zip's `ctx.compact()` passes `customInstructions: NATIVE_MARKER` ("[pi-zip native compaction: ...]"). A compaction carrying it is answered
+while pi-zip's ask is open and cancelled otherwise, so Pi's default summariser never receives it as an instruction. Other instructions (a
+user's `/compact focus`) are left alone. The README tells handler authors to return undefined when `event.customInstructions` starts with
+`[pi-zip native compaction`. Test: `invariants.test.ts` "item 6".
+
+### Deferred
+
+* Item 3, as above.
+* The A2 calibration class (now 4 / 22). It is P2-3; the new members are traces whose path moved at a switch.
+* The cause of the 250 ms on the user's session (item 4b) is inferred, not observed. The notice now records it on the next occurrence.
