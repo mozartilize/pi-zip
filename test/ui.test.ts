@@ -221,6 +221,43 @@ describe("the mark on a folded output", () => {
 		expect(r.renderCall({ command: "ls" }, th, { toolCallId: "c2" }).render(60)).toEqual(["$ ls"]);
 		expect(resolver("zip_recall", () => base)).toBe(base);
 	});
+	test("a built-in renderer that reuses context.lastComponent gets the bare component back, so streaming does not nest wrappers", async () => {
+		const { default: piZip } = await import("../src/index.ts");
+		let resolver: Any = null;
+		const f = fakePi({ registerToolRenderer: (r: Any) => (resolver = r), registerEntryRenderer: () => {} });
+		piZip(f.pi);
+		const seen: Any[] = [];
+		// Pi's read/write/find renderers: `context.lastComponent ?? new Text()`, updated in place and returned
+		const base = {
+			renderCall: (args: Any, _t: Any, c: Any) => {
+				seen.push(c.lastComponent);
+				const comp = c.lastComponent ?? { text: "", render() { return [this.text]; }, invalidate: () => {} };
+				comp.text = `write ${args.path} (${args.n})`;
+				return comp;
+			},
+		};
+		const r = resolver("write", () => base);
+		const { ctx } = fakeCtx([], { branch: [] });
+		await f.handlers.get("session_start")({}, ctx);
+		// tool-execution.js: every args update calls renderCall with the component it returned last time
+		let last: Any;
+		const t0 = performance.now();
+		for (let n = 1; n <= 3000; n++) {
+			last = r.renderCall({ path: "a.ts", n }, th, { toolCallId: "w1", lastComponent: last });
+			last.render(80);
+		}
+		expect(performance.now() - t0).toBeLessThan(500);
+		expect(last.render(80)).toEqual(["write a.ts (3000)"]);
+		expect(seen[0]).toBeUndefined();
+		expect(seen[1]).toBe(seen[2999]); // the same bare component every time, never a wrapper of a wrapper
+		expect(r.renderCall({ path: "a.ts", n: 1 }, th, { toolCallId: "w1", lastComponent: last })).toBe(last); // one wrapper per component
+		// a row pi-zip drew itself (a read of a recall file) is never handed to the built-in renderer to update
+		const rr = resolver("read", () => base);
+		const row = rr.renderCall({ path: "/home/user/.cache/pi-zip/recall/01a11183-cd3b-7713-9d92-44fa8cad9600/k3x9q2m7ab.txt" }, th, { toolCallId: "r1" });
+		seen.length = 0;
+		rr.renderCall({ path: "src/a.ts" }, th, { toolCallId: "r1", lastComponent: row });
+		expect(seen).toEqual([undefined]);
+	});
 });
 
 describe("transcript wiring", () => {
