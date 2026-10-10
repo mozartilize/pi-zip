@@ -49,13 +49,19 @@ export function renderState(word: StateWord, reason: string, width: number, th: 
 
 // ---- status card ------------------------------------------------------------------------------------------------------
 
+/** One learned gap bin of the cache chart: how many times you came back after a gap in [lo, hi) s and the cache was still there / gone.
+ *  Counts are rounded decayed weights (learn.ts keeps no raw per-bin count: old evidence halves after HALF_LIFE newer ones of the bin). */
+export interface ChartBin { lo: number; hi: number; alive: number; gone: number }
+
 export interface CardData {
 	state: "on" | "off" | "paused" | "reread-only";
 	stateNote?: string; // why paused / reread-only
 	model?: string; // provider/id
-	life?: string; // "~5 min" | "~1 h" | "2 h+": how long the cache outlives the last reply
-	measured?: boolean; // life comes from this provider's own replies, not the declared TTL
-	alive?: number[]; // P(cache still there) after being away chartGap(i), one per chart column
+	life?: string; // "~5 min" | "~1 h" | "2 h+": how long the cache outlives the last reply (the declared TTL until something is learned)
+	bins?: ChartBin[]; // learned bins that round to at least one return; none = nothing learned yet: one line, no chart
+	s1?: number; // seconds: the cache is (nearly) always still there under this (learned curve, never the prior)
+	s2?: number; // seconds: it is mostly gone from here on; between s1 and s2 it is not sure yet
+	usually?: boolean; // some bin under s1 has P(still there) < 0.95: "usually still there" instead of "still there"
 	folds: number;
 	foldedTokens: string; // "310K"
 	summaries: number;
@@ -73,34 +79,106 @@ export function fmtLife(s: number): string {
 	return `~${+(s / 3600).toFixed(1)} h`;
 }
 
-/** The cache chart: one column per time away, log-spaced from 30 s to 2 h. The row labels are the axes ("cache" up, "away" across),
- *  so it reads like any chart; the bars still there are in the accent colour, the dead ones dim. */
-export const CHART_COLS = 32;
-const CHART_T0 = 30, CHART_T1 = 7200;
-export const chartGap = (i: number): number => CHART_T0 * (CHART_T1 / CHART_T0) ** (i / (CHART_COLS - 1));
-const chartCol = (s: number): number => Math.round(((CHART_COLS - 1) * Math.log(s / CHART_T0)) / Math.log(CHART_T1 / CHART_T0));
-const BARS = "▁▂▃▄▅▆▇█";
-const TICKS: [number, string][] = [[60, "1m"], [300, "5m"], [900, "15m"], [3600, "1h"], [7200, "2h"]];
-const bar = (p: number): string => BARS[Math.max(0, Math.min(7, Math.round(p * 7)))];
-const ALIVE = 0.5; // a bar at or above this is drawn as still there
+// ---- the cache chart: one dot per time you came back ----------------------------------------------------------------------
+// Across: how long you were away, 30 s to 2 h on a log scale. Above the axis (accent): the times the cache was still there, below
+// (dim): the times it was gone. The axis itself says what to expect: solid while it is (nearly) always there, dashed while not sure,
+// thin after it is gone. A column shows at most STACK_CAP marks; beyond that STACK_CAP - 1 dots and then the count.
 
-/** "1m      5m      15m      1h  2h": tick labels start at their column. */
-export function chartAxis(): string {
-	const s = Array<string>(CHART_COLS + 2).fill(" ");
-	for (const [t, lab] of TICKS) {
-		const c = Math.min(chartCol(t), CHART_COLS - lab.length + 1);
-		if (s.slice(Math.max(0, c - 1), c + lab.length + 1).every((x) => x === " ")) s.splice(c, lab.length, ...lab);
+export const CHART_W = 60; // columns 0..CHART_W
+const CT0 = 30, CT1 = 7200;
+export const STACK_CAP = 4;
+const IND = 11; // the values column of the card: "  " + the 9-wide label
+export const colW = (s: number): number => Math.round((CHART_W * Math.log(s / CT0)) / Math.log(CT1 / CT0));
+const gapW = (c: number): number => CT0 * (CT1 / CT0) ** (c / CHART_W);
+const AXIS_TICKS: [number, string][] = [[30, "30s"], [60, "1m"], [120, "2m"], [300, "5m"], [600, "10m"], [1800, "30m"], [3600, "1h"], [7200, "2h"]];
+const fmtGap = (s: number): string => (s < 60 ? `${Math.round(s)} s` : s < 3600 ? `${+(s / 60).toFixed(1)} min` : `${+(s / 3600).toFixed(1)} h`);
+
+/** What the marks of one side of the axis look like, as rows from the axis outwards: row r (1-based) holds, per column, a dot, a digit of
+ *  the count or a blank. `items` are (column, times); items on the same column merge. A count is drawn on the row of the stack's end,
+ *  centred on its column; when that would touch another mark in its row (neighbouring columns, other counts) it moves, the nearest free
+ *  place first, right before left, and keeps one blank on each side, so two counts never read as one number. Deterministic. */
+export function stackRows(items: { col: number; n: number }[], dot: string = "\u25cf", cap: number = STACK_CAP, width: number = CHART_W + 1): { rows: string[][]; height: number } {
+	const merged = new Map<number, number>();
+	for (const it of items) {
+		const col = Math.max(0, Math.min(width - 1, it.col));
+		if (it.n > 0) merged.set(col, (merged.get(col) ?? 0) + it.n);
 	}
-	return s.join("").trimEnd();
+	const cols = [...merged.entries()].sort((a, b) => a[0] - b[0]);
+	const height = Math.max(1, ...cols.map(([, n]) => Math.min(n, cap)));
+	const rows = Array.from({ length: height }, () => Array<string>(width).fill(" "));
+	const counts: { col: number; text: string; row: number }[] = [];
+	for (const [col, n] of cols) {
+		const dots = n <= cap ? n : cap - 1;
+		for (let r = 0; r < dots; r++) rows[r][col] = dot;
+		if (n > cap) counts.push({ col, text: String(n), row: cap - 1 });
+	}
+	for (const { col, text, row } of counts) {
+		const len = text.length, want = col - Math.floor((len - 1) / 2), line = rows[row];
+		const free = (st: number, gap: boolean) => {
+			if (st < 0 || st + len > width) return false;
+			for (let x = st - (gap ? 1 : 0); x < st + len + (gap ? 1 : 0); x++) if (x >= 0 && x < width && line[x] !== " ") return false;
+			return true;
+		};
+		let at = -1;
+		for (const gap of [true, false]) {
+			for (let d = 0; d < width && at < 0; d++) for (const st of d ? [want + d, want - d] : [want]) if (at < 0 && free(st, gap)) at = st;
+			if (at >= 0) break;
+		}
+		if (at >= 0) for (let k = 0; k < len; k++) line[at + k] = text[k];
+	}
+	return { rows, height };
 }
 
-const lifeText = (c: CardData): string => (c.life ? `expires after ${c.life} idle${c.measured ? " (measured)" : ""}` : "");
+/** Colours the cells of a row (one string per column, null = blank) with as few runs as possible. */
+function paint(cells: { ch: string; color: string }[], th: Th): string {
+	let out = "", run = "", color = "";
+	const flush = () => { if (run) out += color ? th.fg(color, run) : run; run = ""; };
+	for (const c of cells) {
+		if (c.color !== color) flush(), (color = c.color);
+		run += c.ch;
+	}
+	flush();
+	return out.trimEnd();
+}
+
+interface Seg { lead: string; word: string; color: string }
+/** "under 5 min: usually still there · 5–10 min: not sure yet · over 10 min: gone", as segments that wrap whole. */
+function captionSegs(c: CardData): Seg[] {
+	const s1 = c.s1 ?? CT0, s2 = c.s2 ?? CT1;
+	const range = s1 >= 60 && s2 < 3600 ? `${+(s1 / 60).toFixed(1)}–${fmtGap(s2)}` : `${fmtGap(s1)}–${fmtGap(s2)}`; // "5–10 min"
+	return [
+		{ lead: `under ${fmtGap(s1)}: `, word: c.usually ? "usually still there" : "still there", color: "accent" },
+		...(s2 > s1 ? [{ lead: `${range}: `, word: "not sure yet", color: "warning" }] : []),
+		{ lead: `over ${fmtGap(s2)}: `, word: "gone", color: "muted" },
+	];
+}
+const SEP = "  \u00b7  ";
+const segW = (g: Seg) => g.lead.length + g.word.length;
+/** The caption as lines of at most `room` columns, wrapped between segments (a segment wider than the room is cut). */
+function captionLines(segs: Seg[], room: number, th: Th, m: Measure): string[] {
+	if (room < 2) return []; // no room for even a cut sentence
+	const lines: Seg[][] = [[]];
+	for (const g of segs) {
+		const cur = lines[lines.length - 1], w = cur.reduce((a, x) => a + segW(x), 0) + SEP.length * cur.length + segW(g);
+		if (cur.length && w > room) lines.push([g]);
+		else cur.push(g);
+	}
+	return lines.map((l) => {
+		const plain = l.map((g) => g.lead + g.word).join(SEP);
+		if (plain.length > room) return th.fg("dim", m.cut(plain, room));
+		return l.map((g) => th.fg("dim", g.lead) + th.fg(g.color, g.word)).join(th.fg("dim", SEP));
+	});
+}
+const captionPlain = (c: CardData) => captionSegs(c).map((g) => g.lead + g.word).join(SEP);
+
+const idle = (c: CardData): string => (c.life ? `expires after ${c.life} idle` : "");
+const NO_DATA = "a chart appears once you come back after a break";
+const hasChart = (c: CardData): boolean => !!c.model && !!c.bins?.length;
 
 export function cardText(c: CardData): string[] {
 	const rows: [string, string][] = [];
-	// One fact the user can act on ("come back within ~5 min and nothing is touched"), drawn and said: no classes, no jargon.
-	if (c.model && c.alive?.length) rows.push(["model", c.model], ["cache", `${c.alive.map(bar).join("")}  ${lifeText(c)}`.trimEnd()], ["away", chartAxis()]);
-	else if (c.model) rows.push(["cache", `${c.model}${c.life ? ` · ${lifeText(c)}` : ""}`]);
+	if (c.model) rows.push(["model", c.model]);
+	if (c.model) rows.push(["cache", hasChart(c) ? `each dot is one time you came back · ${captionPlain(c)}` : `${idle(c) || "expires after ~5 min idle"} · ${NO_DATA}`]);
 	const n = (x: number, one: string, many = one + "s") => `${x} ${x === 1 ? one : many}`;
 	rows.push(["session", `${c.folds} zipped ~${c.foldedTokens}  ·  ${n(c.summaries, "summary", "summaries")}${c.summaryUsd > 0 ? ` $${c.summaryUsd.toFixed(2)}` : ""}  ·  ${n(c.recalls, "unzip")}`]);
 	if (c.last) rows.push(["last", c.last]);
@@ -109,47 +187,74 @@ export function cardText(c: CardData): string[] {
 	return rows.map(([k, v]) => `${k.padEnd(LABEL_W)}${v}`);
 }
 
+/** The chart rows (without the model row): header, marks above, axis, marks below, axis labels, [legend], caption. */
+function chartRows(c: CardData, width: number, th: Th, m: Measure): string[] {
+	const indent = "  ", label = (k: string) => th.fg("dim", (indent + k).padEnd(indent.length + LABEL_W)), pad = " ".repeat(IND);
+	const bins = c.bins ?? [];
+	const na = bins.reduce((a, b) => a + b.alive, 0), nd = bins.reduce((a, b) => a + b.gone, 0);
+	const up = stackRows(bins.map((b) => ({ col: colW(Math.sqrt(b.lo * b.hi)), n: b.alive })));
+	const down = stackRows(bins.map((b) => ({ col: colW(Math.sqrt(b.lo * b.hi)), n: b.gone })), "\u25cb");
+	const legUp = ["\u25cf", ` still there  ${na}`], legDown = ["\u25cb", ` gone  ${nd}`];
+	const legW = (l: string[]) => l[0].length + l[1].length;
+	const beside = width >= IND + CHART_W + 1 + 3 + Math.max(legW(legUp), legW(legDown));
+	const s1 = c.s1 ?? CT0, s2 = c.s2 ?? CT1;
+	const out: string[] = [label("cache") + th.fg("dim", "each dot is one time you came back")];
+	const side = (rows: string[][], color: string, leg: string[], first: number) =>
+		rows.map((cells, r) => {
+			const line = paint(cells.map((ch) => ({ ch, color: ch === " " ? "" : color })), th);
+			return pad + line + (beside && r === first ? "   " + th.fg(color, leg[0]) + th.fg("muted", leg[1]) : "");
+		});
+	out.push(...side(up.rows.slice().reverse(), "accent", legUp, up.height - 1)); // outermost row first; the legend sits on the row next to the axis
+	out.push(pad + paint(Array.from({ length: CHART_W + 1 }, (_, i) => ({ ch: gapW(i) < s1 ? "\u2501" : gapW(i) < s2 ? "\u2505" : "\u2500", color: gapW(i) < s1 ? "accent" : gapW(i) < s2 ? "warning" : "dim" })), th));
+	out.push(...side(down.rows, "dim", legDown, 0));
+	const ax = Array<string>(CHART_W + 3).fill(" ");
+	for (const [t, lab] of AXIS_TICKS) {
+		const col = Math.min(colW(t), CHART_W - lab.length + 1);
+		for (let k = 0; k < lab.length; k++) ax[col + k] = lab[k];
+	}
+	out.push(label("away") + th.fg("dim", ax.join("").trimEnd()));
+	if (!beside) out.push(pad + th.fg("accent", legUp[0]) + th.fg("muted", legUp[1]) + "   " + th.fg("dim", legDown[0]) + th.fg("muted", legDown[1]));
+	for (const l of captionLines(captionSegs(c), width - IND, th, m)) out.push(pad + l);
+	return out;
+}
+
 export function renderCard(c: CardData, width: number, th: Th, m: Measure = plainMeasure): string[] {
 	const out = renderState(c.state, c.stateNote ?? "", width, th, m);
 	const indent = "  "; // under the words after the monogram
-	// Too narrow for the chart and its axis: the sentence alone says the same thing.
-	if (c.alive?.length && width < indent.length + LABEL_W + Math.max(c.alive.length, chartAxis().length)) c = { ...c, alive: undefined };
-	let under = "";
-	for (const row of cardText(c)) {
-		if (under && !row.startsWith("away ")) out.push(under), (under = "");
-		if (c.alive?.length && row.startsWith("cache ")) {
-			const runs: string[] = [];
-			for (let i = 0; i < c.alive.length; ) {
-				const on = c.alive[i] >= ALIVE;
-				let j = i;
-				while (j < c.alive.length && c.alive[j] >= ALIVE === on) j++;
-				runs.push(th.fg(on ? "accent" : "dim", c.alive.slice(i, j).map(bar).join("")));
-				i = j;
-			}
-			// The sentence goes beside the bars when it fits there whole, else on its own line under the axis: never cut mid-fact.
-			const say = lifeText(c), beside = m.vw(say) <= width - indent.length - LABEL_W - c.alive.length - 2;
-			out.push(th.fg("dim", (indent + "cache").padEnd(indent.length + LABEL_W)) + runs.join("") + (say && beside ? "  " + th.fg("dim", say) : ""));
-			if (say && !beside) under = th.fg("dim", m.cut(" ".repeat(indent.length + LABEL_W) + say, width));
-			continue;
+	const head = (k: string) => th.fg("dim", (indent + k).padEnd(indent.length + LABEL_W));
+	const row = (k: string, v: string) => {
+		const line = m.cut(indent + k.padEnd(LABEL_W) + v, width);
+		if (!line) return;
+		const kk = line.slice(0, indent.length + LABEL_W);
+		out.push(th.fg("dim", kk) + th.fg("dim", line.slice(kk.length)));
+	};
+	if (c.model) {
+		row("model", c.model);
+		if (!hasChart(c)) {
+			// nothing learned yet: one line, the chart appears with the first return after a break
+			const room = width - indent.length - LABEL_W;
+			const v = [`${idle(c) || "expires after ~5 min idle"} \u00b7 ${NO_DATA}`, idle(c) || "expires after ~5 min idle"].find((x) => m.vw(x) <= room);
+			if (v) out.push(head("cache") + th.fg("dim", v));
+			else row("cache", idle(c) || "expires after ~5 min idle");
+		} else if (width >= IND + CHART_W + 1) out.push(...chartRows(c, width, th, m));
+		else {
+			// too narrow for the chart: the caption sentence alone says the same thing
+			const lines = captionLines(captionSegs(c), width - IND, th, m);
+			lines.forEach((l, i) => out.push((i ? " ".repeat(IND) : head("cache")) + l));
 		}
-		if (!c.alive?.length && c.model && c.life && row.startsWith("cache ")) {
-			// Narrow: keep the fact whole, dropping the model name first, then "(measured)".
-			const head = (indent + "cache").padEnd(indent.length + LABEL_W), room = width - m.vw(head);
-			const v = [row.slice(LABEL_W), lifeText(c), lifeText({ ...c, measured: false })].find((x) => m.vw(x) <= room);
-			if (v) { out.push(th.fg("dim", head + v)); continue; }
-		}
-		if (row.startsWith("unzip ")) {
+	}
+	for (const r of cardText({ ...c, model: undefined })) {
+		if (r.startsWith("unzip ")) {
 			// Narrow: the bracketed reason goes first, so where the files are stays whole.
-			const head = (indent + "unzip").padEnd(indent.length + LABEL_W), room = width - m.vw(head);
-			const v = [row.slice(LABEL_W), row.slice(LABEL_W).replace(/ \([^()]*\)$/, "")].find((x) => m.vw(x) <= room);
-			if (v) { out.push(th.fg("dim", head + v)); continue; }
+			const h = head("unzip"), room = width - m.vw(h);
+			const v = [r.slice(LABEL_W), r.slice(LABEL_W).replace(/ \([^()]*\)$/, "")].find((x) => m.vw(x) <= room);
+			if (v) { out.push(th.fg("dim", h + v)); continue; }
 		}
-		const line = m.cut(indent + row, width);
+		const line = m.cut(indent + r, width);
 		if (!line) continue;
 		const k = line.slice(0, indent.length + LABEL_W), v = line.slice(indent.length + LABEL_W);
-		out.push(th.fg("dim", k) + (row.startsWith("session") ? th.fg("text", v) : th.fg("dim", v)));
+		out.push(th.fg("dim", k) + (r.startsWith("session") ? th.fg("text", v) : th.fg("dim", v)));
 	}
-	if (under) out.push(under);
 	return out;
 }
 
