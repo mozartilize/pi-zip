@@ -141,6 +141,15 @@ fn quiet_since_i0() -> F<R> {
         i == i0 || (r.st[i].new_info.is_empty() && !r.st[i].cold_start && (i0 + 1..=i).map(|m| r.st[m].appended).sum::<f64>() <= DELTA)
     })
 }
+/// The session grew by at most DELTA real tokens up to and including this request's own: a plan made for request i (a run plan at the
+/// prompt, a turn_end valve after the response of request i - 1) has seen what was appended at i, so growth that arrives with the
+/// witness request is information the plan had, not just what came before it.
+fn quiet_through_i() -> F<R> {
+    atom("quiet_through_i", |r: &R, i, env: &Env| {
+        let i0 = lookup(env, "i0") as usize;
+        i <= i0 || (i0 + 1..=i).map(|m| r.st[m].appended).sum::<f64>() <= DELTA
+    })
+}
 fn after_i0() -> F<R> {
     atom("after_i0", |_r: &R, i, env: &Env| i > lookup(env, "i0") as usize)
 }
@@ -291,10 +300,11 @@ pub fn derived() -> Vec<Prop> {
             name: "time consistency (no regret)",
             from: &["A2", "A3"],
             why: "an edit is free at a cold cache and paid at a warm one: a warm edit within K_REGRET requests of a cold plan, with no \
-                  new information (switch, foreign compaction, recall, class change, growth > DELTA) in between, means the cold plan \
+                  new information (switch, foreign compaction, recall, class change, growth > DELTA, counted through the witness \
+                  request itself: the plan made for it has seen what that request appended) in between, means the cold plan \
                   was dominated by doing that edit then.",
             evidence: Evidence::Conformance,
-            f: always(cold_plan() >> freeze("i0", index(), !quiet_since_i0().until_within(K_REGRET, after_i0() & zip_edit() & planned_warm()))),
+            f: always(cold_plan() >> freeze("i0", index(), !quiet_since_i0().until_within(K_REGRET, after_i0() & zip_edit() & planned_warm() & quiet_through_i()))),
         },
         Prop {
             id: "NT",
