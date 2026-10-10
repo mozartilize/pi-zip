@@ -1,4 +1,5 @@
-//! Conformance smoke test: the B1 and B2 traces through the bridge on this worktree's src (affine). Skipped without bun or src.
+//! Conformance smoke test: the B1 and B2 traces (minimal counterexamples of bugs the rc fixes clear) through the bridge on this
+//! worktree's src: every property must hold on them now. Skipped without bun or src.
 use pz_formal::bridge::Pool;
 use pz_formal::model::{Run, Trace};
 use pz_formal::spec::all;
@@ -23,13 +24,11 @@ fn src() -> std::path::PathBuf {
 }
 
 #[test]
-fn b1_and_b2_on_affine() {
-    for (file, must_fail) in [("b1.trace", "MP"), ("b2.trace", "NR")] {
+fn b1_and_b2_are_fixed() {
+    for file in ["b1.trace", "b2.trace"] {
         let Some(v) = verdicts(&src(), file) else { return };
-        let ok = |id: &str| v.iter().find(|(p, _)| *p == id).unwrap().1;
-        for harness in ["W", "G", "LW", "A1", "I1"] {
-            assert!(ok(harness), "{file}: {harness} must hold (harness fidelity / lossless): {v:?}");
+        for (id, ok) in &v {
+            assert!(ok, "{file}: {id} must hold (the bug the trace shrank is fixed): {v:?}");
         }
-        assert!(!ok(must_fail), "{file}: {must_fail} must fail on affine (the bug is not fixed there): {v:?}");
     }
 }

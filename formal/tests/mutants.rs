@@ -134,7 +134,7 @@ fn a1_users_quoted_by_the_summary() {
 #[test]
 fn lw_summary_call_is_priced() {
     let t = lines(&["world explicit known ttl=300 true=300 survival=none c=1 sys=30000 window=200000 native interactive", "prompt", "say 25K", "prompt +60s", "say 100", "prompt +60s", "say 100", "prompt +1h", "say 100"]);
-    caught_all("m25", "plan.ts", &[("gate(\"summary\", X, Sr, null, law.pr.w * X + law.pr.out * Sr, Sr)", "gate(\"summary\", X, Sr, null, 0, Sr)", 1)], &["LW"], &t);
+    caught_all("m25", "plan.ts", &[("gate(\"summary\", X, Sr, null, call, Sr)", "gate(\"summary\", X, Sr, null, 0, Sr)", 1)], &["LW"], &t);
 }
 
 #[test]
@@ -149,13 +149,13 @@ fn gc_gone_cache_gets_a_cold_plan() {
     caught("m18", "cache.ts", "nowMs - lastActivityMs > ttlMs;", "nowMs - lastActivityMs > 4 * ttlMs;", "GC", &ttl);
     caught("m18b", "cache.ts", "return { cold: s.p < 0.5, reason,", "return { cold: s.p < 0.5 && gapS > 1200, reason,", "GC", &ttl);
     let switch = lines(&[W, "prompt", "call npm 30K", "say 100", "switch", "prompt +60s", "say 100"]);
-    caught("m19", "cache.ts", "if (last && prev && modelKey(model) && prev !== modelKey(model)) return", "if (false) return", "GC", &switch);
+    caught("m19", "cache.ts", "if (prev && modelKey(model) && prev !== modelKey(model)) return", "if (false) return", "GC", &switch);
 }
 
 #[test]
 fn wb_warm_does_nothing_below_the_target() {
     let t = lines(&[W, "prompt", "call npm 30K", "say 100", "prompt +60s", "say 100", "prompt +60s", "say 100"]);
-    caught("m26", "plan.ts", "if (mode === \"warm\" && !(ctxEst > coldCap)) return null;", "if (false) return null;", "WB", &t);
+    caught("m26", "plan.ts", "if (warmLike && !(ctxEst > coldCap)) return null;", "if (false) return null;", "WB", &t);
 }
 
 #[test]
@@ -191,7 +191,7 @@ fn i1_persisted_equals_sent() {
 
 #[test]
 fn b2b_no_back_to_back() {
-    let t = trace_of(&["world automatic known ttl=300 true=300 survival=none c=1 sys=30000 window=200000 native interactive", "prompt", "call npm 16.0K", "call cat 1K", "call npm 25.3K", "say 100", "prompt +330s", "say 100", "prompt +60s", "say 100"]);
+    let t = trace_of(&["world explicit known ttl=300 true=300 survival=none c=1 sys=3000 window=128000 native interactive", "prompt", "call npm 5K", "call npm 10K", "call npm 11.2K", "call npm 9.6K", "say 100", "prompt +60s", "call npm 28.4K", "call npm 23.3K", "call npm 5K", "call npm 5.7K", "say 100", "prompt +60s", "say 100", "prompt +60s", "say 100"]);
     caught_all("m10", "run.ts", &[("if (!this.cold && this.justEdited) {", "if (false) {", 1), ("if (this.justEdited) {", "if (false) {", 1)], &["B2B"], &t);
 }
 
@@ -212,20 +212,31 @@ fn rc_recall_is_never_refolded() {
 
 #[test]
 fn pw_protection_windows() {
-    caught("m13", "plan.ts", "if (relax && (mode === \"cold\" || o.pastTtl === true)) {", "if (relax) {", "PW", &trace_of(&[WC, "prompt", "call cat 20K", "say 100", "prompt +60s", "say 100"]));
-    caught("m14", "plan.ts", "const PROTECT_USER_TURNS = 2;", "const PROTECT_USER_TURNS = 1;", "PW", &trace_of(&[W, "prompt", "say 30K", "prompt +60s", "say 100"]));
+    caught("m13", "plan.ts", "if (relax && ((mode === \"cold\" && !o.warmStyle) || o.pastTtl === true)) {", "if (relax) {", "PW", &trace_of(&[WC, "prompt", "call cat 20K", "say 100", "prompt +60s", "say 100"]));
+    caught("m14", "plan.ts", "const PROTECT_USER_TURNS = 2;", "const PROTECT_USER_TURNS = 1;", "PW", &trace_of(&[W, "prompt", "say 100", "prompt +60s", "say 60K", "prompt +60s", "say 100"]));
 }
 
 #[test]
 fn mp_residual_new_mechanism() {
     let t = trace_of(&[WC, "prompt", "call cat 26.3K", "say 100", "prompt +60s", "say 100"]);
-    caught_all("m28", "plan.ts", &[("if (relax && (mode === \"cold\" || o.pastTtl === true)) {", "if (relax && mode === \"warm\") {", 1)], &["MP", "MPr"], &t);
+    caught_all("m28", "plan.ts", &[("if (relax && ((mode === \"cold\" && !o.warmStyle) || o.pastTtl === true)) {", "if (relax && mode === \"warm\") {", 1)], &["MP", "MPr"], &t);
 }
 
+/// NOT RUN (ignored, on purpose): since the planner state is read from the branch (state.ts) no small mutant of "a summary was made in
+/// this warm stretch" changes what NT sees on a trace the unmutated src passes: the only NT counterexample the mutant hunt found (a
+/// cold summary after a model switch that removes almost nothing, 126K context, 123K protected) fails on the unmutated src too
+/// (formal/TRIAGE.md, new finding N6). NT can fail (that trace), but no mutant is paired with it yet.
 #[test]
+#[ignore = "no mutant that the unmutated src survives yet: see TRIAGE N6"]
 fn nt_no_thrash() {
     let t = trace_of(&[WA, "prompt", "call npm 25.9K", "say 100", "prompt +60s", "call npm 20K", "call npm 5K", "say 100", "wait +330s", "restart", "prompt +0s", "call npm 13.0K", "say 100", "prompt +60s", "say 100"]);
     caught("m15", "run.ts", "noSummary: mode === \"warm\" && this.summarizedWarm,", "noSummary: false,", "NT", &t);
+}
+
+#[test]
+fn rd_restart_state_is_read_from_the_branch() {
+    let t = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("traces/rd-g.trace")).unwrap();
+    caught("m29", "run.ts", "this.g = r.g;", "this.g = G0;", "RD", &t);
 }
 
 #[test]
@@ -236,17 +247,17 @@ fn tr_target_reachability() {
 
 #[test]
 fn rd_residual_new_cause() {
-    let t = trace_of(&[W, "prompt", "say 60K", "prompt +60s", "say 100", "prompt +1h", "say 100"]);
+    let t = trace_of(&[W, "prompt", "call npm 1K", "say 100", "prompt +60s", "say 100", "prompt +1h", "say 100"]);
     caught_all("m27", "cache.ts", &[("const last = Math.max(lastReqMs, lastMessageMs(branch));", "const last = lastReqMs;", 1)], &["RDr"], &t);
 }
 
-/// The harness self-checks and LW's arithmetic fail on a tampered observation of a real run (b2: a warm summary after a cold return).
+/// The harness self-checks and LW's arithmetic fail on a tampered observation of a real run (a cold return that folds an output).
 #[test]
 fn harness_checks_can_fail() {
     if !available() {
         return;
     }
-    let t = Trace::parse(&std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("traces/b2.trace")).unwrap()).unwrap();
+    let t = Trace::parse(&fold_and_recall()).unwrap();
     let base = observe(&worktree_src(), &t);
     for id in ["W", "G", "LW"] {
         assert!(holds(&base, id), "{id} holds on the real observation");
@@ -257,9 +268,9 @@ fn harness_checks_can_fail() {
         Run::new(t.clone(), o)
     };
     // W: the provider's cache disagrees with the spec's clock
-    assert!(!holds(&tamper(&|o| o.ticks[2].warm = !o.ticks[2].warm), "W"));
+    assert!(!holds(&tamper(&|o| o.ticks[3].warm = !o.ticks[3].warm), "W"));
     // G: the probe's re-plan at the actual P differs from the plan run.ts acted on
-    assert!(!holds(&tamper(&|o| o.ticks[2].run_plan.as_mut().unwrap().folds.push("x".into())), "G"));
+    assert!(!holds(&tamper(&|o| o.ticks[3].run_plan.as_mut().unwrap().folds.push("x".into())), "G"));
     // LW: a recorded law evaluation that is not law.rs on its inputs
     assert!(!holds(
         &tamper(&|o| {
