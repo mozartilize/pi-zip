@@ -142,8 +142,8 @@ fn lw_summary_call_is_priced() {
 /// both through: the old LW only compared a call it found with the summary step's.)
 #[test]
 fn lw_plan_step_call_is_pinned_both_ways() {
-    caught_all("m28", "plan.ts", &[("if (!planGate(ctxAfterFolds - (pre[pick] - S(pre[pick])), 0, call, true, true)) continue;", "if (!planGate(ctxAfterFolds - (pre[pick] - S(pre[pick])), 0, 0, true, true)) continue;", 1)], &["LW"], &summary_prepared_away("prompt +1h"));
-    caught_all("m29", "plan.ts", &[("!planGate(after, untouched, 0, planned, false)", "!planGate(after, untouched, 1000, planned, false)", 1)], &["LW"], &fold_and_recall());
+    caught_all("lw1", "plan.ts", &[("if (!planGate(ctxAfterFolds - (pre[pick] - S(pre[pick])), 0, call, true, true)) continue;", "if (!planGate(ctxAfterFolds - (pre[pick] - S(pre[pick])), 0, 0, true, true)) continue;", 1)], &["LW"], &summary_prepared_away("prompt +1h"));
+    caught_all("lw2", "plan.ts", &[("!planGate(after, untouched, 0, planned, false)", "!planGate(after, untouched, 1000, planned, false)", 1)], &["LW"], &fold_and_recall());
 }
 
 #[test]

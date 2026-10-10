@@ -526,12 +526,17 @@ export class Zip implements ZipControl {
 			const m = branch[i]?.type === "message" ? branch[i].message : null;
 			if (m?.role !== "user" || this.steerIds.has(branch[i].id)) continue;
 			if (skip) { skip = false; continue; }
-			const a = branch.slice(i + 1).find((x: Any) => x?.type === "message" && x.message?.role === "assistant" && x.message.provider)?.message;
+			let a: Any;
+			for (let j = i + 1; j < branch.length && !a; j++) if (branch[j]?.type === "message" && branch[j].message?.role === "assistant" && branch[j].message.provider) a = branch[j].message;
 			if (!a) continue; // a prompt nothing answered
 			const model = { provider: a.provider, id: a.model };
 			const ts = Number(m.timestamp) || Date.parse(branch[i].timestamp) || 0;
 			const ent = models[modelKey(model)];
-			if (detectCold(model, 0, branch.slice(0, i), ts, "", (g, prior) => pWarm(ent, g, prior), this.tier(model)).cold) return false;
+			// detectCold reads only the newest messages before the prompt (the last touch, the last model, the last few cache writes): a window
+			// of them gives its answer (the whole prefix when the window holds no response), and the walk stays linear in a very long session
+			let before = branch.slice(Math.max(0, i - 256), i);
+			if (!before.some((x: Any) => x?.type === "message" && x.message?.role === "assistant")) before = branch.slice(0, i);
+			if (detectCold(model, 0, before, ts, "", (g, prior) => pWarm(ent, g, prior), this.tier(model)).cold) return false;
 		}
 		return true;
 	}
