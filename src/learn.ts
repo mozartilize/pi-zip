@@ -26,8 +26,10 @@ export function lawPrices(cls: CacheClass | undefined, longTier: boolean): Price
 }
 
 // ---- cache survival ------------------------------------------------------------------------------------------------
-/** Gap bins (s): [GAP_EDGES[i], GAP_EDGES[i+1]). Edges sit on the known TTL tiers (300 s, 3600 s): a deterministic TTL never splits a bin. */
-export const GAP_EDGES = [30, 60, 120, 180, 240, 300, 330, 360, 420, 480, 600, 900, 1200, 1800, 2700, 3600, 5400];
+/** Gap bins (s): [GAP_EDGES[i], GAP_EDGES[i+1]). Edges sit on the known TTL tiers (300 s, 3600 s): a deterministic TTL never splits a bin.
+ *  The last edge closes the last bin: a gap at or beyond it (2 h) is outside what was ever observed, it is not recorded and it is planned
+ *  from the declared TTL (a cache seen alive at 110 min says nothing about 156 min). */
+export const GAP_EDGES = [30, 60, 120, 180, 240, 300, 330, 360, 420, 480, 600, 900, 1200, 1800, 2700, 3600, 5400, 7200];
 export const HALF_LIFE = 16; // observations per bin: old evidence counts half after 16 newer ones in the same bin (a provider may change its TTL)
 // The declared TTL as pseudo-observations. Asymmetric because the signal is: a read of the re-sent prefix cannot happen on a dead cache,
 // but warm misses do (GLM 4-9%, glm-flash ~22%, research round 5). Beyond the TTL one clean read overrides it (weight 1/4: one hit -> 0.8);
@@ -48,7 +50,10 @@ export const statsPath = (): string => process.env.PI_ZIP_CACHE_STATS || join(ag
 
 /** ES2023's Array.prototype.findLastIndex (Node >= 18 and Bun have it); tsconfig's lib is ES2022, so it is typed here (types only). */
 interface FindLastIndex { findLastIndex(predicate: (value: number, index: number) => boolean): number }
-export const binOf = (gapS: number): number => (GAP_EDGES as number[] & FindLastIndex).findLastIndex((e) => gapS >= e); // -1 = below 30 s: not recorded
+export const binOf = (gapS: number): number => {
+	const i = (GAP_EDGES as number[] & FindLastIndex).findLastIndex((e) => gapS >= e);
+	return i >= GAP_EDGES.length - 1 ? -1 : i; // -1 = below the first edge or at/above the last: not recorded
+};
 const fin = (x: Any) => typeof x === "number" && Number.isFinite(x) && x >= 0;
 
 /** The persisted stats; a missing, unreadable or malformed file is ignored (empty). */
@@ -59,7 +64,7 @@ export function loadStats(path = statsPath()): File {
 		if (j?.v !== 1 || typeof j.models !== "object" || !j.models) return out;
 		for (const [k, e] of Object.entries<Any>(j.models)) {
 			const bins: Entry["bins"] = {};
-			for (const [b, c] of Object.entries<Any>(e?.bins ?? {})) if (GAP_EDGES[Number(b)] !== undefined && Array.isArray(c) && fin(c[0]) && fin(c[1])) bins[b] = [c[0], c[1]];
+			for (const [b, c] of Object.entries<Any>(e?.bins ?? {})) if (Number(b) < GAP_EDGES.length - 1 && GAP_EDGES[Number(b)] !== undefined && Array.isArray(c) && fin(c[0]) && fin(c[1])) bins[b] = [c[0], c[1]];
 			out.models[k] = { bins, n: fin(e?.n) ? e.n : 0, ...(e?.cls === "explicit" || e?.cls === "automatic" ? { cls: e.cls } : {}) };
 		}
 		return out;
@@ -129,7 +134,8 @@ export function curve(e: Entry | undefined, priorS: number): { bin: number; p: n
  *  between the nearest observed bins below and above (an alive read at 365 s makes every shorter gap warm; a miss makes longer ones dead). */
 export function pWarm(e: Entry | undefined, gapS: number, priorS: number): { p: number; src: "prior" | "learned" } {
 	const prior = gapS <= priorS ? 1 : 0;
-	const c = curve(e, priorS), b = binOf(gapS);
+	// beyond the last edge: no bin, the declared TTL decides (clamped by the newest bin below, as for an unobserved bin)
+	const c = curve(e, priorS), b = gapS >= GAP_EDGES[GAP_EDGES.length - 1] ? GAP_EDGES.length - 1 : binOf(gapS);
 	const at = c.find((x) => x.bin === b);
 	if (at) return { p: at.p, src: "learned" };
 	const hi = c.filter((x) => x.bin < b).at(-1)?.p ?? 1, lo = c.find((x) => x.bin > b)?.p ?? 0;

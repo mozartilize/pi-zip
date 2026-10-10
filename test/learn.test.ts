@@ -37,6 +37,21 @@ describe("learned cache survival", () => {
 		expect(describeSurvival(e, 300)).toContain("360-420s 0.80 n1");
 	});
 
+	test("a gap beyond the last bin's upper edge (2 h) is not recorded, and is planned from the declared TTL, not from the last bin (GC)", () => {
+		// a cache seen alive at 110 min (long tier) says nothing about 156 min
+		const e = record("anthropic/long", { explicit: true, total: 50_000, gapS: 6608, alive: true }, path);
+		expect(pWarm(e, 6608, 3600).p).toBeGreaterThan(0.5); // inside the observed range: learned
+		expect(pWarm(e, 9364, 3600)).toEqual({ p: 0, src: "prior" }); // old code: 0.8, 'learned' from an open-ended bin
+		// a model that declares more than 2 h keeps its declaration beyond it
+		expect(pWarm(e, 9364, 86_400)).toMatchObject({ src: "prior" });
+		expect(pWarm(e, 9364, 86_400).p).toBe(1);
+		// nothing is recorded at or beyond the edge (the class still is), and an old file's open-ended bin keeps loading
+		const n = loadStats(path).models["anthropic/long"].n;
+		record("anthropic/long", { explicit: true, total: 50_000, gapS: 9364, alive: true }, path);
+		expect(loadStats(path).models["anthropic/long"].n).toBe(n);
+		expect(describeSurvival(e, 3600)).toContain("5400-7200s");
+	});
+
 	test("censoring: small prompts, misses right after our own edit, and prompts someone else shrank prove nothing", () => {
 		expect(sample(5_000, 0, 6_000)).toBeNull(); // the shared system prefix alone could explain it
 		expect(sample(50_000, 0, 60_000, true)).toBeNull(); // after our edit, class unknown: the provider may not look back that far

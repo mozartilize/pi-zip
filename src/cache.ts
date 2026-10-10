@@ -91,18 +91,33 @@ const tsOf = (en: Any, inner?: Any): number => {
 	return Number.isFinite(t) ? t : 0;
 };
 
+/** A response that reached no cache: an error that reports no usage (the provider refused the request). One that reports usage was
+ *  read: it touched the cache. An abort (Esc) comes after the provider read and wrote the prompt: it is a touch, with or without usage. */
+export const refused = (m: Any): boolean => {
+	if (m?.role !== "assistant" || m.stopReason !== "error") return false;
+	const u = m.usage;
+	return !((Number(u?.input) || 0) + (Number(u?.cacheRead) || 0) + (Number(u?.cacheWrite) || 0) > 0);
+};
+
 /**
  * Last time anything touched the cache, according to the branch: the newest message, or the newest cache-warm usage entry
  * (Pi's own idle refresh persists `{ type: "usage", kind: "cache_warm" }`, and a refresh keeps the entry alive for another TTL).
+ * A request the provider refused (an error with no usage) touched nothing, and neither did the messages that made it (the prompt or
+ * the tool results it carried, written before it failed): the clock stays at the last request that was read.
  * Fresh process: err on the warm side (0 = unknown).
  */
 export function lastMessageMs(branch: Any[]): number {
-	let last = 0;
+	let last = 0, pending = 0; // pending: the newest non-assistant message since the last response, counted once its response is known
 	for (const en of branch) {
-		if (en?.type === "message" && en.message) last = Math.max(last, tsOf(en, en.message));
-		else if (en?.type === "usage" && en.kind === "cache_warm") last = Math.max(last, tsOf(en));
+		if (en?.type === "message" && en.message) {
+			const t = tsOf(en, en.message);
+			if (en.message.role === "assistant") {
+				if (!refused(en.message)) last = Math.max(last, pending, t);
+				pending = 0;
+			} else pending = Math.max(pending, t);
+		} else if (en?.type === "usage" && en.kind === "cache_warm") last = Math.max(last, tsOf(en));
 	}
-	return last;
+	return Math.max(last, pending); // trailing messages with no response yet (the run in progress) count, as before
 }
 
 /** The newest assistant message that really ran (errors and aborts may never have reached a cache): its provider/model and prompt size. */
@@ -128,7 +143,8 @@ export function detectCold(model: Any, lastReqMs: number, branch: Any[], nowMs =
 	const ttl = resolveTtl(model, branch, tier);
 	const last = Math.max(lastReqMs, lastMessageMs(branch));
 	const prev = lastModel || lastModelInBranch(branch);
-	if (last && prev && modelKey(model) && prev !== modelKey(model)) return { cold: true, reason: `model switch ${prev} -> ${modelKey(model)}`, ttl, pWarm: 0, src: "model switch", gapS: null, pastTtl: false };
+	// a request that went out, even one the provider refused, was made on another model: the new model's cache is not that one
+	if (prev && modelKey(model) && prev !== modelKey(model)) return { cold: true, reason: `model switch ${prev} -> ${modelKey(model)}`, ttl, pWarm: 0, src: "model switch", gapS: null, pastTtl: false };
 	if (!last) return { cold: false, reason: "no prior request", ttl, pWarm: 1, src: "no prior request", gapS: null, pastTtl: false };
 	const gapS = (nowMs - last) / 1000;
 	const byTtl = isColdByTtl(last, nowMs, ttl.ms);

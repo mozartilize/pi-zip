@@ -818,7 +818,8 @@ pub fn probe_mismatch(r: &R, i: usize) -> Option<String> {
     None
 }
 
-/// Every recorded law step is law.rs on the same inputs, at the class ratios. The plan step has no call: compared exactly (ok and K).
+/// Every recorded law step is law.rs on the same inputs, at the class ratios. The plan step has no call, or, when it plans a cut, the
+/// call of that cut's summary step (the whole plan pays the summary call too): compared exactly (ok and K).
 /// A summary step's call is a pricing choice of each version (0.2.8: w X + out S; coldwarm F3: the narrative's real input and output):
 /// it is backed out of K, must cost at least half the uncached read of what it summarises, and the step's verdict must be law.rs's
 /// with that call.
@@ -851,6 +852,21 @@ pub fn law_mismatch(r: &R, i: usize) -> Option<String> {
                 let t = s.t.unwrap_or(s.a);
                 let call = match (s.at.as_str(), s.k) {
                     ("summary", Some(k)) => call_of(pr, s.b, s.a, pt.p, t, k),
+                    // the whole plan's step carries the summary call when it plans a cut (TRIAGE (a) 2): backed out of K like a summary's,
+                    // and it must be the call of the summary step recorded just before it (the same cut), when the summary law ran
+                    ("plan", Some(k)) => {
+                        let call = call_of(pr, s.b, s.a, pt.p, t, k);
+                        if call > 1e-6 * s.b.max(1.0) {
+                            let prev = pt.law.iter().take_while(|x| !std::ptr::eq(*x, s)).last().filter(|x| x.at == "summary");
+                            if let Some((ps, Some(pk))) = prev.map(|x| (x, x.k)) {
+                                let pc = call_of(pr, ps.b, ps.a, pt.p, ps.t.unwrap_or(ps.a), pk);
+                                if (pc - call).abs() > 1e-6 * call.max(1.0) {
+                                    return Some(format!("{} plan at P={}: the call in the plan step ({call:.0}) is not the call of the cut's summary step ({pc:.0})", g.at, pt.p));
+                                }
+                            }
+                        }
+                        call
+                    }
                     _ => 0.0,
                 };
                 if call < -1e-6 * s.b.max(1.0) {
