@@ -192,6 +192,17 @@ fn main() {
                 }
             }
         }
+        Some("gen") => {
+            // print random trace number --index of `check --suite none --random N --seed S` (to replay a verdict's "n" without the shrinker)
+            let seed: u64 = a.opt("--seed").and_then(|x| x.parse().ok()).unwrap_or(1);
+            let index: usize = a.opt("--index").and_then(|x| x.parse().ok()).unwrap_or_else(|| die("--index is required"));
+            let mut rng = Rng::new(seed);
+            let mut t = random_trace(&mut rng);
+            for _ in 0..index {
+                t = random_trace(&mut rng);
+            }
+            println!("{t}");
+        }
         Some("check") => {
             let pool = pool(&a);
             let only: Option<Vec<String>> = a.opt("--only").map(|s| s.split(',').map(String::from).collect());

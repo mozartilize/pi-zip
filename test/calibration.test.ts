@@ -177,6 +177,25 @@ describe("calibrate: per model, Pi's compaction, dropped responses", () => {
 		expect(calibrate(before, undefined, [], CLA).O).toBeCloseTo(R0 * sysEst({ text: "x".repeat(8_000), tools: TOOLS }), 6);
 	});
 
+	// N6: a cold return right after a switch used O = R0 x system and c = C0 (1.5) although the session had measured c = 1.9; every
+	// believed size was 20% off, and the 126K-context summary that "removed 7K" was judged against a floor in the real scale
+	test("a switch to a model of the SAME provider, before its first response: the session's measured O and c carry over (another provider: the defaults)", () => {
+		const e = session(8);
+		provider(e, 30_000, 1.9, ["a1", "a2", "a3", "a4", "a5"]);
+		as(e, ["a1", "a2", "a3", "a4", "a5"], "anthropic", "opus-like");
+		const branch = e.map((x) => ({ type: "message", id: x.sourceEntry.id, message: x.sourceEntry.message }));
+		const sameProvider = calibrate(e, undefined, branch, "anthropic/sonnet-like");
+		expect(sameProvider.c).toBeCloseTo(1.9, 1);
+		expect(Math.abs(sameProvider.O - 30_000)).toBeLessThan(300);
+		expect(sameProvider.oSource).toBe("model");
+		for (const keep of [1, 0.5, 0.2]) expect(Math.abs(sizeOf(sameProvider, keep * content(e)) / (30_000 + 1.9 * keep * content(e)) - 1)).toBeLessThan(0.02);
+		const other = calibrate(e, undefined, branch, "zai/glm-like");
+		expect(other).toMatchObject({ c: C0, source: "default", oSource: "default" });
+		// the previous model's scale follows the system prompt: a tool set that changed moves O as it moves the model's own
+		const moved = calibrate([...e.slice(0, 4), { sourceEntry: { id: "s1", type: "message", message: { role: "system", content: "", toolsAdded: [{ name: "t2", description: "x".repeat(4_000), parameters: {} }], timestamp: 2 } }, messages: [{ role: "system", content: "", toolsAdded: [{ name: "t2", description: "x".repeat(4_000), parameters: {} }], timestamp: 2 }] }, ...e.slice(4)], undefined, branch, "anthropic/sonnet-like");
+		expect(moved.c).toBeCloseTo(1.9, 0);
+	});
+
 	test("the session's first request counts for O only if it went to the current model", () => {
 		const e = switched();
 		const branch = e.map((x) => ({ type: "message", id: x.sourceEntry.id, message: x.sourceEntry.message }));

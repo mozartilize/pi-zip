@@ -1,0 +1,49 @@
+world explicit known ttl=300 true=300 survival=none c=1.7 sys=30000 window=128000 native interactive long warming
+prompt +0s
+call npm 23.6K
+say 100
+prompt +28s
+call recall
+call npm 17.6K
+call cat 12.2K
+call npm 16.2K
+call cat 496
+call recall
+call npm 25.5K
+call cat 40.0K
+call npm 298
+call cat 35.7K
+call npm 5.4K
+call npm 17.2K
+call cat 10.2K
+call npm 28.9K
+call npm 173
+call npm 142
+call npm 3.4K
+call npm 332
+call npm 4.4K
+call recall
+call npm 9.8K
+call npm 196
+call npm 27.0K
+call cat 26.3K
+call npm 130
+call npm 399
+call npm 420
+call cat 939
+call cat 13.0K
+call npm 3.1K
+call cat 13.1K
+call npm 578
+call npm 131
+call npm 712
+say 8.8K
+switch
+wait +2210s
+restart
+prompt +47s
+call cat 126
+call cat 2.0K
+call npm 6.9K
+call npm 263
+say 2.0K

@@ -348,10 +348,26 @@ export function calibrate(entries: Any[], sys?: SysInfo, branch: Any[] = [], mod
 		}
 		const best = ev.sort((a, b) => b.at - a.at)[0];
 		let O = best ? Math.max(0, best.O + (best.S >= 0 && S >= 0 ? R0 * (Snow - best.S) : 0)) : R0 * Snow, oSource: Scale["oSource"] = best?.src ?? "default";
+		// the scale of the newest other model of the same provider (a model switch before the new model's first response)
+		const sameProviderScale = (key: string): Scale | null => {
+			const prov = key.split("/")[0];
+			if (!key || !prov) return null;
+			const other = [...resp].reverse().find((r) => r.key && r.key !== key && r.key.split("/")[0] === prov)?.key
+				?? [...branch].reverse().map((e) => (e?.type === "message" && promptOf(e.message) > 0 ? respKey(e.message) : "")).find((k) => k && k !== key && k.split("/")[0] === prov);
+			const o = other ? fit(other, false) : null;
+			return o && o.source === "usage" && o.oSource !== "default" ? o : null;
+		};
 		// c from the newest response of this model
 		let n = resp.length - 1;
 		while (n >= 0 && !mine(resp[n])) n--;
-		if (n < 0) return { O, c: C0, real: 0, est: 0, source: "default", oSource };
+		if (n < 0) {
+			// no response of this model yet (a model switch): its tokenizer is unknown, but a model of the same provider counts like the one
+			// the session ran on; carrying that model's O and c over keeps the sizes of the first cold return near the real ones. Another
+			// provider keeps the defaults (R0 x the system state, C0).
+			const o = transfer && !best ? sameProviderScale(want) : null;
+			if (o) return { O: o.O, c: o.c, real: 0, est: 0, source: "default", oSource: "model" };
+			return { O, c: C0, real: 0, est: 0, source: "default", oSource };
+		}
 		const N = resp[n];
 		let estN = N.est;
 		const cutLater = !!head && !afterHead(N);
