@@ -60,6 +60,7 @@ interface RigOpts {
 	settings?: Any;
 	// another extension's session_before_compact handler (Pi runs every extension's for pi-zip's compaction too), loaded before or after pi-zip
 	foreign?: { at: "before" | "after"; on: (e: Any, ctx: Any) => Any };
+	latencyMs?: number; // the summary's model call takes this long
 }
 
 async function rig(setup: (sm: SessionManager) => void = populate, opts: RigOpts = {}) {
@@ -79,7 +80,11 @@ async function rig(setup: (sm: SessionManager) => void = populate, opts: RigOpts
 	}
 	const narrativeCalls: Any[] = [];
 	const registry: Any = {
-		complete: async (_m: Any, c: Any) => (narrativeCalls.push(c), { stopReason: "stop", content: [{ type: "text", text: "## Decisions\nnarrative" }], usage: { cost: { total: 0 } } }),
+		complete: async (_m: Any, c: Any) => {
+			narrativeCalls.push(c);
+			if (opts.latencyMs) await new Promise((res) => setTimeout(res, opts.latencyMs));
+			return { stopReason: "stop", content: [{ type: "text", text: "## Decisions\nnarrative" }], usage: { cost: { total: 0 } } };
+		},
 	};
 	const runner = new ExtensionRunner(extensions, runtime, CWD, sm, registry);
 	const noop = () => {};
@@ -119,7 +124,18 @@ async function rig(setup: (sm: SessionManager) => void = populate, opts: RigOpts
 		{ sendMessage: noop, sendUserMessage: noop, appendEntry: (t: string, d: Any) => sm.appendCustomEntry(t, d), setSessionName: noop, getSessionName: () => undefined, setLabel: noop, getActiveTools: () => ["read", "bash", "zip_recall"], getAllTools: () => [], getSettings: () => opts.settings ?? {}, setActiveTools: noop, refreshTools: noop, getCommands: () => [], setModel: async () => false, getThinkingLevel: () => "off", setThinkingLevel: noop } as Any,
 		{ getModel: () => MODEL, getScopedModels: () => [], isIdle: () => opts.idle !== false && !compacting, isProjectTrusted: () => true, getSignal: () => undefined, abort: () => compacting?.abort(), hasPendingMessages: () => false, shutdown: noop, getContextUsage: () => undefined, compact: opts.native ? piCompact : (o: Any) => o?.onError?.(new Error("rig: no compaction")), getSystemPrompt: () => "You are a coding agent." } as Any,
 	);
-	if (opts.tui) runner.setUIContext({ notify: noop, setWorkingMessage: noop, setStatus: noop, setWidget: noop } as Any, "tui");
+	// Pi's TUI hands raw input to the extensions' listeners in order (TuiBase.handleTerminalInput): one may consume it or replace the data
+	const inputListeners = new Set<(data: string) => Any>();
+	const typeKey = (data: string): string | null => {
+		let cur = data;
+		for (const h of [...inputListeners]) {
+			const r = h(cur);
+			if (r?.consume) return null;
+			if (r?.data !== undefined) cur = r.data;
+		}
+		return cur;
+	};
+	if (opts.tui) runner.setUIContext({ notify: noop, setWorkingMessage: noop, setStatus: noop, setWidget: noop, onTerminalInput: (h: (data: string) => Any) => (inputListeners.add(h), () => inputListeners.delete(h)) } as Any, "tui");
 	const projectionMessages = () => sm.buildSessionContext().messages as Any[];
 	/** One request as Pi sends it: the agent state is the session projection; the extension transforms it. */
 	const request = async () => (await runner.emitContext(projectionMessages())) as Any[];
@@ -145,7 +161,8 @@ async function rig(setup: (sm: SessionManager) => void = populate, opts: RigOpts
 	const beforeAgentStart = (text = "next request") => runner.emitBeforeAgentStart(text, undefined, { cwd: CWD } as Any);
 	await runner.emit({ type: "session_start", reason: "startup" } as Any);
 	if (opts.start !== false) await beforeAgentStart();
-	return { sm, runner, request, turnEnd, settle, beforeAgentStart, narrativeCalls, projectionMessages, compactions, compactCalls, foreignCalls };
+	const shutdown = () => runner.emit({ type: "session_shutdown" } as Any);
+	return { sm, runner, request, turnEnd, settle, beforeAgentStart, narrativeCalls, projectionMessages, compactions, compactCalls, foreignCalls, inputListeners, typeKey, shutdown };
 }
 
 const saved: Record<string, string | undefined> = {};
@@ -280,6 +297,75 @@ describe("real Pi: a summary prepared while the user was away goes in through Pi
 			await sleep(300);
 			expect([agoMs, r.narrativeCalls.length]).toEqual([agoMs, 0]); // old code: 1 within ms of session_start (delay max(0, last + 0.8 TTL - now) = 0)
 		}
+	});
+
+	// Restart speed: opening an old session costs nothing (above), but the user's first prompt then waits for the whole summary. The first
+	// raw keystroke says they are here to work: start the summary then, so the typing time is not wasted.
+	test("a reopened session whose cache is dead starts its cold summary on the first keystroke, never consumes or alters it, and unsubscribes", async () => {
+		const r = await rig(undefined, { file: template(240 * 60_000), tui: true, native: false, idle: false, start: false });
+		await sleep(300);
+		expect(r.narrativeCalls.length).toBe(0); // opened, not typed: no call (and one listener waits)
+		expect(r.inputListeners.size).toBe(1);
+		expect(r.typeKey("\x1b[I")).toBe("\x1b[I"); // a focus report is not the user
+		expect(r.typeKey("\x1b[?0u")).toBe("\x1b[?0u"); // nor is a kitty-keyboard reply
+		await sleep(50);
+		expect(r.narrativeCalls.length).toBe(0);
+		expect(r.typeKey("h")).toBe("h"); // the data goes on to Pi untouched
+		await sleep(100);
+		expect(r.narrativeCalls.length).toBe(1);
+		expect(r.inputListeners.size).toBe(0); // unsubscribed at the first key
+		r.typeKey("i");
+		await sleep(100);
+		expect(r.narrativeCalls.length).toBe(1);
+	});
+
+	test("the prompt after the first key takes the running call: no second call, the summary is in the request, the wait is the remainder", async () => {
+		const r = await rig(undefined, { file: template(240 * 60_000), tui: true, native: false, idle: false, start: false, latencyMs: 600 });
+		r.typeKey("h");
+		await sleep(250); // typing the prompt takes 250 ms of the 600 ms call
+		const t0 = performance.now();
+		await r.beforeAgentStart("hello");
+		sendPrompt(r.sm, "hello");
+		const req1 = await r.request();
+		const waited = performance.now() - t0;
+		expect(r.narrativeCalls.length).toBe(1); // the call the key started, not a second one
+		expect(req1.some((m) => m.role === "compactionSummary")).toBe(true);
+		expect(waited).toBeGreaterThan(150); // it still waited for the rest of the call...
+		expect(waited).toBeLessThan(500); // ...not all of it (~350 ms left; a call started at the prompt would take 600)
+	});
+
+	test("a session opened and closed without typing makes no call; one with no UI (pi -p, a subagent) never listens", async () => {
+		const r = await rig(undefined, { file: template(240 * 60_000), tui: true, native: false, idle: false, start: false });
+		expect(r.inputListeners.size).toBe(1);
+		await r.shutdown();
+		expect(r.inputListeners.size).toBe(0);
+		r.typeKey("h");
+		await sleep(150);
+		expect(r.narrativeCalls.length).toBe(0);
+		const quiet = await rig(undefined, { file: template(240 * 60_000), tui: false, start: false });
+		expect(quiet.inputListeners.size).toBe(0);
+		quiet.typeKey("h");
+		await sleep(150);
+		expect(quiet.narrativeCalls.length).toBe(0);
+	});
+
+	test("a key when the cold plan has no summary starts nothing; a prompt without any key leaves no listener behind", async () => {
+		const sm = SessionManager.inMemory(CWD);
+		populate(sm, 0); // short prose: folds reach the cap, no cut
+		const small = [sm.getHeader() as Any, ...sm.getEntries()];
+		const shift = Date.now() - 240 * 60_000 - Math.max(...small.map((e) => e.message?.timestamp ?? 0));
+		for (const e of small) {
+			if (typeof e.message?.timestamp === "number") e.message.timestamp += shift;
+			if (typeof e.timestamp === "string" && e.type !== undefined && e.type !== "session") e.timestamp = new Date(Date.parse(e.timestamp) + shift).toISOString();
+		}
+		const a = await rig(undefined, { file: small, tui: true, native: false, idle: false, start: false });
+		a.typeKey("h");
+		await sleep(100);
+		expect(a.narrativeCalls.length).toBe(0);
+		const b = await rig(undefined, { file: template(240 * 60_000), tui: true, native: false, idle: false, start: false, latencyMs: 50 });
+		expect(b.inputListeners.size).toBe(1);
+		await b.beforeAgentStart("typed elsewhere"); // a prompt that did not come through the keyboard: the listener goes away
+		expect(b.inputListeners.size).toBe(0);
 	});
 
 	test("a restart between the 0.8 mark and the TTL starts the call at once, as the live process's timer would have (formal A3)", async () => {
