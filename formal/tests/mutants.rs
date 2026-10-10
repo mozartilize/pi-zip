@@ -231,15 +231,15 @@ fn mp_residual_new_mechanism() {
     caught_all("m28", "plan.ts", &[("if (relax && ((mode === \"cold\" && !o.warmStyle) || o.pastTtl === true)) {", "if (relax && mode === \"warm\") {", 1)], &["MP", "MPr"], &t);
 }
 
-/// NOT RUN (ignored, on purpose): since the planner state is read from the branch (state.ts) no small mutant of "a summary was made in
-/// this warm stretch" changes what NT sees on a trace the unmutated src passes: the only NT counterexample the mutant hunt found (a
-/// cold summary after a model switch that removes almost nothing, 126K context, 123K protected) fails on the unmutated src too
-/// (formal/TRIAGE.md, new finding N6). NT can fail (that trace), but no mutant is paired with it yet.
+/// N6: a cold return right after a model switch to a model of the same provider planned in O = R0 x system, c = C0 (the session had
+/// measured c = 1.7): the planner believed a 376K context where the real one was 415K, and NT (believed context against the real floor)
+/// saw a summary that removes "almost nothing". `traces/n6-switch.trace` is the shrunk counterexample of
+/// `check --suite none --random 15000 --seed 7` on a2885b1 (the mutant is that source's behaviour: the previous model's scale is not
+/// carried over). It passes on the fixed src.
 #[test]
-#[ignore = "no mutant that the unmutated src survives yet: see TRIAGE N6"]
 fn nt_no_thrash() {
-    let t = trace_of(&[WA, "prompt", "call npm 25.9K", "say 100", "prompt +60s", "call npm 20K", "call npm 5K", "say 100", "wait +330s", "restart", "prompt +0s", "call npm 13.0K", "say 100", "prompt +60s", "say 100"]);
-    caught("m15", "run.ts", "noSummary: mode === \"warm\" && this.summarizedWarm,", "noSummary: false,", "NT", &t);
+    let t = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("traces/n6-switch.trace")).unwrap();
+    caught("m30", "plan.ts", "const o = transfer && !best ? sameProviderScale(want) : null;", "const o = null;", "NT", &t);
 }
 
 #[test]
