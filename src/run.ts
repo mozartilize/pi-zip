@@ -651,7 +651,7 @@ export class Zip implements ZipControl {
 		this.survSrc = src;
 		this.runChecked = false; // the first request decides (cold: the cold plan; warm: only above the cap, if the law fires)
 		this.coldReason = reason;
-		this.coldWhy = src === "model switch" ? "model switched" : cold && gapS !== null ? `away ${fmtAway(gapS)}` : "";
+		this.coldWhy = src === "model switch" ? "cache cold · model switched" : cold && gapS !== null ? `cache cold · away ${fmtAway(gapS)}` : ""; // the warm form says "cache warm · worth it at this size"
 		for (const h of recalledHandlesFromBranch(branch)) this.recalled.add(h);
 		for (let i = branch.length - 1; i >= 0; i--) {
 			const en = branch[i];
@@ -1237,7 +1237,7 @@ export class Zip implements ZipControl {
 
 	/**
 	 * The transcript notice for one plan. Facts only, no claims: what changed (sizes), how long it took, and, expanded, why now
-	 * ("away 47 min") and what was folded. Whether the cache really was cold is learned from the response, silently (/zip shows it).
+	 * ("cache cold · away 47 min") and what was folded. Whether the cache really was cold is learned from the response, silently (/zip shows it).
 	 * `realAfter` > 0: the size the provider reported for the request that carried the plan (shown instead of the estimate).
 	 */
 	private noticeFor(ctx: Any, plan: RunPlan, live: FoldTarget[], cut: Cut | null, ctxTokens: number, realAfter: number) {
