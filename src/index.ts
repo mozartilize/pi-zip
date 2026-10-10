@@ -56,6 +56,11 @@ export default function piZip(pi: ExtensionAPI) {
 		});
 		zip.entryRenderer = typeof pi.registerEntryRenderer === "function";
 		// a folded output keeps its place in the transcript; its call row gets "ƶ zipped" right after its own text
+		// Pi passes the component a renderCall returned last time back as context.lastComponent, and its own renderers update that
+		// component in place and return it. So base gets the bare component back and each component keeps one wrapper: wrapping
+		// the wrapper again on every streamed args update nested one Proxy per update (quadratic render time, a stack overflow).
+		const bare = new WeakMap<object, object>(), wrapper = new WeakMap<object, object>(), now = new WeakMap<object, { id: string; theme: Any }>();
+		const recallRows = new WeakSet<object>(); // our own rows: never handed to a built-in renderer to update
 		pi.registerToolRenderer?.((toolName: string, next: () => Any) => {
 			const base = next();
 			if (toolName === RECALL_TOOL || typeof base?.renderCall !== "function") return base;
@@ -68,25 +73,37 @@ export default function piZip(pi: ExtensionAPI) {
 						const off = typeof args.offset === "number" ? args.offset : undefined, lim = typeof args.limit === "number" ? args.limit : undefined;
 						const range = toolName === "read" && (off !== undefined || lim !== undefined) ? `${off ?? 1}-${lim !== undefined ? (off ?? 1) + lim - 1 : ""}` : undefined;
 						const a = { handle: ref.handle, grep: toolName === "grep" && typeof args.pattern === "string" ? args.pattern : undefined, range };
-						return { render: (width: number) => recallCallLine(a, Math.max(1, width), theme, measure, (h) => zip.labelOf(h)), invalidate: () => {} };
+						const row = { render: (width: number) => recallCallLine(a, Math.max(1, width), theme, measure, (h) => zip.labelOf(h)), invalidate: () => {} };
+						recallRows.add(row);
+						return row;
 					}
-					const comp = base.renderCall(args, theme, c);
+					const prev = c?.lastComponent && typeof c.lastComponent === "object" ? c.lastComponent : undefined;
+					const mine = prev && (bare.has(prev) || recallRows.has(prev));
+					const comp = base.renderCall(args, theme, mine ? { ...c, lastComponent: bare.get(prev) } : c);
 					const id = c?.toolCallId;
 					if (!comp || typeof comp.render !== "function" || typeof id !== "string") return comp;
-					return new Proxy(comp, {
+					if (bare.has(comp)) return comp; // already a wrapper
+					now.set(comp, { id, theme }); // what the wrapper marks with: the latest call and theme this component was rendered for
+					const known = wrapper.get(comp);
+					if (known) return known;
+					const wrapped = new Proxy(comp, {
 						get(t, p, r) {
 							if (p !== "render") return Reflect.get(t, p, r);
 							return (width: number) => {
 								const lines = t.render(width);
-								const h = zip.foldedHandle(id);
+								const cur = now.get(t) ?? { id, theme };
+								const h = zip.foldedHandle(cur.id);
 								try {
-									return h ? markFirstLine(lines, h, width, theme, measure) : lines;
+									return h ? markFirstLine(lines, h, width, cur.theme, measure) : lines;
 								} catch {
 									return lines;
 								}
 							};
 						},
 					});
+					bare.set(wrapped, comp);
+					wrapper.set(comp, wrapped);
+					return wrapped;
 				},
 			};
 		});
