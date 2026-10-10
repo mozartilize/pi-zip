@@ -140,3 +140,25 @@ describe("summarizedWarm: a pi-zip summary since the last cold return", () => {
 		expect(fresh([entry("u0", user(at(0))), entry("a0", resp(60_000, at(0) + 1)), summary({ details: undefined, fromHook: false })]).summarizedWarm).toBe(false);
 	});
 });
+
+describe("a refused request does not move the cache clock (GC)", () => {
+	test("the live clock goes back to the last request that was read, as a restarted process reads it from the branch", () => {
+		const { pi } = fakePi();
+		const z = new Zip(pi) as Any;
+		z.model = MODEL;
+		z.providerRequest({ payload: {} });
+		z.messageEnd(resp(30_000, T0));
+		const real = z.lastReqMs;
+		expect(real).toBeGreaterThan(0);
+		z.lastReqMs = real - 400_000; // pretend the answered request was a while ago
+		const before = z.lastReqMs;
+		z.providerRequest({ payload: {} });
+		expect(z.lastReqMs).toBeGreaterThan(before); // the request went out
+		z.messageEnd(resp(0, T0 + 1, { stopReason: "error", usage: { input: 0, cacheRead: 0, cacheWrite: 0 } }));
+		expect(z.lastReqMs).toBe(before); // the provider refused it: no cache was touched (old code: now)
+		// an error that reports usage was read
+		z.providerRequest({ payload: {} });
+		z.messageEnd(resp(30_000, T0 + 2, { stopReason: "error" }));
+		expect(z.lastReqMs).toBeGreaterThan(before);
+	});
+});

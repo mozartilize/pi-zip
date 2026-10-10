@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { repairPayload } from "../src/guard.ts";
-import { cacheTtlMs, detectCold, isColdByTtl, observedTier, payloadRetention, resolveTtl } from "../src/cache.ts";
+import { cacheTtlMs, detectCold, isColdByTtl, lastMessageMs, observedTier, payloadRetention, resolveTtl } from "../src/cache.ts";
 import { classifyRecoverability, isReadOnlyBash } from "../src/classify.ts";
 import { colorTail, fmtK, noticeText, renderNotice, splitDesc, type NoticeAction, type NoticeData } from "../src/notice.ts";
 import { clipMid, handleFor, makePlaceholder, makePlaceholderFor, outcomeHint, pickKeyLines, shortArgs } from "../src/placeholder.ts";
@@ -608,6 +608,36 @@ describe("cache", () => {
 		expect(detectCold({ promptCache: { short: 300 } }, now - 5000, branch, now).cold).toBe(false);
 		expect(detectCold({ promptCache: { short: 300 } }, 0, branch, now).cold).toBe(true);
 		expect(detectCold({}, 0, [], now)).toMatchObject({ cold: false, reason: "no prior request" });
+	});
+});
+
+describe("the cache clock ignores a request the provider refused (GC)", () => {
+	const m = (role: string, t: number, over: Record<string, unknown> = {}) => ({ type: "message", id: `${role}${t}`, message: { role, timestamp: t, ...over } });
+	const ok = (t: number) => m("assistant", t, { stopReason: "stop", usage: { input: 10, cacheRead: 1000, cacheWrite: 0 } });
+	const refused = (t: number, over: Record<string, unknown> = {}) => m("assistant", t, { stopReason: "error", usage: { input: 0, cacheRead: 0, cacheWrite: 0 }, ...over });
+	test("an error without usage is no touch, nor are the prompt and tool results that went with it", () => {
+		expect(lastMessageMs([m("user", 1000), ok(1100), m("user", 5000), refused(5100)])).toBe(1100);
+		expect(lastMessageMs([m("user", 1000), ok(1100), m("toolResult", 1200), refused(1300), m("user", 9000), refused(9100)])).toBe(1100);
+	});
+	test("an abort (Esc) comes after the provider read the prompt: a touch, with or without usage; an error that reports usage too", () => {
+		expect(lastMessageMs([m("user", 1000), ok(1100), m("user", 5000), refused(5100, { stopReason: "aborted" })])).toBe(5100);
+		const read = (t: number, stopReason: string) => m("assistant", t, { stopReason, usage: { input: 5, cacheRead: 30_000, cacheWrite: 0 } });
+		expect(lastMessageMs([m("user", 1000), ok(1100), m("user", 5000), read(5100, "error")])).toBe(5100);
+		expect(lastMessageMs([m("user", 1000), ok(1100), m("user", 5000), read(5100, "aborted")])).toBe(5100);
+	});
+	test("what is still running counts: trailing prompt or tool result without a response, a cache_warm entry, a branch with no response at all", () => {
+		expect(lastMessageMs([m("user", 1000), ok(1100), m("toolResult", 1200)])).toBe(1200);
+		expect(lastMessageMs([m("user", 1000), ok(1100), { type: "usage", kind: "cache_warm", timestamp: new Date(7000).toISOString() }])).toBe(7000);
+		expect(lastMessageMs([m("user", 1000)])).toBe(1000);
+		expect(lastMessageMs([])).toBe(0);
+	});
+	test("a model switch after a request the provider refused: the new model's cache is not the refused one's, so the return is cold", () => {
+		expect(detectCold({ provider: "p", id: "m2", promptCache: { short: 300 } }, 0, [m("user", 0), refused(10)], 60_000, "p/m1").cold).toBe(true);
+		expect(detectCold({ provider: "p", id: "m2", promptCache: { short: 300 } }, 0, [m("user", 0)], 60_000, "").cold).toBe(false); // nothing was ever sent
+	});
+	test("a return after a refused request is cold by the last real touch", () => {
+		const branch = [m("user", 0), ok(1_000), m("user", 290_000), refused(291_000)];
+		expect(detectCold({ promptCache: { short: 300 } }, 0, branch, 302_000).cold).toBe(true); // 301 s since request 1, not 11 s since the error
 	});
 });
 

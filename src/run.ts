@@ -3,7 +3,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { detectCold, lastMessageMs, lastPrompt, modelKey, payloadRetention, resolveTtl, ttlFor } from "./cache.ts";
+import { detectCold, lastMessageMs, lastPrompt, modelKey, payloadRetention, refused, resolveTtl, ttlFor } from "./cache.ts";
 import { agentDir, describe, lawPrices, loadStats, pWarm, record, sample, statsPath, GAP_EDGES, type Entry } from "./learn.ts";
 import { validateEdits, repairPayload } from "./guard.ts";
 import { fmtK, Stats, noticeDesc, noticeText, type NoticeAction, type NoticeData, type ZipControl } from "./notice.ts";
@@ -91,6 +91,7 @@ export class Zip implements ZipControl {
 	private runEdits = false; // this run carries an edit plan that turn_end has yet to persist
 	private runPlan: RunPlan | null = null;
 	private lastReqMs = 0; // the real-time cache clock: newest request start or end
+	private reqMsBefore = 0; // the clock before the request in flight started: what a refused request gives back
 	private lastModelKey = ""; // provider/model of the newest request: a cache entry belongs to one model
 	private settleIds: string[] = []; // entries the settle plan folded: only used to label a plan as prepared
 	private bg: Bg | null = null;
@@ -1255,6 +1256,7 @@ export class Zip implements ZipControl {
 		// the free cache signal: this response's cacheRead against what this request re-sent unchanged, after this gap (same model only)
 		this.pending = { gapS: last && (this.lastModelKey || this.prevKey) === key ? (now - last) / 1000 : -1, expect: edited ? this.nextEdit! : this.prevTotal, edited, key };
 		this.nextEdit = null;
+		this.reqMsBefore = this.lastReqMs;
 		this.lastReqMs = now;
 		this.lastModelKey = key;
 		this.stats.readSavedTokens += this.stats.activeSaved;
@@ -1279,6 +1281,7 @@ export class Zip implements ZipControl {
 
 	messageEnd(m: Any) {
 		if (m?.role === "assistant" && m.stopReason !== "error" && m.stopReason !== "aborted") this.lastReqMs = Date.now(); // the response is complete: the entry was refreshed when it finished
+		else if (refused(m)) this.lastReqMs = this.reqMsBefore; // the provider refused the request: it touched no cache (cache.ts lastMessageMs reads the branch the same way)
 		if (m?.role === "user" && this.active()) {
 			// the first user message of a run is the prompt; later ones (steering, follow-up) are part of that run's turn. Pi does not mark them, we do.
 			if (this.runUserSeen++ > 0 && typeof m.timestamp === "number") this.steerTs.add(m.timestamp);
