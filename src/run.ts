@@ -12,7 +12,7 @@ import { handleFor, PH_MARK, RECALL_TOOL } from "./placeholder.ts";
 import { branchOutputs, recalledHandlesFromBranch, resolveHandlesInBranch } from "./recall.ts";
 import { cleanupRecall, commandNamesRecall, fileRecallFor, materialize, parseRecallPath, recallRoot, recallRootShown, rewriteCommand, sidDir, type FileRecall } from "./recallfile.ts";
 import { buildCut } from "./summary.ts";
-import { type Any, COMMIT_CUSTOM, envInt, PRODUCT, textOf, tok4 } from "./util.ts";
+import { type Any, COMMIT_CUSTOM, envInt, isKeystroke, PRODUCT, textOf, tok4 } from "./util.ts";
 import { replayGrowth } from "./state.ts";
 import { fmtLife, type CardData, type ChartBin, type StateWord } from "./ui.ts";
 
@@ -495,6 +495,9 @@ export class Zip implements ZipControl {
 			// prompt handles it. Opening or /resuming an old session to browse it must not start a paid summary call.
 			const delayMs = this.scheduleSummary(p, ctx, at || undefined, true);
 			this.ledger({ type: "away_resumed", timerMs: delayMs, lastRequestMs: at });
+			// the cache is already dead: opening the session costs nothing, but the first keystroke says the user is here to work, and the
+			// first prompt will wait for exactly this summary; start it now so the typing time is not wasted
+			if (delayMs < 0) this.armOnFirstKey(ctx);
 		} catch (err) {
 			this.ledger({ type: "error", where: "resume_away", error: errText(err) });
 		}
@@ -606,6 +609,7 @@ export class Zip implements ZipControl {
 	}
 
 	shutdown() {
+		this.disarmKey();
 		this.cancelTimer();
 		this.bg?.controller.abort();
 		this.bg = null;
@@ -614,6 +618,7 @@ export class Zip implements ZipControl {
 	async beforeAgentStart(ctx: Any, e?: Any): Promise<void> {
 		this.liveCtx = ctx;
 		this.cancelTimer(); // the user is back: nothing is started behind their back any more
+		this.disarmKey();
 		this.model = ctx?.model;
 		this.cold = false;
 		this.pastTtl = false;
@@ -810,6 +815,56 @@ export class Zip implements ZipControl {
 		s.activeSaved += cutSaved;
 		s.writeSavedTokens += cutSaved;
 		this.ledger({ type: "summary", via: "native", trigger: cut.trigger, source: "settle", count: cut.count, tokensBefore: before, prefixTokens: Math.round(p.scale.c * cut.prefixTokens), summaryTokens: Math.round(p.scale.c * cut.summaryTokens), ms: cut.ms, compactMs: ms, askMs, waitedMs: 0, llmOk: cut.llmOk, llmError: cut.llmError, costUsd: cut.costUsd, ...this.usageOf(cut) });
+	}
+
+	/** The unsubscribe of the first-keystroke listener (resumeAway), null when none is armed. */
+	private keyOff: (() => void) | null = null;
+	private disarmKey() {
+		const off = this.keyOff;
+		this.keyOff = null;
+		try {
+			off?.();
+		} catch {}
+	}
+
+	/** A reopened session whose cache is dead and whose cold plan would summarise: start that summary on the first raw keystroke after
+	 *  the session opens (Pi API ctx.ui.onTerminalInput; never consumes or alters the data; unsubscribes at the first key). The prompt that
+	 *  follows takes the running call exactly like the live away timer's (takeBg: no second call, the notice shows the real wait). A session
+	 *  opened and closed without typing makes no call (shutdown unsubscribes). Nothing without a UI (`pi -p`, a subagent). */
+	private armOnFirstKey(ctx: Any) {
+		this.disarmKey();
+		const ui = ctx?.ui;
+		if (!ctx?.hasUI || typeof ui?.onTerminalInput !== "function") return;
+		try {
+			this.keyOff = ui.onTerminalInput((data: string) => {
+				if (!isKeystroke(data)) return undefined; // a terminal report (focus, cursor position, cell size, ...) is not the user
+				this.disarmKey();
+				this.startOnKey(ctx);
+				return undefined; // the input goes on to Pi untouched
+			});
+			this.ledger({ type: "key_armed" });
+		} catch (err) {
+			this.ledger({ type: "error", where: "arm_key", error: errText(err) });
+		}
+	}
+
+	/** The first key: plan the cold return again on the session as it is now (a /model or /tree before it may have changed it) and, when it
+	 *  has a cut, write that summary in the background, as the away timer would have. */
+	private startOnKey(ctx: Any) {
+		try {
+			if (!this.active() || this.bg) return;
+			const entries = ((ctx.sessionManager.buildSessionProjection() as Any)?.entries ?? []) as Any[];
+			if (!entries.length || !ctx?.model) return;
+			this.loadEnt(modelKey(ctx.model));
+			const { o } = this.opts(ctx, true, "cold", entries);
+			const p = planContext(entries, o);
+			if (!p || p.cutIdx === null) return;
+			this.awaySig = this.contextSig(ctx);
+			this.startBg(p, ctx);
+			this.ledger({ type: "key_start", key: p.firstKeptEntryId });
+		} catch (err) {
+			this.ledger({ type: "error", where: "start_on_key", error: errText(err) });
+		}
 	}
 
 	private cancelTimer() {
@@ -1154,6 +1209,11 @@ export class Zip implements ZipControl {
 				return;
 			}
 		}
+		this.startBg(p, ctx);
+	}
+
+	/** Write the summary for `p` in the background (its own abort signal: nothing is running, so the run's would be stale). */
+	private startBg(p: PlanResult, ctx: Any) {
 		const controller = new AbortController();
 		const bg: Bg = { key: p.firstKeptEntryId, done: null, promise: Promise.resolve(null), controller };
 		bg.promise = buildCut(p, ctx, controller.signal)
