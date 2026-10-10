@@ -7,6 +7,7 @@ import { record } from "../src/learn.ts";
 import { buildBlocks, planContext, applyPlanToMessages, reserveTokensFor, type Block, type RunPlan } from "../src/plan.ts";
 import { handleFor } from "../src/placeholder.ts";
 import { skeleton } from "../src/summary.ts";
+import { NATIVE_MARKER } from "../src/run.ts";
 import { A, AX, fakeCtx, fakePi, flat, longTurn, project, R, U, withK, type Any } from "./helpers.ts";
 
 const ENV = ["PI_ZIP_TTL_SECS", "PI_ZIP_COLD_CAP", "PI_ZIP_OFF", "PI_ZIP_LEDGER", "PI_ZIP_MIN_GAIN", "PI_ZIP_INTURN_AGE"];
@@ -451,8 +452,8 @@ describe("F12 summary prepared while the user is away (timer at 0.8 x TTL)", () 
 	// ---- the prepared summary goes in through Pi's own compaction (pi-tricks §1b, variant 1) -------------------------------
 	/** The cold return as Pi runs it: before_agent_start sees the session WITHOUT the prompt (Pi appends it after the hook), then the
 	 *  first request. `pi` fakes Pi's side: ctx.compact (asks session_before_compact, appends the entry, projects it), isIdle, settings. */
-	const comeBackNative = async (r: Any, settled: Any, o: { idle?: boolean; compact?: "ok" | "error" | "none"; abort?: boolean; tail?: Any[] } = {}) => {
-		const st = { compactCalls: 0, answer: undefined as Any };
+	const comeBackNative = async (r: Any, settled: Any, o: { idle?: boolean; compact?: "ok" | "error" | "none"; abort?: boolean; tail?: Any[]; beforeMs?: number; postMs?: number } = {}) => {
+		const st = { compactCalls: 0, answer: undefined as Any, instructions: undefined as Any };
 		let branch: Any[] = [...branchOf(done, COLD_TS()), ...(settled?.entries?.length ? [settled.entries.at(-1)] : []), ...(o.tail ?? [])];
 		let comp: Any = null;
 		r.ctx.sessionManager.getBranch = () => branch;
@@ -464,11 +465,14 @@ describe("F12 summary prepared while the user is away (timer at 0.8 x TTL)", () 
 				st.compactCalls++;
 				queueMicrotask(async () => {
 					if (o.compact === "error") return opts?.onError?.(new Error("Compaction failed: provider refused"));
-					st.answer = await r.handlers.get("session_before_compact")?.({ type: "session_before_compact", reason: "manual" }, r.ctx);
+					st.instructions = opts?.customInstructions;
+					if (o.beforeMs) await sleep(o.beforeMs); // another extension's handler, loaded before pi-zip's, takes its time
+					st.answer = await r.handlers.get("session_before_compact")?.({ type: "session_before_compact", reason: "manual", customInstructions: opts?.customInstructions }, r.ctx);
 					const c = st.answer?.compaction;
 					if (!c) return opts?.onError?.(new Error("Compaction cancelled"));
-					comp = { type: "compaction", id: "comp", summary: c.summary, firstKeptEntryId: c.firstKeptEntryId, tokensBefore: c.tokensBefore, details: c.details, fromHook: true };
+					comp = { type: "compaction", id: "comp", timestamp: new Date().toISOString(), summary: c.summary, firstKeptEntryId: c.firstKeptEntryId, tokensBefore: c.tokensBefore, details: c.details, fromHook: true };
 					branch = [...branch, comp];
+					if (o.postMs) await sleep(o.postMs); // Pi's own work after the append: context refresh, projection, token estimate, the chat rebuild
 					opts?.onComplete?.({ ...c });
 				});
 			};
@@ -502,6 +506,75 @@ describe("F12 summary prepared while the user is away (timer at 0.8 x TTL)", () 
 		const te = await r.fire("turn_end", turnEnd([...n.view, A("a6")], "a6"));
 		expect(te?.entries?.some((e: Any) => e.type === "compaction") ?? false).toBe(false);
 		expect(await r.handlers.get("session_before_compact")({ type: "session_before_compact", reason: "threshold" }, r.ctx)).toBeUndefined();
+	});
+
+	const noticeOf = (r: Any) => r.appended.filter((x: Any) => x.customType === "pi-zip/notice" && !x.data?.kind).at(-1)?.data;
+
+	test("item 4(a): the notice carries the native outcome: ok with its timings, or the reason the draft path was taken", async () => {
+		const run = async (o: Any, piExtra: Any = {}) => {
+			const r = await rig(done, COLD_TS(), { modelRegistry: { complete: mkComplete({ calls: 0 }) } }, { registerEntryRenderer: () => {}, ...piExtra });
+			const settled = await settle(r);
+			await sleep(200);
+			const n = await comeBackNative(r, settled, o);
+			await sleep(5);
+			return { n, notice: noticeOf(r) };
+		};
+		const ok = await run({});
+		expect(ok.notice).toMatchObject({ native: "ok" });
+		expect(typeof ok.notice.nativeMs).toBe("number");
+		expect(typeof ok.notice.nativeAskMs).toBe("number");
+		expect((await run({ idle: false })).notice.native).toBe("not idle");
+		expect((await run({ compact: "none" })).notice.native).toBe("no ctx.compact");
+		expect((await run({ compact: "error" })).notice.native).toMatch(/^Pi's compaction failed: .*refused/);
+		expect((await run({}, { getSettings: () => ({ compaction: { keepRecentTokens: 10_000_000 } }) })).notice.native).toBe("nothing to compact");
+		// a later cold return in the same process: the reason is that of the run, not a stale one
+	});
+
+	test("item 4(b): Pi's work after the append is not 'another handler at work': a slow but successful native compaction keeps the native path for the process", async () => {
+		const ledger = `/tmp/pz-native-${process.pid}-${Date.now()}.jsonl`;
+		process.env.PI_ZIP_LEDGER = ledger;
+		const r = await rig(done, COLD_TS(), { modelRegistry: { complete: mkComplete({ calls: 0 }) } }, { registerEntryRenderer: () => {} });
+		const settled = await settle(r);
+		await sleep(200);
+		const n = await comeBackNative(r, settled, { postMs: 600 }); // 600 ms of Pi's post-append refresh on a big branch: > NATIVE_SLOW_MS (250)
+		await sleep(5);
+		const log = readFileSync(ledger, "utf8");
+		expect(log).not.toContain("native_off"); // old code: "Pi's compaction took 6xx ms: another session_before_compact handler at work"
+		expect(noticeOf(r)).toMatchObject({ native: "ok" });
+		expect(noticeOf(r).nativeMs).toBeGreaterThan(550); // the whole call is still recorded
+		expect(noticeOf(r).nativeAskMs).toBeLessThan(100);
+		expect(n.answer.compaction).toBeTruthy();
+		rmSync(ledger, { force: true });
+	});
+
+	test("item 4(b): a handler that really is slow (before ours, or between ours and the append) still ends the native path", async () => {
+		const ledger = `/tmp/pz-native-${process.pid}-${Date.now()}-b.jsonl`;
+		process.env.PI_ZIP_LEDGER = ledger;
+		const r = await rig(done, COLD_TS(), { modelRegistry: { complete: mkComplete({ calls: 0 }) } }, { registerEntryRenderer: () => {} });
+		const settled = await settle(r);
+		await sleep(200);
+		await comeBackNative(r, settled, { beforeMs: 400 });
+		await sleep(5);
+		expect(readFileSync(ledger, "utf8")).toContain("native_off");
+		expect(noticeOf(r).native).toMatch(/spent \d+ ms in session_before_compact handlers: another handler at work/);
+		rmSync(ledger, { force: true });
+	});
+
+	test("item 6: pi-zip's compaction carries a marker for other extensions' handlers; a compaction that carries it is answered or cancelled, never left to Pi's default summariser", async () => {
+		const r = await rig(done, COLD_TS(), { modelRegistry: { complete: mkComplete({ calls: 0 }) } }, { registerEntryRenderer: () => {} });
+		const settled = await settle(r);
+		await sleep(200);
+		const n = await comeBackNative(r, settled);
+		expect(n.instructions).toBe(NATIVE_MARKER);
+		expect(n.answer.compaction).toBeTruthy();
+		// the ask is over: another delivery of a marked compaction (a slow handler of the same event) is cancelled, not passed on
+		const again = await r.handlers.get("session_before_compact")({ type: "session_before_compact", reason: "manual", customInstructions: NATIVE_MARKER }, r.ctx);
+		expect(again).toEqual({ cancel: true });
+		// a compaction with other instructions (the user's /compact focus) is none of pi-zip's business
+		expect(await r.handlers.get("session_before_compact")({ type: "session_before_compact", reason: "manual", customInstructions: "focus on the tests" }, r.ctx)).toBeUndefined();
+		// no ask at all (pi-zip never started one) and the marker present: still cancelled
+		const idle = await rig(done, COLD_TS());
+		expect(await idle.handlers.get("session_before_compact")({ type: "session_before_compact", reason: "manual", customInstructions: NATIVE_MARKER + " more" }, idle.ctx)).toEqual({ cancel: true });
 	});
 
 	test("every gate keeps today's path: not idle, the branch already ends in a compaction, nothing for Pi to compact, no ctx.compact, a failed compaction", async () => {

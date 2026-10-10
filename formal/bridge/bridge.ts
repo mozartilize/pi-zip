@@ -627,6 +627,7 @@ async function runTrace(tr: Any): Promise<Any> {
 			await fire(inst, "session_start", { type: "session_start", reason: "resume" });
 			if (transplant && inst.zip) Object.assign(inst.zip, structuredClone(transplant));
 			await fire(inst, "before_agent_start", { type: "before_agent_start", prompt: userMsg.content, images: [] });
+			await fire(inst, "agent_start", { type: "agent_start" }); // Pi emits it right after before_agent_start (a run an extension's message starts emits only this one)
 			sm2.appendMessage(structuredClone(userMsg));
 			await fire(inst, "message_end", { message: userMsg });
 			const raw = sm2.buildSessionContext().messages;
@@ -877,6 +878,7 @@ async function runTrace(tr: Any): Promise<Any> {
 					const z0: Any = live.zip ?? {};
 					preRun = { sw: !!z0.summarizedWarm, je: !!z0.justEdited };
 					await fire(live, "before_agent_start", { type: "before_agent_start", prompt: text, images: [] });
+					await fire(live, "agent_start", { type: "agent_start" });
 					const userMsg = { role: "user", content: text, timestamp: clock };
 					const uid = sm.appendMessage(userMsg);
 					blocks.push({ id: uid, ev, kind: "user", tok: tokW(userMsg), est: Math.ceil(text.length / 4), turn, tool: null, req: reqNo });

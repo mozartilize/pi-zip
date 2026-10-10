@@ -71,6 +71,11 @@ const nativeDeadlineMs = () => envInt("NATIVE_MS", 2_000);
 /** A compaction slower than this (or half the deadline) had another handler at work too: the native path ends for the process, so its
  *  work (a model call, say) is not paid for, and waited for, at every cold return. */
 const NATIVE_SLOW_MS = 250;
+/** The customInstructions pi-zip passes on its own ctx.compact() (Pi hands them to every session_before_compact handler as
+ *  event.customInstructions). A handler that supplies its own summaries for every compaction (a model call, say) should return undefined
+ *  when event.customInstructions starts with this: pi-zip answers this one itself, and its summary is already written. pi-zip answers or
+ *  cancels every compaction that carries it, so Pi's default summariser never receives it as an instruction. */
+export const NATIVE_MARKER = "[pi-zip native compaction: handlers of session_before_compact return undefined, pi-zip answers this one]";
 
 /** The prompt Pi appends right after before_agent_start, as a projected entry without an id: the plan made before it counts its size. */
 function pendingPrompt(e: Any): Any | null {
@@ -119,7 +124,9 @@ export class Zip implements ZipControl {
 	private pending: { gapS: number; expect: number; edited: boolean; key: string } | null = null;
 	private justEdited = false; // the newest response answered a request that first carried an edit: the next request gets no warm edit
 	// pi-zip's own ctx.compact() in flight: the only compaction session_before_compact answers (compaction null = cancel a late ask)
-	private nativeAsk: { compaction: Any | null; answered: boolean; askedAt: number; until: number } | null = null;
+	private nativeAsk: { compaction: Any | null; answered: boolean; askedAt: number; askedWall: number; until: number } | null = null;
+	/** What became of the native path for this run, for the notice (the session file alone says why a summary went the draft way). */
+	private nativeNote: { native: string; ms?: number; askMs?: number } | null = null;
 	// the native path ended for this process, and why: another extension took part in pi-zip's compaction (answered, cancelled or
 	// replaced it, or took its time), or Pi's compaction failed. Summaries then ride along with the first request (the draft path).
 	private nativeOff: string | null = null;
@@ -615,7 +622,34 @@ export class Zip implements ZipControl {
 		this.bg = null;
 	}
 
+	/** True from before_agent_start to the agent_start that follows it: that run's start has been handled (Pi's prompt() path). A run started
+	 *  by an extension's message (sendMessage with triggerTurn: pi-runway's owed-drive, durable-subagents' attention) emits agent_start only. */
+	private startHandled = false;
+	private starting: Promise<void> | null = null;
+
 	async beforeAgentStart(ctx: Any, e?: Any): Promise<void> {
+		this.startHandled = true;
+		await this.beginRun(ctx, e, true);
+	}
+
+	/** agent_start: handled already by before_agent_start (a prompt), else a run an extension's message started: the same start-of-run
+	 *  handling, minus Pi's compaction (ctx.compact() aborts the run that is starting): the prepared summary is adopted by the run plan. */
+	async agentStart(ctx: Any): Promise<void> {
+		if (this.startHandled) {
+			this.startHandled = false;
+			return;
+		}
+		this.starting = this.beginRun(ctx, undefined, false).catch((err) => this.ledger({ type: "error", where: "agent_start", error: errText(err) }));
+		await this.starting;
+		this.runUserSeen = 1; // no prompt in this run: a user message that comes later is steering
+		this.ledger({ type: "driven_run" });
+	}
+
+	agentEnd() {
+		this.startHandled = false;
+	}
+
+	private async beginRun(ctx: Any, e: Any, viaPrompt: boolean): Promise<void> {
 		this.liveCtx = ctx;
 		this.cancelTimer(); // the user is back: nothing is started behind their back any more
 		this.disarmKey();
@@ -664,7 +698,10 @@ export class Zip implements ZipControl {
 			this.ttlNoticed = true; // once per session
 			if (!this.quiet) this.stateLine(ctx, "cache", ttl.note.replace(`${PRODUCT} · `, ""));
 		}
-		if (cold && this.bg?.done) {
+		this.nativeNote = null;
+		if (cold && this.bg && !viaPrompt) this.nativeNote = { native: "run started by an extension's message: draft path (compact() would abort it)" };
+		else if (cold && this.bg && !this.bg.done) this.nativeNote = { native: "summary not finished when the prompt came" };
+		if (cold && this.bg?.done && viaPrompt) {
 			try {
 				await this.nativeSummary(ctx, e);
 			} catch (err) {
@@ -681,11 +718,28 @@ export class Zip implements ZipControl {
 	 *  another compaction (pi-zip's own was aborted). */
 	sessionBeforeCompact(e?: Any): Any {
 		const a = this.nativeAsk;
+		if (typeof e?.customInstructions === "string" && e.customInstructions.startsWith(NATIVE_MARKER)) {
+			// pi-zip's own compaction: answered, once, while its ask is open; cancelled otherwise (never left to Pi's default summariser, which
+			// would write a summary of the whole transcript with the marker as its instruction)
+			if (a && !a.answered && a.compaction && Date.now() <= a.until) {
+				a.answered = true;
+				a.askedAt = performance.now();
+				a.askedWall = Date.now();
+				return { compaction: a.compaction };
+			}
+			if (a && !a.answered) {
+				a.answered = true;
+				a.askedAt = performance.now();
+				a.askedWall = Date.now();
+			}
+			return { cancel: true };
+		}
 		if (!a || a.answered || Date.now() > a.until) return undefined;
 		if (e?.reason !== undefined && e.reason !== "manual") return undefined; // ctx.compact() is a manual compaction
 		if (!a.compaction && e?.signal && e.signal.aborted !== true) return undefined;
 		a.answered = true;
 		a.askedAt = performance.now();
+		a.askedWall = Date.now();
 		return a.compaction ? { compaction: a.compaction } : { cancel: true };
 	}
 
@@ -733,14 +787,17 @@ export class Zip implements ZipControl {
 		if (!b?.done || !b.key) return;
 		const branch = this.branch(ctx);
 		const pre = ((ctx.sessionManager.buildSessionProjection() as Any)?.entries ?? []) as Any[];
-		const skip = (reason: string) => this.ledger({ type: "native_skip", reason });
+		const skip = (reason: string) => {
+			this.nativeNote = { native: reason };
+			this.ledger({ type: "native_skip", reason });
+		};
 		// the plan the first request will make: the same one, with the prompt Pi is about to append
 		const pending = pendingPrompt(e);
 		const entries = pending ? [...pre, pending] : pre;
 		const { o } = this.opts(ctx, !pending, "cold", entries, this.pWarm);
 		o.pastTtl = this.pastTtl;
 		const p = planContext(entries, o);
-		if (!p || p.cutIdx === null || p.firstKeptEntryId !== b.key) return skip("the summary does not fit this plan");
+		if (!p || p.cutIdx === null || p.firstKeptEntryId !== b.key) return skip(!p || p.cutIdx === null ? "the summary does not fit this plan: the plan at the prompt has no cut" : "the summary does not fit this plan: the plan at the prompt cuts elsewhere");
 		const cut = b.done;
 		if (checkEdits(p.blocks, p.userTurns, p.folds, cut)) return skip("guard");
 		const gate = this.nativeGate(ctx, branch, pre);
@@ -748,7 +805,7 @@ export class Zip implements ZipControl {
 		const before = Math.round(p.ctxTokens);
 		const compaction = { summary: cut.text, firstKeptEntryId: cut.firstKeptEntryId, tokensBefore: before, details: { by: PRODUCT, via: "native", trigger: cut.trigger }, usage: cut.usage };
 		const known = new Set(branch.map((en: Any) => en?.id));
-		const ask = { compaction: compaction as Any | null, answered: false, askedAt: 0, until: Infinity };
+		const ask = { compaction: compaction as Any | null, answered: false, askedAt: 0, askedWall: 0, until: Infinity };
 		this.nativeAsk = ask;
 		const deadline = nativeDeadlineMs(), t0 = performance.now();
 		const res = await new Promise<{ ok: boolean; err?: string; late?: boolean }>((resolve) => {
@@ -770,7 +827,7 @@ export class Zip implements ZipControl {
 				finish(r);
 			};
 			try {
-				ctx.compact({ onComplete: () => done({ ok: true }), onError: (err: Any) => done({ ok: false, err: err instanceof Error ? err.message : String(err) }) });
+				ctx.compact({ customInstructions: NATIVE_MARKER, onComplete: () => done({ ok: true }), onError: (err: Any) => done({ ok: false, err: err instanceof Error ? err.message : String(err) }) });
 			} catch (err) {
 				done({ ok: false, err: errText(err) });
 			}
@@ -786,14 +843,21 @@ export class Zip implements ZipControl {
 				ctx.abort?.();
 			} catch {}
 		}
+		// "another handler at work" is measured over the time other handlers can occupy: before ours (askMs) and, for handlers after ours, from
+		// our answer to the entry's own append (appendCompaction stamps it). Pi's work after the append (the refresh of its context, the
+		// projection and token estimate, session_compact, compaction_end and the chat rebuild) grows with the branch and is nobody's handler:
+		// on a 500K-token branch it alone can pass 250 ms.
+		const appendedAt = entry?.timestamp ? Date.parse(entry.timestamp) : NaN;
+		const handlerMs = entry && askMs !== null ? askMs + (Number.isFinite(appendedAt) && ask.askedWall ? Math.max(0, appendedAt - ask.askedWall) : 0) : ms;
 		const off = entry
-			? added.length > 1 ? "another compaction went in as well" : res.late || ms > Math.min(NATIVE_SLOW_MS, deadline / 2) ? `Pi's compaction took ${ms} ms: another session_before_compact handler at work` : null
+			? added.length > 1 ? "another compaction went in as well" : handlerMs > Math.min(NATIVE_SLOW_MS, deadline / 2) ? `Pi's compaction spent ${handlerMs} ms in session_before_compact handlers: another handler at work` : null
 			: last ? "another extension's compaction went in instead of pi-zip's"
 			: res.late ? (ask.answered ? `Pi's compaction was not done ${deadline} ms after pi-zip answered (cancelled)` : `another session_before_compact handler ran before pi-zip's (cancelled after ${deadline} ms)`)
 			: `Pi's compaction failed: ${res.err ?? "no compaction entry"}`;
 		if (off) this.endNative(off);
+		this.nativeNote = { native: entry && !off ? "ok" : (off ?? "failed"), ms, ...(askMs !== null ? { askMs } : {}) };
 		if (!entry?.id) {
-			this.ledger({ type: "native_fail", ms, askMs, answered: ask.answered, error: res.late ? "deadline" : (res.err ?? "no compaction entry"), foreign: !!last });
+			this.ledger({ type: "native_fail", ms, askMs, handlerMs, answered: ask.answered, error: res.late ? "deadline" : (res.err ?? "no compaction entry"), foreign: !!last });
 			if (last) {
 				// another extension's compaction replaced the context this summary was written for: adopting it, or writing a new one on
 				// top of it, would summarise twice. It is this stretch's summary (summarizedWarm, as after a pi-zip summary).
@@ -814,7 +878,7 @@ export class Zip implements ZipControl {
 		s.summaryUsd += cut.costUsd;
 		s.activeSaved += cutSaved;
 		s.writeSavedTokens += cutSaved;
-		this.ledger({ type: "summary", via: "native", trigger: cut.trigger, source: "settle", count: cut.count, tokensBefore: before, prefixTokens: Math.round(p.scale.c * cut.prefixTokens), summaryTokens: Math.round(p.scale.c * cut.summaryTokens), ms: cut.ms, compactMs: ms, askMs, waitedMs: 0, llmOk: cut.llmOk, llmError: cut.llmError, costUsd: cut.costUsd, ...this.usageOf(cut) });
+		this.ledger({ type: "summary", via: "native", handlerMs, trigger: cut.trigger, source: "settle", count: cut.count, tokensBefore: before, prefixTokens: Math.round(p.scale.c * cut.prefixTokens), summaryTokens: Math.round(p.scale.c * cut.summaryTokens), ms: cut.ms, compactMs: ms, askMs, waitedMs: 0, llmOk: cut.llmOk, llmError: cut.llmError, costUsd: cut.costUsd, ...this.usageOf(cut) });
 	}
 
 	/** The unsubscribe of the first-keystroke listener (resumeAway), null when none is armed. */
@@ -891,6 +955,7 @@ export class Zip implements ZipControl {
 
 	async context(e: Any, ctx: Any): Promise<Any> {
 		if (!this.active()) return undefined;
+		if (this.starting) await this.starting; // agent_start's start-of-run handling of a driven run
 		if (!this.runChecked) {
 			this.runChecked = true;
 			try {
@@ -1319,7 +1384,7 @@ export class Zip implements ZipControl {
 		const why = valve || !this.cold ? "cache warm · worth it at this size" : this.coldWhy;
 		// reqTs: a run plan is announced as its first request goes out, a valve plan at turn_end, before the next request that first carries
 		// it; either way the first assistant message stamped at or after this moment answered the request that carried the plan
-		const data: NoticeData = { v: 2, text: noticeText(notices), before: Math.round(notices[0].tokensBefore), after: Math.round(notices[notices.length - 1].tokensAfter), desc: noticeDesc(notices), why: why || undefined, items, more: Math.max(0, live.length - ITEMS) || undefined, first: !this.noticed && !this.branch(ctx).some((en: Any) => en?.type === "custom" && en.customType === NOTICE_CUSTOM), reqTs: Date.now() };
+		const data: NoticeData = { v: 2, text: noticeText(notices), before: Math.round(notices[0].tokensBefore), after: Math.round(notices[notices.length - 1].tokensAfter), desc: noticeDesc(notices), why: why || undefined, items, more: Math.max(0, live.length - ITEMS) || undefined, first: !this.noticed && !this.branch(ctx).some((en: Any) => en?.type === "custom" && en.customType === NOTICE_CUSTOM), reqTs: Date.now(), ...(cut && !valve && this.nativeNote ? { native: this.nativeNote.native, ...(this.nativeNote.ms !== undefined ? { nativeMs: this.nativeNote.ms } : {}), ...(this.nativeNote.askMs !== undefined ? { nativeAskMs: this.nativeNote.askMs } : {}) } : {}) };
 		this.noticed = true;
 		this.notify(ctx, data.text, data);
 	}

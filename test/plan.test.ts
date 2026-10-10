@@ -425,3 +425,40 @@ describe("native compaction: the run plan is made on the view before it and appl
 		expect(spliceNative(pre, [...pre, prompt], "cmp")).toBeNull(); // the compaction is not the head (another one came after it): no splice
 	});
 });
+
+// ---- item 5: a custom message that starts a run ends the protected tail like a user prompt ---------------------------------
+describe("driven runs (an extension's triggerTurn message): turn boundaries", () => {
+	const C = (id: string, text = "drive the owed work") => {
+		const m = { role: "custom", customType: "owed-drive", content: text, display: true, timestamp: 1 };
+		return { sourceEntry: { id, type: "custom_message" }, messages: [m] };
+	};
+	const turns = (entries: Any[]) => buildBlocks(entries).map((b) => b.userTurn);
+
+	test("a custom message after a final answer starts a turn; one mid-run (after a tool result) does not; a prompt that follows its own starter is the same turn", () => {
+		const e = [U("u1", "first"), A("a1", ["c1"]), R("r1", "c1", 400), A("a2"), C("k1"), A("a3", ["c2"]), R("r2", "c2", 400), C("k2"), A("a4"), C("k3"), U("u2", "typed"), A("a5")];
+		// u1 a1 r1 a2 | k1 a3 r2 k2(mid-run: after a tool result) a4 | k3 u2 (one turn) a5
+		expect(turns(e)).toEqual([1, 1, 1, 1, 2, 2, 2, 2, 2, 3, 3, 3]);
+	});
+
+	test("with no custom messages nothing changes (prompts count as before; steering stays in its turn)", () => {
+		const e = [U("u1", "a"), A("a1"), U("u2", "b"), A("a2"), U("u3", "c")];
+		expect(turns(e)).toEqual([1, 1, 2, 2, 3]);
+		const steer = buildBlocks(e, new Set(["u3"])).map((b) => b.userTurn);
+		expect(steer).toEqual([1, 1, 2, 2, 2]);
+	});
+
+	test("a driven run sequence keeps only the latest run protected: the user's old prompt and the runs after it are summarised, as at a prompt", () => {
+		const old = [U("u1", "the one real prompt"), A("a1", ["c0"]), R("r0", "c0", 30_000), A("a2")];
+		const driven: Any[] = [];
+		for (let i = 1; i <= 6; i++) driven.push(C(`k${i}`), A(`d${i}`, [`x${i}`]), R(`rx${i}`, `x${i}`, 30_000), AX(`e${i}`, 60_000));
+		const e = [...old, ...driven];
+		const p = planContext(e, { cwd: process.cwd(), coldCap: 3000, promptPending: true })!;
+		// the pending prompt is turn 8, the last run turn 7: only they are protected. Old code: every run belonged to turn 1 and the cut
+		// could not pass the real prompt's turn (the protected tail reached back to it: 273K kept of 518K).
+		expect(p.cutIdx).not.toBeNull();
+		const kept = p.blocks.slice(p.cutIdx!).map((b) => b.entryId);
+		expect(kept).toContain("k6");
+		expect(kept).not.toContain("k5");
+		expect(kept.length).toBeLessThan(p.blocks.length / 2);
+	});
+});

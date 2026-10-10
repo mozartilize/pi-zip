@@ -115,6 +115,9 @@ export default function piZip(pi: ExtensionAPI) {
 		zip.resumeAway(ctx); // a resumed session: arm the away timer from its last request, as the settle after it would have
 		return r;
 	});
+	// a run an extension's message starts (sendMessage with triggerTurn) never fires before_agent_start; agent_start always fires
+	pi.on("agent_start", (_e, ctx) => zip.agentStart(ctx));
+	pi.on("agent_end", () => zip.agentEnd());
 	pi.on("before_agent_start", async (e, ctx) => {
 		checkRecall(ctx);
 		zip.refreshFolded(ctx); // the branch may have changed (/tree, fork)

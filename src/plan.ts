@@ -446,6 +446,8 @@ export const countUserTurns = (blocks: Block[]): number => blocks.reduce((a, b) 
 export function buildBlocks(contextEntries: Any[], steerIds?: Set<string>): Block[] {
 	const blocks: Block[] = [];
 	let userTurn = 0;
+	let afterAnswer = false; // the newest block is an assistant's final answer (a run ended there)
+	let starter = false; // a custom message started the turn that is open (no assistant message since)
 	let asst = 0; // assistant messages so far
 	const issued = new Map<string, number>(); // tool call id -> ordinal of the latest assistant message that issued it (ids may be reused)
 	const asstOf: number[] = []; // block idx -> ordinal of the issuing assistant message (toolResult blocks only)
@@ -467,7 +469,19 @@ export function buildBlocks(contextEntries: Any[], steerIds?: Set<string>): Bloc
 			kind = r === "user" ? "user" : r === "assistant" ? "assistant" : r === "toolResult" ? "toolResult" : "other";
 			edited = msg !== raw && msg.content !== raw.content;
 		}
-		if (kind === "user" && !(src.id && steerIds?.has(src.id))) userTurn++;
+		// A turn starts at a real user prompt, or at a custom message that starts a run (an extension's `sendMessage(..., { triggerTurn })`:
+		// pi-runway's owed-drive, durable-subagents' attention; Pi starts a run from it without before_agent_start, and nothing else in the
+		// session says "the user is here"). Such a message follows the previous run's final answer; one that arrives mid-run follows a tool
+		// result and belongs to that run. A prompt that directly follows its own starter (a nextTurn message is stored before the prompt it
+		// rides with) is the same turn: one start, however many entries it took.
+		if (kind === "user") {
+			if (!(src.id && steerIds?.has(src.id)) && !starter) userTurn++;
+			starter = false;
+		} else if (msgs.some((m) => m?.role === "custom")) {
+			if (afterAnswer) { userTurn++; starter = true; }
+		} else if (kind === "assistant" || kind === "toolResult") starter = false;
+		if (kind === "assistant") afterAnswer = msg.stopReason !== "toolUse" && msg.stopReason !== "error" && msg.stopReason !== "aborted";
+		else if (kind === "toolResult") afterAnswer = false;
 		const ours = edited && kind === "toolResult" && textOf(msg.content).startsWith(PH_MARK);
 		if (kind === "assistant") {
 			// aborted / final-error messages stay in the projection but pi-ai drops them before sending: they add no age (their calls still count as issued)
