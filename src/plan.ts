@@ -635,9 +635,11 @@ export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
 	const room = compactionRoom(o.model, o.reserve);
 	const coldCap = (coldTarget(o.coldCap ?? s.coldCap, O, room) - O) / c;
 	const law: Law = o.law ?? { pr: null, g: G0, pWarm: mode === "cold" ? 0 : 1 };
-	const gate = (where: "summary" | "plan", B: number, A: number, r: number | null, call: number, T: number, Tsuf?: number): boolean => {
+	// `cut`: a whole-plan step records whether the plan it judges has a cut (and so carries its summary call); the formal checker pins the
+	// call to 0 for a folds-only plan and to the summary step's call for a cut
+	const gate = (where: "summary" | "plan", B: number, A: number, r: number | null, call: number, T: number, Tsuf?: number, cut?: boolean): boolean => {
 		const t = lawTerms(B, A, law.pWarm, r, law.pr, law.g, call, T);
-		o.trace?.push({ where, ...t, ...(Tsuf !== undefined ? { Tsuf } : {}) });
+		o.trace?.push({ where, ...t, ...(Tsuf !== undefined ? { Tsuf } : {}), ...(cut !== undefined ? { cut } : {}) });
 		return t.ok;
 	};
 	const minGain = o.minGain ?? s.minGain;
@@ -763,8 +765,8 @@ export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
 	 *  a cut makes; `untouched` is the content before the earliest edit (ledger only). A cold plan with some chance of a warm cache is
 	 *  priced by expectation (no prices: a cold plan always fires). T = A (the whole post-edit context, O included, as tuned: the cheaper
 	 *  A - O fires warm edits earlier and loses items offline). */
-	const planGate = (after: number, untouched: number, call: number, planned: boolean): boolean =>
-		!(warmLike || (planned && law.pr)) || gate("plan", Math.max(o.valveB ?? real(ctxEst), real(after)), real(after), room, call, real(after), c * (after - untouched));
+	const planGate = (after: number, untouched: number, call: number, planned: boolean, cut: boolean): boolean =>
+		!(warmLike || (planned && law.pr)) || gate("plan", Math.max(o.valveB ?? real(ctxEst), real(after)), real(after), room, call, real(after), c * (after - untouched), cut);
 	/** The cut for cut points minCut..maxCut: the first that brings the context to the cap, else the deepest; gated = the summary law
 	 *  (no prices: the legacy gain rule) must pass. When the minimal cut's summary or the whole plan with it is refused, the deeper cuts
 	 *  are tried in turn (the gain grows as D^2, the call only with the prefix read). The whole plan's law prices the summary call too.
@@ -795,7 +797,7 @@ export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
 			if (!(pre[pick] >= 2 * S(pre[pick]))) continue;
 			// what the plan leaves: the context with its folds (those inside the prefix too: the prefix is measured as folded, `pre`) minus
 			// what the summary replaces plus the summary. (Counting the voided folds' savings back, as before, overstated it by them.)
-			if (!planGate(ctxAfterFolds - (pre[pick] - S(pre[pick])), 0, call, true)) continue;
+			if (!planGate(ctxAfterFolds - (pre[pick] - S(pre[pick])), 0, call, true, true)) continue;
 			cutIdx = pick;
 			prefixTokens = pre[pick];
 			summaryTokensPlanned = S(pre[pick]);
@@ -839,7 +841,7 @@ export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
 	const planned = folds.length > 0 || cutIdx !== null;
 	// a plan with a cut passed the whole plan's law with its call inside summarise; folds only (no summary wanted, or none the laws
 	// accepted: the deeper cuts and the cut-free plan both stand) is judged here
-	if (cutIdx === null && !planGate(after, untouched, 0, planned)) {
+	if (cutIdx === null && !planGate(after, untouched, 0, planned, false)) {
 		// a cold plan with some chance of a warm cache: the plan a warm cache would make may pay where this one does not
 		if (mode === "cold" && !o.warmStyle && law.pr && law.pWarm > 0 && law.pWarm < 0.5) return planContext(entries, { ...o, warmStyle: true });
 		return null;

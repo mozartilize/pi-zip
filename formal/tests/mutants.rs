@@ -137,6 +137,15 @@ fn lw_summary_call_is_priced() {
     caught_all("m25", "plan.ts", &[("gate(\"summary\", X, Sr, null, call, Sr)", "gate(\"summary\", X, Sr, null, 0, Sr)", 1)], &["LW"], &t);
 }
 
+/// Review P1-3: LW pins the call of a whole-plan step both ways. A plan with a cut that reaches the plan gate with no call (the summary
+/// priced separately only), and a folds-only plan that carries one, are both caught. (Backing the call out of K for every plan step let
+/// both through: the old LW only compared a call it found with the summary step's.)
+#[test]
+fn lw_plan_step_call_is_pinned_both_ways() {
+    caught_all("m28", "plan.ts", &[("if (!planGate(ctxAfterFolds - (pre[pick] - S(pre[pick])), 0, call, true, true)) continue;", "if (!planGate(ctxAfterFolds - (pre[pick] - S(pre[pick])), 0, 0, true, true)) continue;", 1)], &["LW"], &summary_prepared_away("prompt +1h"));
+    caught_all("m29", "plan.ts", &[("!planGate(after, untouched, 0, planned, false)", "!planGate(after, untouched, 1000, planned, false)", 1)], &["LW"], &fold_and_recall());
+}
+
 #[test]
 fn a3_away_timer() {
     caught("m07", "run.ts", "this.armAway(delay, () => void this.runAway(p, ctx));", "void 0;", "A3", &summary_prepared_away("prompt +1h"));
