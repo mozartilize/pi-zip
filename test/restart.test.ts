@@ -1,0 +1,142 @@
+// A restart plans like the live process: growth g, "the newest response carried an edit" and "a summary was made in this warm stretch"
+// are rebuilt from the session (formal/TRIAGE.md (a) 1: RD, B2B, NT). Each test builds a live process from real responses and a fresh
+// one from the branch those responses left, and compares what they know.
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { G0 } from "../src/plan.ts";
+import { replayGrowth } from "../src/state.ts";
+import { Zip } from "../src/run.ts";
+import { COMMIT_CUSTOM, PRODUCT } from "../src/util.ts";
+import { fakeCtx, fakePi, type Any } from "./helpers.ts";
+
+const saved: Record<string, string | undefined> = {};
+// the live process learns into the cache-survival file: a private one, so the other test files' models stay unknown to it
+beforeEach(() => {
+	saved.ttl = process.env.PI_ZIP_TTL_SECS;
+	saved.stats = process.env.PI_ZIP_CACHE_STATS;
+	process.env.PI_ZIP_TTL_SECS = "300";
+	process.env.PI_ZIP_CACHE_STATS = join(mkdtempSync(join(tmpdir(), "pi-zip-restart-")), "cache-survival.json");
+});
+afterEach(() => {
+	for (const [k, v] of [["PI_ZIP_TTL_SECS", saved.ttl], ["PI_ZIP_CACHE_STATS", saved.stats]] as const) if (v === undefined) delete process.env[k]; else process.env[k] = v;
+});
+
+const MODEL = { provider: "rst", id: "m", contextWindow: 1_000_000, promptCache: { short: 300 } };
+const T0 = Date.UTC(2030, 0, 1);
+const resp = (total: number, ts: number, over: Any = {}): Any => ({ role: "assistant", content: [{ type: "text", text: "x" }], provider: "rst", model: "m", stopReason: "stop", timestamp: ts, usage: { input: 10, cacheRead: total - 10, cacheWrite: 0 }, ...over });
+const entry = (id: string, message: Any): Any => ({ type: "message", id, message, timestamp: new Date(message.timestamp).toISOString() });
+const user = (ts: number): Any => ({ role: "user", content: "next", timestamp: ts });
+const commit = (carried: boolean): Any => ({ type: "custom", id: `k${Math.random()}`, customType: COMMIT_CUSTOM, data: { carried } });
+const fold = (target: string): Any => ({ type: "context_edit", id: `e${target}`, targetId: target, replacement: { content: [{ type: "text", text: "[folded by pi-zip" }] } });
+const summary = (over: Any = {}): Any => ({ type: "compaction", id: "cmp", summary: "S", firstKeptEntryId: "x", details: { by: PRODUCT, trigger: "cold" }, timestamp: new Date(T0).toISOString(), ...over });
+
+/** A process that lived through `msgs` (a request goes out, then its response ends), and a fresh one that starts on the branch. */
+function live(msgs: Any[]) {
+	const { pi } = fakePi();
+	const z = new Zip(pi) as Any;
+	for (const m of msgs) {
+		if (m.role !== "assistant") continue;
+		z.model = MODEL;
+		z.providerRequest({ payload: {} });
+		z.messageEnd(m);
+	}
+	return z;
+}
+function fresh(branch: Any[]) {
+	const { pi } = fakePi();
+	const z = new Zip(pi) as Any;
+	z.sessionStart(fakeCtx([], { branch, model: MODEL }).ctx);
+	return z;
+}
+
+describe("growth g is rebuilt from the branch", () => {
+	const totals = [20_000, 23_000, 30_000, 31_000, 55_000, 56_500, 57_000];
+	const msgs = totals.map((t, i) => resp(t, T0 + i * 10_000));
+	const branch = msgs.flatMap((m, i) => [entry(`u${i}`, user(m.timestamp - 1)), entry(`a${i}`, m)]);
+
+	test("a fresh process knows the growth the live one measured, not G0", () => {
+		const l = live(msgs), f = fresh(branch);
+		expect(l.g).not.toBe(G0);
+		expect(f.g).toBeCloseTo(l.g, 9);
+		expect(f.deltas).toEqual(l.deltas);
+	});
+	test("a response that first carried one of our edits adds no delta (the prompt shrank or was rewritten), as live", () => {
+		// the third response carried a run plan (commit marker after it), the sixth a valve plan (marker before it)
+		const b = [...branch.slice(0, 6), commit(true), ...branch.slice(6, 10), commit(false), ...branch.slice(10)];
+		const l = live(msgs);
+		l.deltas = []; l.g = G0; // replay by hand which responses were edited, with the live learner
+		const { pi } = fakePi();
+		const z = new Zip(pi) as Any;
+		msgs.forEach((m, i) => {
+			z.model = MODEL;
+			if (i === 2 || i === 5) z.nextEdit = 0; // the request that first carried an edit
+			z.providerRequest({ payload: {} });
+			z.messageEnd(m);
+		});
+		const f = fresh(b);
+		expect(f.g).toBeCloseTo(z.g, 9);
+		expect(f.g).not.toBeCloseTo(l.g, 3); // and it is not the unmarked answer
+	});
+	test("pure: errors, aborts and other models' responses are skipped like live", () => {
+		const other = resp(90_000, T0 + 5, { model: "o" });
+		const err = resp(0, T0 + 6, { stopReason: "error", usage: undefined });
+		const b = [entry("a", resp(10_000, T0)), entry("o", other), entry("e", err), entry("b", resp(14_000, T0 + 20)), entry("c", resp(16_000, T0 + 30))];
+		// 10K -> (other model: no delta, previous key resets) -> 14K (other key before: no delta) -> 16K (+2K)
+		const r = replayGrowth(b, G0);
+		expect(r.deltas).toEqual([2_000]);
+		expect(r.g).toBeCloseTo(0.9 * G0 + 0.1 * 2_000, 9);
+	});
+});
+
+describe("justEdited: the newest response was the first to carry an edit of ours", () => {
+	const a1 = entry("a1", resp(30_000, T0)), a2 = entry("a2", resp(31_000, T0 + 5_000));
+	test("a run plan is persisted after the response that carried it", () => {
+		expect(fresh([entry("u", user(T0 - 1)), a1, fold("r1"), commit(true)]).justEdited).toBe(true);
+	});
+	test("a valve plan is persisted after the response, but the next request is the first to carry it", () => {
+		expect(fresh([entry("u", user(T0 - 1)), a1, fold("r1"), commit(false)]).justEdited).toBe(false);
+		expect(fresh([entry("u", user(T0 - 1)), a1, fold("r1"), commit(false), a2]).justEdited).toBe(true);
+	});
+	test("an older edit and a later response: not edited; an edit of another extension (no commit entry): not ours", () => {
+		expect(fresh([a1, fold("r1"), commit(true), a2]).justEdited).toBe(false);
+		expect(fresh([entry("u", user(T0 - 1)), a1, { type: "context_edit", id: "x", targetId: "r1", replacement: { content: [{ type: "text", text: "pruned" }] } }]).justEdited).toBe(false);
+	});
+	test("a summary that went in through Pi's compaction before the run is first carried by that run's request", () => {
+		const native = summary({ details: { by: PRODUCT, trigger: "cold", via: "native" } });
+		expect(fresh([a1, native, entry("u", user(T0 + 9_000))]).justEdited).toBe(false); // nothing answered yet
+		expect(fresh([a1, native, entry("u", user(T0 + 9_000)), entry("a2", resp(8_000, T0 + 9_500))]).justEdited).toBe(true);
+	});
+	test("live and fresh agree on a valve edit before a restart (B2B: no warm rewrite right after one)", () => {
+		const { pi } = fakePi();
+		const z = new Zip(pi) as Any;
+		z.model = MODEL;
+		z.nextEdit = 0; // the valve's edit is carried by this request
+		z.providerRequest({ payload: {} });
+		z.messageEnd(a1.message);
+		expect(z.justEdited).toBe(true);
+		expect(fresh([entry("u", user(T0 - 1)), entry("v", resp(20_000, T0 - 10_000)), fold("r0"), commit(false), a1]).justEdited).toBe(true);
+	});
+});
+
+describe("summarizedWarm: a pi-zip summary since the last cold return", () => {
+	const at = (min: number) => T0 + min * 60_000;
+	const base = [entry("u0", user(at(0) - 1)), entry("a0", resp(60_000, at(0))), summary({ timestamp: new Date(at(0)).toISOString() })];
+	test("a warm return after the summary: still in the same warm stretch", () => {
+		const b = [...base, entry("u1", user(at(1))), entry("a1", resp(8_000, at(1) + 1_000))];
+		expect(fresh(b).summarizedWarm).toBe(true);
+	});
+	test("a cold return (gap past the TTL) after it clears the flag, as live does at before_agent_start", () => {
+		const b = [...base, entry("u1", user(at(1))), entry("a1", resp(8_000, at(1) + 1_000)), entry("u2", user(at(30))), entry("a2", resp(8_500, at(30) + 1_000))];
+		expect(fresh(b).summarizedWarm).toBe(false);
+	});
+	test("a summary at a cold return (native, before the prompt) belongs to that return's stretch", () => {
+		const native = summary({ details: { by: PRODUCT, trigger: "cold", via: "native" }, timestamp: new Date(at(30)).toISOString() });
+		const b = [entry("u0", user(at(0) - 1)), entry("a0", resp(60_000, at(0))), native, entry("u1", user(at(30))), entry("a1", resp(8_000, at(30) + 1_000))];
+		expect(fresh(b).summarizedWarm).toBe(true);
+	});
+	test("no summary of ours on the branch: false (Pi's own compaction is not one)", () => {
+		expect(fresh([entry("u0", user(at(0))), entry("a0", resp(60_000, at(0) + 1)), summary({ details: undefined, fromHook: false })]).summarizedWarm).toBe(false);
+	});
+});

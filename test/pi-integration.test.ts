@@ -217,7 +217,9 @@ describe("real Pi: the request view is identical before and after turn_end persi
 		r.sm.appendMessage(result("c8", "y".repeat(4_000), 10_000_002));
 		const piBefore = estimateProjectedContextTokens(r.sm.buildSessionProjection(), r.sm.getBranch()).tokens; // what Pi reads before any draft
 		expect(piBefore).toBe(40_050 + Math.ceil(4_000 / 4)); // usage + the trailing tool result at chars/4
-		const drafts = await r.turnEnd(a, { ...asst([call("c8")], "toolUse"), usage: real });
+		const all = await r.turnEnd(a, { ...asst([call("c8")], "toolUse"), usage: real });
+		expect(all.at(-1)).toMatchObject({ type: "custom", customType: "pi-zip/commit", data: { carried: true } }); // a run plan: the run's requests had carried these edits
+		const drafts = all.filter((d: Any) => d.type !== "custom");
 		expect(drafts.map((d: Any) => d.type)).toEqual(["compaction", ...drafts.slice(1).map(() => "context_edit")]);
 		expect(drafts.length).toBeGreaterThan(1); // a fold in the kept part rides along
 		const comp = r.sm.getBranch().find((e: Any) => e.type === "compaction") as Any;
@@ -288,7 +290,7 @@ describe("real Pi: a summary prepared while the user was away goes in through Pi
 		for (const x of [a, b]) {
 			const id = x.r.sm.appendMessage(asst([call("c9")], "toolUse", 10_000_001));
 			x.r.sm.appendMessage(result("c9", "tiny", 10_000_002));
-			x.drafts = await x.r.turnEnd(id, asst([call("c9")], "toolUse"));
+			x.drafts = (await x.r.turnEnd(id, asst([call("c9")], "toolUse"))).filter((d: Any) => d.type !== "custom"); // (the commit marker is not an edit)
 		}
 		expect(a.drafts.map((d) => d.type)).toEqual(["compaction", ...a.drafts.slice(1).map(() => "context_edit")]);
 		expect(b.drafts.map((d) => d.type)).toEqual(a.drafts.slice(1).map(() => "context_edit"));

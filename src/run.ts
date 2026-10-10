@@ -12,7 +12,8 @@ import { handleFor, PH_MARK, RECALL_TOOL } from "./placeholder.ts";
 import { branchOutputs, recalledHandlesFromBranch, resolveHandlesInBranch } from "./recall.ts";
 import { cleanupRecall, commandNamesRecall, fileRecallFor, materialize, parseRecallPath, recallRoot, recallRootShown, rewriteCommand, sidDir, type FileRecall } from "./recallfile.ts";
 import { buildCut } from "./summary.ts";
-import { type Any, envInt, PRODUCT, textOf, tok4 } from "./util.ts";
+import { type Any, COMMIT_CUSTOM, envInt, PRODUCT, textOf, tok4 } from "./util.ts";
+import { replayGrowth } from "./state.ts";
 import { CHART_COLS, chartGap, fmtLife, type CardData, type StateWord } from "./ui.ts";
 
 export const PLAN_CUSTOM = "pi-zip/plan";
@@ -461,12 +462,50 @@ export class Zip implements ZipControl {
 		for (const h of recalledHandlesFromBranch(branch)) this.recalled.add(h);
 		this.model = ctx?.model;
 		this.ttlNoticed = false;
+		this.restoreState(branch);
 		this.detectConflict(ctx);
 		let recallFilesRemoved = 0;
 		try {
 			recallFilesRemoved = cleanupRecall(); // recall copies older than 14 days (they can be written again from the session)
 		} catch {}
 		this.ledger({ type: "session_start", off: this.off, quiet: this.quiet, conflict: this.conflict, ...(recallFilesRemoved ? { recallFilesRemoved } : {}) });
+	}
+
+	/** What a process that never left would know: growth g, "the newest response carried an edit" and "a summary was made in this warm
+	 *  stretch" are functions of the session, rebuilt from the branch (state.ts; a restart, a resume or a fork plans like the live process). */
+	private restoreState(branch: Any[]) {
+		try {
+			const r = replayGrowth(branch, G0);
+			this.g = r.g;
+			this.deltas = r.deltas;
+			this.justEdited = r.justEdited;
+			this.summarizedWarm = this.summarizedSince(branch);
+			if (branch.length) this.ledger({ type: "state_restored", g: Math.round(this.g), justEdited: this.justEdited, summarizedWarm: this.summarizedWarm });
+		} catch (err) {
+			this.ledger({ type: "error", where: "restore_state", error: errText(err) });
+		}
+	}
+
+	/** Is the newest pi-zip summary of the branch newer than the last cold return? (The live flag: set when a summary is persisted,
+	 *  cleared at a cold return.) Each user prompt after the summary is judged as `detectCold` judged it, from the branch before it. */
+	private summarizedSince(branch: Any[]): boolean {
+		let at = -1;
+		branch.forEach((e, i) => { if (e?.type === "compaction" && e.details?.by === PRODUCT) at = i; });
+		if (at < 0) return false;
+		let skip = branch[at].details?.via === "native"; // the prompt after a native summary is the very return that made it
+		const models = loadStats().models;
+		for (let i = at + 1; i < branch.length; i++) {
+			const m = branch[i]?.type === "message" ? branch[i].message : null;
+			if (m?.role !== "user" || this.steerIds.has(branch[i].id)) continue;
+			if (skip) { skip = false; continue; }
+			const a = branch.slice(i + 1).find((x: Any) => x?.type === "message" && x.message?.role === "assistant" && x.message.provider)?.message;
+			if (!a) continue; // a prompt nothing answered
+			const model = { provider: a.provider, id: a.model };
+			const ts = Number(m.timestamp) || Date.parse(branch[i].timestamp) || 0;
+			const ent = models[modelKey(model)];
+			if (detectCold(model, 0, branch.slice(0, i), ts, "", (g, prior) => pWarm(ent, g, prior), this.tier(model)).cold) return false;
+		}
+		return true;
 	}
 
 	// ---- recall through files (research pi-tricks §2) -----------------------------------------------------------------------
@@ -1170,11 +1209,13 @@ export class Zip implements ZipControl {
 			return undefined;
 		}
 		if (!plan.sent) this.nextEdit = plan.untouched ?? 0; // persisted now, first sent with the next request
+		const sentBefore = !!plan.sent;
 		const ours: Any[] = live.map((t) => ({ type: "context_edit", targetId: t.entryId, replacement: { content: [{ type: "text", text: t.ph }] } }));
 		for (const t of live) if (t.toolCallId) this.foldedCalls.set(t.toolCallId, handleFor(t.entryId));
 		// the compaction draft goes FIRST: Pi writes its tokensBefore from the newest usage only while no edit follows that usage, so a
 		// fold drafted before it would make Pi's "Compacted from N tokens" the chars/4 of a half-applied projection (research pi-tricks §1a)
 		if (cut) ours.unshift({ type: "compaction", summary: cut.text, firstKeptEntryId: cut.firstKeptEntryId, details: { by: PRODUCT, trigger: cut.trigger }, usage: cut.usage });
+		ours.push({ type: "custom", customType: COMMIT_CUSTOM, data: { carried: sentBefore } }); // says who first carried these edits (state.ts, plan.ts calibrate)
 		const before = Math.round(c * live.reduce((a, t) => a + t.entryTokens, 0));
 		const after = Math.round(c * live.reduce((a, t) => a + t.phTokens, 0));
 		const cutSaved = cut ? Math.round(c * (cut.prefixTokens - cut.summaryTokens)) : 0;
