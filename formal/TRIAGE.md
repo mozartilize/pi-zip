@@ -19,21 +19,21 @@ every property, within 0.1% for RD.
 
 ## Summary
 
-| property | before (coldwarm) | rc030 now | rc030 +F2 now | coldwarm now | verdict |
-|---|---|---|---|---|---|
-| A1 nothing is lost | 0 | **0** | 0 | 0 | pass |
-| A2 edit only when gone or it pays | 24 | **24** | 24 | 24 | (a) ×1 |
-| A3 never in the way | 241 (+F2: 679) | **104** | 540 | 104 | (b) ×2 corrected; (a) ×1, +F2 (a) ×1 |
-| I1 run stability | 0 | **0** | 0 | 0 | pass (2 bridge artefacts fixed earlier, see (c)) |
-| RD restart determinism | 8,815 | **8,712** | 8,717 | 8,712 | (a) ×1 root cause (3 fields); (c) ×2 fixed |
-| RC recall never refolded | 0 | **0** | 0 | 0 | pass |
-| PW protection windows | 0 (+F2: 441) | **0** | 0 | 0 | +F2: (b) corrected |
-| B2B no back-to-back warm rewrites | 7 | **7** | 7 | 7 | (a), same root cause as RD |
-| MP monotone in P(warm) | 14 (+F2: 25) | **14** | 25 | 14 | (a) ×3 planner paths; +F2 (a) ×1 |
-| NR no regret | 191 (+F2: 190) | **191** | 190 | 191 | (a) ×2 (B2 for folds, smallest cut); 1 not isolated |
-| NT no thrash | 3 | **1** | 1 | 1 | (b) corrected; (a), same root cause as RD |
-| TR target reachability | 9 | **9** | 9 | 9 | (a) ×2 calibration |
-| LW / G / W (law as specified, harness fidelity) | 0 | **0** | 0 | 0 | pass |
+| property | before (coldwarm) | rc030 now | rc030 +F2 now | coldwarm now | verdict | rc-fixed (rc030 + the fixes below) |
+|---|---|---|---|---|---|---|
+| A1 nothing is lost | 0 | **0** | 0 | 0 | pass | **0** |
+| A2 edit only when gone or it pays | 24 | **24** | 24 | 24 | (a) ×1 | **3** |
+| A3 never in the way | 241 (+F2: 679) | **104** | 540 | 104 | (b) ×2 corrected; (a) ×1, +F2 (a) ×1 | **9** |
+| I1 run stability | 0 | **0** | 0 | 0 | pass (2 bridge artefacts fixed earlier, see (c)) | **0** |
+| RD restart determinism | 8,815 | **8,712** | 8,717 | 8,712 | (a) ×1 root cause (3 fields); (c) ×2 fixed | **0** |
+| RC recall never refolded | 0 | **0** | 0 | 0 | pass | **0** |
+| PW protection windows | 0 (+F2: 441) | **0** | 0 | 0 | +F2: (b) corrected | **0** |
+| B2B no back-to-back warm rewrites | 7 | **7** | 7 | 7 | (a), same root cause as RD | **0** |
+| MP monotone in P(warm) | 14 (+F2: 25) | **14** | 25 | 14 | (a) ×3 planner paths; +F2 (a) ×1 | **1** |
+| NR no regret | 191 (+F2: 190) | **191** | 190 | 191 | (a) ×2 (B2 for folds, smallest cut); 1 not isolated | **2** |
+| NT no thrash | 3 | **1** | 1 | 1 | (b) corrected; (a), same root cause as RD | **0** |
+| TR target reachability | 9 | **9** | 9 | 9 | (a) ×2 calibration | **2** |
+| LW / G / W (law as specified, harness fidelity) | 0 | **0** | 0 | 0 | pass | **0** |
 
 B1 is gone from rc030: no MP, A2 or NR trace is in a B1 class any more (0.2.8: 12,073 MP traces in the B1 class). The B2 summary
 class is down from 951 traces (0.2.8) to 1, with or without F2. Its fold analogue (181) remains.
@@ -282,3 +282,79 @@ A fold-ahead patch and both measurement scripts are kept outside the repo (`/tmp
 
 NR after B: 39 on the unchanged spec, 2 with the two (b) relaxations below; the 37 that depend on the relaxations are warm edits made
 when a large answer arrived with the follow-up prompt (15) or when the context reached Pi's compaction room at a small window (22).
+
+
+## rc results: the fixes, the residuals, what is still open
+
+Full run, rc source (33,340 traces, 285,363 requests, seed 1, 3,000 random traces): `pz-formal check --src ../src --suite standard --random 3000
+--seed 1`. "Before" is the same command on the rc030 source (7182b25).
+
+| property | before | after | what cleared it |
+|---|---|---|---|
+| A1 nothing is lost | 0 | 0 | |
+| A2 edit only when gone or it pays | 4 | 3 | summary call in the plan gate; fallback plans; calibration (residual below) |
+| A3 never in the way | 266 | 9 | away timer armed on resume and re-planned when the context changed (237 + 16); residual below |
+| I1 run stability | 0 | 0 | |
+| RD restart determinism | 9,223 | 0 | g, justEdited, summarizedWarm rebuilt from the branch; the away summary re-planned |
+| RC recall never refolded | 0 | 0 | |
+| PW protection windows | 0 | 0 | |
+| B2B no back-to-back warm rewrites | 4 | 0 | justEdited rebuilt from the branch |
+| MP monotone in P(warm) | 23 | 1 | deeper cuts, folds-only fallback, cold 0 < P < 0.5 fallback; residual below |
+| NR time consistency | 173 | 2 | the hold (B2 for folds) + the two (b) spec relaxations; 39 without them; residual below |
+| NT no thrash | 0 | 0 | but see N6 |
+| TR target reachability | 15 | 2 | `carried` from the commit entries; residual below |
+| GC a gone cache gets a cold plan | 19 | 0 | a refused request is no touch; a last bin that ends at 2 h; a refused request still counts as a request for a model switch |
+| WB warm does nothing below the target | 0 | 0 | |
+| MH an automatic cache keeps its head | 13 | 2 | calibration after a foreign compaction; the away summary re-planned; residual below |
+| RDr | 6 | 0 | |
+| MPr | 0 | 1 | the MP residual above: a trace MP names a known cause for, outside those causes |
+| A2r | 2 | 3 | the A2 residuals above |
+| LW, G, W | 0 | 0 | |
+
+Commits (rc030): 5bcbf82 state rebuilt from the branch; f9a1458 calibration; 5866627 plan gate; 420205f refused request and 2 h bin;
+6bcef19 away timer; 7dd902c B2 for folds (hold); 7d470da and 85ec187 the two spec relaxations (b); 7ab2bb8 the B2 decision;
+3dd97be the cold why-line; fcdd3f8 formal tests; e9af128 the dot chart.
+
+### Residuals, with the reason (not fixed)
+
+* **A2 3 / A2r 3** (one run-plan trace after a model switch and a failed request, two turn_end traces): the warm edit's real gain is
+  56K against a cost of 66K by the law's own model, the planner's own estimate says it pays (K = 60K, ok); its A is 31.6K against 35.0K
+  real (10%), B within 0.1%: the estimate error of the size a plan leaves, which the README gives as 12-15% at worst one time in ten.
+  The calibration items (TR `carried`, `O` after a model switch) are fixed and the class shrank (A2 and A2r no longer contain the
+  model-switch O traces), but a decision at the margin of the law with a 10% size error still flips. Not fixed: it needs a better
+  estimate of what a fold leaves, not a planner change.
+* **A3 9**: by the checker's own class, 7 are "warm return: the run plan summarises while the user waits (B2)" (the cache is warm, the run
+  plan of the prompt itself finds the context over the target and summarises; the valve at the previous turn_end could not know the growth
+  the prompt would bring) and 2 are "cold return before the away timer could fire" (one: return after 1,344 s at a learned P(warm) of 0.33
+  with a cache that was in fact warm). I did not look for a fix for either and have no evidence that the README's "a return before the
+  timer cannot be helped" covers them; they stay open.
+* **MP 1 / MPr 1**: a cold plan at P = 0.25 settles on a deeper cut (65.7K left) where P = 0 keeps the minimal cut (72.6K left), because
+  at P = 0.25 the minimal cut's summary is refused by the gate and the deeper one passes; the plan at P = 0 has no gate to refuse (it
+  always fires). The two plans are each right by their own law; monotonicity would need P = 0 to look at the deeper cuts too.
+* **NR 2**: the checker's classes: one "smallest cut only" (the cold plan's minimal-cut summary was refused, the warm valve's deeper cut
+  paid; the fix for MP did not reach the cold plan at P = 0), one "window slide, summary (B2)" (the cold plan could not cut into the
+  protected turns, the warm valve did a prompt later; a summary never cuts into the latest two turns). Not fixed.
+* **TR 2**: one is the calibration class again (the plan believed it left 39K for a 46K request after a model switch), one is a cold
+  return with P(warm) 0.33 where the plan leaves 46K for a 40K target and no law refused a summary. Not analysed further, not fixed.
+* **MH 2**: a cold return after 4,881 s folds at 6,369 real tokens, inside the 8,192 an automatic cache keeps for the survival sample;
+  the class is "a fold inside the automatic cache's head". Not analysed further, not fixed; the foreign-compaction case that made up
+  most of the 13 is fixed.
+
+### N6. A new finding of the mutant hunt: NT, a cold summary that removes (almost) nothing
+
+Outside the 33,340 traces. A cold return after a model switch, 126K of context of which 123K is the two protected turns, plans a summary
+of the 10K before them: the summary call is paid and the context goes from 126.7K to 119.2K (the floor, the protected turns, is 123.8K).
+NT's clause "a summary that removes (almost) nothing" fails on the rc source and on 6bcef19, and passes on rc030 (7182b25), where the
+same request had the old `after` and the gate refused it; what changed is how the plan prices what it leaves (plan.ts, the whole plan's
+gate with the call). It is in the same family as the F2 findings (a summary at a cold return the protected turns make pointless), not
+one of the (a) bugs of this task; the trace is `/tmp/nt.trace`-like: `world explicit known ttl=300 true=300 survival=none c=1.7 sys=3000
+window=200000 nonative interactive long warming`, 28 events with a switch before the last prompt. Not fixed.
+
+### What was tried and not shipped
+
+* **Item 11 (wait for the running away summary in before_agent_start, then the native path)**: implemented and tested in the rig (native
+  path, tokensBefore equal to the notice's before, requests 1 and 2 byte-identical to the draft path; abort during the wait). In a real TUI (tmux,
+  Pi 1.1.0, a model server that holds the narrative call for 20 s) the screen during the wait in `before_agent_start` is blank: no working
+  indicator, no pi-zip progress, and the typed prompt is not even shown, for the whole wait. The rule was: if that wait shows nothing, keep
+  the wait where it is. Reverted; the patch is kept outside the repo. The wait at the first request (today's draft path) shows Pi's working
+  line with "finishing the summary it started while you were away · Esc cancels this prompt".
