@@ -38,16 +38,6 @@ export const LOOKAHEAD = false;
 export const NARRATIVE_PRICE = true;
 /** The narrative's token budget (chars/4), summary.ts buildCut: clamp(planned - skeleton, 300, NARRATIVE_MAX). */
 export const NARRATIVE_MAX = 4000;
-/** B2 for folds (formal TRIAGE (a) 6): the outputs a cold plan must protect (the previous user turn's, the mutating ones) are no longer
- *  protected one prompt later, when the window slides, and the warm plan then folded them at a warm cache: a rewrite the free cold one
- *  dominated. Now a warm plan holds back the blocks that were protected at the last cold return (PlanOpts.hold: that return's prompt)
- *  until the next cold return, or until the session has grown by more than HOLD_RELEASE real tokens since it (new information), or the
- *  context is at Pi's compaction room; and when even folding them all would not avoid a summary, it is the plan it was before. Chosen
- *  over folding them early at the cold return (the user would lose the previous turn's outputs at the prompt that asks about them):
- *  formal/TRIAGE.md, B2 for folds. */
-export const FOLD_HOLD = true;
-/** The spec's "no new information" is growth <= 10K real tokens (formal DELTA); the estimate is chars/4 x c, 15% off at worst (TOL_TARGET). */
-export const HOLD_RELEASE = 11_500;
 const SUMMARY_FLOOR = 1000;
 const SUMMARY_CAP = 8000;
 const SUMMARY_RATIO = 0.1;
@@ -560,8 +550,6 @@ export interface PlanOpts {
 	narrativePrice?: boolean; // F3, default NARRATIVE_PRICE
 	slide?: number; // internal (F2): plan as if this many more user turns had started (the protected window slid)
 	valveB?: number; // internal (F2): the real context the slid warm plan's law sees (the cold plan's folds already applied)
-	hold?: { anchor: string }; // B2 for folds: the entry id of the prompt of the last cold return (run.ts holdOf); undefined = nothing held
-	holdPass?: boolean; // internal: the held pass of a warm plan with a hold
 	warmStyle?: boolean; // internal: a cold plan at 0 < P(warm) < 0.5 that the law refused is planned once more the way a warm plan is (no relax folds unless pastTtl, the summary gated)
 }
 
@@ -615,14 +603,6 @@ export const contentKeyOf = (content: Any): string => {
  *  passes the same law (expected cost). The cap never exceeds Pi's compaction room. Returns null when there is nothing to plan on
  *  or the law says no. */
 export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
-	if (o.hold && !o.holdPass && (o.mode ?? "cold") === "warm") {
-		// the hold gives way to a summary: when the plan without it summarises, that is the plan (a summary voids the folds before its
-		// cut anyway); otherwise the held plan, with no summary of its own (the next cold return writes it)
-		const full = planContext(entries, { ...o, hold: undefined, trace: undefined });
-		if (!full) return null;
-		if (full.cutIdx !== null) return planContext(entries, { ...o, hold: undefined });
-		return planContext(entries, { ...o, noSummary: true, holdPass: true });
-	}
 	const s = settings();
 	const mode = o.mode ?? "cold";
 	const warmLike = mode === "warm" || o.warmStyle === true; // plans the way a warm plan does (the label of the trigger stays the mode's)
@@ -701,22 +681,7 @@ export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
 	const foldable = (b: Block) => b.kind === "toolResult" && !b.edited && !!b.entryId && b.tokens > foldMin && !isRecall(b) && start[b.idx] >= head && (!o.rereadOnly || classify(b) === "rereadable");
 	const protectedTurn = (b: Block) => b.userTurn >= userTurns - PROTECT_USER_TURNS + 1;
 	const savings = () => folds.reduce((a, t) => a + t.entryTokens - t.phTokens, 0);
-	// the blocks protected at the last cold return stay out of a warm plan's folds (see FOLD_HOLD)
-	const held: (b: Block) => boolean = (() => {
-		const NOT_HELD = () => false;
-		if (mode !== "warm" || !o.hold) return NOT_HELD;
-		const from = blocks.findIndex((b) => b.entryId === o.hold!.anchor); // gone (a later summary replaced it): nothing is held
-		if (from < 0) return NOT_HELD;
-		// what the session grew by before this decision: the blocks between the cold return's prompt and the newest response (that
-		// response, the tool results after it and a new prompt are what the decision is about, not yet something the cache has seen)
-		let lastAsst = blocks.length - 1;
-		while (lastAsst > 0 && blocks[lastAsst].kind !== "assistant") lastAsst--;
-		const grown = c * blocks.slice(from + 1, Math.max(from + 1, lastAsst)).reduce((a, b) => a + b.tokens, 0);
-		if (grown > HOLD_RELEASE || (room !== null && real(ctxEst) >= room)) return NOT_HELD;
-		const turn = blocks[from].userTurn;
-		return (b: Block) => b.userTurn >= turn - PROTECT_USER_TURNS + 1;
-	})();
-	const cands = blocks.filter((b) => foldable(b) && !protectedTurn(b) && !held(b));
+	const cands = blocks.filter((b) => foldable(b) && !protectedTurn(b));
 	for (const b of cands) addFold(b, trig);
 	if (relax && ((mode === "cold" && !o.warmStyle) || o.pastTtl === true)) {
 		// the protected window = the new prompt + the previous user turn; that turn's big reads are what makes a cold return
