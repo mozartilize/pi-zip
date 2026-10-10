@@ -7,12 +7,12 @@ import { detectCold, lastMessageMs, lastPrompt, modelKey, payloadRetention, refu
 import { agentDir, describe, lawPrices, loadStats, pWarm, record, sample, statsPath, GAP_EDGES, type Entry } from "./learn.ts";
 import { validateEdits, repairPayload } from "./guard.ts";
 import { fmtK, Stats, noticeDesc, noticeText, type NoticeAction, type NoticeData, type ZipControl } from "./notice.ts";
-import { applyPlanToMessages, buildBlocks, calibrate, countUserTurns, G0, keepRecentTokensFor, piCanCompact, planContext, rebaseFolds, reserveTokensFor, sizeOf, spliceNative, untouchedEst, UNIT, type Block, type Cut, type FoldTarget, type Law, type PlanOpts, type PlanResult, type RunPlan, type Scale, type SysInfo } from "./plan.ts";
+import { applyPlanToMessages, buildBlocks, calibrate, countUserTurns, FOLD_HOLD, G0, keepRecentTokensFor, piCanCompact, planContext, rebaseFolds, reserveTokensFor, sizeOf, spliceNative, untouchedEst, UNIT, type Block, type Cut, type FoldTarget, type Law, type PlanOpts, type PlanResult, type RunPlan, type Scale, type SysInfo } from "./plan.ts";
 import { handleFor, PH_MARK, RECALL_TOOL } from "./placeholder.ts";
 import { branchOutputs, recalledHandlesFromBranch, resolveHandlesInBranch } from "./recall.ts";
 import { cleanupRecall, commandNamesRecall, fileRecallFor, materialize, parseRecallPath, recallRoot, recallRootShown, rewriteCommand, sidDir, type FileRecall } from "./recallfile.ts";
 import { buildCut } from "./summary.ts";
-import { type Any, COMMIT_CUSTOM, envInt, PRODUCT, textOf, tok4 } from "./util.ts";
+import { type Any, COLD_CUSTOM, COMMIT_CUSTOM, envInt, PRODUCT, textOf, tok4 } from "./util.ts";
 import { replayGrowth } from "./state.ts";
 import { CHART_COLS, chartGap, fmtLife, type CardData, type StateWord } from "./ui.ts";
 
@@ -387,7 +387,17 @@ export class Zip implements ZipControl {
 		const cal = this.scaleOf(ctx, entries);
 		const fileRecall = this.fileRecall(ctx);
 		const rereadOnly = this.recallMode === "reread" || (this.recallMode === "file" && !fileRecall);
-		return { cal, o: { mode, scale: cal, cwd: (ctx?.cwd as string) ?? process.cwd(), recalled: this.recalled, model: ctx?.model, promptPending: pending, rereadOnly, ...(fileRecall ? { fileRecall } : {}), noSummary: mode === "warm" && this.summarizedWarm, reserve: this.reserve(ctx), steerIds: this.steerIds, law: this.law(ctx, pWarm), trace: [] } };
+		return { cal, o: { mode, scale: cal, cwd: (ctx?.cwd as string) ?? process.cwd(), recalled: this.recalled, model: ctx?.model, promptPending: pending, rereadOnly, ...(fileRecall ? { fileRecall } : {}), noSummary: mode === "warm" && this.summarizedWarm, ...(FOLD_HOLD && mode === "warm" ? this.holdOf(ctx) : {}), reserve: this.reserve(ctx), steerIds: this.steerIds, law: this.law(ctx, pWarm), trace: [] } };
+	}
+
+	/** The prompt of the session's last cold return: the first user message after the newest COLD_CUSTOM entry (none: nothing is held). */
+	private holdOf(ctx: Any): { hold?: { anchor: string } } {
+		const branch = this.branch(ctx);
+		let mark = -1;
+		branch.forEach((e: Any, i: number) => { if (e?.type === "custom" && e.customType === COLD_CUSTOM) mark = i; });
+		if (mark < 0) return {};
+		const at = branch.findIndex((e: Any, i: number) => i > mark && e?.type === "message" && e.message?.role === "user" && !this.steerIds.has(e.id));
+		return at < 0 ? {} : { hold: { anchor: branch[at].id } };
 	}
 
 	private law(ctx: Any, pWarm: number): Law {
@@ -630,7 +640,12 @@ export class Zip implements ZipControl {
 		await this.resolveRetention(ctx);
 		const { cold, reason, ttl, pWarm: p, src, gapS, pastTtl } = detectCold(ctx.model, this.lastReqMs, branch, Date.now(), this.lastModelKey, (g, prior) => pWarm(this.ent, g, prior), this.tier(ctx.model));
 		this.cold = cold;
-		if (cold) this.summarizedWarm = false; // a cold return may summarise again
+		if (cold) {
+			this.summarizedWarm = false; // a cold return may summarise again
+			try {
+				this.pi.appendEntry(COLD_CUSTOM, {}); // right before the prompt: the session says where its last cold return was (plan.ts FOLD_HOLD)
+			} catch {}
+		}
 		this.pastTtl = pastTtl;
 		this.pWarm = p;
 		this.survSrc = src;
