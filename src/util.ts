@@ -103,8 +103,3 @@ export function tokensOf(m: Any): number {
 	}
 	return Math.ceil(chars / 4);
 }
-
-/** Custom session entry pi-zip appends right before the prompt of a cold return. A warm plan holds back what that return protected
- *  (plan.ts FOLD_HOLD); the entry makes the return a fact of the session, so a restart reads it instead of guessing from timestamps at
- *  the TTL's edge. Custom entries never reach the model. */
-export const COLD_CUSTOM = "pi-zip/cold";

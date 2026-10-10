@@ -316,21 +316,6 @@ describe("real Pi: a summary prepared while the user was away goes in through Pi
 		expect(read).not.toContain("request 2");
 	});
 });
-
-describe("B2 for folds through the real extension: the cold return leaves its mark, the next warm prompt holds back what it protected", () => {
-	test("a cold return writes pi-zip/cold right before its prompt; a warm return writes none", async () => {
-		const r = await rig(); // every message is hours old: a cold return
-		sendPrompt(r.sm, "next request");
-		const branch = r.sm.getBranch() as Any[];
-		const mark = branch.findIndex((e) => e.type === "custom" && e.customType === "pi-zip/cold");
-		expect(mark).toBeGreaterThan(-1); // old code: none
-		expect(branch[mark + 1]).toMatchObject({ type: "message", message: { role: "user", content: "next request" } });
-		const w = await rig((sm) => { populate(sm); sm.appendMessage(asst([{ type: "text", text: "just now" }], "stop", 0)); (sm.getBranch().at(-1) as Any).message.timestamp = Date.now(); }, { start: false });
-		await w.beforeAgentStart("warm");
-		expect((w.sm.getBranch() as Any[]).some((e) => e.type === "custom" && e.customType === "pi-zip/cold")).toBe(false);
-	});
-});
-
 describe("the notice's why line says the cache was judged cold, as the warm one says it was warm", () => {
 	test("a cold return: 'cache cold · away ...'", async () => {
 		const r = await rig(undefined, { tui: true }); // every message is hours old

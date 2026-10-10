@@ -150,10 +150,16 @@ fn quiet_through_i() -> F<R> {
         i <= i0 || (i0 + 1..=i).map(|m| r.st[m].appended).sum::<f64>() <= DELTA
     })
 }
-/// The context the plan for this request saw (the previous request's view plus what was appended) is below Pi's compaction room. At or
-/// above it the edit is forced: Pi would compact (lossily, at its price) instead; no cold plan could have made it earlier.
-fn below_room() -> F<R> {
-    atom("below_room", |r: &R, i, _| i == 0 || r.st[i - 1].view_tok + r.st[i].appended < r.st[i].room)
+/// The edit is not excused by Pi's compaction room. The context the plan for this request saw (the previous request's view plus what
+/// was appended) is below the room, or it is at or above it but the cold plan's own request (frozen in i0) already sent a context at or
+/// above the room: then the cold plan had left the room unmet and nothing since pushed the context there. Only growth after a cold plan
+/// that sent less than the room excuses a warm edit at the room (review P2-1: the earlier form, "at the room, whatever the cold plan
+/// left", hid regrets of the cold plan itself).
+fn not_pushed_to_room() -> F<R> {
+    atom("not_pushed_to_room", |r: &R, i, env: &Env| {
+        let i0 = lookup(env, "i0") as usize;
+        i == 0 || r.st[i - 1].view_tok + r.st[i].appended < r.st[i].room || r.st[i0].view_tok >= r.st[i0].room
+    })
 }
 fn after_i0() -> F<R> {
     atom("after_i0", |_r: &R, i, env: &Env| i > lookup(env, "i0") as usize)
@@ -310,7 +316,7 @@ pub fn derived() -> Vec<Prop> {
                   compaction room, where the edit is forced) in between, means the cold plan \
                   was dominated by doing that edit then.",
             evidence: Evidence::Conformance,
-            f: always(cold_plan() >> freeze("i0", index(), !quiet_since_i0().until_within(K_REGRET, after_i0() & zip_edit() & planned_warm() & quiet_through_i() & below_room()))),
+            f: always(cold_plan() >> freeze("i0", index(), !quiet_since_i0().until_within(K_REGRET, after_i0() & zip_edit() & planned_warm() & quiet_through_i() & not_pushed_to_room()))),
         },
         Prop {
             id: "NT",
