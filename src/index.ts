@@ -112,6 +112,7 @@ export default function piZip(pi: ExtensionAPI) {
 		checkRecall(ctx);
 		zip.refreshFolded(ctx);
 		zip.welcome(ctx);
+		zip.resumeAway(ctx); // a resumed session: arm the away timer from its last request, as the settle after it would have
 		return r;
 	});
 	pi.on("before_agent_start", async (e, ctx) => {

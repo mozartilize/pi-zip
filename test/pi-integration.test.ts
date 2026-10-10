@@ -563,3 +563,59 @@ describe("real Pi: the idle cache warmer's timing", () => {
 		for (const ttl of [1_000, 10_000, 10_001, 10_200, 15_000, 60_000, 100_000, 300_000, 3_600_000]) expect([ttl, warmingDelayMs(ttl)]).toEqual([ttl, getCacheWarmingDelayMs(ttl)]);
 	});
 });
+
+// formal/TRIAGE.md (a) 7 and 8 (A3, RDr): the summary prepared while the user is away must exist for a process that was restarted in
+// between, and must be for the context the user comes back to, not the one settle saw
+describe("the away summary survives a restart and a rewrite of the context while away", () => {
+	const sleep = (ms: number) => new Promise((res) => setTimeout(res, ms));
+	const template = () => {
+		const sm = SessionManager.inMemory(CWD);
+		populate(sm, 6000); // long prose: folds alone cannot reach the cap, so the cold return needs a summary
+		return [sm.getHeader() as Any, ...sm.getEntries()];
+	};
+	beforeEach(() => { process.env.PI_ZIP_TTL_SECS = "0.1"; });
+
+	test("a resumed process arms the away timer from the branch's last request: the summary is ready before the return (7)", async () => {
+		const r = await rig(undefined, { file: template(), tui: true, native: false, idle: false, start: false }); // session_start only: no settle ever ran in this process
+		await sleep(250);
+		expect(r.narrativeCalls.length).toBe(1); // old code: 0 (armAway was reached only from settle)
+		await r.beforeAgentStart("next request");
+		sendPrompt(r.sm, "next request");
+		const req1 = await r.request();
+		expect(r.narrativeCalls.length).toBe(1); // adopted at the return, not written again while the user waits
+		expect(req1.some((m) => m.role === "compactionSummary")).toBe(true);
+	});
+
+	test("a process that is not interactive, or a session that ended mid-run, prepares nothing", async () => {
+		const quiet = await rig(undefined, { file: template(), tui: false, start: false });
+		await sleep(250);
+		expect(quiet.narrativeCalls.length).toBe(0);
+		const file = template();
+		file.push({ type: "message", id: "tail", parentId: file.at(-1).id, timestamp: new Date(T0).toISOString(), message: asst([call("zz")], "toolUse", 99) });
+		const cut = await rig(undefined, { file, tui: true, start: false });
+		await sleep(250);
+		expect(cut.narrativeCalls.length).toBe(0);
+	});
+
+	test("Pi's compaction while the user is away: the timer plans again on the context as it is, the summary is for the return (8)", async () => {
+		const r = await rig(undefined, { file: template(), tui: true, native: false, idle: false, start: false });
+		r.narrativeCalls.length = 0;
+		await r.settle(); // the plan made now has a cut at the old context
+		const branch = r.sm.getBranch() as Any[];
+		const keep = branch.filter((e) => e.type === "message" && e.message.role === "user")[3]; // Pi's own compaction keeps from the 4th prompt on
+		r.sm.appendCompaction("Pi's own summary of the early part", keep.id, 12_000, undefined, false);
+		await sleep(250); // the timer fires at 0.8 x 100 ms
+		await r.beforeAgentStart("next request");
+		sendPrompt(r.sm, "next request");
+		const req1 = await r.request();
+		const summaries = req1.filter((m) => m.role === "compactionSummary");
+		expect(summaries).toHaveLength(1);
+		expect(JSON.stringify(summaries[0])).toContain("narrative"); // pi-zip's summary of the new context, prepared while away (old code: Pi's, then a second call while the user waits)
+		expect(r.narrativeCalls.length).toBe(1); // one call, made while away
+		// ... for the context as it is: what Pi's compaction replaced (the first prompts) is not in what the call reads (old code: it is)
+		const read = JSON.stringify(r.narrativeCalls[0]);
+		expect(read).toContain("request 4");
+		expect(read).not.toContain("request 1");
+		expect(read).not.toContain("request 2");
+	});
+});
