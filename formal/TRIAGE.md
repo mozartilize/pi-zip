@@ -224,3 +224,61 @@ describes and 0.2.8 predates.
 | spec, MH | the first request to a new model was held to the head rule | excluded: learn.ts takes no sample there |
 | spec, A2 | the summary call priced the whole summary as model output | the narrative call's own tokens (the skeleton and handle table are deterministic); the bridge's narrative model writes as many words as summary.ts asks for |
 | spec, A2 | the 10% tolerance was taken of K, a difference of large terms | 10% of the gross terms of K (rewrite, reads saved, call) |
+
+## rc fixes (v0.3.0 release candidate)
+
+### B2 for folds: the decision (a) 6
+
+Two designs were built behind one switch and measured against 6bcef19 (the rc030 source plus the first five fixes):
+
+* **A, fold ahead.** The cold plan also folds, at the cold return, the previous turn's outputs (any class) that the warm plan at the next
+  prompt would fold. It changes a product promise: the previous turn's outputs, protected until now, are folded at the very prompt that
+  usually asks about that work. PW needs a new exemption (`ahead_ok`).
+* **B, hold.** The warm plan leaves alone the blocks the last cold return protected until the next cold return, or until the session grew
+  by more than 11.5K real tokens since that return's prompt (counted before the newest response), or until Pi's compaction room; where the
+  plan without the hold would summarise, it is that plan. The protection of the latest two turns stays as it is.
+
+Measurements (aggregates only; the sessions are the user's and the repo's bench runs):
+
+| measure | base 6bcef19 | A fold ahead | B hold |
+|---|---|---|---|
+| `live_replay.ts`, user's 3 sessions (24 cold returns, 32 summaries, valve rewrite 417K, waits 130 s) | same | same | same |
+| fold replay (real planner, user's 3 sessions, 277 prompts, 73 cold returns): estimated cost | 181.71M | 180.62M (-0.6%) | 181.71M (0) |
+| ... warm edits / warm rewrite tokens | 75 / 1,730K | 49 / 1,475K | 75 / 1,730K |
+| ... recalls of folded outputs (the model needed it) | 2 | 2 | 2 |
+| fold replay, 398 bench sessions (1,221 cold returns): estimated cost | 281.76M | 229.64M (-18.5%) | 288.33M (+2.3%) |
+| ... warm edits / warm rewrite tokens | 104 / 11,306K | 11 / 1,564K | 39 / 5,010K |
+| ... recalls of folded outputs (same turn as the fold) | 75 (35) | 77 (2) | 55 (15) |
+| ... folds made ahead of the window | 0 | 7,641 of 14,252 cold folds | 0 |
+| `cw_sim.py` F1F3 arm, 626 sessions per cell, Anthropic 300 s: cost / lost items / waits / summaries | 1709.2 / 488 / 2061 s / 127 | 1708.4 / 496 / 2061 s / 127 | 1709.2 / 488 / 2061 s / 127 |
+| ... GLM 300 s | 1023.3 / 492 / 5024 s / 157 | 1021.2 / 504 / 4833 s / 155 | 1023.3 / 492 / 5024 s / 157 |
+| ... Anthropic 3600 s | 1757.7 / 366 / 2565 s / 88 | 1757.1 / 374 / 2565 s / 88 | 1757.7 / 366 / 2565 s / 88 |
+| ... GLM 3600 s | 972.7 / 458 / 6364 s / 150 | 971.8 / 472 / 6448 s / 150 | 972.7 / 458 / 6364 s / 150 |
+| checker PW, spec as in 6bcef19 | 0 | **2,833** | 0 |
+| checker PW, with A's exemption | - | 0 | - |
+| checker NR, spec as in 6bcef19 | 164 | 24 | 39 |
+| checker NR, + growth through the request (b) / + room (b) | 142 / 121 | (24) / 16 | 24 / 2 |
+| checker MP | 1 | 1 | 1 |
+
+How to read it. `live_replay.ts` cannot tell the designs apart: it plans summaries at the recorded cold returns and valve events and reads
+rewrites and waits from the transcript, and neither design changes a summary decision (B cannot even be expressed there, its state is the
+session); its lines are identical for all three. The fold-level replay and the simulator arms (`/tmp` scripts built on the real planner
+and on the repo's `cw_sim.py`, not committed) are the measurements that move.
+
+* **On the user's own sessions A saves 0.6% and 26 warm rewrites; B changes nothing.** On the simulator the cost differences are 0.1%
+  or less either way. A's 18.5% on the bench sessions is not the B2 fix: 54% of its cold folds are folds ahead of the window, at every cold
+  return, i.e. the protection of the previous turn given up wholesale; a warm plan would have folded far fewer of them.
+* **A's lost items are not lower: 496 vs 488 and 504 vs 492 (simulator), 77 vs 75 recalls (bench).** Its waits are lower on one cell
+  (GLM 300 s, -191 s) and higher on another (GLM 3600 s, +84 s). There is no clear cost or wait win.
+* B costs 2.3% on the bench sessions (the held outputs stay in context a little longer) and is neutral on the user's sessions and in the
+  simulator (there the 10K-growth release comes before a hold would bite). It has fewer recalls (55 vs 75) and fewer warm rewrites.
+* A earns its NR count (24) by a changed promise and needs a PW exemption; B reaches 39 on the unchanged spec with no other property
+  moving (MP 1, PW 0, A3 not worse).
+
+**Decision: B.** The numbers are close, and A gives up "the latest two user turns are protected". An earlier B that only skipped the
+held blocks (without the hand-back to a summary) raised MP to 26 and A3 by 4 traces, because the held plan summarised where the fold
+would have done; the committed B returns the plan the code made before when that plan summarises. Option A is not in the source.
+A fold-ahead patch and both measurement scripts are kept outside the repo (`/tmp/pzrc-tools`) and described here only.
+
+NR after B: 39 on the unchanged spec, 2 with the two (b) relaxations below; the 37 that depend on the relaxations are warm edits made
+when a large answer arrived with the follow-up prompt (15) or when the context reached Pi's compaction room at a small window (22).
