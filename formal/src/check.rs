@@ -6,6 +6,7 @@ use crate::logic::Violation;
 use crate::model::*;
 use crate::spec::{explain, Evidence, Prop};
 use std::fmt::Write as _;
+use std::io::Write as _;
 
 pub struct Example {
     pub trace: Trace,
@@ -37,6 +38,9 @@ pub struct Options {
     pub batch: usize,
     pub shrink_rounds: usize,
     pub progress: bool,
+    /// per-trace verdicts, one JSON line per trace in check order: {"n", "events", "fails": {property: class}} (a new failure of a
+    /// saturated property shows up as a changed line, where the counts would hide it)
+    pub verdicts: Option<std::cell::RefCell<std::io::BufWriter<std::fs::File>>>,
 }
 
 /// Check every property on every trace (in batches), then shrink the smallest counterexample of each failing property.
@@ -58,19 +62,28 @@ pub fn check(pool: &Pool, props: &[Prop], traces: impl Iterator<Item = Trace>, o
                 if errors.len() < 5 {
                     errors.push((t, o.errors.clone()));
                 }
+                if let Some(f) = &opts.verdicts {
+                    let _ = writeln!(f.borrow_mut(), "{}", serde_json::json!({ "n": *total - 1, "error": o.errors.first() }));
+                }
                 continue;
             }
             *requests += o.ticks.len();
             let run = Run::new(t, o);
+            let mut fails = serde_json::Map::new();
             for (k, p) in props.iter().enumerate() {
                 if let Some(v) = p.f.first_violation(&run) {
                     counts[k] += 1;
-                    let e = best[k].entry(p.class(&run, &v)).or_insert((0, run.trace.clone()));
+                    let class = p.class(&run, &v);
+                    fails.insert(p.id.to_string(), serde_json::Value::String(format!("{class} @{}", v.at)));
+                    let e = best[k].entry(class).or_insert((0, run.trace.clone()));
                     e.0 += 1;
                     if run.trace.weight() < e.1.weight() {
                         e.1 = run.trace.clone();
                     }
                 }
+            }
+            if let Some(f) = &opts.verdicts {
+                let _ = writeln!(f.borrow_mut(), "{}", serde_json::json!({ "n": *total - 1, "events": run.trace.events.len(), "fails": fails }));
             }
         }
         if opts.progress {

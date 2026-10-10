@@ -1,21 +1,24 @@
 //! pz-formal command line. See README.md ("How to run").
 use pz_formal::bridge::Pool;
 use pz_formal::check::{check, describe_tick, print_report, Options};
-use pz_formal::gen::{quick_suite, random_trace, standard_suite, world_preset, Body, Family, Rng};
+use pz_formal::gen::{quick_suite, random_trace, special, standard_suite, world_preset, Body, Family, Rng};
 use pz_formal::law::{grid, lemmas, Point, Terms};
-use pz_formal::model::{Event, Run, Trace};
+use pz_formal::model::{Run, Trace};
 use pz_formal::spec::{all, explain, Evidence};
 use std::path::PathBuf;
 
 const USAGE: &str = "usage:
   pz-formal check  --src DIR [--suite standard|quick|none] [--family SPEC] [--random N] [--seed S] [--workers W]
-                   [--only ID,ID] [--shrink ROUNDS] [--json FILE] [--pi DIR] [--plan-opts JSON]
+                   [--only ID,ID] [--shrink ROUNDS] [--json FILE] [--verdicts FILE] [--pi DIR] [--plan-opts JSON]
   pz-formal run    --src DIR TRACE_FILE [--pi DIR]      run one trace (text syntax), print every request and the verdicts
   pz-formal lemmas [--src DIR] [--pi DIR]               the law's lemmas on the Rust port (and on the real lawTerms with --src)
   pz-formal spec                                        print the axioms and the derived properties
   pz-formal count  [--suite standard|quick]             how many traces a suite enumerates
 
-  --family 'worlds=explicit,glm depth=4 gaps=60,330,3600 bodies=q,p,b,c specials=switch,restart,foreign'";
+  --family 'worlds=explicit,glm depth=4 gaps=60,330,3600 bodies=q,p,b,c specials=switch,restart,foreign'
+     worlds: explicit glm fresh tools small claude print long file reread warming; bodies: q p b c bb r s f;
+     specials: switch restart foreign late-restart late-switch compact edit
+  --verdicts FILE: one JSON line per trace (in check order): {\"n\", \"fails\": {property: class of its first violation}}";
 
 struct Args(Vec<String>);
 impl Args {
@@ -54,17 +57,7 @@ fn parse_family(spec: &str) -> Family {
             "depth" => f.depth = v.parse().unwrap_or_else(|_| die("bad depth")),
             "gaps" => f.gaps = list.iter().map(|g| g.parse().unwrap_or_else(|_| die("bad gap"))).collect(),
             "bodies" => f.bodies = list.iter().map(|b| Body::parse(b).unwrap_or_else(|| die(&format!("unknown body {b}")))).collect(),
-            "specials" => {
-                f.specials = list
-                    .iter()
-                    .map(|s| match *s {
-                        "switch" => Event::Switch,
-                        "restart" => Event::Restart,
-                        "foreign" => Event::Foreign { size: 2_000 },
-                        _ => die(&format!("unknown special {s}")),
-                    })
-                    .collect()
-            }
+            "specials" => f.specials = list.iter().map(|s| special(s).unwrap_or_else(|| die(&format!("unknown special {s}")))).collect(),
             _ => die(&format!("unknown family key {k}")),
         }
     }
@@ -210,7 +203,8 @@ fn main() {
             eprintln!("checking {} on {} exhaustive + {} random traces ({} workers)", pool.label, exhaustive, n_random, std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0));
             let mut rng = Rng::new(seed);
             let traces = fs.iter().flat_map(|f| f.enumerate()).chain((0..n_random).map(move |_| random_trace(&mut rng)));
-            let opts = Options { batch: 512, shrink_rounds: a.opt("--shrink").and_then(|x| x.parse().ok()).unwrap_or(60), progress: true };
+            let verdicts = a.opt("--verdicts").map(|p| std::io::BufWriter::new(std::fs::File::create(&p).unwrap_or_else(|e| die(&format!("{p}: {e}")))));
+            let opts = Options { batch: 512, shrink_rounds: a.opt("--shrink").and_then(|x| x.parse().ok()).unwrap_or(60), progress: true, verdicts: verdicts.map(std::cell::RefCell::new) };
             let rep = check(&pool, &props, traces, &opts);
             let text = print_report(&rep);
             println!("{text}");
