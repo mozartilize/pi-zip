@@ -500,7 +500,9 @@ export class Zip implements ZipControl {
 			const p = planContext(entries, o);
 			if (!p || p.cutIdx === null) return;
 			const at = lastMessageMs(branch);
-			const delayMs = this.scheduleSummary(p, ctx, at || undefined);
+			// only a timer that is still in the future: a session left longer than that is a cold return, and the run plan of its next
+			// prompt handles it. Opening or /resuming an old session to browse it must not start a paid summary call.
+			const delayMs = this.scheduleSummary(p, ctx, at || undefined, true);
 			this.ledger({ type: "away_resumed", timerMs: delayMs, lastRequestMs: at });
 		} catch (err) {
 			this.ledger({ type: "error", where: "resume_away", error: errText(err) });
@@ -1032,22 +1034,28 @@ export class Zip implements ZipControl {
 		}
 	}
 
-	/** Start the away-timer for a summary; returns the delay in ms. unref'd: it never keeps the process alive. */
-	private scheduleSummary(p: PlanResult, ctx: Any, lastMs?: number): number {
+	/** Start the away-timer for a summary; returns the delay in ms (-1: `future` was asked for and the moment has passed, nothing is armed).
+	 *  unref'd: it never keeps the process alive. */
+	private scheduleSummary(p: PlanResult, ctx: Any, lastMs?: number, future = false): number {
 		const ttl = ttlFor(ctx.model, this.branch(ctx), this.tier(ctx.model));
 		const last = lastMs ?? (this.lastReqMs || Date.now());
-		this.awaySig = this.contextSig(ctx);
 		const warm = this.idleWarming() ? warmingDelayMs(ttl) : undefined;
 		if (warm !== undefined) {
 			// Pi keeps the cache warm between runs (cacheWarming "idle") and decides before each refresh, at its warming delay: a summary
 			// written now would be thrown away at a warm return, so it waits for Pi's decision (cacheWarmingDecision); should none come
 			// (Pi is not warming this request after all), it starts just after the decision was due
+			const due = last + warm + warmingMargin(ttl) - Date.now();
+			if (future && due <= 0) return -1;
+			this.awaySig = this.contextSig(ctx);
 			this.awayPlan = { p, ctx };
-			const delay = Math.max(0, last + warm + warmingMargin(ttl) - Date.now());
+			const delay = Math.max(0, due);
 			this.armAway(delay, () => this.startAway("no warming decision"));
 			return Math.round(delay);
 		}
-		const delay = Math.max(0, last + AWAY_FRACTION * ttl - Date.now());
+		const due = last + AWAY_FRACTION * ttl - Date.now();
+		if (future && due <= 0) return -1;
+		this.awaySig = this.contextSig(ctx);
+		const delay = Math.max(0, due);
 		this.armAway(delay, () => void this.runAway(p, ctx));
 		return Math.round(delay);
 	}
