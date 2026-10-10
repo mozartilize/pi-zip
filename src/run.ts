@@ -4,7 +4,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { detectCold, lastMessageMs, lastPrompt, modelKey, payloadRetention, refused, resolveTtl, ttlFor } from "./cache.ts";
-import { agentDir, describe, lawPrices, loadStats, pWarm, record, sample, statsPath, GAP_EDGES, type Entry } from "./learn.ts";
+import { agentDir, curve, describe, lawPrices, loadStats, pWarm, record, sample, statsPath, GAP_EDGES, type Entry } from "./learn.ts";
 import { validateEdits, repairPayload } from "./guard.ts";
 import { fmtK, Stats, noticeDesc, noticeText, type NoticeAction, type NoticeData, type ZipControl } from "./notice.ts";
 import { applyPlanToMessages, buildBlocks, calibrate, countUserTurns, FOLD_HOLD, G0, keepRecentTokensFor, piCanCompact, planContext, rebaseFolds, reserveTokensFor, sizeOf, spliceNative, untouchedEst, UNIT, type Block, type Cut, type FoldTarget, type Law, type PlanOpts, type PlanResult, type RunPlan, type Scale, type SysInfo } from "./plan.ts";
@@ -14,7 +14,7 @@ import { cleanupRecall, commandNamesRecall, fileRecallFor, materialize, parseRec
 import { buildCut } from "./summary.ts";
 import { type Any, COLD_CUSTOM, COMMIT_CUSTOM, envInt, PRODUCT, textOf, tok4 } from "./util.ts";
 import { replayGrowth } from "./state.ts";
-import { CHART_COLS, chartGap, fmtLife, type CardData, type StateWord } from "./ui.ts";
+import { fmtLife, type CardData, type ChartBin, type StateWord } from "./ui.ts";
 
 export const PLAN_CUSTOM = "pi-zip/plan";
 export const STATE_CUSTOM = "pi-zip/state";
@@ -1448,9 +1448,18 @@ export class Zip implements ZipControl {
 		const key = modelKey(model), ttlS = ttlFor(model, [], this.tier(model)) / 1000, ent = key ? loadStats().models[key] : undefined;
 		let lifeS = 0;
 		for (let g = 30; g <= 7200; g += 30) if (pWarm(ent, g, ttlS).p >= 0.5) lifeS = g;
-		const measured = !!ent && ent.n > 0 && pWarm(ent, Math.max(30, lifeS), ttlS).src === "learned";
 		const life = key ? (lifeS >= 7200 ? "2 h+" : fmtLife(lifeS || ttlS)) : undefined;
-		const alive = key ? Array.from({ length: CHART_COLS }, (_, i) => pWarm(ent, chartGap(i), ttlS).p) : undefined;
+		// the chart: every learned bin that still rounds to a return (the weights are decayed), and where the learned curve says
+		// "still there" ends (s1) and "gone" starts (s2); never the declared TTL
+		const bins: ChartBin[] = Object.entries(ent?.bins ?? {})
+			.map(([b, [a, d]]) => ({ lo: GAP_EDGES[Number(b)], hi: GAP_EDGES[Number(b) + 1] ?? 7200, alive: Math.round(a), gone: Math.round(d) }))
+			.filter((x) => x.lo !== undefined && x.alive + x.gone > 0)
+			.sort((x, y) => x.lo - y.lo);
+		const cur = (ent ? curve(ent, ttlS) : []).map((x) => ({ lo: GAP_EDGES[x.bin], hi: GAP_EDGES[x.bin + 1] ?? 7200, p: x.p }));
+		let s1 = GAP_EDGES[0];
+		for (const x of cur) { if (x.p >= 0.8) s1 = x.hi; else break; }
+		const s2 = cur.find((x) => x.lo >= s1 && x.p <= 0.2)?.lo ?? 7200;
+		const usually = cur.some((x) => x.hi <= s1 && x.p < 0.95);
 		const ts = t.last?.timestamp ? new Date(t.last.timestamp) : null;
 		const hhmm = ts && !Number.isNaN(ts.getTime()) ? `${String(ts.getHours()).padStart(2, "0")}:${String(ts.getMinutes()).padStart(2, "0")}  ` : "";
 		const last = t.last ? `${hhmm}${t.last.data.desc}${t.last.data.why ? " · " + t.last.data.why : ""}` : undefined;
@@ -1459,7 +1468,7 @@ export class Zip implements ZipControl {
 		const rereadWhy = this.recallMode === "file" ? "a tool allowlist hides zip_recall · no session file, so no recall copies" : "a tool allowlist hides zip_recall · only re-readable outputs fold";
 		return {
 			state, stateNote: state === "paused" ? `${this.conflict} also manages context` : state === "off" ? "/zip on to resume" : state === "reread-only" ? rereadWhy : undefined,
-			model: key || undefined, life, measured, alive, folds: t.folds, foldedTokens: fmtK(t.folded), summaries: t.summaries, summaryUsd: t.usd, recalls: t.recalls, last, quiet: this.quiet,
+			model: key || undefined, life, ...(bins.length ? { bins, s1, s2, usually } : {}), folds: t.folds, foldedTokens: fmtK(t.folded), summaries: t.summaries, summaryUsd: t.usd, recalls: t.recalls, last, quiet: this.quiet,
 			...(file ? { unzip: `from files in ${recallRootShown()} (a tool allowlist hides zip_recall)` } : {}),
 		};
 	}
