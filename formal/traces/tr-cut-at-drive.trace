@@ -1,0 +1,11 @@
+world explicit known ttl=300 true=300 survival=none c=1.7 sys=3000 window=200000 native interactive tools=reread
+prompt
+call cat 1K
+call npm 26.6K
+call npm 9.1K
+call npm 15.8K
+say 29.2K
+drive +330s
+say 100
+prompt +330s
+say 100

@@ -60,6 +60,16 @@ function waitFor<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T | null
 	});
 }
 
+/** `regrow` of the newest pi-zip summary on the branch (undefined: none, or one written before 0.3.0 kept no size). */
+const lastRegrow = (branch: Any[]): number | undefined => {
+	for (let i = branch.length - 1; i >= 0; i--) {
+		const e = branch[i];
+		if (e?.type === "compaction" && e.details?.by === PRODUCT) return typeof e.details.regrow === "number" && e.details.regrow > 0 ? e.details.regrow : undefined;
+	}
+	return undefined;
+};
+/** stopReasons of an assistant message that does not end a run (buildBlocks' afterAnswer: a failed or aborted request ends it too). */
+const STOP_NOT_FINAL = new Set(["toolUse"]);
 const errText = (err: unknown) => (err instanceof Error ? (err.stack ?? err.message) : String(err));
 /** A compaction another extension supplied (through session_before_compact): not Pi's own summary, not pi-zip's. */
 const foreignCompaction = (e: Any): boolean => e?.type === "compaction" && !!e.fromHook && e.details?.by !== PRODUCT;
@@ -155,8 +165,10 @@ export class Zip implements ZipControl {
 	entryRenderer = false;
 	private coldWhy = ""; // the expanded notice's "why now" for this run
 	private noticed = false; // a transcript notice was written in this process (the branch may not show it yet)
-	/** A summary was persisted since the last cold run start: later warm plans make none unless at the compaction room. */
+	/** A summary was persisted since the last cold run start: later warm plans make none unless at the compaction room, or until the
+	 *  context has grown back to the size that summary started from (`summaryRegrow`, real tokens after folds; plan.ts regrowAt). */
 	summarizedWarm = false;
+	summaryRegrow: number | undefined = undefined;
 	setRecallMode(mode: "tool" | "file" | "reread", tools: { read: boolean; grep: boolean; bash: boolean }, ctx?: Any) {
 		if (mode !== this.recallMode) this.ledger({ type: "recall_available", ok: mode === "tool", mode, ...tools });
 		this.recallMode = mode;
@@ -394,7 +406,7 @@ export class Zip implements ZipControl {
 		const cal = this.scaleOf(ctx, entries);
 		const fileRecall = this.fileRecall(ctx);
 		const rereadOnly = this.recallMode === "reread" || (this.recallMode === "file" && !fileRecall);
-		return { cal, o: { mode, scale: cal, cwd: (ctx?.cwd as string) ?? process.cwd(), recalled: this.recalled, model: ctx?.model, promptPending: pending, rereadOnly, ...(fileRecall ? { fileRecall } : {}), noSummary: mode === "warm" && this.summarizedWarm, reserve: this.reserve(ctx), steerIds: this.steerIds, law: this.law(ctx, pWarm), trace: [] } };
+		return { cal, o: { mode, scale: cal, cwd: (ctx?.cwd as string) ?? process.cwd(), recalled: this.recalled, model: ctx?.model, promptPending: pending, rereadOnly, ...(fileRecall ? { fileRecall } : {}), noSummary: mode === "warm" && this.summarizedWarm, ...(mode === "warm" && this.summarizedWarm && this.summaryRegrow ? { regrowAt: this.summaryRegrow } : {}), reserve: this.reserve(ctx), steerIds: this.steerIds, law: this.law(ctx, pWarm), trace: [] } };
 	}
 
 	private law(ctx: Any, pWarm: number): Law {
@@ -502,9 +514,11 @@ export class Zip implements ZipControl {
 			// prompt handles it. Opening or /resuming an old session to browse it must not start a paid summary call.
 			const delayMs = this.scheduleSummary(p, ctx, at || undefined, true);
 			this.ledger({ type: "away_resumed", timerMs: delayMs, lastRequestMs: at });
-			// the cache is already dead: opening the session costs nothing, but the first keystroke says the user is here to work, and the
-			// first prompt will wait for exactly this summary; start it now so the typing time is not wasted
-			if (delayMs < 0) this.armOnFirstKey(ctx);
+			// the cache is already dead: opening the session costs nothing, but a prompt being typed says the user is here to work, and that
+			// prompt will wait for exactly this summary; start it then so the typing time is not wasted. Only when the prompt itself will
+			// judge the return cold (learned survival, as beginRun): a cache that outlives its declared TTL gets a warm return, whose plan
+			// would throw a summary started here away.
+			if (delayMs < 0 && this.coldNow(ctx, branch)) this.armOnFirstKey(ctx);
 		} catch (err) {
 			this.ledger({ type: "error", where: "resume_away", error: errText(err) });
 		}
@@ -519,6 +533,7 @@ export class Zip implements ZipControl {
 			this.deltas = r.deltas;
 			this.justEdited = r.justEdited;
 			this.summarizedWarm = this.summarizedSince(branch);
+			this.summaryRegrow = this.summarizedWarm ? lastRegrow(branch) : undefined;
 			if (branch.length) this.ledger({ type: "state_restored", g: Math.round(this.g), justEdited: this.justEdited, summarizedWarm: this.summarizedWarm });
 		} catch (err) {
 			this.ledger({ type: "error", where: "restore_state", error: errText(err) });
@@ -526,22 +541,50 @@ export class Zip implements ZipControl {
 	}
 
 	/** Is the newest pi-zip summary of the branch newer than the last cold return? (The live flag: set when a summary is persisted,
-	 *  cleared at a cold return.) Each user prompt after the summary is judged as `detectCold` judged it, from the branch before it. */
+	 *  cleared at a cold return.) Each return after the summary is judged as `detectCold` judged it, from the branch before it. A return is
+	 *  a user prompt, or a custom message that follows a final answer (a run an extension's message started: agent_start runs the same
+	 *  start of run, run.ts beginRun); a prompt and the custom messages stored right next to it (nextTurn, before_agent_start) are one
+	 *  return, exactly as buildBlocks counts turns. */
 	private summarizedSince(branch: Any[]): boolean {
 		let at = -1;
 		branch.forEach((e, i) => { if (e?.type === "compaction" && e.details?.by === PRODUCT) at = i; });
 		if (at < 0) return false;
 		let skip = branch[at].details?.via === "native"; // the prompt after a native summary is the very return that made it
 		const models = loadStats().models;
+		// afterAnswer: the newest message is a final answer (as buildBlocks); a summary ends no run, so the state before it carries over
+		let afterAnswer = false, starter = false;
+		for (let i = 0; i < at; i++) {
+			const e = branch[i];
+			if (e?.type === "custom_message") { afterAnswer = false; continue; }
+			const r = e?.type === "message" ? e.message?.role : null;
+			if (r === "assistant") afterAnswer = !STOP_NOT_FINAL.has(e.message.stopReason);
+			else if (r === "user" || r === "toolResult") afterAnswer = false;
+		}
 		for (let i = at + 1; i < branch.length; i++) {
-			const m = branch[i]?.type === "message" ? branch[i].message : null;
-			if (m?.role !== "user" || this.steerIds.has(branch[i].id)) continue;
+			const e = branch[i];
+			let m: Any = null;
+			if (e?.type === "custom_message") {
+				if (!afterAnswer) continue; // mid-run, or riding with the prompt just before it
+				afterAnswer = false;
+				starter = true;
+				m = { timestamp: Date.parse(e.timestamp) };
+			} else {
+				const x = e?.type === "message" ? e.message : null;
+				if (x?.role === "assistant") { afterAnswer = !STOP_NOT_FINAL.has(x.stopReason); starter = false; continue; }
+				if (x?.role === "toolResult") { afterAnswer = false; starter = false; continue; }
+				if (x?.role !== "user") continue;
+				afterAnswer = false;
+				const follows = starter; // a prompt right after the custom message that started its run: the same return
+				starter = false;
+				if (follows || this.steerIds.has(e.id)) continue;
+				m = x;
+			}
 			if (skip) { skip = false; continue; }
 			let a: Any;
 			for (let j = i + 1; j < branch.length && !a; j++) if (branch[j]?.type === "message" && branch[j].message?.role === "assistant" && branch[j].message.provider) a = branch[j].message;
 			if (!a) continue; // a prompt nothing answered
 			const model = { provider: a.provider, id: a.model };
-			const ts = Number(m.timestamp) || Date.parse(branch[i].timestamp) || 0;
+			const ts = Number(m.timestamp) || Date.parse(e.timestamp) || 0;
 			const ent = models[modelKey(model)];
 			// detectCold reads only the newest messages before the prompt (the last touch, the last model, the last few cache writes): a window
 			// of them gives its answer (the whole prefix when the window holds no response), and the walk stays linear in a very long session
@@ -637,16 +680,30 @@ export class Zip implements ZipControl {
 	async agentStart(ctx: Any): Promise<void> {
 		if (this.startHandled) {
 			this.startHandled = false;
+			this.promptStart = true; // its first message says whether it really is the prompt's run (messageEnd)
 			return;
 		}
-		this.starting = this.beginRun(ctx, undefined, false).catch((err) => this.ledger({ type: "error", where: "agent_start", error: errText(err) }));
-		await this.starting;
-		this.runUserSeen = 1; // no prompt in this run: a user message that comes later is steering
-		this.ledger({ type: "driven_run" });
+		await this.drivenStart(ctx);
 	}
+
+	private drivenStart(ctx: Any): Promise<void> {
+		this.starting = this.beginRun(ctx, undefined, false)
+			.catch((err) => this.ledger({ type: "error", where: "agent_start", error: errText(err) }))
+			.then(() => {
+				this.runUserSeen = 1; // no prompt in this run: a user message that comes later is steering
+				this.ledger({ type: "driven_run" });
+			});
+		return this.starting;
+	}
+
+	/** Set at an agent_start taken for the prompt's run: before_agent_start fired, but a prompt can still fail before its run starts (Pi's
+	 *  image normalisation), and then the next agent_start belongs to a run an extension's message starts. A prompt's run begins with
+	 *  the user message; a driven run with the custom message: seen at that first message_end, before the run's first request. */
+	private promptStart = false;
 
 	agentEnd() {
 		this.startHandled = false;
+		this.promptStart = false;
 	}
 
 	private async beginRun(ctx: Any, e: Any, viaPrompt: boolean): Promise<void> {
@@ -677,7 +734,7 @@ export class Zip implements ZipControl {
 		await this.resolveRetention(ctx);
 		const { cold, reason, ttl, pWarm: p, src, gapS, pastTtl } = detectCold(ctx.model, this.lastReqMs, branch, Date.now(), this.lastModelKey, (g, prior) => pWarm(this.ent, g, prior), this.tier(ctx.model));
 		this.cold = cold;
-		if (cold) this.summarizedWarm = false; // a cold return may summarise again
+		if (cold) { this.summarizedWarm = false; this.summaryRegrow = undefined; } // a cold return may summarise again
 		this.pastTtl = pastTtl;
 		this.pWarm = p;
 		this.survSrc = src;
@@ -803,7 +860,8 @@ export class Zip implements ZipControl {
 		const gate = this.nativeGate(ctx, branch, pre);
 		if (gate) return skip(gate);
 		const before = Math.round(p.ctxTokens);
-		const compaction = { summary: cut.text, firstKeptEntryId: cut.firstKeptEntryId, tokensBefore: before, details: { by: PRODUCT, via: "native", trigger: cut.trigger }, usage: cut.usage };
+		const regrow = Math.round(p.ctxAfterFolds); // the context this summary starts from (folds applied): see summaryRegrow
+		const compaction = { summary: cut.text, firstKeptEntryId: cut.firstKeptEntryId, tokensBefore: before, details: { by: PRODUCT, via: "native", trigger: cut.trigger, regrow }, usage: cut.usage };
 		const known = new Set(branch.map((en: Any) => en?.id));
 		const ask = { compaction: compaction as Any | null, answered: false, askedAt: 0, askedWall: 0, until: Infinity };
 		this.nativeAsk = ask;
@@ -864,11 +922,13 @@ export class Zip implements ZipControl {
 				this.discardBg();
 				this.foreignRun = true;
 				this.summarizedWarm = true;
+				this.summaryRegrow = undefined; // its size is not known: this stretch ends at the next cold return
 			}
 			return; // nothing went in: the draft path, the run plan adopts the prepared summary as before
 		}
 		this.bg = null; // adopted by Pi's compaction
 		this.summarizedWarm = true; // one summary per warm stretch, as for a draft (commit)
+		this.summaryRegrow = regrow;
 		// the summary is in the session from now on, whatever the run does: book it here (commit() does not book it again)
 		const cutSaved = Math.round(p.scale.c * (cut.prefixTokens - cut.summaryTokens));
 		this.nativeRun = { key: b.key, cut, before, after: Math.round(p.ctxAfterFolds - cutSaved), pre, entryId: entry.id };
@@ -891,36 +951,62 @@ export class Zip implements ZipControl {
 		} catch {}
 	}
 
-	/** A reopened session whose cache is dead and whose cold plan would summarise: start that summary on the first raw keystroke after
-	 *  the session opens (Pi API ctx.ui.onTerminalInput; never consumes or alters the data; unsubscribes at the first key). The prompt that
-	 *  follows takes the running call exactly like the live away timer's (takeBg: no second call, the notice shows the real wait). A session
-	 *  opened and closed without typing makes no call (shutdown unsubscribes). Nothing without a UI (`pi -p`, a subagent). */
+	/** The return a prompt typed now would be, judged as beginRun judges it (learned survival, the request's tier): null when it is warm. */
+	private coldNow(ctx: Any, branch: Any[]): { pWarm: number; pastTtl: boolean } | null {
+		this.loadEnt(modelKey(ctx.model));
+		const d = detectCold(ctx.model, this.lastReqMs, branch, Date.now(), this.lastModelKey, (g, prior) => pWarm(this.ent, g, prior), this.tier(ctx.model));
+		return d.cold ? { pWarm: d.pWarm, pastTtl: d.pastTtl } : null;
+	}
+
+	/** A reopened session whose cache is dead and whose cold plan would summarise: start that summary once the user is typing a prompt
+	 *  (Pi API ctx.ui.onTerminalInput; never consumes or alters the data). A key alone is not enough: Ctrl+C, Ctrl+D, Esc, arrows and
+	 *  `/quit` or `/resume` are how a session is left without working in it. After each key (once Pi's editor has taken it) the editor
+	 *  text decides: non-empty and not a command (`/...`). The prompt that follows takes the running call exactly like the live away
+	 *  timer's (takeBg: no second call, the notice shows the real wait). A session opened and closed without typing a prompt makes no
+	 *  call (shutdown unsubscribes). Nothing without a UI (`pi -p`, a subagent) or without ctx.ui.getEditorText. */
 	private armOnFirstKey(ctx: Any) {
 		this.disarmKey();
 		const ui = ctx?.ui;
-		if (!ctx?.hasUI || typeof ui?.onTerminalInput !== "function") return;
+		if (!ctx?.hasUI || typeof ui?.onTerminalInput !== "function" || typeof ui?.getEditorText !== "function") return;
+		let queued = false;
 		try {
-			this.keyOff = ui.onTerminalInput((data: string) => {
-				if (!isKeystroke(data)) return undefined; // a terminal report (focus, cursor position, cell size, ...) is not the user
-				this.disarmKey();
-				this.startOnKey(ctx);
+			const off = ui.onTerminalInput((data: string) => {
+				if (queued || !isKeystroke(data)) return undefined; // a terminal report (focus, cursor position, cell size, ...) is not the user
+				queued = true;
+				// after Pi's editor handled this key (the listener runs before it), off the input path: the planning below must not delay the key
+				setImmediate(() => {
+					queued = false;
+					if (this.keyOff !== off) return; // disarmed meanwhile (a prompt, a run, shutdown)
+					let text = "";
+					try {
+						text = String(ui.getEditorText() ?? "");
+					} catch {}
+					const t = text.trimStart();
+					if (!t || t.startsWith("/")) return; // nothing typed yet, or a command (/quit, /resume, /model, ...): stay armed
+					this.disarmKey();
+					this.startOnKey(ctx);
+				});
 				return undefined; // the input goes on to Pi untouched
 			});
+			this.keyOff = off;
 			this.ledger({ type: "key_armed" });
 		} catch (err) {
 			this.ledger({ type: "error", where: "arm_key", error: errText(err) });
 		}
 	}
 
-	/** The first key: plan the cold return again on the session as it is now (a /model or /tree before it may have changed it) and, when it
-	 *  has a cut, write that summary in the background, as the away timer would have. */
+	/** The user is typing a prompt: plan the cold return again on the session as it is now (a /model or /tree before it may have changed
+	 *  it), with the P(warm) and pastTtl the prompt's own run plan will use, and, when it has a cut, write that summary in the background,
+	 *  as the away timer would have. */
 	private startOnKey(ctx: Any) {
 		try {
 			if (!this.active() || this.bg) return;
 			const entries = ((ctx.sessionManager.buildSessionProjection() as Any)?.entries ?? []) as Any[];
 			if (!entries.length || !ctx?.model) return;
-			this.loadEnt(modelKey(ctx.model));
-			const { o } = this.opts(ctx, true, "cold", entries);
+			const cold = this.coldNow(ctx, this.branch(ctx));
+			if (!cold) return; // a warm return (a /model back, learned survival): its plan would discard the summary
+			const { o } = this.opts(ctx, true, "cold", entries, cold.pWarm);
+			o.pastTtl = cold.pastTtl;
 			const p = planContext(entries, o);
 			if (!p || p.cutIdx === null) return;
 			this.awaySig = this.contextSig(ctx);
@@ -1403,7 +1489,13 @@ export class Zip implements ZipControl {
 			return undefined;
 		}
 		const bad = checkEdits(o.blocks, o.userTurns, live, cut);
-		if (!bad && cut) this.summarizedWarm = true; // one summary per warm stretch (two in a row cost two uncached calls; the second gains little)
+		const regrow = cut ? Math.round(plan.ctxAfter + c * (cut.prefixTokens - cut.summaryTokens)) : 0; // the context the summary started from
+		if (!bad && cut) {
+			// one summary per warm stretch (two in a row cost two uncached calls; the second gains little), until the context has grown back
+			// to the size this one started from: a second summary then gains what this one did, and the law alone decides
+			this.summarizedWarm = true;
+			this.summaryRegrow = regrow;
+		}
 		if (bad) {
 			this.ledger({ type: "guard_drop", turnIndex: e.turnIndex, reason: bad, folds: live.length, source: plan.source });
 			plan.persisted = false; // keep the request-local view: never switch the fold set mid-run
@@ -1415,7 +1507,7 @@ export class Zip implements ZipControl {
 		for (const t of live) if (t.toolCallId) this.foldedCalls.set(t.toolCallId, handleFor(t.entryId));
 		// the compaction draft goes FIRST: Pi writes its tokensBefore from the newest usage only while no edit follows that usage, so a
 		// fold drafted before it would make Pi's "Compacted from N tokens" the chars/4 of a half-applied projection (research pi-tricks §1a)
-		if (cut) ours.unshift({ type: "compaction", summary: cut.text, firstKeptEntryId: cut.firstKeptEntryId, details: { by: PRODUCT, trigger: cut.trigger, carried: sentBefore }, usage: cut.usage });
+		if (cut) ours.unshift({ type: "compaction", summary: cut.text, firstKeptEntryId: cut.firstKeptEntryId, details: { by: PRODUCT, trigger: cut.trigger, carried: sentBefore, regrow }, usage: cut.usage });
 		ours.push({ type: "custom", customType: COMMIT_CUSTOM, data: { carried: sentBefore } }); // says who first carried these edits (state.ts, plan.ts calibrate)
 		const before = Math.round(c * live.reduce((a, t) => a + t.entryTokens, 0));
 		const after = Math.round(c * live.reduce((a, t) => a + t.phTokens, 0));
@@ -1479,7 +1571,11 @@ export class Zip implements ZipControl {
 		return r.payload;
 	}
 
-	messageEnd(m: Any) {
+	messageEnd(m: Any, ctx?: Any) {
+		if (this.promptStart) {
+			this.promptStart = false;
+			if (m?.role === "custom" && ctx) void this.drivenStart(ctx); // the agent_start was a driven run's: its start of run, now
+		}
 		if (m?.role === "assistant" && m.stopReason !== "error" && m.stopReason !== "aborted") this.lastReqMs = Date.now(); // the response is complete: the entry was refreshed when it finished
 		else if (refused(m)) this.lastReqMs = this.reqMsBefore; // the provider refused the request: it touched no cache (cache.ts lastMessageMs reads the branch the same way)
 		if (m?.role === "user" && this.active()) {

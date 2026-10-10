@@ -16,8 +16,8 @@ const USAGE: &str = "usage:
   pz-formal count  [--suite standard|quick]             how many traces a suite enumerates
 
   --family 'worlds=explicit,glm depth=4 gaps=60,330,3600 bodies=q,p,b,c specials=switch,restart,foreign'
-     worlds: explicit glm fresh tools small claude print long file reread warming; bodies: q p b c bb r s f;
-     specials: switch restart foreign late-restart late-switch compact edit
+     worlds: explicit glm fresh tools small claude print long file reread warming; bodies: q p b c bb r s f n;
+     specials: switch restart foreign late-restart late-switch compact edit drive drive-warm drive-restart
   --verdicts FILE: one JSON line per trace (in check order): {\"n\", \"fails\": {property: class of its first violation}}";
 
 struct Args(Vec<String>);

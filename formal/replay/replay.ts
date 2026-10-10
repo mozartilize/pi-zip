@@ -33,6 +33,7 @@ const PH: any = await import(join(SRC, "placeholder.ts"));
 const PI: any = await import(join(SRC, "../node_modules/@earendil-works/pi-coding-agent/dist/index.js"));
 
 const TTL_S = 300;
+const NO_REGROW = process.env.PZ_NO_REGROW === "1"; // the same source with the warm-stretch flag never lapsing (the rule before 0.3.0's review round 4)
 const LAT = { c0: 3.2, perKUncached: 0.031, perOut: 0.0093 };
 const args = process.argv.slice(2);
 const flag = (name: string) => { const i = args.indexOf(name); return i >= 0 ? args.splice(i, 2)[1] : undefined; };
@@ -99,7 +100,9 @@ function run(path: string) {
 	const lostIds = new Map<string, { tokens: number; sig: string | null; at: number }>(); // summarised away
 	const foldedIds = new Map<string, { tokens: number; sig: string | null; at: number; handle: string }>();
 	const out: any = { requests: reqs.length, turns: turn, coldReturns: 0, summaries: 0, coldSummaries: 0, warmSummaries: 0, foldsCold: 0, foldsWarm: 0, warmEdits: 0, rewriteK: 0, waitS: 0, cost: 0, callCost: 0, lost: 0, recalls: 0, refetchK: 0, planErrors: 0 };
-	let summarizedWarm = false, justEdited = false, prevSize = 0;
+	// summarizedWarm as run.ts keeps it: set by every summary (cold ones too: commit), cleared at a cold return; regrow: the real context
+	// (after folds) the last summary started from (run.ts summaryRegrow, plan.ts regrowAt; a source without the rule ignores the option)
+	let summarizedWarm = false, regrow = 0, justEdited = false, prevSize = 0;
 
 	const apply = (entries: any[]): any[] => {
 		let es = entries;
@@ -122,7 +125,7 @@ function run(path: string) {
 		if (!leaf) return;
 		const cold = q.gap > TTL_S;
 		const coldPlan = q.first && cold;
-		if (coldPlan) { out.coldReturns++; summarizedWarm = false; }
+		if (coldPlan) { out.coldReturns++; summarizedWarm = false; regrow = 0; }
 		const proj = PI.buildSessionProjection(all, leaf.id, byId);
 		const br = branch.slice(0, q.bi);
 		const [provider, ...idp] = q.key.split("/");
@@ -132,7 +135,7 @@ function run(path: string) {
 		let plan: any = null;
 		const mayPlan = coldPlan || !justEdited; // no warm edit on the request right after an edited one
 		if (mayPlan && view.length) {
-			const o: any = { mode: coldPlan ? "cold" : "warm", scale, cwd: header?.cwd ?? "/tmp", model, promptPending: false, steerIds: steer, law: { pr, g: gAt[i] ?? P.G0, pWarm: coldPlan ? 0 : 1 }, trace: [], pastTtl: coldPlan, noSummary: !coldPlan && summarizedWarm, recalled: new Set<string>() };
+			const o: any = { mode: coldPlan ? "cold" : "warm", scale, cwd: header?.cwd ?? "/tmp", model, promptPending: false, steerIds: steer, law: { pr, g: gAt[i] ?? P.G0, pWarm: coldPlan ? 0 : 1 }, trace: [], pastTtl: coldPlan, noSummary: !coldPlan && summarizedWarm, ...(!coldPlan && summarizedWarm && regrow > 0 && !NO_REGROW ? { regrowAt: regrow } : {}), recalled: new Set<string>() };
 			try { plan = P.planContext(view, o); } catch { out.planErrors++; }
 		}
 		const edited = !!plan && (plan.folds.length > 0 || plan.cutIdx !== null);
@@ -145,7 +148,9 @@ function run(path: string) {
 				const call = pr.input * scale.c * Math.max(plan.prefixTokens - prevSum, 0) + pr.out * scale.c * Math.min(plan.summaryTokensPlanned, P.NARRATIVE_MAX ?? 4000);
 				out.callCost += call;
 				out.summaries++;
-				if (coldPlan) out.coldSummaries++; else { out.warmSummaries++; summarizedWarm = true; }
+				if (coldPlan) out.coldSummaries++; else out.warmSummaries++;
+				summarizedWarm = true;
+				regrow = plan.ctxAfterFolds;
 				if (!coldPlan) {
 					const uncachedK = scale.c * Math.max(plan.prefixTokens - prevSum, 0) / 1000;
 					const outTok = Math.min(Math.max(0.1 * (X / scale.c - prevSum), 1000), 4000) * scale.c;

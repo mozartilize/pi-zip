@@ -571,3 +571,192 @@ user's `/compact focus`) are left alone. The README tells handler authors to ret
 * Item 3, as above.
 * The A2 calibration class (now 4 / 22). It is P2-3; the new members are traces whose path moved at a switch.
 * The cause of the 250 ms on the user's session (item 4b) is inferred, not observed. The notice now records it on the next occurrence.
+
+## Round 4: the review of 4795af3 (P0-1, P0-2, P1-1..3, P2) and the model's blind spots
+
+Branch rc030, on top of 4795af3. "Before" is 4795af3's `src`, "after" is this commit's, both under this round's checker (the same
+bridge, spec and suites for both columns: the before column is re-run, not copied from round 3).
+
+### What was fixed
+
+| finding | fix | regression test (fails on 4795af3, checked by running the new tests against 4795af3's `src` in a worktree) |
+|---|---|---|
+| **P0-1** restart forgets driven cold wakes | `run.ts summarizedSince`: a custom message that follows a run's end is a return, judged by `detectCold` at its timestamp; a prompt and the custom messages Pi stores next to it are one return (the same rule as `buildBlocks`). | `restart.test.ts` "a run an extension's message started after a cold gap is a cold return" (4795af3: flag true); "... after a refused request is a return too"; "a prompt and the nextTurn message ... are one return" (a guard against counting the message twice; 4795af3 passes it because it ignores custom messages) |
+| **P0-1, design** "one summary per warm stretch" never expires | The flag lapses once the context (after folds) has grown back to the size the stretch's summary started from (`regrowAt`, `plan.ts`; `summaryRegrow`, `run.ts`, stored as `details.regrow` on pi-zip's compaction entries and restored on resume; older entries have no size and keep the old rule). Growth since the summary is then at least what it removed, so a second summary gains what the first did; the law alone decides. `justEdited` (b2b) is unchanged. | `plan.test.ts` "noSummary lapses at regrowAt"; `restart.test.ts` "the size the summary started from is restored with the flag"; `pi-integration.test.ts` checks `details.regrow` on the entry |
+| **P0-2** a prompt plus a custom message Pi appends counts as two turns | `buildBlocks`: a user message and a custom message that starts a turn clear `afterAnswer`. | `plan.test.ts` "a prompt followed by the custom messages Pi stores after it is ONE turn" (4795af3: 1 1 2 3 3 4 5 5), "the protected tail with a nextTurn message after each prompt" |
+| **P1-1** keys that do not type a prompt start a paid call | The key listener no longer starts on a key: after each key (off the input path, `setImmediate`) it reads `ctx.ui.getEditorText()`; non-empty text that does not start with `/` starts the summary. Ctrl+C, Ctrl+D, Esc, arrows, `/quit`, `/resume` start nothing. Without `getEditorText` nothing is armed. | `pi-integration.test.ts` "keys that do not type a prompt start nothing" (4795af3: 1 call at Ctrl+D), "a command typed and erased, then a prompt" |
+| **P1-2** key path and prompt disagree about a dead cache | Arming and the key's plan use `detectCold` with the learned survival (`coldNow`), and plan with that P(warm) and pastTtl. | `pi-integration.test.ts` "a cache learned to outlive its declared TTL" (4795af3: armed, 1 call) |
+| **P1-3** same provider is not same tokenizer | `plan.ts sameTokenizer`: the same provider and either a vendor's own API (anthropic, openai, google, xai, zai, deepseek, moonshot, minimax, xiaomi; not azure or mistral, whose catalogs list other vendors' models) or the same recognised model family (Claude, GPT, Gemini, ...); unrecognised ids on a multi-vendor provider get the defaults. README sentence corrected. The formal bridge's two models are now `claude-m1`/`claude-m2` (one tokenizer, as its world has one c). | `calibration.test.ts` "a multi-vendor provider: ... GPT -> Claude falls back to the defaults" (4795af3 with a same-provider rule: c 0.9) |
+| P2 first-key latency | Planning runs in `setImmediate`, never inside the input listener. | the first-keystroke test counts projections built inside the listener (4795af3: 1) |
+| P2 swallowed driven run | An `agent_start` taken for a prompt's run checks the run's first `message_end`: a custom message there means the prompt failed before its run (no `agent_start` came for it) and this is a driven run; its start of run runs then, before the first request. | `pi-integration.test.ts` "a prompt that fails before its run starts does not swallow the next driven run's start" (4795af3: the warm plan of the stale start) |
+| P2 flaky timing test | The remainder test now uses a 2 s call and bounds 200-1,800 ms (about 0.8 s of slack each way). | (not a behaviour) |
+| P2 checks that do not discriminate | The two item-5 tests stay as they are (they document behaviour); the discriminating checks are the new ones above and the formal `drive` events below. | |
+
+Found by this round's checker over the new events, fixed (both are part of "GC, TR, RD and protection must hold over them"):
+
+* **A driven run after a failed request joined the failed run's turn.** `buildBlocks` ended a run only at a final
+  answer; a refused or aborted request ends it too. The turn stayed protected and kept a 20K output from folding (cold return at
+  52.6K against 40K). `traces/tr-drive-after-error.trace`; tests: `plan.test.ts` "a custom message after a failed or aborted request
+  starts a turn", `restart.test.ts` (the same rule in `summarizedSince`).
+* **A summary could not keep from a driven run's custom message.** pi-zip cut only at user
+  and assistant messages, so the kept tail in front of a driven run began at the previous turn's final answer (60.6K left of a 40K
+  target, 29K of it that answer). Pi's own cut points include custom messages (`compaction.js isCutPointMessage`); `plan.ts isCutBlock`
+  and the guard now accept a custom message that starts a turn. `traces/tr-cut-at-drive.trace`; test: `plan.test.ts` "a summary before
+  a driven run keeps from the custom message that started it" (4795af3: no cut).
+
+Together: TR 4 -> 0 on the suite and 13 -> 6 on seed 7, against HEAD before these two fixes (the 6 left fail with every drive turned
+into a prompt as well; see below).
+
+### Replay of the regrowth rule (the review's acceptance condition)
+
+`formal/replay/replay.ts` on the 3 recorded sessions (the `zipnotice` set: 6,160 requests, 277 user turns, 76 cold returns). The replay
+now keeps `summarizedWarm` as run.ts does (every summary sets it, a cold one too; round 3's replay set it only for warm summaries), so
+every column below was re-run with it. `PZ_NO_REGROW=1` runs the same source with the flag never lapsing. 0.2.8 cannot be replayed
+(it lacks `wireTokensOf` and other exports the tool needs), so the comparison is 4795af3 against HEAD.
+
+| source | summaries (cold / warm) | warm rewrites | rewritten K | wait s | cost M | lost |
+|---|---|---|---|---|---|---|
+| 4795af3 | 95 (42 / 53) | 43 | 5,314 | 4,014 | 139.74 | 21 |
+| HEAD, flag never lapses | 95 (42 / 53) | 43 | 5,444 | 4,024 | 140.98 | 20 |
+| **HEAD** | 95 (40 / 55) | 44 | 5,502 | 4,070 | **140.16** | 21 |
+
+The regrowth rule lowers the estimated cost by 0.58% against the same source without it (2 more warm summaries, 2 fewer cold ones),
+so it is accepted. HEAD is 0.30% above 4795af3: that is the turn-boundary fixes (P0-2 and the two TR fixes), which protect more of
+session 1 (its prompts carry before_agent_start custom messages): one output fewer is lost there (18 -> 17), and the warm rewrites
+of what the cold return now has to protect cost a little more (the NR "window slide" class, below). Three sessions, no interval.
+
+### The model's blind spots, closed
+
+**(a) Environment.** `model.rs` has two new events. `drive +gap` starts a run the way Pi 1.1.0 `sendCustomMessage(triggerTurn)` ->
+`_runAgentPrompt` does (the bridge fires `agent_start`, appends the custom message, fires its `message_end`, then the first request;
+never `before_agent_start`); it is a new user turn. `nextturn` is a custom message stored right after a prompt (the prompt's turn).
+The bridge's fresh-process probe (RD) replays drives as drives and nextTurn messages with their prompt; A1 holds custom messages to
+"never rewritten, never dropped by position". A new exhaustive family (3,584 traces: explicit and 128K-window worlds, depth 3, bodies
+`q p b n` with `n` = a nextTurn message, specials `drive` (after 1 h), `drive-warm` (after 60 s), `drive-restart` (a cold wake, then a
+restart)), and the random generator turns 12% of the runs after the first into drives and adds a nextTurn message to 10% of the
+prompts (from a second stream seeded from the first, so the rest of each trace is what the seed drew before; about 69% of the seed-7
+traces now contain one or the other). The suite is 33,924 exhaustive + 3,000 random = 36,924 traces.
+
+**(b) Completeness.** New property **WL, a warm summary that pays is not withheld**: (a) every warm turn_end of a request that did
+not fail asks the valve (a decision point exists), unless the request carried a fresh edit (b2b skip) or the run plan is persisted
+there; (b) at a warm decision the one-summary flag constrained, the bridge re-plans with the flag lifted (`free`); if that plan has a
+cut whose summary step and whole-plan step (the call priced) pass with Φ >= 1.25 and the real decision has no cut, the flag is
+excused only while a pi-zip summary (or another extension's compaction) was made since the last cold plan and the context has not
+grown back past the size it started from (10%). NT is restated to match: a second summary in one warm stretch is excused at the
+room or once the context has regrown to the first one's starting size.
+
+*Limit of WL:* its oracle is the real planner with the flag lifted. A pi-zip whose planner never proposes a summary (a broken
+`planContext`) has the same oracle, so (b) cannot see it; (a) sees a valve that is never asked; LW, MP and TR see a broken law or
+candidate search. A planner-independent oracle (the spec computing the best cut from the blocks and pricing it with `law.rs`) is
+the next step and is not built.
+
+**(c) Mutants** (`tests/mutants.rs`, each passes on this `src` and fails on the mutant; 29 mutant tests, all pass):
+
+| test | property | mutant | trace |
+|---|---|---|---|
+| `wl_the_one_summary_flag_lapses` | WL | the flag never lapses (4795af3's rule) | `traces/wl-regrow.trace`: at request 80 the context is back at 100K, the summary started from 75K, a summary with Φ 5.3 is withheld |
+| `wl_a_restart_knows_a_driven_cold_wake` | WL | 4795af3's restore (prompts only, no regrowth rule) | `traces/wl-drive-restart.trace` |
+| `gc_a_driven_run_after_the_ttl_is_cold` | GC | the `agent_start` handler dropped (2cda8e1 and earlier) | `traces/gc-drive.trace` |
+| `pw_a_nexturn_message_is_not_a_turn` | PW | P0-2 reverted | `traces/pw-nextturn.trace` |
+| `tr_a_driven_run_after_a_failed_request_is_a_turn` | TR | a failed request does not end the run's turn | `traces/tr-drive-after-error.trace` |
+| `tr_a_summary_may_keep_from_a_driven_runs_message` | TR | cut only at user/assistant messages | `traces/tr-cut-at-drive.trace` |
+
+Counterexamples 4795af3 gives:
+
+* **WL**, `traces/wl-drive-restart.trace` (P0-1): a warm summary at request 27, a drive after 1 h (planned cold: the live process
+  clears the flag), a restart, then growth. The resumed process restores the flag; at request 81 "the one-summary flag is set, but pi-zip
+  made no summary since the last cold plan (request 53); it withholds a summary that pays (Phi 5.30, context 100,509)". On seed 7 it
+  also fails WL once in the "never lapses" class (shrunk to 59 events: at request 38 the context is 79.2K, the stretch's summary started
+  from 71.9K, a summary with Φ 1.26 is withheld). The standard suite does not reach WL on 4795af3 (it needs a warm summary and then
+  long low-growth stretches); the two regression traces do.
+* **PW / NT / A3** (P0-2), shrunk to 7 events: `prompt; say 100; prompt +60s; say 60K; prompt +60s; nextturn; say 100`: the warm run
+  plan at request 2 summarises the previous turn's 60K answer ("run summary keeps from ..., after the start of protected turn 2"); NT
+  calls it a summary of 217 tokens of conversation into 10K, and the user waits for it (A3). PW fails in 1,579 suite traces and 3,194 of
+  15,000 on seed 7.
+* **TR** over drives: the two traces above (52.6K and 60.6K against 40K).
+
+### Checker table
+
+`pz-formal check --src SRC --suite standard --random 3000 --seed 1 --workers 26 --shrink 40` (36,924 traces, 307,635 requests) and
+`--suite none --random 15000 --seed 7` (15,000 traces, 553,441 requests), both sources under this round's checker:
+
+| property | suite 4795af3 | suite HEAD | seed 7 4795af3 | seed 7 HEAD |
+|---|---|---|---|---|
+| A1, I1, B2B, MP, WB, MPr, LW, G, W | 0 | 0 | 0 | 0 |
+| A2 / A2r | 5 / 5 | 4 / 4 | 23 / 23 | 24 / 24 |
+| A3 | 185 | **24** | 230 | **96** |
+| RD / RDr | 0 / 0 | 0 / 0 | 1 / 1 | 2 / 2 |
+| RC | 0 | 0 | 1 | 1 |
+| PW | 1,579 | **0** | 3,194 | **0** |
+| NR | 139 | 141 | 309 | 338 |
+| NT | 73 | **0** | 6 | **0** |
+| **WL** (new) | 0 | 0 | 1 | **0** |
+| TR | 2 | **0** | 22 | **6** |
+| GC | 0 | 0 | 1 | 1 |
+| MH | 2 | 2 | 7 | 7 |
+
+How to read the rest:
+* A3 24 on the suite: 14 "cold return after a restart" (the P1-1 trade of round 3), 7 B2 warm returns, 2 returns before the timer, 1
+  prepared summary not used; all classes from round 3. Compared trace by trace with HEAD before the two TR fixes, the fixes add 2 (a B2
+  warm summary and a restart return whose path moved).
+* NR +2 / +29: more is protected now (the turn fixes), and outputs the cold return protected are folded warm a prompt later: the
+  deferred "window slide, folds" class (137 of 141).
+* Seed 7, compared trace by trace: RD +1 (trace 589) and A2 +1 net are path shifts into existing classes. The RD class ("clock") also
+  fails on 4795af3 on its shrunk form (`prompt; call npm 1K; say 100; switch; prompt +60s; fail error; prompt +60s; say 100`): after a
+  switch whose first request was refused, the live process remembers the new model as the last one asked, a fresh one reads the branch
+  (refused requests skipped) and sees the switch. TR 6, GC 1, RC 1, RD 2 on seed 7 were each re-run with every `drive` turned into a
+  `prompt` and every `nextturn` removed: all still fail, so none is caused by the new events.
+
+Tests at this commit: `bun test` 469 pass, 0 fail; `bunx tsc --noEmit` clean; `bun run build-check` clean; `cargo test --release` in
+`formal/`: 10 unit + 1 bridge + 29 mutants pass, 0 ignored; `cargo clippy --release --all-targets` clean.
+
+### (d) Coverage against recorded sessions
+
+`bun formal/coverage/coverage.ts /work/sessions-archive` reads every Pi session file under the directory
+(read-only; counts only, no names) and maps each entry of the newest branch onto the model: 305 sessions, 49,408 entries.
+
+| kind | model event | entries | sessions |
+|---|---|---|---|
+| tool result / request with one tool call | Call | 20,076 / 17,264 | 302 / 299 |
+| request that answers | Say | 2,247 | 296 |
+| run start: custom message answered before any prompt | **Drive** | 1,271 | 16 |
+| run start: user prompt | Prompt | 703 | 23 |
+| model_change entry / switch between requests | Switch | 362 / 44 | 305 / 26 |
+| request failed / aborted | Fail error / abort | 205 / 26 | 29 / 8 |
+| another extension's context_edit | Edit | 172 | 26 |
+| steering | Steer | 141 | 12 |
+| Pi's idle cache warming | World warming | 66 | 2 |
+| another extension's compaction | Foreign | 9 | 2 |
+| zip_recall result | Call recall | 7 | 3 |
+| pi-zip's own folds / summaries, extension state entries | (pi-zip's decisions; not in the context) | 94 / 32, 2,037 | |
+
+**Not expressible** (every kind the recorded sessions contain that the model cannot say):
+
+| kind | entries | sessions | why it may matter |
+|---|---|---|---|
+| thinking blocks in a response | 13,748 | 285 | sizes only (the model's tokens are text); pi-zip never edits thinking |
+| several tool calls in one request | 1,264 | 229 | a turn_end follows several results at once: the valve sees a bigger step than the model's one-call requests |
+| custom message followed directly by another (several stored between runs or before one) | 1,573 | 4 | the turn rule (the first starts the turn) is unit-tested, not model-checked |
+| custom message delivered mid-run (an extension's steer / followUp) | 518 | 40 | `Steer` is a user message; a custom one is the same turn by the same rule, but not in the model |
+| system prompt or tool set changed mid-session | 407 | 290 | calibration's O moves with the system state (calibrate's `S`); the model has one system prompt |
+| thinking level change | 340 | 305 | no effect on the planner |
+| the session's first run started by a custom message (a subagent's task) | 284 | 284 | the model's first run is a prompt; every subagent session starts this way |
+| custom message stored before the prompt that follows it | 5 | 2 | the model's `nextturn` follows its prompt (Pi 1.1.0's order); the other order is unit-tested |
+| more than two models | 4 sessions | 4 | the model has two |
+| entries on other branches (/tree, fork, rewind) | 1 | 1 | one linear branch |
+
+Not visible in session files at all, so not counted: restarts and resumes (no entry), and the gaps a cache warmer bridges (only its
+`usage` entries). No recorded session has the Pi 1.1.0 order "prompt, then its nextTurn message" (0 entries): the recordings are from
+older Pi versions or from extensions that do not use nextTurn; P0-2 rests on Pi 1.1.0's source (`agent-session.js` prompt), not on a
+recording.
+
+### Deferred, with the reason
+
+* **The refused request after a switch (RD "clock", 1-2 traces on seed 7, also on 4795af3).** The fix is one line (restore
+  `lastModelKey` on a refused request, as `lastReqMs` already is), but it is outside this review and every source change costs another
+  full checker run; listed for the next round.
+* **A planner-independent oracle for WL**: see the limit above.
+* **Item 3, A2 calibration class, NR window slide (B2 for folds), MH 2, A3 restart trade**: unchanged from rounds 2 and 3, for the
+  reasons given there.
+* **The two item-5 tests the review calls non-discriminating** are kept: they still state behaviour (one start per prompt; a warm
+  driven run plans like a warm prompt). The discriminating tests are the new ones.

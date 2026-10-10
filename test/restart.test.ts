@@ -136,6 +136,36 @@ describe("summarizedWarm: a pi-zip summary since the last cold return", () => {
 		const b = [entry("u0", user(at(0) - 1)), entry("a0", resp(60_000, at(0))), native, entry("u1", user(at(30))), entry("a1", resp(8_000, at(30) + 1_000))];
 		expect(fresh(b).summarizedWarm).toBe(true);
 	});
+	// review P0-1: a run an extension's message starts (owed-drive, dsa-attention) begins with a custom message, never a user prompt; the
+	// walk skipped it, so a restart after "summary, driven cold wake, warm turns" restored summarizedWarm = true and warm summaries stayed off
+	const custom = (id: string, ts: number): Any => ({ type: "custom_message", id, customType: "owed-drive", content: "drive", display: true, timestamp: new Date(ts).toISOString() });
+	test("a run an extension's message started after a cold gap is a cold return: the flag is cleared (old code: true)", () => {
+		const b = [...base, entry("u1", user(at(1))), entry("a1", resp(8_000, at(1) + 1_000)), custom("k2", at(30)), entry("a2", resp(8_500, at(30) + 1_000)), entry("u3", user(at(31))), entry("a3", resp(9_000, at(31) + 1_000))];
+		expect(fresh(b).summarizedWarm).toBe(false);
+		// the same driven run inside the TTL is a warm return: the flag stays
+		const warm = [...base, entry("u1", user(at(1))), entry("a1", resp(8_000, at(1) + 1_000)), custom("k2", at(3)), entry("a2", resp(8_500, at(3) + 1_000))];
+		expect(fresh(warm).summarizedWarm).toBe(true);
+	});
+	test("a prompt and the nextTurn message Pi stores right after it are one return: the message neither uses up the native skip nor counts again", () => {
+		const native = summary({ details: { by: PRODUCT, trigger: "cold", via: "native" }, timestamp: new Date(at(30)).toISOString() });
+		// u1 is the cold return the native summary was made for; k1 rides with it (stored after it, same moment); a2 answers both
+		const b = [entry("u0", user(at(0) - 1)), entry("a0", resp(60_000, at(0))), native, entry("u1", user(at(30))), custom("k1", at(30)), entry("a1", resp(8_000, at(30) + 1_000)), entry("u2", user(at(31))), entry("a2", resp(8_200, at(31) + 1_000))];
+		expect(fresh(b).summarizedWarm).toBe(true);
+		// a custom message mid-run (after a tool call's answer is pending) is no return either
+		const mid = [...base, entry("u1", user(at(1))), entry("t1", resp(8_000, at(1) + 1_000, { stopReason: "toolUse" })), custom("k1", at(30)), entry("a1", resp(8_200, at(30) + 1_000))];
+		expect(fresh(mid).summarizedWarm).toBe(true); // u1 was warm; k1 arrived inside that run (no final answer before it): no return
+	});
+	test("a run an extension's message starts after a refused request is a return too (the failed run ended there)", () => {
+		const b = [...base, entry("u1", user(at(1))), entry("x1", resp(0, at(1) + 1_000, { stopReason: "error", usage: undefined })), custom("k2", at(30)), entry("a2", resp(8_500, at(30) + 1_000))];
+		expect(fresh(b).summarizedWarm).toBe(false);
+	});
+	test("the size the summary started from is restored with the flag (the flag lapses when the context grows back to it)", () => {
+		const b = [entry("u0", user(at(0) - 1)), entry("a0", resp(60_000, at(0))), summary({ timestamp: new Date(at(0)).toISOString(), details: { by: PRODUCT, trigger: "cold", regrow: 61_234 } }), entry("u1", user(at(1))), entry("a1", resp(8_000, at(1) + 1_000))];
+		const f = fresh(b);
+		expect(f.summarizedWarm).toBe(true);
+		expect(f.summaryRegrow).toBe(61_234);
+		expect(fresh(base).summaryRegrow).toBeUndefined(); // an older summary that kept no size: the flag never lapses (as before)
+	});
 	test("no summary of ours on the branch: false (Pi's own compaction is not one)", () => {
 		expect(fresh([entry("u0", user(at(0))), entry("a0", resp(60_000, at(0) + 1)), summary({ details: undefined, fromHook: false })]).summarizedWarm).toBe(false);
 	});

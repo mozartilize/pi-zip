@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { applyPlanToMessages, buildBlocks, compactionRoom, contentKeyOf, planContext, rebaseFolds, RELAX_PREV_TURN, settings, spliceNative, summaryGainOk, legacyValve, VALVE_MIN_REDUCTION, type Cut, type FoldTarget, type PlanOpts, type RunPlan } from "../src/plan.ts";
 import { A, AX, flat, longTurn, R, U, type Any } from "./helpers.ts";
+import { validateEdits } from "../src/guard.ts";
+const blockIdx = (blocks: { entryId: string | null }[], id: string) => blocks.findIndex((b) => b.entryId === id);
 
 const opts = (over: Partial<PlanOpts> = {}): PlanOpts => ({ coldCap: 60_000, cwd: process.cwd(), promptPending: true, ...over });
 
@@ -92,6 +94,16 @@ describe("summary gain gate", () => {
 		expect(planContext(view, opts({ coldCap: 6000, promptPending: false, mode: "warm", noSummary: true }))?.cutIdx ?? null).toBeNull();
 		const tiny = { contextWindow: 60_000 }; // ~83K estimated context is above this room
 		expect(planContext(view, opts({ coldCap: 6000, promptPending: false, mode: "warm", noSummary: true, model: tiny }))!.cutIdx).not.toBeNull();
+	});
+	// review P0-1 (design): "one summary per warm stretch" never expired; it now lapses once the context has grown back to the size the
+	// last summary started from (the growth since is at least what it removed: a second summary gains what the first did)
+	test("noSummary lapses at regrowAt: a context grown back to the size the last summary started from may be summarised again", () => {
+		const view = [...sumCtx, U("u4", "back")];
+		const p = planContext(view, opts({ coldCap: 6000, promptPending: false, mode: "warm" }))!;
+		const now = p.ctxAfterFolds; // the real context after folds the regrow rule compares
+		expect(planContext(view, opts({ coldCap: 6000, promptPending: false, mode: "warm", noSummary: true, regrowAt: now + 1 }))?.cutIdx ?? null).toBeNull();
+		expect(planContext(view, opts({ coldCap: 6000, promptPending: false, mode: "warm", noSummary: true, regrowAt: now }))!.cutIdx).toBe(p.cutIdx);
+		expect(planContext(view, opts({ coldCap: 6000, promptPending: false, mode: "warm", noSummary: false, regrowAt: now + 1 }))!.cutIdx).toBe(p.cutIdx); // no flag: nothing to lapse
 	});
 	test("the next summary is planned at least as big as the previous one it carries (no re-summary of a small new prefix)", () => {
 		const SUM = "S".repeat(48_000); // previous summary ~12K tokens, as in a real migrated session
@@ -438,6 +450,53 @@ describe("driven runs (an extension's triggerTurn message): turn boundaries", ()
 		const e = [U("u1", "first"), A("a1", ["c1"]), R("r1", "c1", 400), A("a2"), C("k1"), A("a3", ["c2"]), R("r2", "c2", 400), C("k2"), A("a4"), C("k3"), U("u2", "typed"), A("a5")];
 		// u1 a1 r1 a2 | k1 a3 r2 k2(mid-run: after a tool result) a4 | k3 u2 (one turn) a5
 		expect(turns(e)).toEqual([1, 1, 1, 1, 2, 2, 2, 2, 2, 3, 3, 3]);
+	});
+
+	// review P0-2: Pi 1.1.0 stores the prompt FIRST and then the nextTurn / before_agent_start messages that ride with it
+	// (agent-session.js prompt); a user message never cleared afterAnswer, so that custom message started a turn of its own: three prompts
+	// counted as five turns, and "the current turn and the previous one" covered only the current prompt
+	test("a prompt followed by the custom messages Pi stores after it is ONE turn (user then custom, as Pi 1.1.0 appends them)", () => {
+		const e = [U("u1", "a"), A("a1"), U("u2", "b"), C("k2"), A("a2"), U("u3", "c"), C("k3"), C("k3b")];
+		expect(turns(e)).toEqual([1, 1, 2, 2, 2, 3, 3, 3]); // old code: 1 1 2 3 3 4 5 5
+		// a driven run's starter followed by another custom message (before_agent_start of a later prompt is not involved): one turn
+		expect(turns([U("u1", "a"), A("a1"), C("k1"), C("k1b"), A("a2")])).toEqual([1, 1, 2, 2, 2]);
+		// steering after a final answer (the run goes on) and a custom message after it: the same run
+		expect(buildBlocks([U("u1", "a"), A("a1"), U("s1", "also"), C("k1"), A("a2")], new Set(["s1"])).map((b) => b.userTurn)).toEqual([1, 1, 1, 1, 1]);
+	});
+
+	// formal TR, round 4: a run that ended in a failed (refused) or aborted request is over; the run an extension's message starts next
+	// is a new turn (old code: it joined the failed run's turn, which then stayed protected and kept a 20K output from folding)
+	test("a custom message after a failed or aborted request starts a turn (the run ended there)", () => {
+		const err = (id: string, stopReason: string) => {
+			const message = { role: "assistant", content: [], stopReason, timestamp: 1 };
+			return { sourceEntry: { id, type: "message", message }, messages: [message] };
+		};
+		expect(turns([U("u1", "a"), A("a1", ["c1"]), R("r1", "c1", 400), err("x1", "error"), C("k1"), A("a2")])).toEqual([1, 1, 1, 1, 2, 2]);
+		expect(turns([U("u1", "a"), err("x1", "aborted"), C("k1"), A("a2")])).toEqual([1, 1, 2, 2]);
+	});
+
+	test("the protected tail with a nextTurn message after each prompt is still the current prompt and the previous one", () => {
+		const e: Any[] = [];
+		for (let i = 1; i <= 4; i++) e.push(U(`u${i}`, `p${i}`), C(`k${i}`), A(`a${i}`, [`c${i}`]), R(`r${i}`, `c${i}`, 20_000), AX(`e${i}`, 30_000));
+		const p = planContext(e, { cwd: process.cwd(), coldCap: 3000, promptPending: false })!;
+		// the latest two user turns are prompts 3 and 4: nothing of turn 3 may be cut (old code: turns 6..8 were 3's and 4's, so the
+		// window covered only prompt 4 and its nextTurn message, and prompt 3's turn was summarised)
+		expect(p.cutIdx).not.toBeNull();
+		const firstKept = p.blocks[p.cutIdx!];
+		expect(firstKept.userTurn).toBeLessThanOrEqual(3);
+		const kept = p.blocks.slice(p.cutIdx!).map((b) => b.entryId);
+		for (const id of ["u3", "k3", "a3", "r3", "e3", "u4", "k4"]) expect(kept).toContain(id);
+	});
+
+	// formal TR, round 4: a summary may keep from the custom message that started a run (Pi's own cut points include it); before, the
+	// first kept block had to be a user or assistant message, so the kept tail in front of a driven run began at the previous turn's
+	// final answer (29K of prose kept at a cold return)
+	test("a summary before a driven run keeps from the custom message that started it, not from the previous final answer", () => {
+		const e = [U("u1", "the one real prompt"), A("a1", ["c1"]), R("r1", "c1", 30_000), AX("a2", 60_000), C("k2"), AX("a3", 400)];
+		const p = planContext(e, { cwd: process.cwd(), coldCap: 3000, promptPending: true })!;
+		expect(p.cutIdx).not.toBeNull();
+		expect(p.firstKeptEntryId).toBe("k2"); // old code: "a2" (the 60K answer stayed)
+		expect(validateEdits(p.blocks, { folds: new Map(p.folds.map((f) => [blockIdx(p.blocks, f.entryId), f.ph])), recover: new Map(p.folds.map((f) => [blockIdx(p.blocks, f.entryId), f.recover])), cut: p.cutIdx }, p.userTurns)).toBeNull();
 	});
 
 	test("with no custom messages nothing changes (prompts count as before; steering stays in its turn)", () => {

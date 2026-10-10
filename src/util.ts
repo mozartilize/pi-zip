@@ -106,7 +106,8 @@ export function tokensOf(m: Any): number {
 
 /** Is this raw terminal input the user typing? Reports the terminal sends by itself (focus in/out, cursor position, cell size, device
  *  attributes and mode replies, a kitty-keyboard flags reply, mouse events, OSC/DCS/APC strings) are not. Everything else is: a letter,
- *  a control key, an arrow or function key (CSI), a paste. Only used to decide when to start work; the data is never touched. */
+ *  a control key, an arrow or function key (CSI), a paste. Only a filter: whether the user is typing a prompt is decided from the
+ *  editor text after the key (run.ts armOnFirstKey); the data is never touched. */
 export function isKeystroke(data: string): boolean {
 	if (!data) return false;
 	if (/^\x1b\[[IO]$/.test(data)) return false; // focus in / out

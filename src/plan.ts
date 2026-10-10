@@ -348,12 +348,14 @@ export function calibrate(entries: Any[], sys?: SysInfo, branch: Any[] = [], mod
 		}
 		const best = ev.sort((a, b) => b.at - a.at)[0];
 		let O = best ? Math.max(0, best.O + (best.S >= 0 && S >= 0 ? R0 * (Snow - best.S) : 0)) : R0 * Snow, oSource: Scale["oSource"] = best?.src ?? "default";
-		// the scale of the newest other model of the same provider (a model switch before the new model's first response)
+		// the scale of the newest other model of the same provider AND the same model family (a model switch before the new model's first
+		// response): a multi-vendor provider (github-copilot, openrouter, opencode, bedrock, ...) serves several tokenizers
 		const sameProviderScale = (key: string): Scale | null => {
 			const prov = key.split("/")[0];
 			if (!key || !prov) return null;
-			const other = [...resp].reverse().find((r) => r.key && r.key !== key && r.key.split("/")[0] === prov)?.key
-				?? [...branch].reverse().map((e) => (e?.type === "message" && promptOf(e.message) > 0 ? respKey(e.message) : "")).find((k) => k && k !== key && k.split("/")[0] === prov);
+			const kin = (k: string) => !!k && k !== key && sameTokenizer(k, key);
+			const other = [...resp].reverse().find((r) => kin(r.key))?.key
+				?? [...branch].reverse().map((e) => (e?.type === "message" && promptOf(e.message) > 0 ? respKey(e.message) : "")).find(kin);
 			const o = other ? fit(other, false) : null;
 			return o && o.source === "usage" && o.oSource !== "default" ? o : null;
 		};
@@ -402,6 +404,30 @@ export function calibrate(entries: Any[], sys?: SysInfo, branch: Any[] = [], mod
 	return fit(model || [...resp].reverse().find((r) => r.key)?.key || "", true);
 }
 
+/** The model family a model id belongs to, by the vendor names model ids carry (null: not recognised). */
+const FAMILIES: [RegExp, string][] = [
+	[/claude|anthropic|opus|sonnet|haiku/, "anthropic"], [/gpt|codex|openai|(^|[/.~])o[1-9]([-.]|$)/, "openai"], [/gemini|gemma|google/, "google"], [/grok|x-ai|xai/, "xai"],
+	[/glm|z-ai|zai/, "zai"], [/kimi|moonshot/, "moonshot"], [/deepseek/, "deepseek"], [/qwen|alibaba/, "qwen"], [/minimax/, "minimax"],
+	[/mistral|codestral|devstral|magistral|ministral|pixtral/, "mistral"], [/llama|meta/, "meta"], [/mimo|xiaomi/, "xiaomi"],
+];
+export function modelFamily(id: string): string | null {
+	const s = id.toLowerCase();
+	const hits = new Set(FAMILIES.filter(([re]) => re.test(s)).map(([, f]) => f));
+	return hits.size === 1 ? [...hits][0] : null; // none, or ambiguous ("anthropic/claude" is one; "glm-on-mistral" style ids are not guessed)
+}
+/** Providers that serve only their vendor's models (Pi's catalog; mistral is not one: it lists GLM models too). */
+const FIRST_PARTY = new Set(["anthropic", "openai", "openai-codex", "google", "google-vertex", "xai", "zai", "zai-coding-cn", "deepseek", "moonshotai", "moonshotai-cn", "kimi-coding", "minimax", "minimax-cn", "xiaomi", "xiaomi-token-plan-ams", "xiaomi-token-plan-cn", "xiaomi-token-plan-sgp"]);
+/** Do two models ("provider/id") count tokens alike? The same provider, and either a vendor's own API or the same recognised model
+ *  family: a multi-vendor provider (github-copilot: GPT, Claude, Gemini, Grok; openrouter) is not one tokenizer. Unrecognised ids of a
+ *  multi-vendor provider never match (the defaults stand). */
+export function sameTokenizer(a: string, b: string): boolean {
+	const ia = a.indexOf("/"), ib = b.indexOf("/");
+	if (ia <= 0 || ib <= 0 || a.slice(0, ia) !== b.slice(0, ib)) return false;
+	if (FIRST_PARTY.has(a.slice(0, ia))) return true; // a vendor's own API serves its own models
+	const fa = modelFamily(a.slice(ia + 1)), fb = modelFamily(b.slice(ib + 1));
+	return fa !== null && fa === fb;
+}
+
 /** The cold cap's target in real tokens of the WHOLE context (system prompt and tools included, as the cap was tuned): max(cap, O + cap/2),
  *  never above Pi's compaction room. While O is under half the cap this is the plain whole-context cap. Above that the target is O plus
  *  half the cap of conversation: never at or below O, where no edit reaches it (0.2.9's 40K with O = 29-55K summarised at every cold
@@ -446,7 +472,7 @@ export const countUserTurns = (blocks: Block[]): number => blocks.reduce((a, b) 
 export function buildBlocks(contextEntries: Any[], steerIds?: Set<string>): Block[] {
 	const blocks: Block[] = [];
 	let userTurn = 0;
-	let afterAnswer = false; // the newest block is an assistant's final answer (a run ended there)
+	let afterAnswer = false; // the newest block is an assistant message that ended a run (a final answer, a failed or aborted request)
 	let starter = false; // a custom message started the turn that is open (no assistant message since)
 	let asst = 0; // assistant messages so far
 	const issued = new Map<string, number>(); // tool call id -> ordinal of the latest assistant message that issued it (ids may be reused)
@@ -473,14 +499,19 @@ export function buildBlocks(contextEntries: Any[], steerIds?: Set<string>): Bloc
 		// pi-runway's owed-drive, durable-subagents' attention; Pi starts a run from it without before_agent_start, and nothing else in the
 		// session says "the user is here"). Such a message follows the previous run's final answer; one that arrives mid-run follows a tool
 		// result and belongs to that run. A prompt that directly follows its own starter (a nextTurn message is stored before the prompt it
-		// rides with) is the same turn: one start, however many entries it took.
+		// rides with) is the same turn: one start, however many entries it took. Pi 1.1.0 stores a prompt FIRST and then the nextTurn and
+		// before_agent_start messages that ride with it (agent-session.js prompt): those follow a user message, not an answer, so they never
+		// start a turn of their own (every start clears afterAnswer).
 		if (kind === "user") {
 			if (!(src.id && steerIds?.has(src.id)) && !starter) userTurn++;
 			starter = false;
+			afterAnswer = false;
 		} else if (msgs.some((m) => m?.role === "custom")) {
-			if (afterAnswer) { userTurn++; starter = true; }
+			if (afterAnswer) { userTurn++; starter = true; afterAnswer = false; }
 		} else if (kind === "assistant" || kind === "toolResult") starter = false;
-		if (kind === "assistant") afterAnswer = msg.stopReason !== "toolUse" && msg.stopReason !== "error" && msg.stopReason !== "aborted";
+		// a run ends at its final answer, and also at a request that failed or was aborted (Esc): a custom message after either starts
+		// the next run (formal TR, round 4: a driven run after a refused request was counted into the failed run's turn)
+		if (kind === "assistant") afterAnswer = msg.stopReason !== "toolUse";
 		else if (kind === "toolResult") afterAnswer = false;
 		const ours = edited && kind === "toolResult" && textOf(msg.content).startsWith(PH_MARK);
 		if (kind === "assistant") {
@@ -494,6 +525,11 @@ export function buildBlocks(contextEntries: Any[], steerIds?: Set<string>): Bloc
 	for (const b of blocks) if (b.kind === "toolResult") b.age = asst - asstOf[b.idx];
 	return blocks;
 }
+
+/** Where a summary may cut (the first kept block): a user or assistant message, or an extension's custom message (Pi's own cut points
+ *  include it: compaction.js isCutPointMessage). Without the custom message, the turn a run an extension started could only be kept
+ *  from the previous turn's final answer on (formal TR, round 4: 50K of answer kept in front of a driven run). */
+export const isCutBlock = (b: Block): boolean => !!b.entryId && (b.kind === "user" || b.kind === "assistant" || (b.kind === "other" && b.msg?.role === "custom"));
 
 export function toolCallIndex(blocks: Block[]): Calls {
 	const m: Calls = new Map();
@@ -572,6 +608,8 @@ export interface PlanOpts {
 	minGain?: number;
 	inturnAge?: number; // default settings().inturnAge (PI_ZIP_INTURN_AGE, 60); 0 = outputs of the protected turns never fold on age
 	noSummary?: boolean; // a summary was already made while this cache stayed warm: no second one unless the context is at/above the compaction room
+	regrowAt?: number; // with noSummary: the real context (after folds) the last summary started from; once the context has grown back to it (the
+	// growth since that summary is at least what it removed), a second summary gains what the first did and the law alone decides again
 	rereadOnly?: boolean; // zip_recall is not available to the model: fold only outputs that can be re-read (classify "rereadable")
 	fileRecall?: FileRecall; // zip_recall is hidden but read, grep or bash is active: fold as in full mode, placeholders name the recall file
 	pastTtl?: boolean; // a user return after the declared TTL: a warm plan may relax into the previous user turn too (RELAX_PREV_TURN)
@@ -746,7 +784,8 @@ export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
 	const floor = prevSum + blocks.reduce((a, b) => a + (protectedTurn(b) ? (tokOverride.get(b.idx) ?? b.tokens) : 0), 0);
 	const target = Math.max(coldCap, floor + SUMMARY_FLOOR);
 	const atRoom = room !== null && real(ctxAfterFolds) >= room;
-	const sumTrigger: "cold" | "valve" | null = ctxAfterFolds > target && (!o.noSummary || atRoom) ? trig : null;
+	const noSummary = !!o.noSummary && !(o.regrowAt !== undefined && o.regrowAt > 0 && real(ctxAfterFolds) >= o.regrowAt);
+	const sumTrigger: "cold" | "valve" | null = ctxAfterFolds > target && (!noSummary || atRoom) ? trig : null;
 	let cutIdx: number | null = null;
 	let prefixTokens = 0;
 	let summaryTokensPlanned = 0;
@@ -768,7 +807,7 @@ export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
 	 *  Applies the first cut both laws accept (folds in the prefix are void) and returns true, or changes nothing. */
 	const summarise = (maxCut: number, gated: boolean): boolean => {
 		const cuts: number[] = [];
-		for (let i = minCut; i < blocks.length && i <= maxCut; i++) if (blocks[i].entryId && (blocks[i].kind === "user" || blocks[i].kind === "assistant")) cuts.push(i);
+		for (let i = minCut; i < blocks.length && i <= maxCut; i++) if (isCutBlock(blocks[i])) cuts.push(i);
 		if (!cuts.length) return false;
 		let acc = 0;
 		for (let i = 0; i < blocks.length; i++) {
@@ -805,7 +844,7 @@ export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
 		const limit = blocks.findIndex((b) => protectedTurn(b));
 		summarise(limit >= 0 ? limit : blocks.length - 1, true);
 	}
-	if (f2 && cutIdx === null && law.pr && ctxAfterFolds > coldCap && (!o.noSummary || atRoom)) {
+	if (f2 && cutIdx === null && law.pr && ctxAfterFolds > coldCap && (!noSummary || atRoom)) {
 		// F2 lookahead: the warm valve's plan at the next user turn (this context, its folds applied, the window slid by one turn). If it
 		// would summarise, the summary is written now, at the cold return, where the rewrite costs nothing extra (and at settle it is
 		// prepared while the user is away), instead of one turn later as a warm rewrite the user waits for.

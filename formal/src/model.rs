@@ -130,10 +130,16 @@ pub enum Tool {
 /// writes between runs, `Compact` is Pi's own compaction (its threshold, an overflow or /compact; between runs or mid-run), `Edit`
 /// is another extension's context_edit of the oldest output the model still sees (anywhere). The away timer and Pi's cache
 /// warming are not environment events: the clock fires them.
+/// `Drive` starts a run the way an extension's message does (Pi 1.1.0 `sendCustomMessage(..., { triggerTurn: true })` ->
+/// `_runAgentPrompt`: agent_start, the custom message appended, the first request; never before_agent_start): pi-runway's owed-drive,
+/// durable-subagents' attention. It is a new user turn, as a prompt is (README rule 3's protected turns). `NextTurn` is a custom
+/// message Pi stores right after a prompt (a nextTurn message, or a before_agent_start handler's message): part of the prompt's turn.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "e", rename_all = "lowercase")]
 pub enum Event {
     Prompt { gap: u32 },
+    Drive { gap: u32 },
+    NextTurn,
     Call { tool: Tool, size: u32 },
     Say { size: u32 },
     Fail { abort: bool },
@@ -146,6 +152,10 @@ pub enum Event {
     Edit,
 }
 impl Event {
+    /// Events that start a run: a prompt, or a custom message that triggers a turn.
+    pub fn starts_run(&self) -> bool {
+        matches!(self, Event::Prompt { .. } | Event::Drive { .. })
+    }
     /// Events that happen outside a run and belong to the run they precede.
     pub fn is_special(&self) -> bool {
         matches!(self, Event::Switch | Event::Restart | Event::Foreign { .. } | Event::Wait { .. } | Event::Compact | Event::Edit)
@@ -202,6 +212,8 @@ impl fmt::Display for Event {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Event::Prompt { gap } => write!(f, "prompt +{}", dur(*gap)),
+            Event::Drive { gap } => write!(f, "drive +{}", dur(*gap)),
+            Event::NextTurn => write!(f, "nextturn"),
             Event::Call { tool, size } => match tool {
                 Tool::Recall => write!(f, "call recall"),
                 Tool::Npm => write!(f, "call npm {}", k(*size)),
@@ -296,6 +308,8 @@ impl Trace {
                     }
                 }
                 "prompt" => events.push(Event::Prompt { gap: w.get(1).map(|g| num(g.trim_start_matches('+'))).transpose()?.unwrap_or(0) }),
+                "drive" => events.push(Event::Drive { gap: w.get(1).map(|g| num(g.trim_start_matches('+'))).transpose()?.unwrap_or(0) }),
+                "nextturn" => events.push(Event::NextTurn),
                 "call" => {
                     let tool = match w.get(1).copied() {
                         Some("npm") => Tool::Npm,
@@ -334,7 +348,7 @@ impl Trace {
                 .iter()
                 .map(|e| match e {
                     Event::Call { size, .. } | Event::Say { size } | Event::Foreign { size } => *size as u64 / 100,
-                    Event::Prompt { gap } | Event::Wait { gap } => *gap as u64 / 60,
+                    Event::Prompt { gap } | Event::Drive { gap } | Event::Wait { gap } => *gap as u64 / 60,
                     _ => 10,
                 })
                 .sum::<u64>()
@@ -361,6 +375,8 @@ pub struct BlockObs {
     pub recall_of: Option<String>,
     /// a user message typed while the agent ran (steering, follow-up): part of the current turn
     pub steer: bool,
+    /// a custom message that started a run (`Drive`): a new user turn; a custom message riding with a prompt (`NextTurn`) is not
+    pub starts: bool,
 }
 
 /// One message of a request as sent: its hash, real tokens, and what it is.
@@ -462,9 +478,25 @@ pub struct Grid {
     pub p: f64,
     pub past_ttl: bool,
     pub no_summary: bool,
+    /// with no_summary: the real context (after folds) at which the flag lapses (the size the stretch's summary started from)
+    pub regrow_at: Option<f64>,
     pub g: Option<f64>,
     pub pr: Option<Prices>,
     pub grid: Vec<GridPt>,
+    /// WL's oracle: a warm decision the one-summary flag constrained, planned again at the actual P with the flag lifted
+    pub free: Option<FreePlan>,
+}
+
+/// The plan a warm decision would have made without the one-summary-per-warm-stretch flag (everything else as captured).
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct FreePlan {
+    pub plan: bool,
+    pub cut: Option<String>,
+    pub folds: Vec<String>,
+    pub after_folds: Option<f64>,
+    pub law: Vec<LawStep>,
+    pub error: Option<String>,
 }
 impl Grid {
     pub fn actual(&self) -> Option<&GridPt> {
@@ -481,6 +513,7 @@ pub struct ZipState {
     pub g: Option<f64>,
     pub just_edited: bool,
     pub summarized_warm: bool,
+    pub summary_regrow: Option<f64>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -598,6 +631,14 @@ pub struct Block {
     pub req: i64,
     pub recall_of: Option<String>,
     pub steer: bool,
+    /// a custom message that started a run (a new user turn)
+    pub starts: bool,
+}
+impl Block {
+    /// The block that starts a user turn: a prompt (not steering), or a custom message that started a run.
+    pub fn starts_turn(&self) -> bool {
+        (self.kind == "user" && !self.steer) || (self.kind == "custom" && self.starts)
+    }
 }
 
 /// What a block looks like in one request: shown as is, folded to a placeholder, or summarised away (not in the request).
@@ -678,6 +719,7 @@ impl Run {
                 req: b.req,
                 recall_of: b.recall_of.clone(),
                 steer: b.steer,
+                starts: b.starts,
             })
             .collect();
         let by_id = blocks.iter().enumerate().map(|(i, b)| (b.id.clone(), i)).collect();
@@ -703,14 +745,14 @@ impl Run {
             let switched = i > 0 && self.obs.ticks[i - 1].model != t.model;
             let s0 = t.state0.as_ref();
             let (believed_cold, p, past_ttl) = if t.n == 0 { s0.map(|s| (s.cold, s.p_warm.unwrap_or(1.0), s.past_ttl)).unwrap_or((false, 1.0, false)) } else { (false, 1.0, false) };
-            let user_turns = self.blocks.iter().filter(|b| b.kind == "user" && !b.steer && b.req <= i as i64).count() as u32;
+            let user_turns = self.blocks.iter().filter(|b| b.starts_turn() && b.req <= i as i64).count() as u32;
             let recalled = self.blocks.iter().filter(|b| b.recover == Recover::RecallResult && b.req < i as i64).filter_map(|b| b.recall_of.clone()).collect();
             let appended = self
                 .blocks
                 .iter()
                 .filter(|b| match b.kind.as_str() {
                     "assistant" | "toolResult" => b.req == i as i64 - 1,
-                    "user" | "foreignSummary" => b.req == i as i64 && (i == 0 || b.req > self.obs.ticks[i - 1].req as i64),
+                    "user" | "custom" | "foreignSummary" => b.req == i as i64 && (i == 0 || b.req > self.obs.ticks[i - 1].req as i64),
                     _ => false,
                 })
                 .map(|b| b.tok)

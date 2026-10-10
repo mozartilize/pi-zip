@@ -159,10 +159,13 @@ function withFile(manager: Any): Any {
 interface World { cls: "explicit" | "automatic"; known: boolean; ttl: number; ttlTrue: number; survival: "none" | "outlives"; c: number; sys: number; window: number; native: boolean; interactive: boolean; tier: "short" | "long"; tools: "full" | "file" | "reread"; warming: boolean }
 const DEFAULT_WORLD: World = { cls: "explicit", known: true, ttl: 300, ttlTrue: 300, survival: "none", c: 1, sys: 3000, window: 200_000, native: true, interactive: true, tier: "short", tools: "full", warming: false };
 const LONG_TTL = 3600; // the 1-hour tier
+// the two models a switch moves between: one vendor's family (the world has one tokenizer scale c), so pi-zip may carry the session's
+// scale across a switch (plan.ts sameTokenizer)
+const MODEL_IDS = ["claude-m1", "claude-m2"];
 
 function seedStats(w: World) {
 	const models: Any = {};
-	for (const id of ["m1", "m2"]) {
+	for (const id of MODEL_IDS) {
 		const e: Any = { bins: {}, n: 0 };
 		if (w.known) e.cls = w.cls;
 		if (w.survival === "outlives") {
@@ -192,7 +195,7 @@ async function runTrace(tr: Any): Promise<Any> {
 	// the cache lifetime the provider really keeps: on the long tier the declared hour, scaled like the short tier's truth
 	const ttlTrueS = long ? Math.round((LONG_TTL * w.ttlTrue) / w.ttl) : w.ttlTrue;
 	const cost = w.warming ? { input: 15, output: 75, cacheRead: 1.5, cacheWrite: 18.75 } : { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 };
-	const models = ["m1", "m2"].map((id) => ({ provider: "p", id, api: "anthropic-messages", contextWindow: w.window, maxTokens: 8192, reasoning: false, input: ["text"], cost, promptCache: { short: w.ttl, long: LONG_TTL } }));
+	const models = MODEL_IDS.map((id) => ({ provider: "p", id, api: "anthropic-messages", contextWindow: w.window, maxTokens: 8192, reasoning: false, input: ["text"], cost, promptCache: { short: w.ttl, long: LONG_TTL } }));
 	let mi = 0;
 	const sysText = body("SYSTEM", w.sys);
 	const sm = withFile(SessionManager.inMemory(CWD));
@@ -365,6 +368,7 @@ async function runTrace(tr: Any): Promise<Any> {
 		for (const e of manager.getBranch()) if (e.type === "message" && e.message) byHash.set(sha(llmJson(e.message)), e.id);
 		for (const pe of proj.entries) for (const m of pe.messages ?? []) {
 			if (pe.sourceEntry?.id) byMsg.set(m, pe.sourceEntry.id);
+			if (pe.sourceEntry?.type === "custom_message") byHash.set(sha(llmJson(m)), pe.sourceEntry.id); // an extension's message (drive, nextturn)
 			const src = pe.sourceEntry;
 			if (src?.type === "message" && src.message?.role === "toolResult") byCall.set(src.message.toolCallId, src.id);
 		}
@@ -446,7 +450,19 @@ async function runTrace(tr: Any): Promise<Any> {
 			const after = r ? r.ctxAfterFolds - (r.cutIdx !== null ? c * (r.prefixTokens - r.summaryTokensPlanned) : 0) : null;
 			out.push({ p, actual: p === actual, mode, plan: !!r, ahead: !!r?.ahead, folds: r ? r.folds.map((f: Any) => f.entryId) : [], cut: r?.firstKeptEntryId ?? null, prefix: r ? c * r.prefixTokens : 0, sum: r ? c * r.summaryTokensPlanned : 0, before: r?.ctxTokens ?? null, afterFolds: r ? r.ctxAfterFolds : null, after, law: o.trace.map((t: Any) => ({ at: t.where, ok: t.ok, B: t.B, A: t.A, T: t.T, K: t.K, phi: t.phi, eta: t.eta, ...(t.cut !== undefined ? { cut: t.cut } : {}) })) });
 		}
-		return { at: cap.at, mode: cap.mode, p: actual, pastTtl: !!(cap.live?.pastTtl ?? cap.o.pastTtl), noSummary: !!cap.o.noSummary, g: cap.o.law?.g ?? null, pr: cap.o.law?.pr ?? null, grid: out };
+		// WL's oracle: a warm decision the one-summary-per-warm-stretch flag constrained, planned again at the actual P with the flag lifted
+		// (everything else as captured): the summary the flag kept out, if any, and the law's verdict on it
+		let free: Any = null;
+		if (cap.mode === "warm" && cap.o.noSummary) {
+			const o = { ...cap.o, pastTtl: cap.live?.pastTtl ?? cap.o.pastTtl, law: { ...cap.o.law, pWarm: actual }, noSummary: false, regrowAt: undefined, trace: [] };
+			try {
+				const r = plan.planContext(cap.entries, o);
+				free = { plan: !!r, cut: r?.firstKeptEntryId ?? null, folds: r ? r.folds.map((f: Any) => f.entryId) : [], afterFolds: r ? r.ctxAfterFolds : null, law: o.trace.map((t: Any) => ({ at: t.where, ok: t.ok, B: t.B, A: t.A, T: t.T, K: t.K, phi: t.phi, eta: t.eta, ...(t.cut !== undefined ? { cut: t.cut } : {}) })) };
+			} catch (err) {
+				free = { error: String(err) };
+			}
+		}
+		return { at: cap.at, mode: cap.mode, p: actual, pastTtl: !!(cap.live?.pastTtl ?? cap.o.pastTtl), noSummary: !!cap.o.noSummary, regrowAt: cap.o.regrowAt ?? null, g: cap.o.law?.g ?? null, pr: cap.o.law?.pr ?? null, grid: out, free };
 	}
 
 	// A second pi-zip instance on the live session, never driven: the model's way back to a folded output (its zip_recall, its
@@ -499,6 +515,8 @@ async function runTrace(tr: Any): Promise<Any> {
 		const originals = new Map<string, Any>();
 		for (const e of branch) if (e.type === "message") originals.set(e.id, e.message);
 		const origHashes = new Set([...originals.values()].map((m) => sha(llmJson(m))));
+		// extensions' messages (a run's starter, a prompt's nextTurn message) as Pi projects them: pi-zip never rewrites them
+		for (const pe of sm.buildSessionProjection().entries) if (pe.sourceEntry?.type === "custom_message") for (const m of pe.messages ?? []) origHashes.add(sha(llmJson(m)));
 		const visible = new Set<string>();
 		const folded: { id: string; text: string }[] = [];
 		desc.forEach((d: Any, k: number) => {
@@ -508,14 +526,14 @@ async function runTrace(tr: Any): Promise<Any> {
 				else if (d.ph) folded.push({ id: d.id, text: textOfMsg(view[k]) });
 				else if (sha(llmJson(o)) !== d.h) { if (!foreignEdited.has(d.id)) issues.push(`toolResult ${d.id} rewritten but not a pi-zip placeholder`); }
 				else visible.add(d.id);
-			} else if (d.role === "user" || d.role === "assistant" || d.role === "system") {
+			} else if (d.role === "user" || d.role === "assistant" || d.role === "system" || d.role === "custom") {
 				if (!origHashes.has(d.h)) issues.push(`${d.role} message rewritten (${d.id ?? "?"})`);
 				if (d.id) visible.add(d.id);
 			}
 		});
 		// by position: the conversation the request carries is the session's, from its first kept message to the newest, one to one
 		// and in order (a summary may stand for a prefix; nothing in between may go missing)
-		const convo = branch.filter((e: Any) => e.type === "message" && e.message?.role !== "system").map((e: Any) => e.id);
+		const convo = branch.filter((e: Any) => (e.type === "message" && e.message?.role !== "system") || e.type === "custom_message").map((e: Any) => e.id);
 		const kept = desc.filter((d: Any) => d.role !== "system" && !d.sum);
 		if (kept.some((d: Any) => !d.id)) issues.push(`the request carries ${kept.filter((d: Any) => !d.id).length} message(s) the session does not hold`);
 		else if (kept.length) {
@@ -582,7 +600,7 @@ async function runTrace(tr: Any): Promise<Any> {
 	const TRANSPLANT: Record<string, string[]> = {
 		g: ["g", "deltas"],
 		justEdited: ["justEdited"],
-		summarizedWarm: ["summarizedWarm"],
+		summarizedWarm: ["summarizedWarm", "summaryRegrow"],
 		clock: ["lastReqMs", "lastModelKey", "prevTotal", "prevKey"],
 	};
 	const KNOWN = ["g", "justEdited", "summarizedWarm"]; // TRIAGE (a) 1: the three fields the session does not carry
@@ -616,6 +634,7 @@ async function runTrace(tr: Any): Promise<Any> {
 		}
 	}
 	let probeAt = 0;
+	let probeNextTurn: Any[] = []; // custom messages that rode with the prompt of the run the fresh probe replays (nextturn)
 	let ncSeen = 0;
 	let statsAtPrompt = "";
 	async function freshInner(snapshot: Any[], userMsg: Any, liveDesc: Any[], transplant: Any | null) {
@@ -626,10 +645,21 @@ async function runTrace(tr: Any): Promise<Any> {
 		try {
 			await fire(inst, "session_start", { type: "session_start", reason: "resume" });
 			if (transplant && inst.zip) Object.assign(inst.zip, structuredClone(transplant));
-			await fire(inst, "before_agent_start", { type: "before_agent_start", prompt: userMsg.content, images: [] });
-			await fire(inst, "agent_start", { type: "agent_start" }); // Pi emits it right after before_agent_start (a run an extension's message starts emits only this one)
-			sm2.appendMessage(structuredClone(userMsg));
-			await fire(inst, "message_end", { message: userMsg });
+			if (userMsg.role === "custom") {
+				// a run an extension's message starts: agent_start only, then the message (Pi 1.1.0 _runAgentPrompt)
+				await fire(inst, "agent_start", { type: "agent_start" });
+				sm2.appendCustomMessageEntry(userMsg.customType, userMsg.content, userMsg.display);
+				await fire(inst, "message_end", { message: userMsg });
+			} else {
+				await fire(inst, "before_agent_start", { type: "before_agent_start", prompt: userMsg.content, images: [] });
+				await fire(inst, "agent_start", { type: "agent_start" }); // Pi emits it right after before_agent_start (a run an extension's message starts emits only this one)
+				sm2.appendMessage(structuredClone(userMsg));
+				await fire(inst, "message_end", { message: userMsg });
+				for (const c of probeNextTurn) {
+					sm2.appendCustomMessageEntry(c.customType, c.content, c.display);
+					await fire(inst, "message_end", { message: c });
+				}
+			}
 			const raw = sm2.buildSessionContext().messages;
 			const out = await fire(inst, "context_with_system", { type: "context_with_system", messages: raw });
 			const view = out?.messages ?? raw;
@@ -803,7 +833,7 @@ async function runTrace(tr: Any): Promise<Any> {
 			waitRun: narrativeCalls.slice(nc0, nc1).filter((c) => c.phase === "present").length,
 			waitTe: narrativeCalls.slice(nc1).filter((c) => c.phase === "present").length,
 			grids: [...planGrids, ...teGrids],
-			zip: { g: z?.g ?? null, justEdited: !!z?.justEdited, summarizedWarm: !!z?.summarizedWarm },
+			zip: { g: z?.g ?? null, justEdited: !!z?.justEdited, summarizedWarm: !!z?.summarizedWarm, summaryRegrow: z?.summaryRegrow ?? null },
 		};
 		ncSeen = nc1;
 		probeAt = T0 + t0 * 1000;
@@ -884,7 +914,44 @@ async function runTrace(tr: Any): Promise<Any> {
 					blocks.push({ id: uid, ev, kind: "user", tok: tokW(userMsg), est: Math.ceil(text.length / 4), turn, tool: null, req: reqNo });
 					await fire(live, "message_end", { type: "message_end", message: userMsg });
 					const liveState = Object.fromEntries(Object.values(TRANSPLANT).flat().map((f) => [f, z0[f]]));
+					probeNextTurn = [];
 					pendingProbe = lastResp ? { snapshot, userMsg, liveState: structuredClone(liveState) } : null;
+					break;
+				}
+				case "drive": {
+					// a run an extension's message starts (Pi 1.1.0 sendCustomMessage(..., { triggerTurn: true }) -> _runAgentPrompt):
+					// agent_start, the custom message appended, its message_end, the first request; never before_agent_start
+					await closeRun(ev);
+					if (lastResp) await advance((e.gap ?? 60) * 1000);
+					turn++;
+					runNo++;
+					reqInRun = 0;
+					runOpen = true;
+					const snapshot = [sm.getHeader(), ...sm.getEntries()];
+					statsAtPrompt = existsSync(STATS) ? readFileSync(STATS, "utf8") : "";
+					const z0: Any = live.zip ?? {};
+					preRun = { sw: !!z0.summarizedWarm, je: !!z0.justEdited };
+					await fire(live, "agent_start", { type: "agent_start" });
+					const text = `owed work ${turn}: continue with what was left open`;
+					const cm = { role: "custom", customType: "owed-drive", content: text, display: true, timestamp: clock };
+					const cid = sm.appendCustomMessageEntry(cm.customType, cm.content, cm.display);
+					blocks.push({ id: cid, ev, kind: "custom", starts: true, tok: tokW(cm), est: Math.ceil(text.length / 4), turn, tool: null, req: reqNo });
+					await fire(live, "message_end", { type: "message_end", message: cm });
+					const liveState = Object.fromEntries(Object.values(TRANSPLANT).flat().map((f) => [f, z0[f]]));
+					probeNextTurn = [];
+					pendingProbe = lastResp ? { snapshot, userMsg: cm, liveState: structuredClone(liveState) } : null;
+					break;
+				}
+				case "nextturn": {
+					// a custom message Pi stores right after the prompt (a nextTurn message, a before_agent_start handler's message): the
+					// prompt's turn
+					if (!runOpen || reqInRun > 0) throw new Error(`event ${ev} (nextturn) not right after a prompt`);
+					const text = `context for request ${turn}: the notes the user keeps`;
+					const cm = { role: "custom", customType: "topping-prompt", content: text, display: false, timestamp: clock };
+					const cid = sm.appendCustomMessageEntry(cm.customType, cm.content, cm.display);
+					blocks.push({ id: cid, ev, kind: "custom", starts: false, tok: tokW(cm), est: Math.ceil(text.length / 4), turn, tool: null, req: reqNo });
+					await fire(live, "message_end", { type: "message_end", message: cm });
+					probeNextTurn.push(cm);
 					break;
 				}
 				case "call":
