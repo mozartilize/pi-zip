@@ -444,7 +444,7 @@ async function runTrace(tr: Any): Promise<Any> {
 			}
 			const c = r ? (r.scale?.c ?? r.k ?? 1) : 1;
 			const after = r ? r.ctxAfterFolds - (r.cutIdx !== null ? c * (r.prefixTokens - r.summaryTokensPlanned) : 0) : null;
-			out.push({ p, actual: p === actual, mode, plan: !!r, ahead: !!r?.ahead, folds: r ? r.folds.map((f: Any) => f.entryId) : [], cut: r?.firstKeptEntryId ?? null, prefix: r ? c * r.prefixTokens : 0, sum: r ? c * r.summaryTokensPlanned : 0, before: r?.ctxTokens ?? null, afterFolds: r ? r.ctxAfterFolds : null, after, law: o.trace.map((t: Any) => ({ at: t.where, ok: t.ok, B: t.B, A: t.A, T: t.T, K: t.K, phi: t.phi, eta: t.eta })) });
+			out.push({ p, actual: p === actual, mode, plan: !!r, ahead: !!r?.ahead, folds: r ? r.folds.map((f: Any) => f.entryId) : [], cut: r?.firstKeptEntryId ?? null, prefix: r ? c * r.prefixTokens : 0, sum: r ? c * r.summaryTokensPlanned : 0, before: r?.ctxTokens ?? null, afterFolds: r ? r.ctxAfterFolds : null, after, law: o.trace.map((t: Any) => ({ at: t.where, ok: t.ok, B: t.B, A: t.A, T: t.T, K: t.K, phi: t.phi, eta: t.eta, ...(t.cut !== undefined ? { cut: t.cut } : {}) })) });
 		}
 		return { at: cap.at, mode: cap.mode, p: actual, pastTtl: !!(cap.live?.pastTtl ?? cap.o.pastTtl), noSummary: !!cap.o.noSummary, g: cap.o.law?.g ?? null, pr: cap.o.law?.pr ?? null, grid: out };
 	}

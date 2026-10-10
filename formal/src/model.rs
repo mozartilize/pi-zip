@@ -419,6 +419,8 @@ pub struct LawStep {
     pub k: Option<f64>,
     pub phi: Option<f64>,
     pub eta: Option<f64>,
+    /// a whole-plan step only: the plan it judges has a cut (the source reports it; older sources do not)
+    pub cut: Option<bool>,
 }
 
 /// One plan the planner would make at this decision point, at one P(warm) (everything else held fixed).

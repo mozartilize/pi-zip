@@ -863,26 +863,43 @@ pub fn law_mismatch(r: &R, i: usize) -> Option<String> {
             ));
         }
         let gg = g.g.unwrap_or(2500.0);
+        let reports_cut = g.grid.iter().any(|pt| pt.law.iter().any(|x| x.at == "plan" && x.cut.is_some()));
         for pt in &g.grid {
+            // a plan with a cut ends in an accepted whole-plan step that carries its cut (and so the summary call); a plan without one
+            // has no such accepted step (it would have applied the cut). Only for a source that reports the flag.
+            if reports_cut && !pt.law.is_empty() && !pt.ahead {
+                let last = pt.law.iter().rev().find(|x| x.at == "plan");
+                let cut_ok = last.map(|x| x.ok && x.cut == Some(true)).unwrap_or(false);
+                if pt.cut.is_some() && !cut_ok {
+                    return Some(format!("{} plan at P={}: a cut is planned, but the law has no accepted whole-plan step for a cut (the summary call was never priced into the plan)", g.at, pt.p));
+                }
+                if pt.cut.is_none() && cut_ok {
+                    return Some(format!("{} plan at P={}: no cut is planned, but the law accepted a whole-plan step with a cut", g.at, pt.p));
+                }
+            }
             for s in &pt.law {
                 let t = s.t.unwrap_or(s.a);
                 let call = match (s.at.as_str(), s.k) {
                     ("summary", Some(k)) => call_of(pr, s.b, s.a, pt.p, t, k),
-                    // the whole plan's step carries the summary call when it plans a cut (TRIAGE (a) 2): backed out of K like a summary's,
-                    // and it must be the call of the summary step recorded just before it (the same cut), when the summary law ran
-                    ("plan", Some(k)) => {
+                    // the whole plan's step carries the summary call exactly when it plans a cut (TRIAGE (a) 2). Review P1-3: pinned both
+                    // ways, by the flag the planner records on the step. A cut's step carries the call of the summary step recorded just
+                    // before it (the same cut), to the token; a folds-only plan's step has no call, so K is checked exactly as before the
+                    // call was priced into the plan (a source that does not report the flag has no call in any plan step, same rule).
+                    ("plan", Some(k)) if s.cut == Some(true) && !pt.ahead => {
                         let call = call_of(pr, s.b, s.a, pt.p, t, k);
-                        if call > 1e-6 * s.b.max(1.0) {
-                            let prev = pt.law.iter().take_while(|x| !std::ptr::eq(*x, s)).last().filter(|x| x.at == "summary");
-                            if let Some((ps, Some(pk))) = prev.map(|x| (x, x.k)) {
+                        let prev = pt.law.iter().position(|x| std::ptr::eq(x, s)).and_then(|j| j.checked_sub(1)).map(|j| &pt.law[j]).filter(|x| x.at == "summary");
+                        match prev.and_then(|x| x.k.map(|pk| (x, pk))) {
+                            Some((ps, pk)) => {
                                 let pc = call_of(pr, ps.b, ps.a, pt.p, ps.t.unwrap_or(ps.a), pk);
-                                if (pc - call).abs() > 1e-6 * call.max(1.0) {
+                                if (pc - call).abs() > 1e-6 * call.abs().max(pc.abs()).max(1.0) {
                                     return Some(format!("{} plan at P={}: the call in the plan step ({call:.0}) is not the call of the cut's summary step ({pc:.0})", g.at, pt.p));
                                 }
                             }
+                            None => return Some(format!("{} plan at P={}: a whole-plan step for a cut with no summary step before it", g.at, pt.p)),
                         }
                         call
                     }
+                    ("plan", Some(k)) if pt.ahead && s.cut == Some(true) => call_of(pr, s.b, s.a, pt.p, t, k), // a lookahead summary passes no summary gate
                     _ => 0.0,
                 };
                 if call < -1e-6 * s.b.max(1.0) {
