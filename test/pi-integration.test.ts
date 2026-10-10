@@ -422,7 +422,7 @@ describe("real Pi: another extension's session_before_compact handler takes part
 		expect(r.compactCalls).toEqual({ n: 1, ended: 1 });
 		expect(comps(r)).toEqual([]); // nothing went in during the run
 		const drafts = await finishTurn(r);
-		expect(drafts.filter((d) => d.type === "compaction").map((d) => d.details)).toEqual([{ by: "pi-zip", trigger: "cold" }]);
+		expect(drafts.filter((d) => d.type === "compaction").map((d) => d.details)).toEqual([{ by: "pi-zip", trigger: "cold", carried: true }]);
 		expect(comps(r)).toHaveLength(1);
 		expect(rows("native_off").map((x) => x.reason)).toEqual(["another session_before_compact handler ran before pi-zip's (cancelled after 200 ms)"]);
 	});

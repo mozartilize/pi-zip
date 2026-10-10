@@ -2,7 +2,7 @@
 import { classifyRecoverability, type Recover } from "./classify.ts";
 import { handleFor, makePlaceholderFor, pickKeyLines, RECALL_TOOL, shortArgs } from "./placeholder.ts";
 import { createHash } from "node:crypto";
-import { type Any, PRODUCT, clamp, envInt, piTokensOf, textOf, tok4, tokensOf } from "./util.ts";
+import { type Any, COMMIT_CUSTOM, PRODUCT, clamp, envInt, piTokensOf, textOf, tok4, tokensOf } from "./util.ts";
 import { PH_MARK } from "./placeholder.ts";
 import { MIN_EXPECT, type Prices } from "./learn.ts";
 import { commandNamesRecall, parseRecallPath, type FileRecall } from "./recallfile.ts";
@@ -226,26 +226,67 @@ function firstRequest(branch: Any[], key: string): { real: number; est: number; 
 	return null;
 }
 
+/** chars/4 of the context the request behind the response `id` carried, rebuilt from the branch the way Pi projects it: the newest
+ *  compaction before the response, the entries it keeps, everything after it, and the edits persisted before the response, plus the
+ *  edits of a run plan persisted right after it (their commit entry says the response itself carried them). null: `id` is not on the
+ *  branch. Used when a compaction written after the response (Pi's own, another extension's) removed that request's content from the
+ *  projection, so the projection cannot say what the response measured. */
+function requestEst(branch: Any[], id: string): number | null {
+	const at = branch.findIndex((e) => e?.id === id);
+	if (at < 0) return null;
+	const pre = branch.slice(0, at);
+	const edit = new Map<string, Any>();
+	for (const e of pre) if (e?.type === "context_edit") edit.set(e.targetId, e.replacement);
+	for (let i = at + 1; i < branch.length && !(branch[i]?.type === "message" || branch[i]?.type === "compaction"); i++) {
+		const e = branch[i];
+		if (e?.type === "custom" && e.customType === COMMIT_CUSTOM) {
+			if (e.data?.carried) for (let j = at + 1; j < i; j++) if (branch[j]?.type === "context_edit") edit.set(branch[j].targetId, branch[j].replacement);
+			break;
+		}
+	}
+	let ci = -1;
+	pre.forEach((e, i) => { if (e?.type === "compaction") ci = i; });
+	const kept = ci < 0 ? pre : [pre[ci], ...pre.slice(0, ci).slice(Math.max(0, pre.findIndex((e) => e?.id === pre[ci].firstKeptEntryId))).filter((e) => !(e?.type === "message" && e.message?.role === "system")), ...pre.slice(ci + 1)];
+	let est = 0;
+	for (const e of kept) {
+		if (e?.type === "compaction" || e?.type === "branch_summary") est += tokensOf({ role: "compactionSummary", summary: e.summary });
+		else if (e?.type === "custom_message") est += tokensOf({ role: "custom", content: edit.has(e.id) ? edit.get(e.id)?.content : e.content });
+		else if (e?.type === "message" && e.message) {
+			const rep = edit.get(e.id);
+			if (rep === null) continue;
+			const m = rep && e.message.role !== "system" ? { ...e.message, content: typeof rep.content === "string" && e.message.role !== "user" ? [{ type: "text", text: rep.content }] : rep.content } : e.message;
+			est += wireTokensOf(m);
+		}
+	}
+	return est;
+}
+
 /** O and c from the projection (`entries`) and, for the session's first request, the branch; `sys` stands in for a transcript without
  *  system messages. `model` = "provider/id" of the model the next request goes to (default: the newest response's): O and c are
  *  properties of the provider's tokenizer, so only that model's responses are evidence. With none, O = R0 x the system state and
  *  c = C0; with responses but no O evidence of its own (a model switch mid-session), O keeps the size another model measured in
  *  content units, X = O' / c' (the system prompt and tools tokenize like the content around them): real = c (X + E). */
 export function calibrate(entries: Any[], sys?: SysInfo, branch: Any[] = [], model?: string): Scale {
-	type Resp = { at: number; est: number; real: number; read: number; nSys: number; ts: number; key: string };
+	type Resp = { at: number; est: number; real: number; read: number; nSys: number; ts: number; key: string; id: string };
 	const resp: Resp[] = [];
 	const sysMsgs: Any[] = [];
-	const edits: { at: number; target: string }[] = [];
+	const edits: { at: number; target: string; foreign: boolean }[] = [];
+	const marks: { at: number; carried: boolean }[] = []; // pi-zip's commit entries: who first carried the edits right before them (run.ts commit)
 	const orig = new Map<string, { at: number; d: number }>(); // edited entries: tokens their originals add back
+	const withMsgs: number[] = [0]; // withMsgs[k]: entries before k that carry messages (a commit group has none inside it)
 	let est = 0, sysAt = 0; // sysAt: responses before the newest system message
 	entries.forEach((pe, at) => {
 		const src = pe.sourceEntry, msgs: Any[] = pe.messages ?? [];
-		if (src?.type === "context_edit") edits.push({ at, target: src.targetId });
+		withMsgs.push(withMsgs[at] + (msgs.length ? 1 : 0));
+		// an edit with a replacement that is not our placeholder is another extension's (never carried by a request of ours); one without
+		// (a bare entry) is judged by the size heuristics below
+		if (src?.type === "context_edit") edits.push({ at, target: src.targetId, foreign: "replacement" in src && !textOf(src.replacement?.content).startsWith(PH_MARK) });
+		if (src?.type === "custom" && src.customType === COMMIT_CUSTOM) marks.push({ at, carried: !!src.data?.carried });
 		if (src?.type === "message" && msgs.length === 1 && msgs[0] !== src.message) orig.set(src.id, { at, d: wireTokensOf(src.message) - wireTokensOf(msgs[0]) });
 		for (const m of msgs) {
 			if (m?.role === "system") { sysMsgs.push(m); sysAt = resp.length; continue; }
 			const real = promptOf(m);
-			if (real > 0) resp.push({ at, est, real, read: Number(m.usage.cacheRead) || 0, nSys: sysMsgs.length, ts: Number(m.timestamp) || 0, key: respKey(m) });
+			if (real > 0) resp.push({ at, est, real, read: Number(m.usage.cacheRead) || 0, nSys: sysMsgs.length, ts: Number(m.timestamp) || 0, key: respKey(m), id: src?.id ?? "" });
 			est += wireTokensOf(m);
 		}
 	});
@@ -257,7 +298,34 @@ export function calibrate(entries: Any[], sys?: SysInfo, branch: Any[] = [], mod
 	// a pi-zip summary persisted as a turn_end draft was request-local first (a run plan carries it before its entry exists); one that
 	// went in through Pi's compaction before the run (details.via "native") is carried after its entry, exactly like Pi's own
 	const local = !!head && head.details?.by === PRODUCT && head.details?.via !== "native";
+	// Was the request behind this response sent after the head compaction entry was written? The branch's order says (timestamps tie when
+	// a compaction follows a response in the same millisecond); without the branch the timestamps do.
+	const pos = new Map<string, number>();
+	if (head) branch.forEach((e, i) => { if (typeof e?.id === "string") pos.set(e.id, i); });
+	const afterHead = (r: Resp): boolean => {
+		const h = pos.get(head?.id), i = pos.get(r.id);
+		return h !== undefined && i !== undefined ? i > h : r.ts > headMs;
+	};
 	const opening = (r: { real: number; est: number } | null | undefined) => !!r && C0 * r.est <= 0.1 * r.real; // content small next to O
+
+	/** The first commit entry of the group of pi-zip edits that starts at entry `at` (none when a message comes first). */
+	const markOf = (at: number) => marks.find((m) => m.at > at && withMsgs[m.at] - withMsgs[at + 1] === 0);
+	/** Index of the newest response in `resp` before entry `at`. */
+	const respBefore = (at: number) => resp.reduce((k, r, i) => (r.at < at ? i : k), -1);
+	/** Tokens the originals add back for response i: edits persisted after it that its own request did not carry (the projection counts
+	 *  their placeholders). A commit entry says who carried them (a run plan: the response before the entry; a valve plan: the next one);
+	 *  with none (a session of an older version) the sizes decide, for the newest response only (`legacy`). */
+	const addBack = (i: number, legacy: boolean): number => {
+		let d = 0;
+		for (const x of edits) {
+			const t = orig.get(x.target);
+			if (x.at <= resp[i].at || !t || t.at >= resp[i].at) continue;
+			const m = x.foreign ? undefined : markOf(x.at);
+			if (m ? m.carried && respBefore(m.at) === i : !x.foreign && legacy) continue;
+			d += t.d;
+		}
+		return d;
+	};
 
 	const fit = (want: string, transfer: boolean): Scale => {
 		const mine = (r: Resp | undefined): r is Resp => !!r && (!want || !r.key || r.key === want);
@@ -266,11 +334,13 @@ export function calibrate(entries: Any[], sys?: SysInfo, branch: Any[] = [], mod
 		const f = branch.length ? firstRequest(branch, want) : head ? null : resp.find(mine); // the session's first request
 		if (f && opening(f)) ev.push({ at: -1, O: f.real - C0 * f.est, S: "S" in f ? f.S : sAt(f.nSys), src: "first" });
 		const ci = resp.findIndex((r, i) => i >= sysAt && mine(r)), cur = resp[ci]; // the first response sent with the current system prompt and tools
-		if (cur && (!head || cur.ts > headMs) && opening(cur)) ev.push({ at: ci, O: cur.real - C0 * cur.est, S, src: "first" });
+		// its content as its request carried it: edits persisted after it (a model switch, say, then a run plan's folds) are in `est`
+		const curEst = cur ? cur.est + addBack(ci, false) : 0;
+		if (cur && (!head || afterHead(cur)) && opening({ real: cur.real, est: curEst })) ev.push({ at: ci, O: cur.real - C0 * curEst, S, src: "first" });
 		if (head) {
 			// the summary at the head was first carried by the first response after its entry, or, for pi-zip's own request-local summary
 			// (a run plan), by the last one before it; Pi's, another extension's or a native pi-zip compaction is never sent before its entry
-			const after = resp.findIndex((r) => r.ts > headMs), ours = local;
+			const after = resp.findIndex((r) => afterHead(r)), ours = local;
 			for (const i of after < 0 ? (ours ? [resp.length - 1] : []) : ours ? [after - 1, after] : [after]) {
 				const r = resp[i], prev = resp[i - 1];
 				if (mine(r) && r.read > 0 && r.read < 0.8 * r.real && (!prev || r.read < 0.8 * prev.real)) { ev.push({ at: i, O: r.read, S: sAt(r.nSys), src: "summary" }); break; }
@@ -284,20 +354,27 @@ export function calibrate(entries: Any[], sys?: SysInfo, branch: Any[] = [], mod
 		if (n < 0) return { O, c: C0, real: 0, est: 0, source: "default", oSource };
 		const N = resp[n];
 		let estN = N.est;
-		const later = edits.filter((x) => x.at > N.at), cutLater = !!head && headMs > N.ts;
-		if (later.length || cutLater) {
-			// carried (a run plan): the prompt shrank, or a read stopped early; a cache miss alone (no read at all) proves nothing.
+		const cutLater = !!head && !afterHead(N);
+		const later = edits.filter((x) => x.at > N.at);
+		const rebuilt = cutLater && !local && !!N.id ? requestEst(branch, N.id) : null; // what its request carried: the compaction after it removed that from the projection
+		if (rebuilt !== null && rebuilt > 0) estN = rebuilt;
+		else if (later.length || cutLater) {
+			// carried (a run plan): the prompt shrank, or a read stopped early; a cache miss alone (no read at all) proves nothing. The
+			// commit entries of pi-zip's edits say it outright; the sizes decide only for edits without one (older sessions).
 			// Pi's own compaction is never request-local.
 			let p = n - 1;
 			while (p >= 0 && !mine(resp[p])) p--;
 			const P = resp[p];
-			const carried = !(cutLater && !local) && (!P || N.real < P.real || (N.read > 0 && N.read < 0.8 * P.real));
+			const heur = !P || N.real < P.real || (N.read > 0 && N.read < 0.8 * P.real);
+			const carried = !(cutLater && !local) && (cutLater && typeof head.details?.carried === "boolean" ? head.details.carried : heur);
 			if (!carried && cutLater) return { O, c: C0, real: N.real, est: 0, source: "default", oSource }; // what it carried is summarised away
-			if (!carried) for (const x of later) { const t = orig.get(x.target); if (t && t.at < N.at) estN += t.d; }
+			estN += addBack(n, heur && carried);
 		}
 		if (!best && transfer && estN > 0) {
 			// no O of its own: the newest other model's O in content units
-			const other = [...resp].reverse().find((r) => r.key && r.key !== want)?.key;
+			// (a compaction may have taken the other model's responses out of the projection: the branch still has them)
+			const other = [...resp].reverse().find((r) => r.key && r.key !== want)?.key
+				?? [...branch].reverse().map((e) => (e?.type === "message" && promptOf(e.message) > 0 ? respKey(e.message) : "")).find((k) => k && k !== want);
 			const o = other ? fit(other, false) : null;
 			if (o && o.oSource !== "default" && o.c > 0) {
 				const X = o.O / o.c, c = clamp(N.real / (X + estN), C_MIN, C_MAX);

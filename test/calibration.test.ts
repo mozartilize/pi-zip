@@ -448,3 +448,93 @@ describe("stats and notices use the plan's scale", () => {
 		expect(notes).toHaveLength(1);
 	});
 });
+
+// formal/TRIAGE.md (a) 4 (N1) and (a) 9 (TR): what the calibration takes from a response must be what that response's request carried
+describe("calibrate: the request behind a response (compactions, who carried which edit, a model switch)", () => {
+	const mark = (id: string, carried: boolean) => ({ sourceEntry: { id, type: "custom", customType: "pi-zip/commit", data: { carried } }, messages: [] });
+	const PH = "[folded by pi-zip · bash ls]\nkey line\nFull original is saved: call zip_recall(\"h\")";
+	const edit = (id: string, target: string, text = PH) => ({ sourceEntry: { id, type: "context_edit", targetId: target, replacement: { content: [{ type: "text", text }] } }, messages: [] });
+	const folded = (x: Any[], target: string, text = PH) => x.map((pe) => (pe.sourceEntry.id === target ? { sourceEntry: pe.sourceEntry, messages: [{ ...pe.messages[0], content: [{ type: "text", text }] }] } : pe));
+	const asBranch = (e: Any[]) => e.filter((x) => x.sourceEntry.message).map((x) => ({ type: "message", id: x.sourceEntry.id, message: x.sourceEntry.message }));
+
+	test("N1: Pi's (or another extension's) compaction written after the newest response: c is what that response's request measured, not C0 (the plan after it used 1.5 for a c of 1.0)", () => {
+		const T = Date.parse("2026-10-09T04:00:00Z");
+		const raw = session(6, 40_000);
+		provider(raw, 30_000, 2.2, ["a1", "a7"]); // a7 carried the whole pre-compaction context
+		for (const x of raw) Object.assign(x.sourceEntry.message, { timestamp: T - 1_000 });
+		const branch = asBranch(raw);
+		branch.push({ type: "compaction", id: "cmp", summary: "s".repeat(8_000), firstKeptEntryId: "r5", timestamp: new Date(T).toISOString(), details: {} } as Any);
+		const comp = { sourceEntry: branch[branch.length - 1], messages: [{ role: "compactionSummary", summary: "s".repeat(8_000), tokensBefore: 0, timestamp: T }] };
+		const e = [comp, ...raw.slice(raw.findIndex((x) => x.sourceEntry.id === "r5"))]; // Pi keeps from r5 on: the response a7 is in the kept part, its request is not
+		const cal = calibrate(e, undefined, branch);
+		expect(cal.c).toBeCloseTo(2.2, 1);
+		expect(cal).toMatchObject({ source: "usage", real: 30_000 + Math.round(2.2 * content(raw, raw.length - 1)) });
+		expect(cal.est).toBe(content(raw, raw.length - 1)); // the content its request carried: all of it, before the compaction
+		expect(cal.O).toBeCloseTo(30_000, -2);
+		// without the branch (a test, a print-mode stub) nothing is known of that request: C0, as before
+		expect(calibrate(e)).toMatchObject({ c: C0, source: "default" });
+		// a response whose request is not on the branch's side of the compaction is no evidence either
+		expect(calibrate(e, undefined, branch.slice(0, 2).concat(branch.slice(-1)))).toMatchObject({ c: C0 });
+	});
+
+	test("N1: after a model switch and a compaction that took the other model's responses out of the projection, O still transfers from the branch (it was R0 x the system state: 4K for 2K)", () => {
+		const T = Date.parse("2026-10-09T04:00:00Z");
+		const raw = session(6, 8_000);
+		provider(raw, 2_100, 1.0, ["a1", "a2"]);
+		as(raw, ["a1", "a2"], "zai", "glm-like");
+		provider(raw, 2_100, 1.0, ["a4", "a5", "a7"]);
+		as(raw, ["a4", "a5", "a7"], "anthropic", "claude-like");
+		for (const x of raw) Object.assign(x.sourceEntry.message, { timestamp: T - 1_000 });
+		const branch = asBranch(raw);
+		const cut = raw.findIndex((x) => x.sourceEntry.id === "r5");
+		branch.push({ type: "compaction", id: "cmp", summary: "s".repeat(4_000), firstKeptEntryId: "r5", timestamp: new Date(T).toISOString(), details: {} } as Any);
+		const comp = { sourceEntry: branch[branch.length - 1], messages: [{ role: "compactionSummary", summary: "s".repeat(4_000), tokensBefore: 0, timestamp: T }] };
+		const cal = calibrate([comp, ...raw.slice(cut)], undefined, branch, "anthropic/claude-like");
+		expect(cal.oSource).toBe("model");
+		expect(cal.O).toBeLessThan(3_000);
+	});
+
+	test("TR: a run plan's request that grew and missed the cache still carried its folds: the commit entry says so, no original is added back", () => {
+		const raw = session(7, 24_000);
+		provider(raw, 30_000, 2.2, ["a1", "a7"]); // the opening request, and the last request before the user left
+		const fe = folded(raw, "r1");
+		// the cold return's request (a8): its fold of r1 removed less than the previous turn added, and nothing was read from the cache
+		provider(fe, 30_000, 2.2, ["a8"], () => 0);
+		const N = raw.find((x) => x.sourceEntry.id === "a8").sourceEntry.message, P = raw.find((x) => x.sourceEntry.id === "a7").sourceEntry.message;
+		expect(N.usage.input + N.usage.cacheRead + N.usage.cacheWrite).toBeGreaterThanOrEqual(P.usage.input + P.usage.cacheRead + P.usage.cacheWrite);
+		const run = calibrate([...fe, edit("ed1", "r1"), mark("mk", true)], undefined, asBranch(raw));
+		expect(run.c).toBeCloseTo(2.2, 1);
+		expect(run.est).toBe(content(fe, fe.length - 1)); // the folded content: what a8's request carried
+		// the same edit as a warm valve plan (the next request is the first to carry it): the original is added back
+		const valve = calibrate([...fe, edit("ed1", "r1"), mark("mk", false)], undefined, asBranch(raw));
+		expect(valve.est).toBeGreaterThan(run.est + 3_000);
+		// ... and another extension's edit never was carried by a request of ours
+		const foreign = calibrate([...fe, edit("ed1", "r1", "[pruned by another extension]")], undefined, asBranch(raw));
+		expect(foreign.est).toBeGreaterThan(run.est + 3_000);
+	});
+
+	test("TR: after a model switch, the first request of the new model carried the originals of folds persisted after it: it is not an opening request", () => {
+		// GLM opens; the user switches to Claude mid-session: Claude's first request (a5) carries 40K tokens of conversation. A valve then
+		// folds most of it (persisted after a5's response, carried by the next request), so the projection's estimate for a5 is tiny
+		const e = session(6, 40_000);
+		provider(e, 15_000, 1.0, ["a1", "a2", "a3", "a4"]);
+		as(e, ["a1", "a2", "a3", "a4"], "zai", "glm-like");
+		provider(e, 30_000, 1.9, ["a5"]);
+		let v = e;
+		for (const r of ["r1", "r2", "r3", "r4"]) v = folded(v, r);
+		provider(v, 30_000, 1.9, ["a6", "a7"]); // the requests after the valve carry its folds
+		as(e, ["a5", "a6", "a7"], "anthropic", "claude-like");
+		const k = v.findIndex((x) => x.sourceEntry.id === "r5");
+		const entries = [...v.slice(0, k + 1), edit("e1", "r1"), edit("e2", "r2"), edit("e3", "r3"), edit("e4", "r4"), mark("mk", false), ...v.slice(k + 1)];
+		const cal = calibrate(entries, undefined, asBranch(e), "anthropic/claude-like");
+		expect(cal.oSource).toBe("model"); // not "first": a5 is no opening request (the old code read O = 105K off it)
+		for (const keep of [0.5, 0.2]) {
+			const E = keep * content(e);
+			expect(Math.abs(sizeOf(cal, E) / (30_000 + 1.9 * E) - 1)).toBeLessThan(0.05);
+		}
+	});
+	const as = (e: Any[], ids: string[], provider: string, model: string) => {
+		for (const x of e) if (ids.includes(x.sourceEntry.id)) Object.assign(x.sourceEntry.message, { provider, model });
+		return e;
+	};
+});

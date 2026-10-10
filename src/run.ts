@@ -1214,7 +1214,7 @@ export class Zip implements ZipControl {
 		for (const t of live) if (t.toolCallId) this.foldedCalls.set(t.toolCallId, handleFor(t.entryId));
 		// the compaction draft goes FIRST: Pi writes its tokensBefore from the newest usage only while no edit follows that usage, so a
 		// fold drafted before it would make Pi's "Compacted from N tokens" the chars/4 of a half-applied projection (research pi-tricks §1a)
-		if (cut) ours.unshift({ type: "compaction", summary: cut.text, firstKeptEntryId: cut.firstKeptEntryId, details: { by: PRODUCT, trigger: cut.trigger }, usage: cut.usage });
+		if (cut) ours.unshift({ type: "compaction", summary: cut.text, firstKeptEntryId: cut.firstKeptEntryId, details: { by: PRODUCT, trigger: cut.trigger, carried: sentBefore }, usage: cut.usage });
 		ours.push({ type: "custom", customType: COMMIT_CUSTOM, data: { carried: sentBefore } }); // says who first carried these edits (state.ts, plan.ts calibrate)
 		const before = Math.round(c * live.reduce((a, t) => a + t.entryTokens, 0));
 		const after = Math.round(c * live.reduce((a, t) => a + t.phTokens, 0));
