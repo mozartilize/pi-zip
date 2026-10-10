@@ -472,6 +472,31 @@ export class Zip implements ZipControl {
 		this.ledger({ type: "session_start", off: this.off, quiet: this.quiet, conflict: this.conflict, ...(recallFilesRemoved ? { recallFilesRemoved } : {}) });
 	}
 
+	/** A resumed (or restarted, reloaded, forked) process arms the away timer from the branch's last request, as `settle` would have after
+	 *  it (formal TRIAGE (a) 7): the summary for the next cold return is prepared while the user is away, not while they wait. Only when
+	 *  the session ended on a finished response (a run cut off mid-tool has no settle point) and the plan for it has a cut. Called after
+	 *  the recall mode is known (it decides which outputs fold, so which plan the return will make). */
+	resumeAway(ctx: Any) {
+		try {
+			const branch = this.branch(ctx);
+			if (!this.active() || !ctx?.hasUI || !ctx?.model) return;
+			const last = [...branch].reverse().find((en: Any) => en?.type === "message" && en.message);
+			const m = last?.message;
+			if (m?.role !== "assistant" || m.stopReason === "toolUse") return;
+			const entries = ((ctx.sessionManager.buildSessionProjection() as Any)?.entries ?? []) as Any[];
+			if (!entries.length) return;
+			this.loadEnt(modelKey(ctx.model));
+			const { o } = this.opts(ctx, true, "cold", entries);
+			const p = planContext(entries, o);
+			if (!p || p.cutIdx === null) return;
+			const at = lastMessageMs(branch);
+			const delayMs = this.scheduleSummary(p, ctx, at || undefined);
+			this.ledger({ type: "away_resumed", timerMs: delayMs, lastRequestMs: at });
+		} catch (err) {
+			this.ledger({ type: "error", where: "resume_away", error: errText(err) });
+		}
+	}
+
 	/** What a process that never left would know: growth g, "the newest response carried an edit" and "a summary was made in this warm
 	 *  stretch" are functions of the session, rebuilt from the branch (state.ts; a restart, a resume or a fork plans like the live process). */
 	private restoreState(branch: Any[]) {
@@ -977,6 +1002,9 @@ export class Zip implements ZipControl {
 				}
 			} else {
 				this.discardBg();
+				// no cut now, but the timer still runs: if Pi's own compaction or another extension's edit rewrites the context while the user
+				// is away, the plan made then may have one (runAway plans again when the context changed since this settle)
+				scheduledMs = this.scheduleSummary(p, ctx);
 			}
 			this.ledger({ type: "settle_plan", folds: p.folds.length, summary: p.cutIdx !== null, ...(p.ahead ? { ahead: true } : {}), timerMs: scheduledMs, ...this.calOf(cal), ctxBefore: Math.round(p.ctxTokens), ms: Math.round(performance.now() - t0) });
 			if (!p.folds.length && p.cutIdx === null) return undefined;
@@ -990,9 +1018,10 @@ export class Zip implements ZipControl {
 	}
 
 	/** Start the away-timer for a summary; returns the delay in ms. unref'd: it never keeps the process alive. */
-	private scheduleSummary(p: PlanResult, ctx: Any): number {
+	private scheduleSummary(p: PlanResult, ctx: Any, lastMs?: number): number {
 		const ttl = ttlFor(ctx.model, this.branch(ctx), this.tier(ctx.model));
-		const last = this.lastReqMs || Date.now();
+		const last = lastMs ?? (this.lastReqMs || Date.now());
+		this.awaySig = this.contextSig(ctx);
 		const warm = this.idleWarming() ? warmingDelayMs(ttl) : undefined;
 		if (warm !== undefined) {
 			// Pi keeps the cache warm between runs (cacheWarming "idle") and decides before each refresh, at its warming delay: a summary
@@ -1006,6 +1035,19 @@ export class Zip implements ZipControl {
 		const delay = Math.max(0, last + AWAY_FRACTION * ttl - Date.now());
 		this.armAway(delay, () => void this.runAway(p, ctx));
 		return Math.round(delay);
+	}
+
+	/** What the model would see of the branch, by its newest context entry: a message, edit, compaction or summary (our own bookkeeping
+	 *  entries and other extensions' custom entries change nothing). A different one at the timer than at settle means something
+	 *  rewrote the context in between (Pi's compaction, another extension's edit). */
+	private awaySig = "";
+	private contextSig(ctx: Any): string {
+		const branch = this.branch(ctx);
+		for (let i = branch.length - 1; i >= 0; i--) {
+			const t = branch[i]?.type;
+			if (t === "message" || t === "context_edit" || t === "compaction" || t === "branch_summary" || t === "custom_message") return `${t}:${branch[i].id}`;
+		}
+		return "";
 	}
 
 	/** One timer for the away summary (unref'd: it never keeps the process alive); a newer one, or the user's return, cancels it. */
@@ -1077,8 +1119,26 @@ export class Zip implements ZipControl {
 		return undefined;
 	}
 
-	private async runAway(p: PlanResult, ctx: Any) {
+	private async runAway(p0: PlanResult, ctx: Any) {
 		if (!this.active()) return;
+		let p = p0;
+		if (this.contextSig(ctx) === this.awaySig && p0.cutIdx === null) return; // nothing was planned and nothing changed
+		if (this.contextSig(ctx) !== this.awaySig) {
+			// something rewrote the context since the plan was made (Pi's own compaction, another extension's edit): the summary prepared
+			// for the old plan would be discarded at the return (its cut is not this plan's). Plan again on the session as it is now.
+			try {
+				const entries = ((ctx.sessionManager.buildSessionProjection() as Any)?.entries ?? []) as Any[];
+				const { o } = this.opts(ctx, true, "cold", entries);
+				const q = entries.length ? planContext(entries, o) : null;
+				this.ledger({ type: "away_replan", from: p0.firstKeptEntryId, to: q?.firstKeptEntryId ?? null });
+				if (!q || q.cutIdx === null) return this.discardBg();
+				if (this.bg && this.bg.key !== q.firstKeptEntryId) this.discardBg();
+				p = q;
+			} catch (err) {
+				this.ledger({ type: "error", where: "away_replan", error: errText(err) });
+				return;
+			}
+		}
 		const controller = new AbortController();
 		const bg: Bg = { key: p.firstKeptEntryId, done: null, promise: Promise.resolve(null), controller };
 		bg.promise = buildCut(p, ctx, controller.signal)
