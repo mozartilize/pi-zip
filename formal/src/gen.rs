@@ -22,6 +22,9 @@ pub enum Body {
     S,
     /// a command output, then the next request fails (the provider refuses it) and the run ends
     F,
+    /// a custom message rides with the prompt (Pi stores it right after the prompt: nextTurn, before_agent_start), then a mid-size
+    /// command output: one user turn, not two
+    N,
 }
 pub const LARGE: u32 = 60_000;
 pub const MID: u32 = 25_000;
@@ -37,6 +40,7 @@ impl Body {
             "r" => Body::R,
             "s" => Body::S,
             "f" => Body::F,
+            "n" => Body::N,
             _ => return None,
         })
     }
@@ -51,6 +55,7 @@ impl Body {
             Body::R => vec![Event::Call { tool: Tool::Recall, size: 0 }, say],
             Body::S => vec![Event::Call { tool: Tool::Npm, size: MID }, Event::Steer, Event::Call { tool: Tool::Npm, size: MID }, say],
             Body::F => vec![Event::Call { tool: Tool::Npm, size: LARGE / 2 }, Event::Fail { abort: false }],
+            Body::N => vec![Event::NextTurn, Event::Call { tool: Tool::Npm, size: MID }, say],
         }
     }
 }
@@ -77,6 +82,11 @@ pub fn special(name: &str) -> Option<Vec<Event>> {
         "late-switch" => vec![Event::Wait { gap: 240 }, Event::Switch],
         "compact" => vec![Event::Compact],
         "edit" => vec![Event::Edit],
+        // a run an extension's message starts (no prompt), an hour after the previous one (a cold wake) or a minute after it (warm),
+        // and the cold wake followed by a restart (a resumed process must know the wake was a cold return)
+        "drive" => vec![Event::Drive { gap: 3_600 }, Event::Call { tool: Tool::Npm, size: MID }, Event::Say { size: 100 }],
+        "drive-warm" => vec![Event::Drive { gap: 60 }, Event::Call { tool: Tool::Npm, size: MID }, Event::Say { size: 100 }],
+        "drive-restart" => vec![Event::Drive { gap: 3_600 }, Event::Call { tool: Tool::Npm, size: MID }, Event::Say { size: 100 }, Event::Restart],
         _ => return None,
     })
 }
@@ -186,6 +196,14 @@ pub fn standard_suite() -> Vec<Family> {
         },
         // depth 3 in the other tool selections, the 1-hour tier and with Pi's idle cache warming
         Family { worlds: vec![w("long"), w("file"), w("reread"), w("warming")], depth: 3, gaps: vec![60, 330, 3600, 7200], bodies: vec![Body::Q, Body::P, Body::C, Body::R], specials: vec![] },
+        // depth 3: runs an extension's message starts (cold, warm, a cold wake then a restart) and prompts a custom message rides with
+        Family {
+            worlds: vec![w("explicit"), w("small")],
+            depth: 3,
+            gaps: vec![60, 3600],
+            bodies: vec![Body::Q, Body::P, Body::B, Body::N],
+            specials: vec![sp("drive"), sp("drive-warm"), sp("drive-restart")],
+        },
     ]
 }
 
@@ -248,6 +266,9 @@ pub fn random_trace(rng: &mut Rng) -> Trace {
     let world = World { survival: if world.ttl_true > world.ttl && rng.chance(0.7) { Survival::Outlives } else { Survival::None }, ..world };
     let runs = 3 + rng.below(8);
     let mut events = Vec::new();
+    // runs an extension's message starts and custom messages riding with a prompt are drawn from a second stream seeded from this one's
+    // state (not advancing it): the rest of every trace is what the same seed drew before they existed
+    let mut aux = Rng::new(rng.0.rotate_left(29) ^ 0xA076_1D64_78BD_642F);
     for k in 0..runs {
         if k > 0 {
             if rng.chance(0.05) {
@@ -282,7 +303,14 @@ pub fn random_trace(rng: &mut Rng) -> Trace {
                 _ => rng.log(700.0, 20_000.0),
             }
         };
-        events.push(Event::Prompt { gap });
+        if k > 0 && aux.chance(0.12) {
+            events.push(Event::Drive { gap });
+        } else {
+            events.push(Event::Prompt { gap });
+            if aux.chance(0.1) {
+                events.push(Event::NextTurn);
+            }
+        }
         let calls = if rng.chance(0.04) { 20 + rng.below(50) } else { rng.below(7) };
         for _ in 0..calls {
             let tool = if rng.chance(0.06) { Tool::Recall } else if rng.chance(0.4) { Tool::Cat } else { Tool::Npm };
@@ -312,7 +340,7 @@ fn runs_of(t: &Trace) -> Vec<(usize, usize)> {
     let mut k = 0;
     while k < t.events.len() {
         let mut s = k;
-        while s < t.events.len() && !matches!(t.events[s], Event::Prompt { .. }) {
+        while s < t.events.len() && !t.events[s].starts_run() {
             s += 1;
         }
         if s >= t.events.len() {
@@ -337,7 +365,7 @@ fn runs_of(t: &Trace) -> Vec<(usize, usize)> {
 /// a steering message only right after a tool call of an open run.
 pub fn normalize(mut t: Trace) -> Trace {
     while t.events.first().is_some_and(|e| !matches!(e, Event::Prompt { .. })) {
-        t.events.remove(0);
+        t.events.remove(0); // the session starts with a prompt (a run an extension starts needs a session to start in)
     }
     if let Some(Event::Prompt { gap }) = t.events.first_mut() {
         *gap = 0;
@@ -346,15 +374,21 @@ pub fn normalize(mut t: Trace) -> Trace {
     let mut open = false;
     for e in t.events {
         match e {
-            Event::Prompt { .. } | Event::Switch | Event::Restart | Event::Foreign { .. } | Event::Wait { .. } => {
+            Event::Prompt { .. } | Event::Drive { .. } | Event::Switch | Event::Restart | Event::Foreign { .. } | Event::Wait { .. } => {
                 if open {
                     out.push(Event::Say { size: 100 });
                     open = false;
                 }
-                if let Event::Prompt { .. } = e {
+                if e.starts_run() {
                     open = true;
                 }
                 out.push(e);
+            }
+            Event::NextTurn => {
+                // only right after a prompt (Pi stores it with the prompt, before the first request)
+                if open && matches!(out.last(), Some(Event::Prompt { .. }) | Some(Event::NextTurn)) {
+                    out.push(e);
+                }
             }
             Event::Say { .. } | Event::Fail { .. } => {
                 if open {
@@ -403,10 +437,16 @@ pub fn candidates(t: &Trace) -> Vec<Trace> {
             x.events.remove(k);
             push(x);
         }
+        // a run an extension started becomes a prompted one
+        if let Event::Drive { gap } = t.events[k] {
+            let mut x = t.clone();
+            x.events[k] = Event::Prompt { gap };
+            push(x);
+        }
     }
     // merge a run into the previous one (its prompt disappears, its events stay)
     for &(s, _) in runs.iter().skip(1) {
-        if let Some(p) = (s..t.events.len()).find(|&j| matches!(t.events[j], Event::Prompt { .. })) {
+        if let Some(p) = (s..t.events.len()).find(|&j| t.events[j].starts_run()) {
             let mut x = t.clone();
             x.events.remove(p);
             push(x);
@@ -439,6 +479,13 @@ pub fn candidates(t: &Trace) -> Vec<Trace> {
                 for &g in &GAPS {
                     let mut x = t.clone();
                     x.events[k] = Event::Prompt { gap: g };
+                    push(x);
+                }
+            }
+            Event::Drive { gap } if !GAPS.contains(gap) => {
+                for &g in &GAPS {
+                    let mut x = t.clone();
+                    x.events[k] = Event::Drive { gap: g };
                     push(x);
                 }
             }

@@ -293,3 +293,78 @@ fn harness_checks_can_fail() {
         "LW"
     ));
 }
+
+// ---- review round 4: the model's blind spots (runs an extension's message starts, nextTurn messages, completeness) -------------
+
+fn trace_file(name: &str) -> String {
+    std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("traces").join(name)).unwrap()
+}
+
+/// WL (b): the one-summary-per-warm-stretch flag lapses once the context has grown back to the size the stretch's summary started
+/// from. The mutant is the flag of 4795af3, which never lapses: at request 80 the context is back at 100K (the summary started from
+/// 75K) and a summary that pays (Phi 5.3) is withheld. NT holds on the src: the second summary comes after the regrowth.
+#[test]
+fn wl_the_one_summary_flag_lapses() {
+    let t = trace_file("wl-regrow.trace");
+    caught_all(
+        "wl1",
+        "plan.ts",
+        &[("const noSummary = !!o.noSummary && !(o.regrowAt !== undefined && o.regrowAt > 0 && real(ctxAfterFolds) >= o.regrowAt);", "const noSummary = !!o.noSummary;", 1)],
+        &["WL"],
+        &t,
+    );
+}
+
+/// WL (b), review P0-1: a summary, a cold wake started by an extension's message, a restart: the resumed process must know the wake
+/// ended the warm stretch. The mutant is 4795af3's restore: it walks only user prompts (summarizedSince) and has no regrowth rule, so
+/// it restores the flag for a stretch the wake had ended and withholds the summary at request 81 (Phi 5.3); 4795af3 itself fails WL
+/// on this trace the same way. (With the regrowth rule alone the flag would lapse at the same request: both edits are needed.)
+#[test]
+fn wl_a_restart_knows_a_driven_cold_wake() {
+    let t = trace_file("wl-drive-restart.trace");
+    caught_all(
+        "wl2",
+        "run.ts",
+        &[
+            ("if (!afterAnswer) continue; // mid-run, or riding with the prompt just before it", "continue;", 1),
+            ("this.summaryRegrow = this.summarizedWarm ? lastRegrow(branch) : undefined;", "this.summaryRegrow = undefined;", 1),
+        ],
+        &["WL"],
+        &t,
+    );
+}
+
+/// GC over `drive`: a run an extension's message starts after an hour is planned cold. The mutant drops the agent_start handling
+/// (2cda8e1 and earlier): the driven run is planned on the state of the previous prompt.
+#[test]
+fn gc_a_driven_run_after_the_ttl_is_cold() {
+    let t = trace_file("gc-drive.trace");
+    caught("drv", "index.ts", "pi.on(\"agent_start\", (_e, ctx) => zip.agentStart(ctx));", "", "GC", &t);
+}
+
+/// PW over `nextturn`, review P0-2: Pi stores a prompt first and the nextTurn message after it; the mutant (4795af3's buildBlocks)
+/// counts that message as a turn of its own, so the window covers only the newest prompt and the previous turn's output is folded
+/// at a cold return. 4795af3 fails PW on this trace at request 2.
+#[test]
+fn pw_a_nexturn_message_is_not_a_turn() {
+    let t = trace_file("pw-nextturn.trace");
+    caught("p02", "plan.ts", "\t\t\tstarter = false;\n\t\t\tafterAnswer = false;\n", "\t\t\tstarter = false;\n", "PW", &t);
+}
+
+/// TR over `drive`, found by this round's run: a run an extension's message starts right after a refused request is a new turn
+/// (the failed run ended there). The mutant (4795af3 / 007d1d1's buildBlocks) counts it into the failed run's turn, which stays
+/// protected, so the cold return an hour later keeps a 20K output and stops at 52.6K against a 40K target.
+#[test]
+fn tr_a_driven_run_after_a_failed_request_is_a_turn() {
+    let t = trace_file("tr-drive-after-error.trace");
+    caught("trd", "plan.ts", "if (kind === \"assistant\") afterAnswer = msg.stopReason !== \"toolUse\";", "if (kind === \"assistant\") afterAnswer = msg.stopReason !== \"toolUse\" && msg.stopReason !== \"error\" && msg.stopReason !== \"aborted\";", "TR", &t);
+}
+
+/// TR over `drive`, found by this round's seed-7 run: a summary before a run an extension started keeps from that run's custom
+/// message (one of Pi's own cut points). The mutant (4795af3) cuts only at user and assistant messages, so the kept tail starts at the
+/// previous turn's 29K final answer and the cold return leaves 60.6K against a 40K target.
+#[test]
+fn tr_a_summary_may_keep_from_a_driven_runs_message() {
+    let t = trace_file("tr-cut-at-drive.trace");
+    caught("trc", "plan.ts", " || (b.kind === \"other\" && b.msg?.role === \"custom\"));", ");", "TR", &t);
+}

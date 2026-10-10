@@ -1,5 +1,5 @@
 // Guard (F13, I5): validate an edit set before committing it, and repair orphan tool results in the outgoing payload.
-import { finalAnswerIdx, RELAX_PREV_TURN, settings, type Block } from "./plan.ts";
+import { finalAnswerIdx, isCutBlock, RELAX_PREV_TURN, settings, type Block } from "./plan.ts";
 import type { Any } from "./util.ts";
 
 const PROTECT_USER_TURNS = 2;
@@ -66,7 +66,7 @@ export function validateEdits(blocks: Block[], plan: EditSet, userTurns: number)
 		if (plan.cut < 1 || plan.cut >= blocks.length) return `bad cut ${plan.cut}`;
 		if (limit >= 0 && plan.cut > limit && !(plan.ahead && plan.cut <= finalAnswerIdx(blocks, userTurns - 1))) return `cut ${plan.cut} inside the last ${PROTECT_USER_TURNS} user turns`;
 		const kb = blocks[plan.cut];
-		if (!kb.entryId || (kb.kind !== "user" && kb.kind !== "assistant")) return `cut ${plan.cut} is not at a user/assistant message`;
+		if (!isCutBlock(kb)) return `cut ${plan.cut} is not at a user, assistant or custom message`;
 		// only what the cut itself would create is our problem; a session that was already odd stays as odd as it was
 		const before = pairingIssues(blocks, 0);
 		for (const issue of pairingIssues(blocks, plan.cut)) if (!before.has(issue) && issue.startsWith("orphanResult")) return `the cut would orphan a tool result: ${issue}`;

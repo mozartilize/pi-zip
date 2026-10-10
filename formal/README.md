@@ -73,8 +73,12 @@ say 100
   the agent runs, delivered before the next request: not a new user turn), `wait +gap` (the run ends and time passes without a
   prompt, so what follows happens at the return), `switch` (model), `restart` (a fresh pi process), `foreign SIZE` (another
   extension's compaction, between runs), `compact` (Pi's own compaction: its `prepareCompaction` cut, `fromHook` false; between
-  runs or mid-run), `edit` (another extension's `context_edit` of the oldest output the model still sees; anywhere). The away
-  timer and Pi's cache refreshes are not events: the clock fires them.
+  runs or mid-run), `edit` (another extension's `context_edit` of the oldest output the model still sees; anywhere), `drive +gap`
+  (a run an extension's message starts, as Pi 1.1.0 `sendCustomMessage(..., { triggerTurn: true })` -> `_runAgentPrompt` does:
+  `agent_start`, the custom message appended, the first request, **no** `before_agent_start`; a new user turn), `nextturn` (a
+  custom message Pi stores right after a prompt: a nextTurn message or a `before_agent_start` handler's message; the prompt's turn).
+  The away timer and Pi's cache refreshes are not events: the clock fires them. `formal/coverage/coverage.ts` maps recorded
+  sessions onto these events and lists what they cannot express (TRIAGE.md, round 4).
 * **Blocks** (session entries): kind, size, user turn, recoverability (re-readable, not re-readable, a recall result), the
   request that issued them; at each request each block is visible, folded or summarised, and recalled or not.
 * **Cache**: per model, a response (not a refused request) or a refresh at t keeps the prefix until t + the kept TTL. Warm/cold at
@@ -112,7 +116,8 @@ that the next turn_end valve could make (B2). The first round excused any decisi
 | B2B | no back-to-back warm rewrites | A2 | □(zip_edit → ¬○(zip_edit ∧ cache_warm ∧ planned_warm)) | the second rewrite pays the write twice for one saving |
 | MP | monotone in P(warm) | A2 | □ monotone_in_p | an edit is never cheaper at a warm cache than at a cold one: at every decision point, re-planned on a grid of P with everything else fixed, the plan at a lower P covers or beats (smaller context, or the cold target reached) the plan at a higher P |
 | NR | time consistency (no regret) | A2, A3 | □(cold_plan → [i0:=i] ¬(quiet U≤10 (i > i0 ∧ zip_edit ∧ planned_warm))) | an edit is free cold and paid warm: a warm edit within 10 requests of a cold plan with no new information means the cold plan was dominated |
-| NT | no thrash | A2, A3 | □(zip_summary → ¬○(¬cold_plan U (zip_summary ∧ ¬cold_plan ∧ ¬at_room))) ∧ □(zip_summary → summary_worth_it) | two summaries in one warm stretch are two uncached calls for one saving; a summary that removes less than it writes, or works within a minimal summary of the floor (system prompt + previous summary + protected turns), is a summary for nothing |
+| NT | no thrash | A2, A3 | □(zip_summary → [s0:=start] ¬○(¬cold_plan U (zip_summary ∧ ¬cold_plan ∧ ¬at_room ∧ start < s0·(1−TOL)))) ∧ □(zip_summary → summary_worth_it) | two summaries in one warm stretch are two uncached calls for one saving, unless the context has grown back to the size the first one started from (then the second gains what the first did); a summary that removes less than it writes, or works within a minimal summary of the floor (system prompt + previous summary + protected turns), is a summary for nothing |
+| WL | a warm summary that pays is not withheld | A2, A3 | □ warm_summary_not_withheld | **completeness** (every other property is safety, and a pi-zip that never summarises passes them): (a) every warm turn_end of a request that did not fail asks the valve, unless b2b or the run plan is persisted there; (b) a warm decision the one-summary flag constrained, re-planned with the flag lifted, withholds a summary whose summary step and whole-plan step (call priced) pass with Φ ≥ 1.25 only while a pi-zip summary (or a foreign compaction) was made since the last cold plan and the context has not grown back past the size it started from (10%) |
 | TR | target reachability | A2 | □(cold_plan → target_reached_or_excused) | the cold return is the one free rewrite: it reaches the cold target (±15%) unless the floor fills it, the law refused the summary, or the class is not known yet |
 | GC | a gone cache gets a cold plan | A2 | □ gone_is_cold | README rule 2, "after the TTL, or after switching model, pi-zip folds": a run after a model switch is planned at P = 0; a run whose cache was last touched (a response that reached the provider, or Pi's refresh) longer ago than the declared TTL is marked past it, and longer ago than both the declared and the kept TTL is planned cold |
 | WB | warm does nothing below the target | A2 | □(zip_edit ∧ planned_warm → warm_above_target) | README rule 2, "while the cache is warm it does nothing" except the valve above the target: a new edit planned at P ≥ 0.5 comes from a request (real size) above the cold target (15% tolerance) |
@@ -177,12 +182,15 @@ in rc030 are other candidate-set effects (TRIAGE.md).
   restart or foreign compaction placed before any run (4,032); depth 3 over {60 s, 1 h} × {quick, prose, command, a steered run,
   a run whose last request fails} with a restart after an hour away, a switch after 4 minutes away, Pi's own compaction or
   another extension's edit before any run (4,500); depth 3 over {60 s, 330 s, 1 h, 2 h} × {quick, prose, re-readable, recall}
-  on the 1-hour tier, with recall through files, in reread-only mode and with Pi's idle cache warming (4,096);
+  on the 1-hour tier, with recall through files, in reread-only mode and with Pi's idle cache warming (4,096); depth 3 over
+  {60 s, 1 h} × {quick, prose, command, a prompt with a nextTurn message} in an explicit and a 128K-window world, with a run an
+  extension's message starts after an hour, after a minute, or after an hour followed by a restart (3,584);
 * **3,000 random traces** at realistic sizes (3 to 10 runs, 0 to 6 tool calls a run, 4% long autonomous runs of 20 to 70 calls,
   outputs 100 to 40K log-uniform, gaps from seconds to hours across the TTL; steering, failed and aborted requests, Pi's
   compaction and other extensions' edits mid-run and between runs, restarts and switches at the return; random worlds including
-  the 1-hour tier, both allowlist modes and idle cache warming);
-* 33,340 traces and about 285,000 requests per source; one minimal counterexample is kept per (property, mechanism) and shrunk
+  the 1-hour tier, both allowlist modes and idle cache warming; 12% of the runs after the first started by an extension's message,
+  10% of the prompts with a nextTurn message, drawn from a second stream so the rest of each trace is what the seed drew before);
+* 36,924 traces and about 308,000 requests per source (33,340 before round 4); one minimal counterexample is kept per (property, mechanism) and shrunk
   greedily (drop runs, events, specials; round sizes and gaps to canonical values; move the world to the default);
 * **per-trace verdicts** (`--verdicts FILE`): one JSON line per trace with the class of every property it fails, so two runs
   (two sources, or a source and a mutant) can be compared trace by trace where the counts would hide a change.
@@ -198,6 +206,9 @@ in rc030 are other candidate-set effects (TRIAGE.md).
   model answers instantly with as many words as summary.ts asks for (summary *content* quality is not checked, only what A1
   requires of it); Pi's compaction uses `keepRecentTokens` 20,000 and a fixed summary text; another extension's edit always prunes
   the oldest visible output; the cache warmer's refresh is a 1-token request that re-sends the newest prefix.
+* **WL's oracle is the planner.** WL (b) re-plans a warm decision with the one-summary flag lifted: a planner that never proposes a
+  summary has the same oracle. WL (a) sees a valve that is never asked; LW, MP and TR see a broken law or candidate search. A
+  planner-independent oracle (the spec pricing the best cut itself with `law.rs`) is not built.
 * **Taken from the code, not derived.** A2 reads g (the growth per request in the law's read term) from the planner's own trace:
   how the session's growth should be measured is pi-zip's choice (README "measured in the session"), and RD already shows that g
   is lost on a restart. The protection window (2 user turns, 60 requests) is restated in the spec, not read from the code.
@@ -222,6 +233,10 @@ in rc030 are other candidate-set effects (TRIAGE.md).
   one). `--no-session` itself is not modelled.
 
 ## Results (last acceptance run)
+
+The table below is the second round's. The current counts (round 4: the `drive` / `nextturn` events, WL, 36,924 traces) are in
+TRIAGE.md, "Round 4", next to 4795af3 run under the same checker.
+
 
 Traces failing, out of 33,340 per source (0 = pass), about 285,000 requests each, 0 bridge errors. Sources: 0.2.8 =
 `/tmp/pz-replay/src`; affine = this worktree's `src` (f5deda1); coldwarm = `/tmp/pz-coldwarm/src` 1fe03c2; rc030 =
@@ -286,8 +301,8 @@ as turns, PW 0 → 1,932; m06 explicit w 1.25 → 0.3, LW 0 → 25,449; m25 summ
 m26 warm below the cap, WB 4 → 692 (new class). m15 (`summarizedWarm` ignored) moves NT 4 → 28 in its existing class: caught
 by the per-trace verdicts only. m03 and m04 are now caught by A1 itself (0 → 5,523 and 0 → 5,218; m04 before only by I1).
 
-`tests/mutants.rs` keeps one mutant per property as a regression test (A1 ×5, A2/LW, A3 ×2, I1, RC ×3, PW ×3, B2B, NT, TR, GC ×3,
-WB, MH, LW ×2, MPr, RDr) and shows that W, G and LW's arithmetic fail on a tampered observation.
+`tests/mutants.rs` keeps one mutant per property as a regression test (A1 ×5, A2/LW, A3 ×2, I1, RC ×3, PW ×4, B2B, NT, TR ×3, GC ×4,
+WB, MH, LW ×2, MPr, RDr, WL ×2; round 4 added WL, PW over `nextturn`, GC over `drive` and two TR over `drive`, see TRIAGE.md) and shows that W, G and LW's arithmetic fail on a tampered observation.
 
 ## How to run
 
@@ -308,6 +323,6 @@ cargo test && cargo clippy --all-targets
 
 `check` options: `--suite standard|quick|none`, `--family 'worlds=explicit,glm depth=4 gaps=60,330,3600 bodies=q,p,b,c
 specials=switch,restart,foreign'` (worlds: explicit glm fresh tools small claude print long file reread warming; bodies: q p b c
-bb r s f; specials: switch restart foreign late-restart late-switch compact edit), `--random N --seed S`, `--only A2,MP`,
+bb r s f n; specials: switch restart foreign late-restart late-switch compact edit drive drive-warm drive-restart), `--random N --seed S`, `--only A2,MP`,
 `--shrink ROUNDS` (0 = no shrinking), `--workers W`, `--verdicts FILE` (per-trace verdicts, JSON lines), `--plan-opts JSON`,
 `--pi DIR` (another pi-coding-agent). A standard check without shrinking takes about 3 minutes for 33,340 traces on 28 cores.

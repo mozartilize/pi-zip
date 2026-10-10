@@ -1,7 +1,7 @@
 // Token scale: real = O + c x content, both read from the branch itself (no stored state), used by every limit and every number shown.
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { readFileSync, unlinkSync } from "node:fs";
-import { buildBlocks, C0, C_MAX, C_MIN, calibrate, coldTarget, planContext, R0, sizeOf, sysEst, UNIT } from "../src/plan.ts";
+import { buildBlocks, C0, C_MAX, C_MIN, calibrate, coldTarget, planContext, R0, sameTokenizer, sizeOf, sysEst, UNIT } from "../src/plan.ts";
 import { lawPrices } from "../src/learn.ts";
 import { A, AX, fakeCtx, fakePi, flat, R, U, type Any } from "./helpers.ts";
 
@@ -194,6 +194,28 @@ describe("calibrate: per model, Pi's compaction, dropped responses", () => {
 		// the previous model's scale follows the system prompt: a tool set that changed moves O as it moves the model's own
 		const moved = calibrate([...e.slice(0, 4), { sourceEntry: { id: "s1", type: "message", message: { role: "system", content: "", toolsAdded: [{ name: "t2", description: "x".repeat(4_000), parameters: {} }], timestamp: 2 } }, messages: [{ role: "system", content: "", toolsAdded: [{ name: "t2", description: "x".repeat(4_000), parameters: {} }], timestamp: 2 }] }, ...e.slice(4)], undefined, branch, "anthropic/sonnet-like");
 		expect(moved.c).toBeCloseTo(1.9, 0);
+	});
+
+	// review P1-3: "same provider" is not "same tokenizer" on a multi-vendor provider (github-copilot serves GPT, Claude, Gemini and Grok;
+	// openrouter, gateways). A GPT -> Claude switch there carried c ~ 0.9 where Claude's is ~ 1.7: every size believed at half its value
+	test("a multi-vendor provider: the scale carries over only within one model family (GPT -> Claude falls back to the defaults)", () => {
+		const e = session(8);
+		provider(e, 30_000, 0.9, ["a1", "a2", "a3", "a4", "a5"]);
+		as(e, ["a1", "a2", "a3", "a4", "a5"], "github-copilot", "gpt-5");
+		const branch = e.map((x) => ({ type: "message", id: x.sourceEntry.id, message: x.sourceEntry.message }));
+		expect(calibrate(e, undefined, branch, "github-copilot/claude-sonnet-4.5")).toMatchObject({ c: C0, source: "default", oSource: "default" }); // old code: c 0.9, oSource "model"
+		expect(calibrate(e, undefined, branch, "openrouter/anthropic/claude-sonnet-4.5")).toMatchObject({ c: C0, source: "default" }); // another provider
+		const gpt = calibrate(e, undefined, branch, "github-copilot/gpt-5-mini"); // the same family on the same provider: carried
+		expect(gpt.c).toBeCloseTo(0.9, 1);
+		expect(gpt.oSource).toBe("model");
+		// unrecognised ids on a multi-vendor provider are not guessed
+		as(e, ["a1", "a2", "a3", "a4", "a5"], "openrouter", "acme/model-x");
+		expect(calibrate(e, undefined, branch.map((b) => ({ ...b, message: e.find((x) => x.sourceEntry.id === b.id)!.sourceEntry.message })), "openrouter/acme/model-y")).toMatchObject({ c: C0, source: "default" });
+		expect(sameTokenizer("anthropic/claude-opus-4-1", "anthropic/claude-sonnet-4-5")).toBe(true);
+		expect(sameTokenizer("github-copilot/claude-sonnet-4", "github-copilot/gpt-5")).toBe(false);
+		expect(sameTokenizer("openrouter/anthropic/claude-opus-4", "openrouter/anthropic/claude-sonnet-4")).toBe(true);
+		expect(sameTokenizer("openrouter/openai/gpt-5", "openrouter/z-ai/glm-4.6")).toBe(false);
+		expect(sameTokenizer("mistral/mistral-large", "mistral/glm-4.6")).toBe(false); // mistral's catalog lists GLM models too
 	});
 
 	test("the session's first request counts for O only if it went to the current model", () => {
