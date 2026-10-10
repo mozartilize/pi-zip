@@ -33,7 +33,32 @@ pub enum Survival {
     Outlives,
 }
 
-/// The world: provider, cache and session setup. `ttl` is declared, `ttl_true` is what the provider really keeps.
+/// The cache tier Pi asks for: the short one (the model's declared `ttl`), or the 1-hour tier (`PI_CACHE_RETENTION=long`, a 1-hour
+/// cache_control in every request payload).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Tier {
+    #[default]
+    Short,
+    Long,
+}
+
+/// The tools the model has: zip_recall declared (full); a `--tools read,bash` allowlist that hides it (recall through files); an
+/// allowlist without read, grep, bash or zip_recall (only re-readable outputs may fold).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Tools {
+    #[default]
+    Full,
+    File,
+    Reread,
+}
+
+/// The 1-hour tier's declared lifetime.
+pub const LONG_TTL: u32 = 3600;
+
+/// The world: provider, cache and session setup. `ttl` is declared, `ttl_true` is what the provider really keeps (on the long tier
+/// both scale to the hour: declared 3600 s, kept 3600 x ttl_true / ttl).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct World {
@@ -52,15 +77,37 @@ pub struct World {
     pub native: bool,
     /// interactive (the away timer exists)
     pub interactive: bool,
+    #[serde(default)]
+    pub tier: Tier,
+    #[serde(default)]
+    pub tools: Tools,
+    /// Pi's idle cache warming is on (settings cacheWarming "idle"; Pi's own CacheWarmer refreshes the cache between runs while it
+    /// pays, and asks extensions first)
+    #[serde(default)]
+    pub warming: bool,
 }
 impl Default for World {
     fn default() -> Self {
-        World { cls: Class::Explicit, known: true, ttl: 300, ttl_true: 300, survival: Survival::None, c: 1.0, sys: 3000, window: 200_000, native: true, interactive: true }
+        World { cls: Class::Explicit, known: true, ttl: 300, ttl_true: 300, survival: Survival::None, c: 1.0, sys: 3000, window: 200_000, native: true, interactive: true, tier: Tier::Short, tools: Tools::Full, warming: false }
     }
 }
 impl World {
     pub fn room(&self) -> f64 {
         (self.window as f64 - 16_384.0 - 8_192.0).max(4_096.0)
+    }
+    /// The lifetime pi-zip is told (the model's promptCache for the tier in use).
+    pub fn ttl_decl(&self) -> f64 {
+        match self.tier {
+            Tier::Short => self.ttl as f64,
+            Tier::Long => LONG_TTL as f64,
+        }
+    }
+    /// The lifetime the provider really keeps.
+    pub fn ttl_kept(&self) -> f64 {
+        match self.tier {
+            Tier::Short => self.ttl_true as f64,
+            Tier::Long => (LONG_TTL as f64 * self.ttl_true as f64 / self.ttl as f64).round(),
+        }
     }
 }
 
@@ -75,19 +122,34 @@ pub enum Tool {
 }
 
 /// Environment events. A `Prompt` starts a run (and ends the previous one); `Call` is one assistant request whose response calls a
-/// tool, followed by the tool result of `size` tokens; `Say` is the assistant request that answers in prose and ends the run.
-/// `Switch` changes the model for the next prompt, `Restart` is a fresh pi process on the same session, `Foreign` is a compaction
-/// written by someone else (Pi itself or another extension). The away timer is not an environment event: the clock fires it
-/// (0.8 x TTL after the last request) when a gap is long enough.
+/// tool, followed by the tool result of `size` tokens; `Say` is the assistant request that answers in prose and ends the run; `Fail`
+/// is an assistant request that fails (the provider refuses it, or the user aborts it with Esc) and ends the run; `Steer` is a
+/// message the user types while the agent runs (Pi delivers it before the next request; it is not a new user turn).
+/// `Wait` ends the run and lets time pass without a prompt (so a `Restart` or a `Switch` can happen at the return), `Switch` changes
+/// the model for the next prompt, `Restart` is a fresh pi process on the same session, `Foreign` is a compaction another extension
+/// writes between runs, `Compact` is Pi's own compaction (its threshold, an overflow or /compact; between runs or mid-run), `Edit`
+/// is another extension's context_edit of the oldest output the model still sees (anywhere). The away timer and Pi's cache
+/// warming are not environment events: the clock fires them.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "e", rename_all = "lowercase")]
 pub enum Event {
     Prompt { gap: u32 },
     Call { tool: Tool, size: u32 },
     Say { size: u32 },
+    Fail { abort: bool },
+    Steer,
+    Wait { gap: u32 },
     Switch,
     Restart,
     Foreign { size: u32 },
+    Compact,
+    Edit,
+}
+impl Event {
+    /// Events that happen outside a run and belong to the run they precede.
+    pub fn is_special(&self) -> bool {
+        matches!(self, Event::Switch | Event::Restart | Event::Foreign { .. } | Event::Wait { .. } | Event::Compact | Event::Edit)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -119,7 +181,7 @@ impl fmt::Display for World {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "world {} {} ttl={} true={} survival={} c={} sys={} window={}{}{}",
+            "world {} {} ttl={} true={} survival={} c={} sys={} window={}{}{}{}{}{}",
             match self.cls { Class::Explicit => "explicit", Class::Automatic => "automatic" },
             if self.known { "known" } else { "unknown" },
             self.ttl,
@@ -129,7 +191,10 @@ impl fmt::Display for World {
             self.sys,
             self.window,
             if self.native { " native" } else { " nonative" },
-            if self.interactive { " interactive" } else { " print" }
+            if self.interactive { " interactive" } else { " print" },
+            if self.tier == Tier::Long { " long" } else { "" },
+            match self.tools { Tools::Full => "", Tools::File => " tools=file", Tools::Reread => " tools=reread" },
+            if self.warming { " warming" } else { "" }
         )
     }
 }
@@ -143,9 +208,14 @@ impl fmt::Display for Event {
                 Tool::Cat => write!(f, "call cat {}", k(*size)),
             },
             Event::Say { size } => write!(f, "say {}", k(*size)),
+            Event::Fail { abort } => write!(f, "fail {}", if *abort { "abort" } else { "error" }),
+            Event::Steer => write!(f, "steer"),
+            Event::Wait { gap } => write!(f, "wait +{}", dur(*gap)),
             Event::Switch => write!(f, "switch"),
             Event::Restart => write!(f, "restart"),
             Event::Foreign { size } => write!(f, "foreign {}", k(*size)),
+            Event::Compact => write!(f, "compact"),
+            Event::Edit => write!(f, "edit"),
         }
     }
 }
@@ -199,6 +269,9 @@ impl Trace {
                             "nonative" => world.native = false,
                             "interactive" => world.interactive = true,
                             "print" => world.interactive = false,
+                            "long" => world.tier = Tier::Long,
+                            "short" => world.tier = Tier::Short,
+                            "warming" => world.warming = true,
                             _ => {
                                 let (key, val) = t.split_once('=').ok_or(format!("bad world token {t:?}"))?;
                                 match key {
@@ -208,6 +281,14 @@ impl Trace {
                                     "c" => world.c = val.parse().map_err(|e| format!("{e}"))?,
                                     "sys" => world.sys = num(val)?,
                                     "window" => world.window = num(val)?,
+                                    "tools" => {
+                                        world.tools = match val {
+                                            "full" => Tools::Full,
+                                            "file" => Tools::File,
+                                            "reread" => Tools::Reread,
+                                            _ => return Err(format!("bad tools {val:?}")),
+                                        }
+                                    }
                                     _ => return Err(format!("unknown world key {key:?}")),
                                 }
                             }
@@ -226,6 +307,11 @@ impl Trace {
                     events.push(Event::Call { tool, size });
                 }
                 "say" => events.push(Event::Say { size: w.get(1).map(|s| num(s)).transpose()?.unwrap_or(100) }),
+                "fail" => events.push(Event::Fail { abort: w.get(1) == Some(&"abort") }),
+                "steer" => events.push(Event::Steer),
+                "wait" => events.push(Event::Wait { gap: w.get(1).map(|g| num(g.trim_start_matches('+'))).transpose()?.unwrap_or(0) }),
+                "compact" => events.push(Event::Compact),
+                "edit" => events.push(Event::Edit),
                 "switch" => events.push(Event::Switch),
                 "restart" => events.push(Event::Restart),
                 "foreign" => events.push(Event::Foreign { size: w.get(1).map(|s| num(s)).transpose()?.unwrap_or(2000) }),
@@ -248,7 +334,7 @@ impl Trace {
                 .iter()
                 .map(|e| match e {
                     Event::Call { size, .. } | Event::Say { size } | Event::Foreign { size } => *size as u64 / 100,
-                    Event::Prompt { gap } => *gap as u64 / 60,
+                    Event::Prompt { gap } | Event::Wait { gap } => *gap as u64 / 60,
                     _ => 10,
                 })
                 .sum::<u64>()
@@ -273,6 +359,8 @@ pub struct BlockObs {
     /// the request that produced it (assistant, toolResult) or the first request that carries it (user, foreignSummary)
     pub req: i64,
     pub recall_of: Option<String>,
+    /// a user message typed while the agent ran (steering, follow-up): part of the current turn
+    pub steer: bool,
 }
 
 /// One message of a request as sent: its hash, real tokens, and what it is.
@@ -343,6 +431,8 @@ pub struct GridPt {
     pub plan: bool,
     /// a lookahead summary (coldwarm F2): its cut may lie inside the previous user turn, before that turn's final answer
     pub ahead: bool,
+    /// a warm plan at an actual cold return whose warm twin would have been skipped by the b2b rule (no plan)
+    pub b2b: bool,
     pub folds: Vec<String>,
     pub cut: Option<String>,
     /// real tokens the cut summarises, and the planned summary
@@ -402,6 +492,8 @@ pub struct Fresh {
     pub fresh_plan: Vec<Value>,
     /// in-memory state groups whose transplant into the fresh process makes it plan like the live one (g, justEdited, ...)
     pub fixed_by: Vec<String>,
+    /// the three fields TRIAGE names (g, justEdited, summarizedWarm) transplanted together make the fresh process plan alike
+    pub fixed_by_known: bool,
     pub fixed_by_all: bool,
 }
 
@@ -418,6 +510,11 @@ pub struct Tick {
     pub t1: f64,
     pub gap: Option<f64>,
     pub model: String,
+    /// the narrative model calls since the previous request's turn_end, in real tokens (the summary a new edit of this request uses
+    /// is the last one)
+    pub narr: Vec<NarrCall>,
+    /// the response failed: "error" (the provider refused the request; its cache was not touched) or "aborted" (Esc)
+    pub failed: Option<String>,
     /// the bridge's provider found the cache alive
     pub warm: bool,
     pub total: f64,
@@ -447,6 +544,24 @@ pub struct Tick {
     pub lossless: Vec<String>,
 }
 
+/// One narrative model call (the summary's model-written part): what it read uncached and what it wrote, real tokens.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct NarrCall {
+    pub input: f64,
+    pub output: f64,
+    pub away: bool,
+}
+
+/// A cache refresh by Pi's idle cache warming (a tiny request that re-sends the newest prefix).
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct Refresh {
+    pub model: String,
+    pub t: f64,
+    pub alive: bool,
+}
+
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct Obs {
@@ -454,6 +569,7 @@ pub struct Obs {
     pub errors: Vec<String>,
     pub blocks: Vec<BlockObs>,
     pub ticks: Vec<Tick>,
+    pub refreshes: Vec<Refresh>,
 }
 
 // ================================================================================================================================
@@ -479,6 +595,7 @@ pub struct Block {
     pub recover: Recover,
     pub req: i64,
     pub recall_of: Option<String>,
+    pub steer: bool,
 }
 
 /// What a block looks like in one request: shown as is, folded to a placeholder, or summarised away (not in the request).
@@ -492,8 +609,12 @@ pub enum Shown {
 /// The abstract state when request i is sent.
 #[derive(Clone, Debug, Default)]
 pub struct St {
-    /// the spec's cache: a response from this model ended at most ttl_true seconds ago
+    /// the spec's cache: a response from this model (or a refresh of it) ended at most the kept TTL ago
     pub warm: bool,
+    /// seconds since anything last touched this model's cache (a response that reached the provider, or a refresh); None: never
+    pub touch_gap: Option<f64>,
+    /// the model differs from the previous request's
+    pub switched: bool,
     /// the first request of a run, at a cache that is gone (by the spec's clock)
     pub cold_start: bool,
     /// what pi-zip believed when it planned this request: cold (P(warm) < 0.5) and P(warm); in a run P = 1
@@ -554,6 +675,7 @@ impl Run {
                 },
                 req: b.req,
                 recall_of: b.recall_of.clone(),
+                steer: b.steer,
             })
             .collect();
         let by_id = blocks.iter().enumerate().map(|(i, b)| (b.id.clone(), i)).collect();
@@ -567,11 +689,19 @@ impl Run {
         let room = w.room();
         let mut last_resp: HashMap<&str, f64> = HashMap::new();
         let mut out = Vec::with_capacity(self.obs.ticks.len());
+        let kept = w.ttl_kept();
         for (i, t) in self.obs.ticks.iter().enumerate() {
-            let warm = last_resp.get(t.model.as_str()).is_some_and(|r| t.t0 - r <= w.ttl_true as f64 + 1e-6);
+            // Pi's cache warming refreshed this model's cache before the request
+            for f in self.obs.refreshes.iter().filter(|f| f.t <= t.t0 + 1e-9 && (i == 0 || f.t > self.obs.ticks[i - 1].t0)) {
+                let e = last_resp.entry(f.model.as_str()).or_insert(f.t);
+                *e = e.max(f.t);
+            }
+            let touch_gap = last_resp.get(t.model.as_str()).map(|r| t.t0 - r);
+            let warm = touch_gap.is_some_and(|g| g < kept - 1e-6);
+            let switched = i > 0 && self.obs.ticks[i - 1].model != t.model;
             let s0 = t.state0.as_ref();
             let (believed_cold, p, past_ttl) = if t.n == 0 { s0.map(|s| (s.cold, s.p_warm.unwrap_or(1.0), s.past_ttl)).unwrap_or((false, 1.0, false)) } else { (false, 1.0, false) };
-            let user_turns = self.blocks.iter().filter(|b| b.kind == "user" && b.req <= i as i64).count() as u32;
+            let user_turns = self.blocks.iter().filter(|b| b.kind == "user" && !b.steer && b.req <= i as i64).count() as u32;
             let recalled = self.blocks.iter().filter(|b| b.recover == Recover::RecallResult && b.req < i as i64).filter_map(|b| b.recall_of.clone()).collect();
             let appended = self
                 .blocks
@@ -583,7 +713,7 @@ impl Run {
                 })
                 .map(|b| b.tok)
                 .sum();
-            let mut new_info: Vec<String> = t.env.iter().filter(|e| matches!(e.as_str(), "switch" | "foreign" | "recall")).cloned().collect();
+            let mut new_info: Vec<String> = t.env.iter().filter(|e| matches!(e.as_str(), "switch" | "foreign" | "recall" | "compact" | "edit")).cloned().collect();
             if i == 1 && !w.known {
                 new_info.push("class".into());
             }
@@ -593,8 +723,10 @@ impl Run {
             let protected_from = user_turns.saturating_sub(PROTECT_USER_TURNS - 1);
             let protected: f64 = t.view.iter().filter(|m| m.id.as_ref().and_then(|id| self.block(id)).is_some_and(|b| b.turn >= protected_from && b.kind != "system")).map(|m| m.tok).sum();
             let target = (COLD_CAP.max(sys + COLD_CAP / 2.0)).min(room);
-            out.push(St { warm, cold_start: t.n == 0 && !warm, believed_cold, p, past_ttl, user_turns, recalled, appended, new_info, view_tok, floor: sys + prev_sum + protected, prev_sum, target, room });
-            last_resp.insert(t.model.as_str(), t.t1);
+            out.push(St { warm, touch_gap, switched, cold_start: t.n == 0 && !warm, believed_cold, p, past_ttl, user_turns, recalled, appended, new_info, view_tok, floor: sys + prev_sum + protected, prev_sum, target, room });
+            if t.failed.as_deref() != Some("error") {
+                last_resp.insert(t.model.as_str(), t.t1);
+            }
         }
         out
     }

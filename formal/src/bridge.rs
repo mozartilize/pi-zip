@@ -41,7 +41,9 @@ impl Pool {
     }
 
     fn spawn(&self, k: usize) -> Result<Worker, String> {
-        let work = std::env::temp_dir().join(format!("pz-formal-{}-{k}", std::process::id()));
+        // one directory per worker of every pool (several pools may live in one process: the tests run in parallel)
+        static POOLS: AtomicU64 = AtomicU64::new(0);
+        let work = std::env::temp_dir().join(format!("pz-formal-{}-{}-{k}", std::process::id(), POOLS.fetch_add(1, Ordering::Relaxed)));
         let mut cmd = Command::new("bun");
         cmd.arg(&self.script).arg(&self.src);
         if let Some(pi) = &self.pi {

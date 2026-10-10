@@ -202,6 +202,13 @@ mod tests {
 
     #[test]
     fn lemmas_hold_on_the_port() {
+        // the lemmas' premise: every class ratio has w >= r > 0 (LW checks the planner uses exactly these)
+        for cls in [Class::Explicit, Class::Automatic] {
+            for long in [false, true] {
+                let p = class_prices(cls, long);
+                assert!(p.w >= p.r && p.r > 0.0 && p.out > 0.0, "{cls:?} long={long}: {p:?}");
+            }
+        }
         let pts = grid();
         for l in lemmas(&pts, &|q: &Point| q.terms()) {
             assert!(l.counterexample.is_none(), "{}: {:?}", l.name, l.counterexample);

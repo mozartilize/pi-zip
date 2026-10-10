@@ -11,6 +11,12 @@ mis-stated (the corrected statement is now the spec); **(c)** an artefact of the
 uncorrected spec and bridge. It was taken on coldwarm, which plans identically to rc030: after correction the two agree on
 every property, within 0.1% for RD.
 
+> **Second round (review fixes).** The counts in the sections below are the first round's, on its 24,744-trace suite and its
+> first spec. The review found A1, A2 and A3 partly vacuous and the trace alphabet too small; the spec, the bridge and the suite
+> are revised (README "The axioms", "Limits"), and the current counts on 33,340 traces are in the README's results table.
+> What the revision found that the first round could not see is in "Second round: new findings" at the end of this file. One
+> (b) correction of the first round is **withdrawn**: A3 no longer excuses a warm return's run plan (see the (b) table).
+
 ## Summary
 
 | property | before (coldwarm) | rc030 now | rc030 +F2 now | coldwarm now | verdict |
@@ -124,7 +130,7 @@ restarts at the start of the gap.
 
 | property | original statement | corrected statement | traces removed |
 |---|---|---|---|
-| A3 | the user waits for a summary call only at Pi's compaction room | ... only at Pi's compaction room, **in the warm valve** (README rule 3: "at a cold return and in the warm valve alike"; A2 checks it pays), or **at a return a model switch made cold** (the cache dies at the prompt: nothing to prepare while away) | 20 valve + 117 switch (coldwarm) |
+| A3 | the user waits for a summary call only at Pi's compaction room | ... only at Pi's compaction room, **in the warm valve at a turn_end** (mid-run: the user already waits for the agent; A2 checks it pays), or **at a return a model switch made cold** (the cache dies at the prompt: nothing to prepare while away). *Round 2:* the first round excused every decision at P ≥ 0.5, a warm return's run plan included, citing README rule 3's "at a cold return and in the warm valve alike". That sentence is about how the call is priced, not about letting the user wait; the excuse hid B2 (A3 passed on `traces/b2.trace`). It is withdrawn, and the narrower rule is stated in the README as a product decision | 20 valve + 117 switch (coldwarm); round 2 puts back 3,455 (affine) and 11 (coldwarm) B2 waits |
 | PW (+F2) | a summary never cuts into the latest two user turns | ... except an F2 lookahead cut at a cold plan (`ahead`), which may reach the previous turn's **final answer** (the guard's own rule) | 441 (+F2) |
 | NT | at most one summary per warm stretch of the real cache | ... per warm stretch **as pi-zip believes it**: a stretch ends at a return planned cold. Learning that a cache outlives its declared TTL is outside the spec | 2 |
 | B2B | no edit on a warm cache right after an edit | no edit **planned warm** right after an edit (same reason as NT) | 0.2.8: 5 |
@@ -153,3 +159,66 @@ cd formal && cargo build --release
 ```
 The minimal counterexample of every class is in `out/rc030.json` / `out/rc030-lookahead.json` after `run-all.sh` (not
 committed; about 70 minutes on 28 cores under `pi-durable-subagents hold machine`).
+
+## Second round: new findings
+
+The revised checker (positional A1 with the real `zip_recall` and recall-file round trips, a real provider payload through the
+guard, A2 at the class ratios and the requests' real sizes with no blanket excuse below P = 0.5, A3 without the warm-return
+excuse, and the new properties GC, WB, MH and the residuals RDr, MPr, A2r) on the extended alphabet (steering, failed and aborted
+requests, Pi's own compaction and another extension's edit mid-run and between runs, restarts and switches at the return, the
+1-hour tier, both allowlist modes, Pi's idle cache warming). Counts are traces out of 33,340 (`run-all.sh`, seed 1), affine /
+coldwarm 1fe03c2 (0.2.8 where it shares the cause). Every item is (a), a code behaviour, unless marked.
+
+### N1. Calibration after a compaction pi-zip did not write (WB 4/0, MH 13/13, A2 and A2r 1/1)
+After Pi's own compaction (or another extension's), `calibrate` (`plan.ts`) takes c from the newest reply, whose real size is the
+*pre-compaction* request (78K in the minimal trace), against the estimate of the *post-compaction* projection (19K): c = 3.9
+instead of 1.0, and O falls back to its default. Until the next reply the planner believes the context is about four times its
+size: a warm return 7 s after Pi's compaction summarises a 21K context it believes is 60K (WB: the user waits for a summary
+below the target), a cold return folds a 4K request inside the automatic cache's 8K head (MH), and a cold summary whose call
+does not pay goes out (A2r). Fix direction: in `calibrate`, skip a reply whose request predates the newest compaction entry, or
+add back what that compaction removed. The other A2r trace on each source is a turn_end valve whose folds pay by the planner's
+estimate but leave more than it planned (affine 4% more, within noise; coldwarm 32% more, after a model switch: the O of (a) 4). (0.2.8, with its single ratio, has the same failure after another extension's edit: WB 38,
+A2r 135 by the planner's estimate.)
+
+### N2. A refused request counts as a cache touch (GC 16/16, 0.2.8 16)
+`cache.ts lastMessageMs` takes the newest message of the branch, including an assistant message with `stopReason: "error"`
+(the provider refused it: overloaded, rate limit). A return 302 s after the last *successful* response, 296 s after the refused
+one, is planned warm and not past the TTL (`detectCold`); the cache is dead. The return then pays the full rewrite of an
+unfolded context, and the learned survival records a dead sample at a gap that is shorter than the real one. Fix direction: skip
+errored (and aborted-before-send) assistant messages in `lastMessageMs`, as `lastPrompt` already does. The checker models an
+error as refused before the provider read the prompt; an error after it (mid-stream) would touch the cache, so the fix should
+keep messages that report usage.
+
+### N3. Pi's compaction or another extension's edit between runs voids the away summary (A3 6/16, RDr 3/6)
+The away timer prepares the plan made at settle (`armAway(delay, () => runAway(p, ctx))`, `run.ts`). A compaction or context
+edit that lands after settle (Pi's threshold compaction runs exactly then) is not seen by that plan: either the prepared summary
+no longer matches and the user waits for a new one at the return (A3), or it is used and differs from what a fresh process
+plans at the same instant (RDr: its handle table still counts the output the other extension pruned). Fix direction: re-plan
+when the away timer fires (or when the branch's leaf changed since settle) instead of reusing `p`.
+
+### N4. The learned survival's last bin is open-ended (GC 3/3)
+`learn.ts GAP_EDGES` ends at 5,400 s: every longer gap shares that bin. A cache seen alive once at 110 minutes is believed warm
+(P 0.80) at 156 minutes, after it died; the return pays a full rewrite of an unfolded context. Only reachable with a cache that
+outlives 90 minutes (in the checker: the 1-hour tier on a provider that keeps twice its declared TTL). Fix direction: an upper
+edge at a multiple of the longest declared TTL, beyond which the declared TTL's prior decides.
+
+### N5. B2 is back in A3 (A3 3,455/11)
+Not new code behaviour: the first round's A3 excused it (see the (b) table). On coldwarm, F1 gates the warm summary, but 11
+warm returns still summarise in the run plan while the user waits (minimal: 22 events, reread-only mode). The fix direction of
+(a) 5 and F2 applies.
+
+### Not code bugs (0.2.8 only, the README of the current version)
+0.2.8 fails A1 (177) and RC (60) only in the allowlist worlds: it has no recall through files, so with `--tools read,bash` an
+output it summarised away cannot be read back (the model has neither `zip_recall` nor a recall file), and it refolds an output
+the model read back. rc030 fails exactly what coldwarm fails, on every property, with and without F2. It fails MH (169) because it
+has no automatic-cache head, and NT (197) with summaries that remove almost nothing. These are features the current README
+describes and 0.2.8 predates.
+
+### Checker corrections made while triaging (c)
+| where | artefact | fix |
+|---|---|---|
+| bridge, reread mode | the model's "re-run" of a folded command returned the original bytes for any command | a re-run of `cat` returns the file, of anything else new output (`npm test` is not re-readable) |
+| bridge, A1 | the in-memory session reported no session file, so rc030 (which needs one for recall files) fell back to reread-only placeholders, and A1 demanded a recall file in every allowlist placeholder (rc030: 390 false A1 traces) | the session reports a file (nothing is written); A1 accepts the way back each placeholder names, a re-read only for an output that can be re-read |
+| spec, MH | the first request to a new model was held to the head rule | excluded: learn.ts takes no sample there |
+| spec, A2 | the summary call priced the whole summary as model output | the narrative call's own tokens (the skeleton and handle table are deterministic); the bridge's narrative model writes as many words as summary.ts asks for |
+| spec, A2 | the 10% tolerance was taken of K, a difference of large terms | 10% of the gross terms of K (rewrite, reads saved, call) |

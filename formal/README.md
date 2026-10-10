@@ -7,6 +7,8 @@ every decision; the Rust checker evaluates the properties over those decisions, 
 randomly at realistic sizes, and shrinks every counterexample to a minimal readable trace.
 
 It rediscovers both bugs found live on 0.2.8 (B1, B2) as 6-event counterexamples, and found the others listed in `TRIAGE.md`.
+Every property is shown to be able to fail: `tests/mutants.rs` injects one bug per property into a copy of `src` and asserts the
+property passes on the original and fails on the mutant (see "Mutation score").
 
 ## Layout
 
@@ -19,7 +21,8 @@ It rediscovers both bugs found live on 0.2.8 (B1, B2) as 6-event counterexamples
 | `src/gen.rs` | exhaustive enumeration, random traces, shrinking |
 | `src/check.rs`, `src/bridge.rs`, `src/main.rs` | the checker, the bun process pool, the CLI |
 | `bridge/bridge.ts` | the conformance bridge: drives a pi-zip `src` dir through a trace, answers JSON |
-| `TRIAGE.md` | every failing property on the v0.3.0 candidate (rc030), classified, with the code site |
+| `TRIAGE.md` | every failing property on the v0.3.0 candidate (rc030), classified, with the code site; the second round's new findings |
+| `tests/mutants.rs` | every property can fail: one injected bug per property, passes on `src`, fails on the mutant |
 | `out/` | the last acceptance run (reports and JSON), not committed |
 
 ## The spec language, and why this one
@@ -57,24 +60,46 @@ say 100
 
 * **World**: cache class (explicit / automatic, known or still to learn), declared TTL and the TTL the provider really keeps,
   learned survival, real tokens per chars/4 token, system prompt size, context window (→ Pi's compaction room), Pi's
-  `ctx.compact` available, interactive or print mode.
+  `ctx.compact` available, interactive or print mode; the cache tier (`long`: `PI_CACHE_RETENTION=long`, a 1-hour
+  `cache_control` in every payload, declared 3600 s); the tool selection (`tools=file`: an allowlist `read,bash` that hides
+  `zip_recall`, recall through files and the `tool_call` hook; `tools=reread`: an allowlist without read, grep, bash or
+  `zip_recall`, only re-readable outputs may fold); `warming`: Pi's idle cache warming on (Pi's real `CacheWarmer`, its own
+  economics and timers, asking pi-zip's `cache_warming_decision` handler).
 * **Events**: `prompt +gap` (user prompt after a gap), `call npm|cat|recall SIZE` (an assistant request whose tool returns SIZE
-  tokens: `npm` mutates, so it cannot be re-read; `cat` can; `recall` is `zip_recall` of the newest folded output), `say SIZE`
-  (the request that answers and ends the run), `switch` (model), `restart` (a fresh pi process), `foreign SIZE` (a compaction
-  someone else wrote). The away timer is not an event: the clock fires it.
+  tokens: `npm` mutates, so it cannot be re-read, and its output has one failing-test line; `cat` can; `recall` is how the model
+  gets the newest folded output back in the world's tool selection: `zip_recall`, a `read` of the recall file, or a re-run),
+  `say SIZE` (the request that answers and ends the run), `fail error|abort` (the request fails: the provider refuses it and its
+  cache is untouched, or the user presses Esc after the provider read the prompt; the run ends), `steer` (a message typed while
+  the agent runs, delivered before the next request: not a new user turn), `wait +gap` (the run ends and time passes without a
+  prompt, so what follows happens at the return), `switch` (model), `restart` (a fresh pi process), `foreign SIZE` (another
+  extension's compaction, between runs), `compact` (Pi's own compaction: its `prepareCompaction` cut, `fromHook` false; between
+  runs or mid-run), `edit` (another extension's `context_edit` of the oldest output the model still sees; anywhere). The away
+  timer and Pi's cache refreshes are not events: the clock fires them.
 * **Blocks** (session entries): kind, size, user turn, recoverability (re-readable, not re-readable, a recall result), the
   request that issued them; at each request each block is visible, folded or summarised, and recalled or not.
-* **Cache**: per model, a response at t keeps the prefix until t + true TTL. Warm/cold at a request is a fact of this clock;
-  what pi-zip *believed* (P(warm), cold, past TTL) is observed separately.
+* **Cache**: per model, a response (not a refused request) or a refresh at t keeps the prefix until t + the kept TTL. Warm/cold at
+  a request is a fact of this clock; what pi-zip *believed* (P(warm), cold, past TTL) is observed separately.
+* **Requests**: each goes to the provider as a real Anthropic-shaped payload (system blocks, tools, `tool_use` / `tool_result`
+  pairs, errored and aborted messages dropped as pi-ai does, the tier's `cache_control`), through pi-zip's
+  `before_provider_request` (its request repair, `guard.ts`, and its payload-tier reading run on it).
 * **Costs**: the law's own units (`law.rs`): read r, rewrite w, output, the summary call; growth g.
 
 ## The axioms
 
 | | axiom | formula |
 |---|---|---|
-| A1 | nothing is lost | □ nothing_lost: every message except a folded output or a summary goes out byte for byte (user text, tool args, system prompt, thinking); every output the model does not see verbatim comes back byte for byte from `zip_recall`; a user request summarised away is quoted verbatim |
-| A2 | edit only when the cache is gone or the edit pays | □ (zip_edit → pays_or_cold): a new edit was planned at a cache believed gone, or the law's own model, **with the summary call priced as what it is** (uncached read of the conversation since the previous summary plus the summary written), says it costs no more than not editing |
-| A3 | never in the way | □ (user_waits → at_room ∨ valve_summary ∨ switched): the user waits for a summary call only at Pi's compaction room, in the warm valve (rule 3 allows it; A2 prices it), or at a return a model switch made cold |
+| A1 | nothing is lost | □ nothing_lost: the request carries the session's conversation **by position**, one to one and in order from its first kept message to the newest (a summary may stand for a prefix, nothing in between may go missing); every message except a folded output or a summary goes out byte for byte (user text, tool args, system prompt, thinking); pi-zip's request guard does not have to rewrite the payload (an edit that broke a tool_use / tool_result pair); **every folded block names its handle and shows its key lines** (first, last, the error line, as README rule 1 says); every output the model does not see verbatim comes back byte for byte **the way the model gets it back**: `zip_recall(handle)` as the tool executes it, all pages, or a `read` of the recall file the placeholder names (through pi-zip's `tool_call` hook), and in reread-only mode only re-readable outputs fold; a user request pi-zip summarised away is quoted verbatim |
+| A2 | edit only when the cache is gone or the edit pays | □ (zip_edit → pays): the law's own model, **at the class ratios of the true cache class and tier** (not the planner's prices) and **at the request's real sizes** (B: what the request would have sent without the edit; A: what it sent), with the summary call priced as what it is (uncached read of the conversation the cut replaces, without the carried previous summary, plus the summary written), says the edit costs no more than not editing (10% tolerance: the planner's calibrated estimate). At P < 0.5 folds are free (lemma C), and a summary must also pay its call at its own margin (what the cut removes beyond the folds): no decision is excused for being cold |
+| A3 | never in the way | □ (user_waits → at_room ∨ valve_summary ∨ switched): the user waits for a summary call only at Pi's compaction room, in the warm valve **at a turn_end** (A2 checks it pays), or at a return a model switch made cold |
+
+**A3 is a product decision, stated here because pi-zip's README does not say it.** README rule 3's "the same inequality prices the
+extra model call in" (at a cold return and in the warm valve alike) is about how a summary call is *priced*, not about when the user
+may wait for one. The spec allows a wait only where nothing better exists: at Pi's compaction room (Pi would make the user wait
+anyway), at a turn_end valve (mid-run: the user is already waiting for the agent, and the context crossed the target during the
+run, so nothing could be prepared), and at a return a switch made cold (the cache dies at the prompt). A warm return's run plan is
+**not** excused: the user just sent a prompt to a warm cache and waits for a summary that the cold plan before could have made, or
+that the next turn_end valve could make (B2). The first round excused any decision at P(warm) ≥ 0.5, so A3 passed on
+`traces/b2.trace`, where the user waits at request 2.
 
 ## Derived properties
 
@@ -89,18 +114,26 @@ say 100
 | NR | time consistency (no regret) | A2, A3 | □(cold_plan → [i0:=i] ¬(quiet U≤10 (i > i0 ∧ zip_edit ∧ planned_warm))) | an edit is free cold and paid warm: a warm edit within 10 requests of a cold plan with no new information means the cold plan was dominated |
 | NT | no thrash | A2, A3 | □(zip_summary → ¬○(¬cold_plan U (zip_summary ∧ ¬cold_plan ∧ ¬at_room))) ∧ □(zip_summary → summary_worth_it) | two summaries in one warm stretch are two uncached calls for one saving; a summary that removes less than it writes, or works within a minimal summary of the floor (system prompt + previous summary + protected turns), is a summary for nothing |
 | TR | target reachability | A2 | □(cold_plan → target_reached_or_excused) | the cold return is the one free rewrite: it reaches the cold target (±15%) unless the floor fills it, the law refused the summary, or the class is not known yet |
-| LW | the law as specified | A2 | □ law_as_specified | every law evaluation of the real planner equals `law.rs` on the same inputs (the summary step's call term is backed out of K and must be ≥ 0), so the lemmas below apply to the code |
+| GC | a gone cache gets a cold plan | A2 | □ gone_is_cold | README rule 2, "after the TTL, or after switching model, pi-zip folds": a run after a model switch is planned at P = 0; a run whose cache was last touched (a response that reached the provider, or Pi's refresh) longer ago than the declared TTL is marked past it, and longer ago than both the declared and the kept TTL is planned cold |
+| WB | warm does nothing below the target | A2 | □(zip_edit ∧ planned_warm → warm_above_target) | README rule 2, "while the cache is warm it does nothing" except the valve above the target: a new edit planned at P ≥ 0.5 comes from a request (real size) above the cold target (15% tolerance) |
+| MH | an automatic cache keeps its head | A2 | □ head_kept | README: on an automatic prefix cache every edit leaves the first 8K tokens alone, so the response right after a fold still says whether the cache survived (folds only; a cut replaces the prefix, and the first request to a new model is no sample) |
+| RDr, MPr, A2r | residuals | RD, MP, A2 | the property, minus the known root causes | RD after transplanting the three fields TRIAGE (a) 1 names together (g, justEdited, summarizedWarm); MP outside the mechanisms TRIAGE (a) 3 and 6 name; A2 outside B1 and the plan gate without the call (TRIAGE (a) 2). RD, MP and A2 fail in thousands of traces on 0.2.8 and affine; a new bug of their kind shows up only here (and in the per-trace verdicts) |
+| LW | the law as specified | A2 | □ law_as_specified | every law evaluation of the real planner equals `law.rs` on the same inputs **at the class ratios** of the true class and tier (learn.ts `CLASS_RATIOS`, which satisfy the lemmas' premise w ≥ r > 0, a unit test); a summary step's call term, backed out of K, is at least half the uncached read of what it summarises; so the lemmas below apply to the code |
 | G, W | harness fidelity | | | the P-grid re-plan at the actual P reproduces the decision run.ts acted on; the bridge's provider keeps the cache exactly as the spec's clock says |
 
-**New information** (NR) is exactly: a model switch, a foreign compaction, a `zip_recall`, the cache class learned from the first
-response, a new cold return, or growth of more than DELTA = 10K real tokens since the cold plan. Everything else, in particular
+**New information** (NR) is exactly: a model switch, a foreign compaction (another extension's or Pi's own), another extension's
+context edit, a `zip_recall` (counted from the request after the one whose response called it: that request is the first to carry
+the recalled output), the cache class learned from the first response, a new cold return, or growth of more than DELTA = 10K real
+tokens since the cold plan. Everything else, in particular
 **the protection window sliding by one user turn** and the passage of time below the TTL, is not new information. B2 is the
 first, so a cold plan that could not summarise only because the window had not slid yet is dominated by the warm summary one
 prompt later.
 
 **Monotonicity** is checked at every decision point of every trace by re-planning with the real `planContext` and the captured
 options (entries, scale, prices, g, recalled set, pastTtl), varying only P over {0, .25, .49, .51, .75, 1} plus the actual P, with
-the mode derived from P exactly as run.ts derives it (cold iff P < 0.5). Property G checks that this probe reproduces the actual decision.
+the mode derived from P exactly as run.ts derives it (cold iff P < 0.5). At an actual cold return, a warm probe sees the state a
+warm return would have seen: `summarizedWarm` as it stood before the return (a cold return resets it), and the b2b rule (a warm
+return right after an edited request plans nothing). Property G checks that the probe reproduces the actual decision.
 
 ## What is proven, what is checked
 
@@ -111,16 +144,24 @@ decision of every trace that the code calls it as specified):
 Let D = B − A, T' = min(T, A), K(P) = (w − r)(P·T' − (1 − P)·D) + call, gain = r·D²/(2·max(g, 1)) + η·D, ok = (K ≤ 0 ∨ gain ≥ K).
 
 * **M (monotone in P).** dK/dP = (w − r)(T' + D). The code guarantees D > 0 (`if (!(A < B)) return none`, the first line of
-  lawTerms), T' ≥ 0 (A ≥ 0: A is a context size, at least O), and w ≥ r (`learn.ts CLASS_RATIOS`: 1.25 > 0.1, 2 > 0.1 on the
+  lawTerms), T' ≥ 0 (T ≥ 0 and A ≥ 0: every call site passes T = A, the post-edit context size, at least O; lawTerms itself does
+  not check T, so a call site with T < 0 would void M), and w ≥ r (`learn.ts CLASS_RATIOS`: 1.25 > 0.1, 2 > 0.1 on the
   long tier, 1 > 0.2; and `pr.r > 0` is required, else the P-free legacy rule applies). So T' + D > 0 and K is non-decreasing
   in P, while gain does not depend on P. Both disjuncts of ok are preserved when P decreases: ok is antitone in P. ∎
 * **G (gain ≥ 0).** r > 0, D > 0 make the read term ≥ 0. η > 0 only when B ≥ room; its numerator is
-  w(B − keep) + out·s + (w − r)(keep + s) = w·B + (w − r)·s − r·keep with s ≥ 1000; since the room is ≥ 4096 (`MIN_TARGET`), w ≥ 1
-  and r ≤ 0.2 (CLASS_RATIOS), w·B ≥ 4096 > 0.2·20000 = r·keep, so η ≥ 0. ∎
+  w(B − keep) + out·s + (w − r)(keep + s) = w·B + out·s + (w − r)·s − r·keep with s ≥ 1000. The out·s term is ≥ 0 (out > 0), so
+  it suffices that w·B ≥ r·keep: the room is ≥ 4096 (`MIN_TARGET`), w ≥ 1 and r ≤ 0.2 (CLASS_RATIOS), so w·B ≥ 4096 >
+  0.2·20000 = r·keep, and η ≥ 0. ∎ (The first round dropped the out·s term from the algebra; the bound held regardless.)
 * **E (economic sanity: an edit chosen under the law never costs more than not editing, in expectation, in the law's model).**
   The law's model says E[cost | edit] − E[cost | no edit] = K − gain. If gain ≥ K this is ≤ 0. If K ≤ 0, K − gain ≤ −gain ≤ 0 by G. ∎
 * **C (a dead cache always edits).** P = 0, call = 0: K = −(w − r)·D < 0. ∎
 * **S (a model call only makes an edit harder).** call ≥ 0 adds to K and nothing else. ∎
+
+The premise **w ≥ r > 0** is checked against the code, not assumed: the unit test `lemmas_hold_on_the_port` asserts it for every
+class ratio, and LW asserts at every decision that the planner's prices *are* those class ratios (a planner that priced with
+the model's price table, a wrong tier or a changed ratio fails LW). LW's summary-step check is no longer a tautology: the call
+term it backs out of K must cost at least half the uncached read of the prefix it summarises, so a summary call priced at 0
+fails it.
 
 The lemmas are about the law, so they say where non-monotonicity in the *implementation* can come from: not the law, but the
 **candidate plan** the law is asked about, which may change with the mode. B1 is exactly that. In 0.2.8 the warm plan asked the
@@ -133,67 +174,120 @@ in rc030 are other candidate-set effects (TRIAGE.md).
 * **exhaustive families** (`pz-formal count`): depth-4 runs over gaps {60 s, 330 s, 1 h} × bodies {quick answer, 60K prose,
   30K command output, 30K re-readable output} in an explicit and a GLM-like world (13,824 traces); depth 5 over {60 s, 1 h} ×
   {quick, prose, command} (3,888); depth 3 over {60 s, 270 s, 1 h} × {quick, prose, two 25K outputs, recall} with one switch,
-  restart or foreign compaction placed before any run (4,032);
+  restart or foreign compaction placed before any run (4,032); depth 3 over {60 s, 1 h} × {quick, prose, command, a steered run,
+  a run whose last request fails} with a restart after an hour away, a switch after 4 minutes away, Pi's own compaction or
+  another extension's edit before any run (4,500); depth 3 over {60 s, 330 s, 1 h, 2 h} × {quick, prose, re-readable, recall}
+  on the 1-hour tier, with recall through files, in reread-only mode and with Pi's idle cache warming (4,096);
 * **3,000 random traces** at realistic sizes (3 to 10 runs, 0 to 6 tool calls a run, 4% long autonomous runs of 20 to 70 calls,
-  outputs 100 to 40K log-uniform, gaps from seconds to hours across the TTL, random worlds);
-* 24,744 traces and 239,402 requests per source; one minimal counterexample is kept per (property, mechanism) and shrunk greedily
-  (drop runs, events, specials; round sizes and gaps to canonical values; move the world to the default).
+  outputs 100 to 40K log-uniform, gaps from seconds to hours across the TTL; steering, failed and aborted requests, Pi's
+  compaction and other extensions' edits mid-run and between runs, restarts and switches at the return; random worlds including
+  the 1-hour tier, both allowlist modes and idle cache warming);
+* 33,340 traces and about 285,000 requests per source; one minimal counterexample is kept per (property, mechanism) and shrunk
+  greedily (drop runs, events, specials; round sizes and gaps to canonical values; move the world to the default);
+* **per-trace verdicts** (`--verdicts FILE`): one JSON line per trace with the class of every property it fails, so two runs
+  (two sources, or a source and a mutant) can be compared trace by trace where the counts would hide a change.
 
 ## Limits
 
 * **Bounds.** Depth ≤ 5 runs exhaustively, sizes in a few buckets; random traces are not exhaustive. K_REGRET = 10 requests,
-  DELTA = 10K, size tolerances 10% (15% for the cold target, the README's own estimate error).
+  DELTA = 10K, size tolerances 10% (15% for the cold target, the README's own estimate error; 10% of K for A2).
 * **Abstractions.** Tool outputs are synthetic text; real tokens = c × chars/4 exactly (no tokenizer noise, so every size error
-  the checker sees comes from pi-zip's calibration, not the text); one tool call per request; no images, thinking, steering,
-  errors or aborts; the provider cache is an exact prefix cache with a hard TTL; two models; no Pi idle cache warming; the
-  narrative model returns a fixed text instantly (summary *content* quality is not checked, only what A1 requires of it).
+  the checker sees comes from pi-zip's calibration, not the text); one tool call per request; no images or thinking; the
+  provider cache is an exact prefix cache with a hard TTL; a failed request (`fail error`) is one the provider refused before
+  reading the prompt (an error after the provider read it is not modelled), an abort is one it read; two models; the narrative
+  model answers instantly with as many words as summary.ts asks for (summary *content* quality is not checked, only what A1
+  requires of it); Pi's compaction uses `keepRecentTokens` 20,000 and a fixed summary text; another extension's edit always prunes
+  the oldest visible output; the cache warmer's refresh is a 1-token request that re-sends the newest prefix.
+* **Taken from the code, not derived.** A2 reads g (the growth per request in the law's read term) from the planner's own trace:
+  how the session's growth should be measured is pi-zip's choice (README "measured in the session"), and RD already shows that g
+  is lost on a restart. The protection window (2 user turns, 60 requests) is restated in the spec, not read from the code.
 * **Mirrored, not called.** Pi's agent loop and its event order (`session_start`, `before_agent_start`, prompt appended, per
-  request `context_with_system` → `before_provider_request` → assistant `message_end` → tool result → `turn_end`, then
-  `agent_before_settle`); the provider and its usage reports; Pi's `AgentSession.compact()` around the real `prepareCompaction`
-  (as in pi-zip's own integration test rig); the clock and timers (virtual `Date` and `setTimeout`). Called for real: pi-zip's
-  `index.ts` wiring and everything below it (run.ts cold detection, run plan, valve, b2b skip, summarizedWarm, pastTtl, away timer,
-  native compaction, persistence at turn_end, learning), Pi's `SessionManager` and `AgentSession._applyBoundaryDrafts`,
-  `convertToLlm`.
+  request `context_with_system` → `before_provider_request` → assistant `message_end` → `tool_call` → tool result → `turn_end`,
+  then `agent_before_settle`); the provider and its usage reports; Pi's `AgentSession.compact()` around the real
+  `prepareCompaction`; the clock and timers (virtual `Date` and `setTimeout`); the payload pi-ai would build (Anthropic shape
+  only: the guard's OpenAI, Responses, Google and Bedrock paths do not run). Called for real: pi-zip's `index.ts` wiring and
+  everything below it (run.ts cold detection, run plan, valve, b2b skip, summarizedWarm, pastTtl, away timer, native
+  compaction, persistence at turn_end, learning, steering marks, the `tool_call` hook, the payload tier, `guard.ts`
+  `repairPayload`, the `zip_recall` tool's `execute`), Pi's `SessionManager`, `AgentSession._applyBoundaryDrafts`,
+  `prepareCompaction`, `convertToLlm` and `CacheWarmer`.
 * **Probes.** MP re-plans with `planContext` and the options run.ts passed (captured by wrapping `Zip.prototype.opts`); RD runs a
   second pi-zip instance on a snapshot of the session and of the learned-survival file, at the instant the live request was sent,
-  and to name the cause transplants the live in-memory fields into it (g, justEdited, summarizedWarm, clock, learned class).
+  and to name the cause transplants the live in-memory fields into it (g, justEdited, summarizedWarm, clock; the learned class
+  and survival are not transplanted: `beforeAgentStart` reloads them from disk). A1's recall round trips run on a third pi-zip
+  instance on the live session, so they never touch the live instance's state.
 * **Options.** `--plan-opts '{"lookahead":true}'` merges planner options into every `planContext` call (how coldwarm's F2 is
   turned on without editing src).
-* The checker never writes outside a per-worker temp dir (stats, recall files, flags); the session under test is in memory.
+* The checker never writes outside a per-worker temp dir (stats, recall files, flags); the session under test is in memory but
+  reports a session file, as every session started without `--no-session` does (rc030 turns recall through files off without
+  one). `--no-session` itself is not modelled.
 
 ## Results (last acceptance run)
 
-Traces failing, out of 24,744 per source (0 = pass). Sources: 0.2.8 = `/tmp/pz-replay/src`; affine = this worktree's `src`
-(f5deda1); coldwarm = `/tmp/pz-coldwarm/src` 1fe03c2; rc030 = `/tmp/pz-rc/src` fa3a467 (the v0.3.0 candidate); +F2 = with
-`--plan-opts '{"lookahead":true}'`. Every failing class, its code site and its fix direction are in `TRIAGE.md`.
+Traces failing, out of 33,340 per source (0 = pass), about 285,000 requests each, 0 bridge errors. Sources: 0.2.8 =
+`/tmp/pz-replay/src`; affine = this worktree's `src` (f5deda1); coldwarm = `/tmp/pz-coldwarm/src` 1fe03c2; rc030 =
+`/tmp/pz-rc/src` fa3a467 (the v0.3.0 candidate); +F2 = with `--plan-opts '{"lookahead":true}'`. Every failing class, its code
+site and its fix direction are in `TRIAGE.md` (the second round's new ones at its end). The first round's numbers (24,744
+traces, the first spec) are not comparable: A1 now checks by position and through the real recall paths, A2 has no blanket
+excuse below P = 0.5 and prices from the class, A3 no longer excuses a warm return, and the alphabet is larger.
 
-| property | evidence | 0.2.8 | affine | coldwarm | coldwarm +F2 | rc030 | rc030 +F2 |
-|---|---|---|---|---|---|---|---|
-| A1 nothing is lost | conformance | 0 | 0 | 0 | 0 | 0 | 0 |
-| A2 edit only when gone or it pays | conformance | 4,305 | 3,978 | 24 | 24 | 24 | 24 |
-| A3 never in the way | conformance | 83 | 85 | 104 | 540 | 104 | 540 |
-| I1 run stability | conformance | 0 | 0 | 0 | 0 | 0 | 0 |
-| RD restart determinism | conformance | 10,622 | 10,279 | 8,712 | 8,717 | 8,712 | 8,717 |
-| RC recall never refolded | conformance | 0 | 0 | 0 | 0 | 0 | 0 |
-| PW protection windows | conformance | 0 | 0 | 0 | 0 | 0 | 0 |
-| B2B no back-to-back warm rewrites | conformance | 6 | 5 | 7 | 7 | 7 | 7 |
-| MP monotone in P(warm) | proven (law) + conformance (planner) | 14,055 | 13,585 | 14 | 25 | 14 | 25 |
-| NR time consistency / no regret | conformance | 1,559 | 1,534 | 191 | 190 | 191 | 190 |
-| NT no thrash | conformance | 221 | 3 | 1 | 1 | 1 | 1 |
-| TR target reachability | conformance | 0 | 9 | 9 | 9 | 9 | 9 |
-| LW law as specified (lemmas M, E, G, C, S) | proven + conformance | 0 | 0 | 0 | 0 | 0 | 0 |
-| G, W harness fidelity | conformance | 0 | 0 | 0 | 0 | 0 | 0 |
+| property | 0.2.8 | affine | coldwarm | coldwarm +F2 | rc030 | rc030 +F2 |
+|---|---|---|---|---|---|---|
+| A1 nothing is lost | 177 | 0 | 0 | 0 | 0 | 0 |
+| A2 edit only when the cache is gone or the edit pays | 3,359 | 2,915 | 4 | 4 | 4 | 4 |
+| A3 never in the way | 3,576 | 3,647 | 266 | 705 | 266 | 705 |
+| I1 run stability | 0 | 0 | 0 | 0 | 0 | 0 |
+| RD restart determinism | 11,667 | 11,392 | 9,223 | 9,234 | 9,223 | 9,234 |
+| RC recall is never refolded | 60 | 0 | 0 | 0 | 0 | 0 |
+| PW protection windows | 0 | 0 | 0 | 0 | 0 | 0 |
+| B2B no back-to-back warm rewrites | 5 | 3 | 4 | 3 | 4 | 3 |
+| MP monotone in P(warm) | 15,627 | 15,137 | 23 | 36 | 23 | 36 |
+| NR time consistency (no regret) | 1,596 | 1,547 | 173 | 170 | 173 | 170 |
+| NT no thrash | 199 | 4 | 0 | 0 | 0 | 0 |
+| TR target reachability | 0 | 14 | 15 | 15 | 15 | 15 |
+| GC a gone cache gets a cold plan | 19 | 19 | 19 | 19 | 19 | 19 |
+| WB warm does nothing below the target | 45 | 4 | 0 | 0 | 0 | 0 |
+| MH an automatic cache keeps its head | 169 | 13 | 13 | 12 | 13 | 12 |
+| RDr restart determinism, residual | 4 | 3 | 6 | 7 | 6 | 7 |
+| MPr monotone in P(warm), residual | 0 | 0 | 0 | 0 | 0 | 0 |
+| A2r edit only when gone or it pays, residual | 136 | 2 | 2 | 2 | 2 | 2 |
+| LW the law as specified | 0 | 0 | 0 | 0 | 0 | 0 |
+| G the P-grid probe reproduces the real decision | 0 | 0 | 0 | 0 | 0 | 0 |
+| W the bridge's world is the spec's world | 0 | 0 | 0 | 0 | 0 | 0 |
 
 The two live bugs, rediscovered on 0.2.8 as minimal counterexamples (`traces/b1.trace`, `traces/b2.trace`):
 
 * **B1**: MP fails at the third request of `prompt; say 60K; prompt +60s; say 100; prompt +60s; say 100`. The warm run plan
-  summarises (P >= 0.51) what the cold plan's summary gate refuses at P = 0. Class "B1, the warm summary skips the summary gate the
-  cold one fails": 12,073 traces.
-* **B2**: NR fails at `prompt; say 60K; prompt +1h; say 100; prompt +60s; say 100`. The cold return cannot cut into the protected
-  60K turn, the window slides at the next prompt, and the warm run plan summarises while the user waits. 951 traces.
+  summarises (P >= 0.51) what the cold plan's summary gate refuses at P = 0. A2 now fails there too: the warm summary's call
+  is priced by no gate.
+* **B2**: NR fails at `prompt; say 60K; prompt +1h; say 100; prompt +60s; say 100`, and now A3 as well: the user waits for the
+  warm run plan's summary at request 2.
 
-0.2.8's lower A3 count is not a better score. Its waits are mostly in the warm valve, which rule 3 allows; A2 counts them as
-unpriced (4,305). In rc030 B1 is gone and the B2 summary class is down to one trace. What is left is the (a) list in `TRIAGE.md`.
+## Mutation score
+
+The review's 29 mutants of this worktree's `src` (`/tmp/pz-review-mut/m*`, one change each; 27 real, 2 equivalent), each
+checked on the standard suite plus 3,000 random traces (seed 1, no shrinking) with per-trace verdicts
+(`mutation/run.sh`, then `python3 mutation/cmp.py`; the mutant copies are the review's, in `/tmp/pz-review-mut/m*`). The unmutated copy, run twice, gives identical
+counts, classes and verdicts. A mutant is **caught** when a property that names the injected bug goes from 0 to failing or gains
+a counterexample class (the review's criterion), or, with per-trace verdicts, newly fails on traces where it passed.
+
+| | first round (review) | now |
+|---|---|---|
+| caught by a property that names the bug | 16 of 27 (59%) | 25 of 27 (93%) |
+| ... counting per-trace verdicts | (not available) | 27 of 27 (100%) |
+| caught only as a side effect | 4 (m06, m18b, m25, m26) | 0 (2 by the review's criterion alone: m15, m20) |
+| survived | 7 (m01, m02, m18, m19, m20, m21, m22) | 0 |
+| equivalent | 2 (m16, m24) | 2 (m16, m24: no property changes) |
+
+The seven survivors and the four side-effect catches, now (named property, base → mutant, traces): m01 `zip_recall` returns
+truncated bytes, A1 0 → 15,780; m02 placeholder without a handle, A1 0 → 14,447; m18 past-TTL at 4 × TTL, GC 19 → 13,656 (new
+class); m18b cold only after 20 min, GC 19 → 7,896 (new class); m19 a switch not cold, GC 19 → 1,682 (new class); m20 no
+`MIN_EXPECT` head, MH 13 → 3,351 (same class: per-trace verdicts); m21 1-hour tier ignored, LW 0 → 1,332; m22 steering counted
+as turns, PW 0 → 1,932; m06 explicit w 1.25 → 0.3, LW 0 → 25,449; m25 summary call free, LW 0 → 18,517 and A2r (new class);
+m26 warm below the cap, WB 4 → 692 (new class). m15 (`summarizedWarm` ignored) moves NT 4 → 28 in its existing class: caught
+by the per-trace verdicts only. m03 and m04 are now caught by A1 itself (0 → 5,523 and 0 → 5,218; m04 before only by I1).
+
+`tests/mutants.rs` keeps one mutant per property as a regression test (A1 ×5, A2/LW, A3 ×2, I1, RC ×3, PW ×3, B2B, NT, TR, GC ×3,
+WB, MH, LW ×2, MPr, RDr) and shows that W, G and LW's arithmetic fail on a tampered observation.
 
 ## How to run
 
@@ -208,10 +302,12 @@ cargo build --release
 ./target/release/pz-formal lemmas --src ../src                    # the law's lemmas, on the port and on the real lawTerms
 ./target/release/pz-formal run --src /tmp/pz-replay/src traces/b2.trace   # replay one trace, every request and verdict
 pi-durable-subagents hold machine -- ./target/release/pz-formal check --src ../src --random 3000 --json out/affine.json
-pi-durable-subagents hold machine -- ./run-all.sh             # the acceptance run: every source (about 70 min on 28 cores)
+pi-durable-subagents hold machine -- ./run-all.sh             # the acceptance run: every source (about 90 min on 28 cores)
 cargo test && cargo clippy --all-targets
 ```
 
 `check` options: `--suite standard|quick|none`, `--family 'worlds=explicit,glm depth=4 gaps=60,330,3600 bodies=q,p,b,c
-specials=switch,restart,foreign'`, `--random N --seed S`, `--only A2,MP`, `--shrink ROUNDS` (0 = no shrinking), `--workers W`,
-`--plan-opts JSON`, `--pi DIR` (another pi-coding-agent). A standard check without shrinking takes about 75 s for 24,744 traces.
+specials=switch,restart,foreign'` (worlds: explicit glm fresh tools small claude print long file reread warming; bodies: q p b c
+bb r s f; specials: switch restart foreign late-restart late-switch compact edit), `--random N --seed S`, `--only A2,MP`,
+`--shrink ROUNDS` (0 = no shrinking), `--workers W`, `--verdicts FILE` (per-trace verdicts, JSON lines), `--plan-opts JSON`,
+`--pi DIR` (another pi-coding-agent). A standard check without shrinking takes about 3 minutes for 33,340 traces on 28 cores.
