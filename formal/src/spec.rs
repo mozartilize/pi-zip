@@ -150,6 +150,11 @@ fn quiet_through_i() -> F<R> {
         i <= i0 || (i0 + 1..=i).map(|m| r.st[m].appended).sum::<f64>() <= DELTA
     })
 }
+/// The context the plan for this request saw (the previous request's view plus what was appended) is below Pi's compaction room. At or
+/// above it the edit is forced: Pi would compact (lossily, at its price) instead; no cold plan could have made it earlier.
+fn below_room() -> F<R> {
+    atom("below_room", |r: &R, i, _| i == 0 || r.st[i - 1].view_tok + r.st[i].appended < r.st[i].room)
+}
 fn after_i0() -> F<R> {
     atom("after_i0", |_r: &R, i, env: &Env| i > lookup(env, "i0") as usize)
 }
@@ -301,10 +306,11 @@ pub fn derived() -> Vec<Prop> {
             from: &["A2", "A3"],
             why: "an edit is free at a cold cache and paid at a warm one: a warm edit within K_REGRET requests of a cold plan, with no \
                   new information (switch, foreign compaction, recall, class change, growth > DELTA, counted through the witness \
-                  request itself: the plan made for it has seen what that request appended) in between, means the cold plan \
+                  request itself: the plan made for it has seen what that request appended; and a context that reached Pi's \
+                  compaction room, where the edit is forced) in between, means the cold plan \
                   was dominated by doing that edit then.",
             evidence: Evidence::Conformance,
-            f: always(cold_plan() >> freeze("i0", index(), !quiet_since_i0().until_within(K_REGRET, after_i0() & zip_edit() & planned_warm() & quiet_through_i()))),
+            f: always(cold_plan() >> freeze("i0", index(), !quiet_since_i0().until_within(K_REGRET, after_i0() & zip_edit() & planned_warm() & quiet_through_i() & below_room()))),
         },
         Prop {
             id: "NT",
