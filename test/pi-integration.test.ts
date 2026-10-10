@@ -275,11 +275,21 @@ describe("real Pi: a summary prepared while the user was away goes in through Pi
 	});
 
 	test("opening an old session starts no summary call: its return is a cold return, the run plan of its next prompt handles it (review P1-1)", async () => {
-		for (const agoMs of [5_000, 240 * 60_000, 7_200 * 60_000]) {
+		for (const agoMs of [5_000, 240 * 60_000, 7_200 * 60_000]) { // all past the 1 s TTL: the cache the session left is dead
 			const r = await rig(undefined, { file: template(agoMs), tui: true, native: false, idle: false, start: false });
 			await sleep(300);
 			expect([agoMs, r.narrativeCalls.length]).toEqual([agoMs, 0]); // old code: 1 within ms of session_start (delay max(0, last + 0.8 TTL - now) = 0)
 		}
+	});
+
+	test("a restart between the 0.8 mark and the TTL starts the call at once, as the live process's timer would have (formal A3)", async () => {
+		process.env.PI_ZIP_TTL_SECS = "30";
+		const r = await rig(undefined, { file: template(27_000), tui: true, native: false, idle: false, start: false }); // 27 s of 30: past 24 s (0.8), before 30 s
+		await sleep(400);
+		expect(r.narrativeCalls.length).toBe(1); // the user may come back after the TTL: the summary is ready
+		const early = await rig(undefined, { file: template(5_000), tui: true, native: false, idle: false, start: false }); // before the mark: a timer, not a call
+		await sleep(400);
+		expect(early.narrativeCalls.length).toBe(0);
 	});
 
 	test("a process that is not interactive, or a session that ended mid-run, prepares nothing", async () => {
