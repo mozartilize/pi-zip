@@ -38,6 +38,9 @@ export interface NoticeData {
 	items?: NoticeItem[];
 	more?: number; // folded outputs not listed
 	first?: boolean; // the session's first notice: say once that originals are kept
+	native?: string; // a summary's way into the session: "ok" (Pi's compaction, before the run) or why it went the draft way (a skip or off reason)
+	nativeMs?: number; // the whole ctx.compact() call, when it ran
+	nativeAskMs?: number; // ... how long it took to reach pi-zip's session_before_compact handler (the handlers before ours)
 	reqTs?: number; // when the first request carrying this plan went out (ms): the renderer shows that request's real size as "after"
 }
 

@@ -836,3 +836,13 @@ describe("/zip status after a restart", async () => {
 		expect(zip.statsLine(ctx)).toContain("this session: 3 zipped (~45K tokens), 1 summary, 1 unzip");
 	});
 });
+
+import { isKeystroke } from "../src/util.ts";
+describe("isKeystroke: what counts as the user typing (the first-key summary start)", () => {
+	test("keys, control keys, arrows, function keys, kitty-encoded keys and a paste count", () => {
+		for (const k of ["h", " ", "\r", "\x7f", "\x03", "\x1b", "\x1b[A", "\x1b[1;5C", "\x1bOP", "\x1b[97u", "\x1b[13;2u", "\x1b[200~pasted text\x1b[201~", "é", "\x1bb"]) expect([k, isKeystroke(k)]).toEqual([k, true]);
+	});
+	test("terminal reports and mouse events do not: focus, cursor position, cell size, device attributes, kitty flags, DECRPM, OSC/DCS/APC strings", () => {
+		for (const k of ["", "\x1b[I", "\x1b[O", "\x1b[12;40R", "\x1b[6;18;9t", "\x1b[?62;4c", "\x1b[?0u", "\x1b[?2026;2$y", "\x1b[<0;10;5M", "\x1b[<0;10;5m", "\x1b]11;rgb:0000/0000/0000\x07", "\x1bP>|kitty\x1b\\", "\x1b_Gi=1;OK\x1b\\"]) expect([k, isKeystroke(k)]).toEqual([k, false]);
+	});
+});

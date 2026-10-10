@@ -412,6 +412,72 @@ describe("real Pi: a summary prepared while the user was away goes in through Pi
 		expect(read).not.toContain("request 2");
 	});
 });
+describe("item 5: a run an extension's message starts (sendMessage with triggerTurn) never fires before_agent_start; agent_start does", () => {
+	const sleep = (ms: number) => new Promise((res) => setTimeout(res, ms));
+	const template = (agoMs: number) => {
+		const sm = SessionManager.inMemory(CWD);
+		populate(sm, 6000); // long prose: folds alone cannot reach the cap, so the cold return needs a summary
+		const file = [sm.getHeader() as Any, ...sm.getEntries()];
+		const newest = Math.max(...file.map((e) => e.message?.timestamp ?? 0));
+		const shift = Date.now() - agoMs - newest;
+		for (const e of file) {
+			if (typeof e.message?.timestamp === "number") e.message.timestamp += shift;
+			if (typeof e.timestamp === "string" && e.type !== undefined && e.type !== "session") e.timestamp = new Date(Date.parse(e.timestamp) + shift).toISOString();
+		}
+		return file;
+	};
+	beforeEach(() => { process.env.PI_ZIP_TTL_SECS = "1"; });
+	/** What Pi does for sendCustomMessage({ ..., triggerTurn: true }) on an idle session: agent_start, the message appended, the first request. */
+	const drive = async (r: Any, text = "drive the owed work") => {
+		await r.runner.emit({ type: "agent_start" } as Any);
+		r.sm.appendCustomMessageEntry("owed-drive", text, true);
+		return r.request();
+	};
+
+	test("a driven run after a gap longer than the TTL gets the cold plan (old code: no plan, a full cold rewrite of the whole context)", async () => {
+		const r = await rig(undefined, { file: template(240 * 60_000), tui: true, native: false, idle: false, start: false });
+		const req = await drive(r);
+		expect(req.some((m) => m.role === "compactionSummary")).toBe(true); // the summary the folds alone could not replace
+		expect(r.narrativeCalls.length).toBe(1);
+		expect(req.some(isFolded) || req.some((m) => m.role === "compactionSummary")).toBe(true);
+		expect(req.some((m) => m.role === "custom")).toBe(true); // the message that started the run is kept
+	});
+
+	test("a summary prepared while away is adopted by the driven run (one call), and ctx.compact() is never called: it would abort the run that is starting", async () => {
+		const r = await rig(undefined, { file: template(240 * 60_000), tui: true, native: true, idle: true, start: false });
+		r.typeKey("h"); // the first key of the reopened session starts the summary
+		await sleep(150);
+		expect(r.narrativeCalls.length).toBe(1);
+		const req = await drive(r);
+		expect(r.narrativeCalls.length).toBe(1); // adopted, not written again
+		expect(r.compactCalls.n).toBe(0);
+		expect(req.some((m) => m.role === "compactionSummary")).toBe(true);
+	});
+
+	test("a prompt still goes through before_agent_start once: agent_start after it does not start the run a second time", async () => {
+		const r = await rig(undefined, { file: template(240 * 60_000), tui: true, native: false, idle: false, start: false });
+		await r.beforeAgentStart("next request");
+		await r.runner.emit({ type: "agent_start" } as Any);
+		sendPrompt(r.sm, "next request");
+		const req = await r.request();
+		expect(r.narrativeCalls.length).toBe(1);
+		expect(req.filter((m) => m.role === "compactionSummary")).toHaveLength(1);
+	});
+
+	test("a warm driven run (inside the TTL) is planned exactly as a warm prompt is (the valve), not as a cold return", async () => {
+		process.env.PI_ZIP_TTL_SECS = "300";
+		const driven = await rig(undefined, { file: template(2_000), tui: true, native: false, idle: false, start: false });
+		const dReq = await drive(driven);
+		const prompted = await rig(undefined, { file: template(2_000), tui: true, native: false, idle: false, start: false });
+		await prompted.beforeAgentStart("next request");
+		sendPrompt(prompted.sm, "next request");
+		const pReq = await prompted.request();
+		expect(driven.narrativeCalls.length).toBe(prompted.narrativeCalls.length);
+		expect(dReq.some(isFolded)).toBe(pReq.some(isFolded));
+		expect(dReq.some((m) => m.role === "compactionSummary")).toBe(pReq.some((m) => m.role === "compactionSummary"));
+	});
+});
+
 describe("the notice's why line says the cache was judged cold, as the warm one says it was warm", () => {
 	test("a cold return: 'cache cold · away ...'", async () => {
 		const r = await rig(undefined, { tui: true }); // every message is hours old
