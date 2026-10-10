@@ -78,3 +78,32 @@ describe("a plan the law refuses falls back to the plan a warm cache would make 
 		expect(planContext(ctx, { ...o, mode: "cold", law: law(0, 200) })?.folds.some((f) => f.trig === "cold(relax)")).toBe(true);
 	});
 });
+
+describe("B2 for folds: a warm plan holds back what the last cold return protected (FOLD_HOLD)", () => {
+	// turn 1: a 440K-char (110K-token) mutating output; turn 2 is the cold return's prompt (u2): the output was protected there (previous turn); turn 3 is
+	// the next prompt, the window has slid and a warm plan used to fold it at the warm cache
+	const turn1 = [U("u1", "one"), A("a1", ["c1"]), R("r1", "c1", 440_000), A("a1b")];
+	const ctx = (mid: Any[] = []) => [...turn1, U("u2", "two"), A("a2"), ...mid, U("u3", "three")];
+	const o = { ...base, mode: "warm" as const, coldCap: 20_000, law: law(1, 500), pastTtl: false };
+	test("without a hold the slid window folds it (the regret); with the cold return's prompt as the anchor it stays", () => {
+		expect(planContext(ctx(), o)?.folds.map((f) => f.entryId)).toEqual(["r1"]);
+		expect(planContext(ctx(), { ...o, hold: { anchor: "u2" } })).toBeNull(); // old code: the same fold as above
+	});
+	test("the hold ends when the session has grown by more than 11.5K real tokens before the newest response (new information)", () => {
+		const grown = ctx([A("a2b", ["c2"]), R("r2", "c2", 100_000), A("a2c")]);
+		expect(planContext(grown, { ...o, hold: { anchor: "u2" } })?.folds.map((f) => f.entryId)).toContain("r1");
+		const small = ctx([A("a2b", ["c2"]), R("r2", "c2", 20_000), A("a2c")]);
+		expect(planContext(small, { ...o, hold: { anchor: "u2" } })?.folds.map((f) => f.entryId) ?? []).not.toContain("r1");
+	});
+	test("it ends at Pi's compaction room, and when its anchor is gone (a later summary replaced it)", () => {
+		const tight = { ...o, model: { contextWindow: 130_000 }, hold: { anchor: "u2" } };
+		expect(planContext(ctx(), tight)?.folds.map((f) => f.entryId)).toEqual(["r1"]); // 110K tokens of context >= the room of a 130K window: forced
+		expect(planContext(ctx(), { ...o, hold: { anchor: "gone" } })?.folds.map((f) => f.entryId)).toEqual(["r1"]);
+	});
+	test("a cold plan never holds, and a hold gives way to the summary the plan would write anyway", () => {
+		expect(planContext(ctx(), { ...o, mode: "cold", law: law(0, 500), hold: { anchor: "u2" } })?.folds.map((f) => f.entryId)).toEqual(["r1"]);
+		const prose = [U("u1", "one"), AX("x1", 80_000), A("a1"), U("u2", "two"), AX("x2", 80_000), A("a2"), U("u3", "three")];
+		const w = planContext(prose, { ...o, hold: { anchor: "u2" }, law: law(1, 300) });
+		expect(w).toEqual(planContext(prose, { ...o, law: law(1, 300) })); // the same plan as without the hold
+	});
+});
