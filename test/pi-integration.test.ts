@@ -248,336 +248,24 @@ describe("real Pi: the request view is identical before and after turn_end persi
 
 describe("real Pi: a summary prepared while the user was away goes in through Pi's own compaction (pi-tricks §1b, variant 1)", () => {
 	const sleep = (ms: number) => new Promise((res) => setTimeout(res, ms));
-	const template = () => {
+	/** The session as a file whose newest response is `agoMs` old (the rig of every other test is hours old: a cold session). */
+	const template = (agoMs = 0) => {
 		const sm = SessionManager.inMemory(CWD);
 		populate(sm, 6000); // long prose: folds alone cannot reach the cap, so the cold return needs a summary
-		return [sm.getHeader() as Any, ...sm.getEntries()];
-	};
-	/** The end of the previous run, the user away past the TTL (the away timer prepares the summary), then the cold return. */
-	async function coldReturn(file: Any[], native: boolean, settings?: Any) {
-		const r = await rig(undefined, { file, tui: true, native, idle: native, start: false, settings }); // not idle: the draft path
-		await r.settle();
-		await sleep(250); // the timer fired at 0.8 x 100 ms and the (stubbed) narrative call returned
-		await r.beforeAgentStart("next request");
-		sendPrompt(r.sm, "next request");
-		const req1 = await r.request();
-		await sleep(5); // the notice is appended right after the request view (setTimeout 0)
-		return { r, req1, drafts: [] as Any[] };
-	}
-	const lastNotice = (sm: SessionManager) => (sm.getBranch().filter((e: Any) => e.type === "custom" && e.customType === "pi-zip/notice" && !e.data?.kind).at(-1) as Any)?.data;
-	beforeEach(() => { process.env.PI_ZIP_TTL_SECS = "0.1"; });
-
-	test("the run's first request carries exactly the bytes of the draft path; Pi's [compaction] figure is the notice's before", async () => {
-		const file = template();
-		const a = await coldReturn(file, false), b = await coldReturn(file, true);
-		expect(a.r.narrativeCalls.length).toBe(1); // prepared while away, once, on both paths
-		expect(b.r.narrativeCalls.length).toBe(1);
-		// native: Pi's compaction entry is in the session before the prompt; draft path: nothing until turn_end
-		const branchB = b.r.sm.getBranch() as Any[];
-		const comp = branchB.filter((e) => e.type === "compaction");
-		expect(comp).toHaveLength(1);
-		expect(comp[0]).toMatchObject({ fromHook: true, details: { by: "pi-zip", via: "native", trigger: "cold" } });
-		expect(branchB.indexOf(comp[0])).toBeLessThan(branchB.findIndex((e) => e.type === "message" && e.message.content === "next request"));
-		expect(a.r.sm.getBranch().some((e: Any) => e.type === "compaction")).toBe(false);
-		expect(a.req1.some((m) => m.role === "compactionSummary")).toBe(true);
-		expect(a.req1.some(isFolded)).toBe(true); // a fold in the kept part rides along
-		for (const mid of [true, false]) expect(llm(b.req1, mid)).toBe(llm(a.req1, mid));
-		const nb = lastNotice(b.r.sm);
-		expect(nb.before).toBe(comp[0].tokensBefore);
-		expect(nb.before).toBe(lastNotice(a.r.sm).before);
-		expect(nb.desc).toContain("ready while you were away");
-		// turn_end: the draft path persists the compaction (first) and the folds, the native path only the folds; request 2 is identical
-		for (const x of [a, b]) {
-			const id = x.r.sm.appendMessage(asst([call("c9")], "toolUse", 10_000_001));
-			x.r.sm.appendMessage(result("c9", "tiny", 10_000_002));
-			x.drafts = (await x.r.turnEnd(id, asst([call("c9")], "toolUse"))).filter((d: Any) => d.type !== "custom"); // (the commit marker is not an edit)
+		const file = [sm.getHeader() as Any, ...sm.getEntries()];
+		const newest = Math.max(...file.map((e) => e.message?.timestamp ?? 0));
+		const shift = Date.now() - agoMs - newest;
+		for (const e of file) {
+			if (typeof e.message?.timestamp === "number") e.message.timestamp += shift;
+			if (typeof e.timestamp === "string" && e.type !== undefined && e.type !== "session") e.timestamp = new Date(Date.parse(e.timestamp) + shift).toISOString();
 		}
-		expect(a.drafts.map((d) => d.type)).toEqual(["compaction", ...a.drafts.slice(1).map(() => "context_edit")]);
-		expect(b.drafts.map((d) => d.type)).toEqual(a.drafts.slice(1).map(() => "context_edit"));
-		expect(b.drafts.map((d) => d.targetId)).toEqual(a.drafts.slice(1).map((d) => d.targetId));
-		const a2 = await a.r.request(), b2 = await b.r.request();
-		for (const mid of [true, false]) expect(llm(b2, mid)).toBe(llm(a2, mid));
-	});
-
-	test("Pi would find nothing to compact (its keepRecentTokens): pi-zip does not ask, and the draft path carries the summary", async () => {
-		const b = await coldReturn(template(), true, { compaction: { keepRecentTokens: 10_000_000 } });
-		expect(b.r.compactions).toHaveLength(0);
-		expect(b.r.sm.getBranch().some((e: Any) => e.type === "compaction")).toBe(false);
-		expect(b.req1.some((m) => m.role === "compactionSummary")).toBe(true); // request-local, as before
-	});
-
-	test("session_before_compact answers only pi-zip's own request: Pi's or /compact's compaction gets undefined", async () => {
-		const r = await rig(undefined, { file: template(), tui: true, native: true });
-		const branch = r.sm.getBranch();
-		const preparation = prepareCompaction(branch as Any, { enabled: true, reserveTokens: 16_384, keepRecentTokens: 2_000 });
-		expect(preparation).toBeDefined();
-		const out = await r.runner.emit({ type: "session_before_compact", preparation, branchEntries: branch, reason: "threshold", willRetry: false, signal: new AbortController().signal } as Any);
-		expect(out).toBeUndefined();
-	});
-});
-
-describe("real Pi: another extension's session_before_compact handler takes part in pi-zip's compaction (Pi runs them all)", () => {
-	const sleep = (ms: number) => new Promise((res) => setTimeout(res, ms));
-	const template = (extra?: (sm: SessionManager) => void) => {
-		const sm = SessionManager.inMemory(CWD);
-		populate(sm, 6000); // long prose: folds alone cannot reach the cap, so the cold return needs a summary
-		extra?.(sm);
-		return [sm.getHeader() as Any, ...sm.getEntries()];
+		return file;
 	};
-	const moreTurns = (sm: SessionManager, ts: number, n: number) => {
-		for (let i = 0; i < n; i++) {
-			sm.appendMessage(user(`later ${i}`, ts + 2 * i));
-			sm.appendMessage(asst([{ type: "text", text: `later done ${i} ${"explanation ".repeat(6000)}` }], "stop", ts + 2 * i + 1));
-		}
-	};
-	const OTHER = (e: Any) => ({ compaction: { summary: "OTHER SUMMARY", firstKeptEntryId: e.preparation.firstKeptEntryId, tokensBefore: e.preparation.tokensBefore, details: { by: "other" } } });
-	/** Another extension's own keep policy: it keeps the last three turns (from "request 4"), more than Pi's 20K tokens would. */
-	const OTHER_KEEPS_MORE = (e: Any) => ({ compaction: { ...OTHER(e).compaction, firstKeptEntryId: e.branchEntries.find((x: Any) => x.type === "message" && x.message.content === "request 4").id } });
-	const PIZIP = "[summary of earlier conversation by pi-zip]";
-	let ledger = "";
-	beforeEach(() => {
-		process.env.PI_ZIP_TTL_SECS = "0.1";
-		process.env.PI_ZIP_NATIVE_MS = "200"; // the deadline of pi-zip's own compaction (2 s in production)
-		ledger = `/tmp/pi-zip-coexist-${process.pid}-${Math.random().toString(36).slice(2)}.jsonl`;
-		process.env.PI_ZIP_LEDGER = ledger;
-	});
-	afterEach(() => {
-		delete process.env.PI_ZIP_NATIVE_MS;
-		delete process.env.PI_ZIP_LEDGER;
-		rmSync(ledger, { force: true });
-	});
-	const rows = (type: string): Any[] => {
-		try {
-			return readFileSync(ledger, "utf8").trim().split("\n").map((l) => JSON.parse(l)).filter((x) => x.type === type);
-		} catch {
-			return [];
-		}
-	};
-	/** Away past the TTL: settle plans, the timer prepares the summary (stubbed narrative call). */
-	const away = async (r: Any) => {
-		await r.settle();
-		await sleep(250);
-	};
-	/** The return: before_agent_start (timed: the user's prompt waits for it), Pi appends the prompt, the run's first request. */
-	const back = async (r: Any, text = "next request", ts = 10_000_000) => {
-		const t0 = performance.now();
-		await r.beforeAgentStart(text);
-		const waited = performance.now() - t0;
-		r.sm.appendMessage(user(text, ts));
-		const req1 = (await r.request()) as Any[];
-		await sleep(5);
-		return { req1, waited };
-	};
-	const finishTurn = async (r: Any, ts = 10_000_001) => {
-		const id = r.sm.appendMessage(asst([call("c9")], "toolUse", ts));
-		r.sm.appendMessage(result("c9", "tiny", ts + 1));
-		return (await r.turnEnd(id, asst([call("c9")], "toolUse"))) as Any[];
-	};
-	const comps = (r: Any) => (r.sm.getBranch() as Any[]).filter((e) => e.type === "compaction");
-	const summaries = (req: Any[]) => req.filter((m) => m.role === "compactionSummary").map((m) => String(m.summary));
-
-	test("loaded after pi-zip, it answers with its own summary (Pi keeps the last answer): that compaction stays the only one; pi-zip neither adopts its prepared summary nor writes one on top", async () => {
-		const r = await rig(undefined, { file: template(), tui: true, native: true, start: false, foreign: { at: "after", on: OTHER_KEEPS_MORE } });
-		await away(r);
-		const { req1 } = await back(r);
-		expect(r.foreignCalls).toEqual(["manual"]); // Pi ran it for pi-zip's compaction
-		expect(comps(r).map((c) => c.summary)).toEqual(["OTHER SUMMARY"]);
-		expect(summaries(req1)).toEqual(["OTHER SUMMARY"]); // nothing of pi-zip's on top of it
-		const drafts = await finishTurn(r);
-		expect(drafts.filter((d) => d.type === "compaction")).toEqual([]);
-		expect(comps(r)).toHaveLength(1);
-		expect(r.narrativeCalls.length).toBe(1); // the summary prepared while away, and no second one
-		expect((r.sm.getBranch() as Any[]).some((e) => e.type === "custom" && e.customType === "pi-zip/unused-summary")).toBe(true); // discarded: its cost is booked
-		expect(rows("native_off").map((x) => x.reason)).toEqual(["another extension's compaction went in instead of pi-zip's"]);
-	});
-
-	test("loaded before pi-zip, it answers at once: pi-zip's answer comes last and wins; the native path stays on", async () => {
-		const r = await rig(undefined, { file: template(), tui: true, native: true, start: false, foreign: { at: "before", on: OTHER } });
-		await away(r);
-		const { req1 } = await back(r);
-		expect(r.foreignCalls).toEqual(["manual"]);
-		expect(comps(r)).toHaveLength(1);
-		expect(comps(r)[0]).toMatchObject({ fromHook: true, details: { by: "pi-zip", via: "native" } });
-		expect(summaries(req1)).toHaveLength(1);
-		expect(summaries(req1)[0]).toContain(PIZIP);
-		expect(rows("native_off")).toEqual([]);
-	});
-
-	test("loaded before pi-zip, it takes its time (it writes its own summary, ignoring the abort): cancelled at the deadline, the prompt goes on at once, nothing lands later, the draft path carries pi-zip's summary", async () => {
-		const seen: Any = {};
-		const slow = async (e: Any) => {
-			await sleep(1_000);
-			seen.aborted = e.signal.aborted;
-			return OTHER(e);
-		};
-		const r = await rig(undefined, { file: template(), tui: true, native: true, start: false, foreign: { at: "before", on: slow } });
-		await away(r);
-		const { req1, waited } = await back(r);
-		expect(waited).toBeLessThan(600); // the deadline (200 ms here), not the 1 s the other handler takes
-		expect(comps(r)).toEqual([]);
-		expect(summaries(req1)).toHaveLength(1);
-		expect(summaries(req1)[0]).toContain(PIZIP); // request-local, as on the draft path
-		await sleep(1_100); // the other handler has answered by now; Pi's compaction ends, cancelled
-		expect(seen.aborted).toBe(true);
-		expect(r.compactCalls).toEqual({ n: 1, ended: 1 });
-		expect(comps(r)).toEqual([]); // nothing went in during the run
-		const drafts = await finishTurn(r);
-		expect(drafts.filter((d) => d.type === "compaction").map((d) => d.details)).toEqual([{ by: "pi-zip", trigger: "cold", carried: true }]);
-		expect(comps(r)).toHaveLength(1);
-		expect(rows("native_off").map((x) => x.reason)).toEqual(["another session_before_compact handler ran before pi-zip's (cancelled after 200 ms)"]);
-	});
-
-	test("loaded before pi-zip, it finishes in time but not at once (a model call, say): pi-zip's answer wins this once, then the native path ends, so that call is not paid for and waited for at every cold return", async () => {
-		process.env.PI_ZIP_NATIVE_MS = "2000"; // the production deadline: 400 ms is inside it, and over the 250 ms of a compaction that is pi-zip's alone
-		const modelCall = async (e: Any) => (await sleep(400), OTHER(e));
-		const r = await rig(undefined, { file: template(), tui: true, native: true, start: false, foreign: { at: "before", on: modelCall } });
-		await away(r);
-		const first = await back(r);
-		expect(comps(r).map((c) => c.details)).toEqual([{ by: "pi-zip", via: "native", trigger: "cold" }]);
-		expect(summaries(first.req1)[0]).toContain(PIZIP);
-		expect(rows("native_off").map((x) => x.reason)).toEqual([expect.stringMatching(/^Pi's compaction took \d+ ms: another session_before_compact handler at work$/)]);
-		await finishTurn(r);
-		moreTurns(r.sm, 10_100_000, 3);
-		await away(r);
-		const second = await back(r, "and again", 10_200_000);
-		expect(second.waited).toBeLessThan(300);
-		expect(r.compactCalls.n).toBe(1);
-		expect(r.foreignCalls).toEqual(["manual"]);
-		expect(rows("native_skip").map((x) => x.reason)).toEqual(["off for this process"]);
-		expect(summaries(second.req1)).toHaveLength(1);
-		expect(summaries(second.req1)[0]).toContain(PIZIP); // the draft path carries it, as before
-	});
-
-	test("loaded after pi-zip, it takes its time: pi-zip does not wait past the deadline, and Pi's compaction is cancelled, so its late result never lands during the run", async () => {
-		const seen: Any = {};
-		const slow = async (e: Any) => {
-			await sleep(1_000);
-			seen.aborted = e.signal.aborted;
-			return undefined; // pi-zip's answer would stand
-		};
-		const r = await rig(undefined, { file: template(), tui: true, native: true, start: false, foreign: { at: "after", on: slow } });
-		await away(r);
-		const { req1, waited } = await back(r);
-		expect(waited).toBeLessThan(600);
-		expect(comps(r)).toEqual([]);
-		expect(summaries(req1)[0]).toContain(PIZIP);
-		await sleep(1_100);
-		expect(seen.aborted).toBe(true);
-		expect(r.compactCalls).toEqual({ n: 1, ended: 1 });
-		expect(comps(r)).toEqual([]); // pi-zip's answer was the last one, but Pi saw its abort signal before appending
-		const drafts = await finishTurn(r);
-		expect(drafts.filter((d) => d.type === "compaction")).toHaveLength(1);
-		expect(comps(r)).toHaveLength(1);
-		expect(rows("native_off").map((x) => x.reason)).toEqual(["Pi's compaction was not done 200 ms after pi-zip answered (cancelled)"]);
-	});
-
-	for (const at of ["before", "after"] as const) {
-		test(`loaded ${at} pi-zip, it cancels manual compactions: the draft path takes the summary, and the next cold return does not ask Pi again`, async () => {
-			const cancels = (e: Any) => (e.reason === "manual" ? { cancel: true } : undefined);
-			const r = await rig(undefined, { file: template(), tui: true, native: true, start: false, foreign: { at, on: cancels } });
-			await away(r);
-			const first = await back(r);
-			expect(r.compactCalls.n).toBe(1);
-			expect(comps(r)).toEqual([]);
-			expect(summaries(first.req1)[0]).toContain(PIZIP);
-			const drafts = await finishTurn(r);
-			expect(drafts[0]).toMatchObject({ type: "compaction", details: { by: "pi-zip" } });
-			expect(rows("native_off").map((x) => x.reason)).toEqual(["Pi's compaction failed: Compaction cancelled"]);
-			// the next cold return in this process: no second ctx.compact (Pi's red "Compaction cancelled" at most once)
-			moreTurns(r.sm, 10_100_000, 3); // still in the past: every message is hours old, so this return is cold too
-			await away(r);
-			const second = await back(r, "and again", 10_200_000);
-			expect(r.narrativeCalls.length).toBe(2);
-			expect(r.compactCalls.n).toBe(1);
-			expect(r.foreignCalls).toEqual(["manual"]);
-			expect(summaries(second.req1)).toHaveLength(1);
-			expect(summaries(second.req1)[0]).toContain(PIZIP);
-			expect(rows("native_skip").map((x) => x.reason)).toEqual(["off for this process"]);
-		});
-	}
-
-	test("a compaction another extension supplied is already in the branch: pi-zip does not ask Pi at all (that extension's handler would run for pi-zip's too)", async () => {
-		const file = template((sm) => {
-			const kept = sm.getBranch().filter((e: Any) => e.type === "message" && e.message.role === "user").at(1) as Any;
-			sm.appendCompaction("EARLIER OTHER SUMMARY", kept.id, 50_000, { by: "other" }, true);
-			moreTurns(sm, 9_000_000, 3);
-		});
-		const r = await rig(undefined, { file, tui: true, native: true, start: false });
-		await away(r);
-		const { req1 } = await back(r);
-		expect(r.compactCalls.n).toBe(0);
-		expect(rows("native_skip").map((x) => x.reason)).toEqual(["another extension's compaction is in this branch"]);
-		expect(summaries(req1)).toHaveLength(1);
-		expect(summaries(req1)[0]).toContain(PIZIP); // the draft path, as before
-	});
-});
-
-describe("real Pi: pi-zip predicts Pi's 'Nothing to compact' exactly (piCanCompact against Pi's own prepareCompaction)", () => {
-	test("small, large, after a compaction, every keepRecentTokens", async () => {
-		const { piCanCompact } = await import("../src/plan.ts");
-		const sessions: Array<[string, SessionManager]> = [];
-		const mk = (name: string, fill: (sm: SessionManager) => void) => {
-			const sm = SessionManager.inMemory(CWD);
-			fill(sm);
-			sessions.push([name, sm]);
-		};
-		mk("empty", () => {});
-		mk("one prompt", (sm) => sm.appendMessage(user("hi", 1)));
-		mk("one turn", (sm) => { sm.appendMessage(user("hi", 1)); sm.appendMessage(asst([{ type: "text", text: "hello" }], "stop", 2)); });
-		mk("populated", (sm) => populate(sm));
-		mk("prose", (sm) => populate(sm, 6000));
-		mk("compacted then one turn", (sm) => {
-			populate(sm, 2000);
-			const kept = sm.getBranch().filter((e: Any) => e.type === "message" && e.message.role === "user").at(-2) as Any;
-			sm.appendCompaction("S".repeat(4_000), kept.id, 0, {}, false);
-			sm.appendMessage(user("after", 9_000_000));
-			sm.appendMessage(asst([{ type: "text", text: "x ".repeat(3_000) }], "stop", 9_000_001));
-		});
-		mk("ends with a compaction", (sm) => {
-			populate(sm);
-			const kept = sm.getBranch().filter((e: Any) => e.type === "message" && e.message.role === "user").at(-1) as Any;
-			sm.appendCompaction("S", kept.id, 0, {}, false);
-		});
-		let checked = 0;
-		const seen = new Set<boolean>();
-		for (const [name, sm] of sessions) {
-			for (const keepRecent of [0, 500, 2_000, 20_000, 60_000, 10_000_000]) {
-				const branch = sm.getBranch();
-				const pi = !!prepareCompaction(branch as Any, { enabled: true, reserveTokens: 16_384, keepRecentTokens: keepRecent });
-				const last = branch[branch.length - 1] as Any;
-				const ours = last?.type !== "compaction" && piCanCompact(sm.buildSessionProjection().entries as Any[], keepRecent);
-				expect([name, keepRecent, ours]).toEqual([name, keepRecent, pi]);
-				seen.add(pi);
-				checked++;
-			}
-		}
-		expect(checked).toBe(42);
-		expect([...seen].sort()).toEqual([false, true]); // both answers occur
-	});
-});
-
-describe("real Pi: the idle cache warmer's timing", () => {
-	test("warmingDelayMs is Pi's own getCacheWarmingDelayMs", async () => {
-		const { getCacheWarmingDelayMs } = await import("../node_modules/@earendil-works/pi-coding-agent/dist/core/cache-warmer.js");
-		const { warmingDelayMs } = await import("../src/run.ts");
-		for (const ttl of [1_000, 10_000, 10_001, 10_200, 15_000, 60_000, 100_000, 300_000, 3_600_000]) expect([ttl, warmingDelayMs(ttl)]).toEqual([ttl, getCacheWarmingDelayMs(ttl)]);
-	});
-});
-
-// formal/TRIAGE.md (a) 7 and 8 (A3, RDr): the summary prepared while the user is away must exist for a process that was restarted in
-// between, and must be for the context the user comes back to, not the one settle saw
-describe("the away summary survives a restart and a rewrite of the context while away", () => {
-	const sleep = (ms: number) => new Promise((res) => setTimeout(res, ms));
-	const template = () => {
-		const sm = SessionManager.inMemory(CWD);
-		populate(sm, 6000); // long prose: folds alone cannot reach the cap, so the cold return needs a summary
-		return [sm.getHeader() as Any, ...sm.getEntries()];
-	};
-	beforeEach(() => { process.env.PI_ZIP_TTL_SECS = "0.1"; });
+	beforeEach(() => { process.env.PI_ZIP_TTL_SECS = "1"; });
 
 	test("a resumed process arms the away timer from the branch's last request: the summary is ready before the return (7)", async () => {
 		const r = await rig(undefined, { file: template(), tui: true, native: false, idle: false, start: false }); // session_start only: no settle ever ran in this process
-		await sleep(250);
+		await sleep(1_300); // the timer fires at 0.8 x the 1 s TTL after the last response
 		expect(r.narrativeCalls.length).toBe(1); // old code: 0 (armAway was reached only from settle)
 		await r.beforeAgentStart("next request");
 		sendPrompt(r.sm, "next request");
@@ -586,19 +274,28 @@ describe("the away summary survives a restart and a rewrite of the context while
 		expect(req1.some((m) => m.role === "compactionSummary")).toBe(true);
 	});
 
+	test("opening an old session starts no summary call: its return is a cold return, the run plan of its next prompt handles it (review P1-1)", async () => {
+		for (const agoMs of [5_000, 240 * 60_000, 7_200 * 60_000]) {
+			const r = await rig(undefined, { file: template(agoMs), tui: true, native: false, idle: false, start: false });
+			await sleep(300);
+			expect([agoMs, r.narrativeCalls.length]).toEqual([agoMs, 0]); // old code: 1 within ms of session_start (delay max(0, last + 0.8 TTL - now) = 0)
+		}
+	});
+
 	test("a process that is not interactive, or a session that ended mid-run, prepares nothing", async () => {
 		const quiet = await rig(undefined, { file: template(), tui: false, start: false });
-		await sleep(250);
+		await sleep(1_300);
 		expect(quiet.narrativeCalls.length).toBe(0);
 		const file = template();
-		file.push({ type: "message", id: "tail", parentId: file.at(-1).id, timestamp: new Date(T0).toISOString(), message: asst([call("zz")], "toolUse", 99) });
+		file.push({ type: "message", id: "tail", parentId: file.at(-1).id, timestamp: new Date().toISOString(), message: asst([call("zz")], "toolUse", 99) });
 		const cut = await rig(undefined, { file, tui: true, start: false });
-		await sleep(250);
+		await sleep(1_300);
 		expect(cut.narrativeCalls.length).toBe(0);
 	});
 
 	test("Pi's compaction while the user is away: the timer plans again on the context as it is, the summary is for the return (8)", async () => {
-		const r = await rig(undefined, { file: template(), tui: true, native: false, idle: false, start: false });
+		process.env.PI_ZIP_TTL_SECS = "0.1";
+		const r = await rig(undefined, { file: template(3_600_000), tui: true, native: false, idle: false, start: false });
 		r.narrativeCalls.length = 0;
 		await r.settle(); // the plan made now has a cut at the old context
 		const branch = r.sm.getBranch() as Any[];
