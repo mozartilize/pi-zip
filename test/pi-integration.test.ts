@@ -633,3 +633,14 @@ describe("B2 for folds through the real extension: the cold return leaves its ma
 		expect((w.sm.getBranch() as Any[]).some((e) => e.type === "custom" && e.customType === "pi-zip/cold")).toBe(false);
 	});
 });
+
+describe("the notice's why line says the cache was judged cold, as the warm one says it was warm", () => {
+	test("a cold return: 'cache cold · away ...'", async () => {
+		const r = await rig(undefined, { tui: true }); // every message is hours old
+		sendPrompt(r.sm, "next request");
+		await r.request();
+		await new Promise((res) => setTimeout(res, 5));
+		const notice = (r.sm.getBranch().filter((e: Any) => e.type === "custom" && e.customType === "pi-zip/notice" && !e.data?.kind).at(-1) as Any)?.data;
+		expect(notice?.why).toMatch(/^cache cold · away [\d.]+ (s|min|h)$/); // old code: "away 3.0 h"
+	});
+});

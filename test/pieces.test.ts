@@ -778,7 +778,7 @@ describe("notices and stats", () => {
 	});
 	const th = { fg: (_c: string, t: string) => t };
 	const data: NoticeData = {
-		v: 2, text: "", before: 74000, after: 43000, desc: "zipped 12 old outputs in 6 ms", why: "away 47 min",
+		v: 2, text: "", before: 74000, after: 43000, desc: "zipped 12 old outputs in 6 ms", why: "cache cold · away 47 min",
 		items: [{ label: "bash npm test", turn: 1, tokens: 14000, handle: "k3x9q2m7ab" }, { label: "read src/payment.ts", turn: 1, tokens: 9000, handle: "p8d2x1qa0m" }], more: 10,
 	};
 	test("collapsed: one line; narrow terminals drop the time, then the words, never the numbers; nothing exceeds the width", () => {
@@ -795,7 +795,7 @@ describe("notices and stats", () => {
 		expect(ex[1]).toMatch(/^ {2}bash npm test +14K   k3x9q2m7ab$/);
 		expect(ex[2]).toMatch(/^ {2}read src\/payment\.ts +\d+K   \w{10}$/);
 		expect(ex[3]).toBe("  … 10 more");
-		expect(ex[4]).toBe("  away 47 min");
+		expect(ex[4]).toBe("  cache cold · away 47 min");
 	});
 	test("colours by meaning: monogram accent+bold, words muted, the size now success+bold, the rest dim", () => {
 		const tag = { fg: (c: string, t: string) => `<${c}>${t}</${c}>`, bold: (t: string) => `*${t}*` };

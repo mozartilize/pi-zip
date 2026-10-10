@@ -43,14 +43,14 @@ One mark, ƶ, and three words: **zipped**, **unzip**, **summarized**. Only the n
 ƶ summarized 64 requests   182K → 41K   38.2 s · ready while you were away
 ```
 
-The second line appears once per session. A summary that made you wait says so (`waited 8.4 s`, highlighted from 2 s on). Click the line (or expand tool output with ctrl+o) to see what was zipped and why now:
+The second line appears once per session. A summary that made you wait says so (`waited 8.4 s`, highlighted from 2 s on). Click the line (or expand tool output with ctrl+o) to see what was zipped and why now (a cold return says `cache cold · away 47 min` or `cache cold · model switched`, a warm edit `cache warm · worth it at this size`):
 
 ```
 ƶ zipped 12 old outputs   74K → 43K   6 ms
   bash npm test         14K   k3x9q2m7ab
   read src/payment.ts  9.1K   p8d2x1qa0m
   … 10 more
-  away 47 min
+  cache cold · away 47 min
 ```
 
 These lines are saved in the session, so they are still there after a restart, but they are never sent to the model. On narrow terminals the time goes first, then the words; the numbers always stay. A summary still shows up as Pi's own `[compaction]` block as well; the ƶ line next to it tells you who made it. The pi-zip numbers are real tokens, the same scale as Pi's context meter (the meter adds the newest reply's output on top); the `Compacted from N tokens` figure in Pi's block is pi-zip's own size before for a summary prepared while you were away (that one goes in through Pi's compaction, before your prompt); for any other summary it is Pi's own estimate taken when the entry is saved, so it may not match.
