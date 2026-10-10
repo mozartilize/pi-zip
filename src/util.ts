@@ -3,6 +3,13 @@ export type Any = any;
 
 export const PRODUCT = "pi-zip";
 
+/** Custom session entry pi-zip appends after the edits (context_edit / compaction) it persists at a turn_end: `{ carried }` says whether
+ *  the request(s) of the run had already sent them (a run plan: persisted after the response that first carried it) or whether the next
+ *  request is the first to carry them (a warm-valve plan). The edits alone do not say which, and the planner's state (growth, "the
+ *  newest response carried an edit", the size scale) is read from the branch, so a restart plans like a process that never left.
+ *  Custom entries never reach the model. */
+export const COMMIT_CUSTOM = "pi-zip/commit";
+
 export const textOf = (c: Any): string =>
 	typeof c === "string" ? c : Array.isArray(c) ? c.filter((b: Any) => b?.type === "text").map((b: Any) => b.text ?? "").join("\n") : "";
 

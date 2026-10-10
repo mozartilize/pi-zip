@@ -134,7 +134,7 @@ describe("I1 byte stability: every request of a run sends the same prefix, and i
 		expect(req1.messages[0].role).toBe("compactionSummary");
 		const all = [...big, A("a6")];
 		const te = await r.fire("turn_end", turnEnd(all, "a6"));
-		expect(te.entries.map((e: Any) => e.type)).toEqual(["compaction", "context_edit"]);
+		expect(te.entries.map((e: Any) => e.type)).toEqual(["compaction", "context_edit", "custom"]); // the edits, then the commit marker
 		expect(te.entries[0].firstKeptEntryId).toBe("u3");
 		expect(te.entries[1].targetId).toBe("r5");
 		// the order changes nothing in what the session projects
