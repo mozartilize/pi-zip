@@ -10,7 +10,7 @@ import { clipMid, handleFor, makePlaceholder, makePlaceholderFor, outcomeHint, p
 import { buildBlocks, toolCallIndex } from "../src/plan.ts";
 import { A, type Any, fakeCtx, fakePi, R, U } from "./helpers.ts";
 import { branchOutputs, parseRange, recalledHandlesFromBranch, recallSections, resolveHandlesInBranch, searchOutputs, sliceRecall } from "../src/recall.ts";
-import { handleRowsOf, handleTable, INDEX_TOKENS, skeleton } from "../src/summary.ts";
+import { handleRowsOf, handleTable, INDEX_TOKENS, skeleton, TABLE_ROWS } from "../src/summary.ts";
 import { TOOL_FRAME_CHARS, tokensOf } from "../src/util.ts";
 
 const zipRecallName = "zip_recall";
@@ -134,10 +134,10 @@ describe("handles and placeholders", () => {
 		expect(t).toContain(handleFor("r69"));
 		const rows = many.map((i) => ({ handle: `h${i}`, tool: "bash", args: "", hint: "" }));
 		const table = handleTable(rows)!;
-		expect(table).toContain("30 older folded outputs omitted");
+		expect(table).toContain(`${70 - TABLE_ROWS} older folded outputs omitted`);
 		expect(table).toContain("- h69 ");
-		expect(table).not.toContain("- h29 ");
-		expect(table).toContain("- h30 ");
+		expect(table).not.toContain(`- h${69 - TABLE_ROWS} `);
+		expect(table).toContain(`- h${70 - TABLE_ROWS} `);
 	});
 	test("handle index: handles of an earlier summary survive when its own block is full of unrelated carried-forward text", () => {
 		const session = (n: number, from = 0) => {
