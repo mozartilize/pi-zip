@@ -152,7 +152,7 @@ fn lw_plan_step_call_is_pinned_both_ways() {
 /// the user wait; the mutant is 0.3.0's turn_end (always wait).
 #[test]
 fn a3_warm_turn_end_does_not_wait() {
-    caught("r5b", "run.ts", "if (!ctx?.hasUI || p.atRoom) return \"wait\";", "return \"wait\";", "A3", &trace_file("a3-warm-turn-end.trace"));
+    caught("r5b", "run.ts", "if (!ctx?.hasUI || p.atRoom || p.atRoomUnedited) return \"wait\";", "return \"wait\";", "A3", &trace_file("a3-warm-turn-end.trace"));
 }
 
 /// Round 5, rule B at a warm prompt: a warm return after a restart, nothing prepared (b2-restart.trace); with rule B it waits for
