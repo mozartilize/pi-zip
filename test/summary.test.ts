@@ -3,7 +3,7 @@
 import { describe, expect, test } from "bun:test";
 import { buildBlocks, toolCallIndex } from "../src/plan.ts";
 import { handleFor } from "../src/placeholder.ts";
-import { buildCut, handleRowsOf, handleTable, parseSummary, PREV_NARRATIVE_CHARS, previousNarrative, skeleton } from "../src/summary.ts";
+import { BUDGET, buildCut, FIRST_REQUESTS, handleRowsOf, handleTable, parseSummary, PREV_NARRATIVE_CHARS, previousNarrative, skeleton, TABLE_ROWS } from "../src/summary.ts";
 import { A, R, U, type Any } from "./helpers.ts";
 
 const tcall = (id: string, name: string, args: Any) => {
@@ -56,24 +56,25 @@ const prevBlockOf = (prompt: string) => /<previous-narrative[^>]*>\n([\s\S]*?)\n
 const cmdHandle = (L: number, k: number) => handleFor(`r-b${L}-${k}`);
 
 describe("sectioned carry-forward: nested summaries, 4 levels deep", () => {
-	test("the newest requests survive every level, the oldest go first, and the omission count adds up", async () => {
+	test("requests: the session's first one and the newest are verbatim, the ones between shortened then counted; numbers are the session's", async () => {
 		const texts = await chain(4);
 		const last = texts[3];
-		const kept = requestsOf(last);
-		// every request of the newest level is verbatim; whatever is kept is a contiguous newest suffix of the 16 requests, oldest dropped first
-		for (let k = 1; k <= 4; k++) expect(last).toContain(`REQ-4-${k} please keep working on item 4.${k}; `.repeat(1).trim());
-		const all: Array<[number, number]> = [1, 2, 3, 4].flatMap((L) => [1, 2, 3, 4].map((k) => [L, k] as [number, number]));
-		expect(kept).toEqual(all.slice(all.length - kept.length));
-		expect(kept.length).toBeLessThan(16); // the budget did drop something
-		expect(kept[0][0]).toBeGreaterThanOrEqual(2); // ... and what it dropped is the oldest
-		const m = /\[… (\d+) older requests omitted …\]/.exec(last)!;
-		expect(Number(m[1])).toBe(16 - kept.length);
-		// numbering continues over what was left out
-		expect(last).toContain(`\n${16 - kept.length + 1}. REQ-${kept[0][0]}-${kept[0][1]} `);
-		expect(last).not.toContain("REQ-1-1 ");
-		// level 3 -> level 4: a summary of a summary does not lose what the previous one still held beyond the budget
-		const k3 = requestsOf(texts[2]);
-		expect(kept.slice(0, Math.max(0, kept.length - 4)).every(([L, k]) => k3.some(([l, kk]) => l === L && kk === k))).toBe(true);
+		const lines = sec(last, "## User requests").split("\n").slice(1);
+		const nums = lines.filter((l) => /^\d+\. /.test(l)).map((l) => Number(/^(\d+)\./.exec(l)![1]));
+		expect(nums).toEqual([...nums].sort((a, b) => a - b)); // in order
+		expect(last).toContain(`\n1. REQ-1-1 please keep working on item 1.1; `); // the first request defines the task: kept, as number 1
+		expect(last).toContain(`\n16. REQ-4-4 please keep working on item 4.4; `); // the newest, verbatim
+		const verbatim = lines.filter((l) => /^\d+\. REQ-/.test(l)).length;
+		const short = lines.filter((l) => /^\d+\. ≈ REQ-\d+-\d+ please/.test(l));
+		const omitted = [...last.matchAll(/\[… (\d+) older requests omitted …\]/g)].reduce((a, m) => a + Number(m[1]), 0);
+		expect(short.length).toBeGreaterThan(0);
+		expect(short.every((l) => l.length <= 110)).toBe(true);
+		expect(verbatim + short.length + omitted).toBe(16); // every request is accounted for
+		expect(last.split("\n")[2]).toMatch(/^## User requests \(.*≈ shortened/);
+		// a shortened request stays shortened in the next summary; numbering stays the session's
+		const s3 = sec(texts[2], "## User requests").split("\n").filter((l) => /^\d+\. ≈ /.test(l));
+		for (const l of s3) if (last.includes(l.slice(0, 12))) expect(last).toContain(l);
+		expect(sec(last, "## User requests").length).toBeLessThan(BUDGET.users + BUDGET.usersFirst + BUDGET.usersShort + 500);
 	});
 
 	test("handles: the newest commands are listed, older ones are counted and their handles move to the index; nothing newer than the budget is lost", async () => {
@@ -201,14 +202,14 @@ describe("sectioned carry-forward: nested summaries, 4 levels deep", () => {
 		expect(sizes[4]).toBeLessThan(12_000); // tokens (chars/4)
 	});
 
-	test("the folded-outputs table keeps earlier rows with their hints, newest 40, and counts the rest", async () => {
+	test("the folded-outputs table keeps earlier rows with their hints, newest TABLE_ROWS, and counts the rest", async () => {
 		const last = (await chain(4))[3];
 		const t = sec(last, "## Folded outputs");
 		expect(t).toContain(`- ${cmdHandle(4, 30)} · bash make step-4-30`); // newest first-class
 		expect(t).toContain("KEY-4-30: value"); // hint
 		expect(t).toContain("KEY-3-30: value"); // a row carried from the previous summary keeps its hint
 		const rows = t.split("\n").filter((l) => l.startsWith("- "));
-		expect(rows.length).toBeLessThanOrEqual(40);
+		expect(rows.length).toBeLessThanOrEqual(TABLE_ROWS);
 		expect(t).toMatch(/\[… \d+ older folded outputs omitted from this table …\]/);
 	});
 });
@@ -217,13 +218,13 @@ describe("handleTable merge", () => {
 	const row = (i: number) => ({ handle: `h${String(i).padStart(9, "0")}x`.slice(0, 10), tool: "bash", args: `c${i}`, hint: `hint ${i}`, turn: i });
 	test("previous rows are kept (hints included), a handle appears once with its newest text, and omissions accumulate", () => {
 		const a = handleTable(Array.from({ length: 45 }, (_, i) => row(i)))!;
-		expect(a).toContain("5 older folded outputs omitted");
+		expect(a).toContain(`${45 - TABLE_ROWS} older folded outputs omitted`);
 		const b = handleTable([row(44), ...Array.from({ length: 10 }, (_, i) => ({ ...row(100 + i), hint: "new" }))], a)!;
-		expect(b).toContain("[… 15 older folded outputs omitted from this table …]");
+		expect(b).toContain(`[… ${45 - TABLE_ROWS + 10} older folded outputs omitted from this table …]`);
 		expect(b.match(new RegExp(row(44).handle, "g"))).toHaveLength(1);
 		expect(b).toContain("hint 43"); // an earlier row, with its hint
 		expect(b).not.toContain("hint 10 ");
-		expect(b.split("\n").filter((l) => l.startsWith("- "))).toHaveLength(40);
+		expect(b.split("\n").filter((l) => l.startsWith("- "))).toHaveLength(TABLE_ROWS);
 	});
 });
 
@@ -350,14 +351,22 @@ describe("old formats and foreign summaries", () => {
 		}
 	});
 
-	test("the first request of the session is not pinned: with nothing left of the budget it goes first, with a count", () => {
+	test("the first request(s) of the session stay verbatim while they fit their budget (they define the task); the rest go oldest first, with a count", () => {
 		const big = (n: number) => `R${n} ` + "w".repeat(2700);
 		let prev: string | null = null;
 		for (let i = 0; i < 4; i++) prev = skeleton(buildBlocks([U(`a${i}`, big(i * 3)), U(`b${i}`, big(i * 3 + 1)), U(`c${i}`, big(i * 3 + 2)), A(`e${i}`)]), prev).text;
 		const t = prev!;
-		expect(t).not.toContain("R0 ");
-		expect(t).toContain("R11 ");
-		expect(/\[… (\d+) older requests omitted …\]/.exec(t)![1]).toBe(String(12 - (t.match(/^\d+\. R\d+ /gm) ?? []).length));
+		expect(t).toContain("\n1. R0 www"); // pinned
+		expect(t).not.toContain("\n2. R1 www"); // the second does not fit beside it: not pinned
+		expect(t).toContain("\n12. R11 www");
+		const listed = (t.match(/^\d+\. (≈ )?R\d+ /gm) ?? []).length;
+		const omitted = [...t.matchAll(/\[… (\d+) older requests omitted …\]/g)].reduce((a, m) => a + Number(m[1]), 0);
+		expect(listed + omitted).toBe(12);
+		expect(FIRST_REQUESTS).toBeGreaterThanOrEqual(1);
+		// short first requests: the first FIRST_REQUESTS stay
+		let q: string | null = null;
+		for (let i = 0; i < 6; i++) q = skeleton(buildBlocks([U(`s${i}`, i === 0 ? "TASK: build X" : i === 1 ? "TASK2: and Y" : big(i)), A(`f${i}`)]), q).text;
+		expect(q).toContain("\n1. TASK: build X\n2. TASK2: and Y\n");
 	});
 });
 
@@ -381,16 +390,18 @@ describe("user requests survive carry-forward intact", () => {
 		expect(t).toContain("\n## Files touched\n");
 	});
 
-	test("with the budget forcing a drop, whole requests go, the count is exact and the rest keeps its numbering", () => {
+	test("with the budget forcing a drop, whole requests go or are shortened, the count is exact and every request keeps its number", () => {
 		const big = (n: number) => `REQ${n}\n1. item\n2. item\n` + "x".repeat(5000);
-		let t = skeleton(level([big(1), big(2), big(3)]), null).text;
-		t = skeleton(level([big(4), big(5)]), t).text;
-		t = skeleton(level([big(6)]), t).text;
+		let t = skeleton(level(Array.from({ length: 10 }, (_, i) => big(i + 1))), null).text;
+		t = skeleton(level(Array.from({ length: 10 }, (_, i) => big(i + 11))), t).text;
+		t = skeleton(level([big(21)]), t).text;
 		const u = users(t);
-		expect(u.items.length + u.omitted).toBe(6);
+		expect(u.items.length + u.omitted).toBe(21);
 		expect(u.omitted).toBeGreaterThan(0);
-		for (const [i, item] of u.items.entries()) expect(item.startsWith(`REQ${u.omitted + i + 1}\n1. item\n2. item\n`)).toBe(true);
-		expect(t).toContain(`${u.omitted + 1}. REQ${u.omitted + 1}\n   1. item`);
+		for (const [i, item] of u.items.entries()) expect(item.replace(/^≈ /, "").startsWith(`REQ${u.nums![i]}`)).toBe(true);
+		expect(u.items.filter((x) => !x.startsWith("≈ ")).map((_, i) => u.nums![i])).toContain(1);
+		expect(t).toContain(`\n21. REQ21\n   1. item`);
+		expect(t).toContain(`\n1. REQ1\n   1. item`);
 	});
 
 	test("repeated identical requests are all kept, in order, across levels", () => {

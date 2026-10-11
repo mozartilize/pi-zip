@@ -4,7 +4,7 @@ import { randomUUID } from "node:crypto";
 import { blockTime, cdDirOf, clipMid, distinctLines, handleFor, outcomeHint, pickKeyLines, RECALL_TOOL, sharedCdDirs, shortArgs, whenLabel } from "./placeholder.ts";
 import { type Block, type Cut, type PlanResult, settings, toolCallIndex } from "./plan.ts";
 import { type FileRecall, fileRecallHow } from "./recallfile.ts";
-import { type Any, clamp, clip, fmtWhen, textOf, tok4 } from "./util.ts";
+import { type Any, clamp, clip, envInt, fmtWhen, textOf, tok4 } from "./util.ts";
 
 export const SUMMARY_MARK = "[summary of earlier conversation by pi-zip]";
 const POLICY_BLOCK_RE = /violate|terms of service|usage polic|content polic|acceptable use/i;
@@ -25,7 +25,8 @@ export interface HandleRow {
 const TABLE_HEAD = "## Folded outputs (originals recallable with zip_recall; handles stay valid after later summaries or compaction)";
 /** The same heading when zip_recall is hidden and the originals are read from recall files (parseSummary keys on "## Folded outputs"). */
 const tableHead = (file?: FileRecall) => (file ? `## Folded outputs (originals in ${file.dir}/<handle>.txt; handles stay valid after later summaries or compaction)` : TABLE_HEAD);
-const TABLE_ROWS = 40;
+/** The folded-outputs table: newest rows (eval-chosen with the BUDGET below, research round5/sumfmt.md). */
+export const TABLE_ROWS = envInt("SUM_TABLE_ROWS", 30);
 const when = (r: { at?: number; turn?: number; when?: string }) => { const w = r.when ?? whenLabel(r.at, r.turn); return w ? ` · ${w}` : ""; };
 const tableLine = (r: HandleRow) => `- ${r.handle} · ${r.tool}${r.args ? " " + r.args : ""}${when(r)}${r.outcome ? ` · ${r.outcome}` : ""} · ${clip(r.hint, 90)}`;
 
@@ -54,7 +55,7 @@ const FILE_OP = new RegExp(`^(\\S+): (${H})$`);
 const TABLE_ROW = new RegExp(`^- (${H}) · (\\S+)((?: [^·]*?)?)(?: · (${W}))?(?: · (.*))?$`);
 const INDEX_HEAD = "## Handle index";
 /** Budget of the "Handle index" section, in tokens. */
-export const INDEX_TOKENS = 1500;
+export const INDEX_TOKENS = envInt("SUM_INDEX_TOKENS", 2500);
 
 interface IndexRow {
 	handle: string;
@@ -136,6 +137,7 @@ function handleIndex(now: IndexRow[], previous: string | null, listed: string, b
 interface Items {
 	items: string[]; // oldest first
 	omitted: number; // older items already left out by earlier merges
+	nums?: number[]; // user requests: the number each item was written with (1 = the session's first request), when the format says
 }
 interface FileRow {
 	path: string;
@@ -168,6 +170,9 @@ const SECTIONS: Array<[RegExp, string]> = [
 ];
 /** Heading written for the user section. Its request bodies indent every continuation line by USER_INDENT, so a numbered list or a `## ` heading inside a request cannot be taken for an item or section start. Older summaries have no such marker and are parsed heuristically. */
 const USERS_HEAD = "## User requests (verbatim, oldest first, continuation lines indented)";
+/** Heading once older requests in the middle are shortened (USERS budget): those lines start with SHORT_MARK. */
+const USERS_HEAD_SHORT = "## User requests (oldest first, continuation lines indented; the first and the newest verbatim, lines starting with ≈ shortened to their start)";
+const SHORT_MARK = "≈ ";
 const USER_INDENT = "   ";
 const OMIT_ROW = /^\[… (\d+) [^\]]*?(?:omitted|not listed)[^\]]*…\]$/;
 const COVERS_ROW = /^Covers \d+ earlier messages\./;
@@ -193,7 +198,7 @@ export function parseSummary(text: string | null): ParsedSummary {
 			if (at) out.narrativeAt = at[1];
 			const dirs = CMD_DIRS_RE.exec(line);
 			if (dirs) out.cmdDirs.push(...dirs[1].split(", ").filter((d) => d && !out.cmdDirs.includes(d)));
-			occ.push({ key: hit[1], lines: [], indented: hit[1] === "users" && line.trim() === USERS_HEAD });
+			occ.push({ key: hit[1], lines: [], indented: hit[1] === "users" && (line.trim() === USERS_HEAD || line.trim() === USERS_HEAD_SHORT) });
 			if (hit[1] !== "free" && hit[1] !== "narr") out.structured = true;
 			continue;
 		}
@@ -204,6 +209,10 @@ export function parseSummary(text: string | null): ParsedSummary {
 		const body = lines.filter((l) => l.trim() !== "" && l.trim() !== NONE_ROW);
 		if (key === "users") {
 			const r = indented ? parseIndentedUsers(lines) : parseUsers(lines);
+			// numbers: as written (current format), else counted (older formats: the omitted ones come first, numbering is continuous)
+			const base = out.users.omitted + out.users.items.length + r.omitted;
+			const nums = r.nums ?? r.items.map((_, i) => base + i + 1);
+			out.users.nums = [...(out.users.nums ?? out.users.items.map((_, i) => i + 1)), ...nums];
 			out.users.items.push(...r.items);
 			out.users.omitted += r.omitted;
 			continue;
@@ -245,10 +254,12 @@ export function parseSummary(text: string | null): ParsedSummary {
 
 /** Current format: an unindented `N. ` line starts a request, indented lines continue it (number values are ignored: they are display only). */
 function parseIndentedUsers(lines: string[]): Items {
-	const out: Items = { items: [], omitted: 0 };
+	const out: Items = { items: [], omitted: 0, nums: [] };
 	let cur: string[] | null = null;
+	let num = 0;
 	const close = () => {
-		if (cur) out.items.push(cur.join("\n").replace(/\s+$/, ""));
+		const t = cur?.join("\n").replace(/\s+$/, "");
+		if (t && t !== NONE_ROW) out.items.push(t), out.nums!.push(num);
 		cur = null;
 	};
 	for (const line of lines) {
@@ -258,14 +269,14 @@ function parseIndentedUsers(lines: string[]): Items {
 			out.omitted += Number(om[1]);
 			continue;
 		}
-		const m = /^\d+\. (.*)$/.exec(line);
+		const m = /^(\d+)\. (.*)$/.exec(line);
 		if (m) {
 			close();
-			cur = [m[1]];
+			num = Number(m[1]);
+			cur = [m[2]];
 		} else if (cur) cur.push(line.startsWith(USER_INDENT) ? line.slice(USER_INDENT.length) : line.trim() === "" ? "" : line);
 	}
 	close();
-	out.items = out.items.filter((t) => t !== NONE_ROW && t !== "");
 	return out;
 }
 
@@ -323,7 +334,62 @@ const bashCommands = (blocks: Block[]): string[] =>
 	blocks.flatMap((b) => (b.kind === "assistant" ? (b.msg.content ?? []).filter((c: Any) => c?.type === "toolCall" && c.name === "bash").map((c: Any) => String(c.arguments?.command ?? "")) : []));
 
 /** Per-section budgets (characters unless noted); the total stays near the old design's 12,000-char carry plus the new prefix's own lists. */
-const BUDGET = { users: 16000, files: 6000, cmds: 10000, others: 5000, errors: 4000, lines: 60, errorLines: 15 };
+export const BUDGET = {
+	users: envInt("SUM_USERS", 4000), // the newest requests, verbatim
+	usersFirst: envInt("SUM_USERS_FIRST", 3000), // the session's first requests (they define the task), verbatim, while they fit
+	usersShort: envInt("SUM_USERS_SHORT", 1000), // the requests between, one shortened line each (SHORT_CHARS), newest first while they fit; the rest are counted
+	files: envInt("SUM_FILES", 6000),
+	cmds: envInt("SUM_CMDS", 5000),
+	cmdChars: envInt("SUM_CMD_CHARS", 80), // one command row's command, clipped in the middle
+	others: envInt("SUM_OTHERS", 3000),
+	errors: envInt("SUM_ERRORS", 2000),
+	lines: envInt("SUM_LINES", 60),
+	errorLines: envInt("SUM_ERROR_LINES", 8),
+};
+export const FIRST_REQUESTS = 2; // at most this many of the session's first requests are kept verbatim (BUDGET.usersFirst)
+export const SHORT_CHARS = 100;
+
+/**
+ * User requests, previous (older) then new, numbered over the whole session: the first requests (numbers 1..FIRST_REQUESTS, while
+ * they fit usersFirst) and the newest (users) verbatim; the ones between shortened to one line (usersShort, newest first); the rest
+ * counted. A request already shortened stays as it is.
+ */
+function mergeUsers(prev: Items, now: string[]): { lines: string[]; omitted: number } {
+	const pn = prev.nums ?? prev.items.map((_, i) => prev.omitted + i + 1);
+	const last = Math.max(prev.omitted + prev.items.length, pn.at(-1) ?? 0);
+	const all = [...prev.items.map((t, i) => ({ t, n: pn[i] })), ...now.map((t, i) => ({ t, n: last + i + 1 }))];
+	const keep = new Map<number, string>(); // index in all -> line text
+	let used = 0;
+	for (let i = 0; i < all.length && all[i].n <= FIRST_REQUESTS && !all[i].t.startsWith(SHORT_MARK); i++) {
+		if (used + all[i].t.length + 1 > BUDGET.usersFirst) break;
+		used += all[i].t.length + 1;
+		keep.set(i, all[i].t);
+	}
+	used = 0;
+	let k = all.length - 1;
+	for (; k >= 0 && !keep.has(k); k--) {
+		if (all[k].t.startsWith(SHORT_MARK) || (used + all[k].t.length + 1 > BUDGET.users && k < all.length - 1)) break; // the newest always stays
+		used += all[k].t.length + 1;
+		keep.set(k, all[k].t);
+	}
+	used = 0;
+	for (; k >= 0 && !keep.has(k); k--) {
+		const l = all[k].t.startsWith(SHORT_MARK) ? all[k].t : SHORT_MARK + clip(all[k].t, SHORT_CHARS);
+		if (used + l.length + 8 > BUDGET.usersShort) break;
+		used += l.length + 8;
+		keep.set(k, l);
+	}
+	// gaps by number: what this merge leaves out and what earlier summaries already left out alike
+	const lines: string[] = [];
+	let at = 0;
+	for (const i of [...keep.keys()].sort((a, b) => a - b)) {
+		const gap = all[i].n - at - 1;
+		if (gap > 0) lines.push(`[… ${gap} older requests omitted …]`);
+		lines.push(`${all[i].n}. ${keep.get(i)!.replace(/\n/g, "\n" + USER_INDENT)}`);
+		at = all[i].n;
+	}
+	return { lines, omitted: Math.max(0, (all.at(-1)?.n ?? 0) - keep.size) };
+}
 /**
  * The narrative call's word budget for a narrative budget of this many tokens. A merge (a previous narrative given) asks for at most
  * MERGE_WORDS: given an old narrative to carry, the model writes about 1.55x its budget (S6 chain probe: 2,349 words for 1,500, 1,547 for
@@ -409,7 +475,7 @@ export function skeleton(prefix: Block[], previous: string | null, tableText = "
 				const tag = res ? ` (${whenLabel(blockTime(res), res.userTurn)}${res.entryId ? ", " + handleFor(res.entryId) : ""})` : ""; // every result is recallable, so every one gets its handle
 				const d = cdDirOf(String(a.command ?? ""));
 				if (d && shared.has(d)) usedDirs.add(d);
-				cmds.push(`\`${shortArgs({ command: String(a.command ?? "") }, 160, shared)}\` -> ${status}${tag}`);
+				cmds.push(`\`${shortArgs({ command: String(a.command ?? "") }, BUDGET.cmdChars, shared)}\` -> ${status}${tag}`);
 			} else if (typeof a.path === "string" || typeof a.file_path === "string") {
 				const p = String(a.path ?? a.file_path);
 				if (!files.has(p)) files.set(p, new Map());
@@ -417,7 +483,7 @@ export function skeleton(prefix: Block[], previous: string | null, tableText = "
 				ops.set(c.name, res?.entryId ? handleFor(res.entryId) : (ops.get(c.name) ?? null));
 			} else if (c.name !== RECALL_TOOL) {
 				const tag = res ? ` (${whenLabel(blockTime(res), res.userTurn)}${res.entryId ? ", " + handleFor(res.entryId) : ""})` : " (no result)";
-				others.push(`${c.name} ${shortArgs(a, 160)}${tag}`);
+				others.push(`${c.name} ${shortArgs(a)}${tag}`);
 			}
 			if (res?.entryId && c.name !== RECALL_TOOL) {
 				now.push({ handle: handleFor(res.entryId), tool: c.name, args: shortArgs(a, 60, shared), turn: res.userTurn, at: blockTime(res) });
@@ -427,9 +493,8 @@ export function skeleton(prefix: Block[], previous: string | null, tableText = "
 		}
 	}
 	const prev = parseSummary(previous);
-	// user requests: previous (older) then new; the oldest go first, numbering continues over what was left out
-	const mu = mergeItems(prev.users.items, users, prev.users.omitted, Infinity, BUDGET.users, null); // no dedup: a repeated "yes" is a different request each time
-	const userLines = mu.kept.map((u, i) => `${mu.omitted + i + 1}. ${u.replace(/\n/g, "\n" + USER_INDENT)}`);
+	// user requests: previous (older) then new, the first and the newest verbatim, the ones between shortened, numbered over the session
+	const mu = mergeUsers(prev.users, users);
 	// files: a path touched again moves to the newest end with its newest handles
 	const merged = new Map<string, FileRow>(prev.files.rows.map((r) => [r.path, r]));
 	for (const [path, ops] of files) {
@@ -450,9 +515,8 @@ export function skeleton(prefix: Block[], previous: string | null, tableText = "
 			: `Covers ${prefix.length} earlier messages. Their tool outputs are no longer in your context but are kept exactly: the 10-character code next to a command, file or call below is its handle. ` +
 					`To use what an output said, ${RECALL_TOOL} it (grep/range for a part; grep alone searches every earlier output) rather than re-running or re-reading (results may differ). Folded blocks later in the conversation work the same way.`,
 	);
-	out.push(USERS_HEAD);
-	if (mu.omitted) out.push(`[… ${mu.omitted} older requests omitted …]`);
-	out.push(...(userLines.length ? userLines : [NONE_ROW]));
+	out.push(mu.lines.some((l) => /^\d+\. ≈ /.test(l)) ? USERS_HEAD_SHORT : USERS_HEAD);
+	out.push(...(mu.lines.length ? mu.lines : [NONE_ROW]));
 	out.push(...list("## Files touched", mf, "older omitted"));
 	const dirs = [...prev.cmdDirs.filter((d) => !usedDirs.has(d)), ...usedDirs].slice(-3);
 	out.push(...list(cmdsHead(dirs), mc, "older omitted"));
