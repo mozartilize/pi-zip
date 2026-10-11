@@ -235,9 +235,9 @@ function run(path: string) {
 					bg.moved++;
 				}
 				if (bg) { bg.seen++; out.teSeenPending++; if (bg.key !== K) out.teMovedPending++; }
-				if (plan.atRoom || V030) {
-					if (plan.atRoom) out.waitsAtRoom++; else out.waits++;
-					const wk = plan.atRoom ? "waitRoomS" : "waitS";
+				if (plan.atRoom || plan.atRoomUnedited || V030) {
+					if (plan.atRoom || plan.atRoomUnedited) out.waitsAtRoom++; else out.waits++;
+					const wk = plan.atRoom || plan.atRoomUnedited ? "waitRoomS" : "waitS";
 					if (bg && bg.key === K) { out[wk] += Math.max(0, bg.readyAt - now) / 1000; used(q.first ? "usedNative" : "usedTe"); }
 					else { if (bg) { waste("wastedMoved"); bg = null; } out[wk] += latOf(plan, r!.scale.c) / 1000; pay(plan, r!.scale.c); }
 					adopt(plan);
