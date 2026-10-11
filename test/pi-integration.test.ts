@@ -388,10 +388,17 @@ describe("real Pi: a summary prepared while the user was away goes in through Pi
 		writeFileSync(process.env.PI_ZIP_CACHE_STATS, JSON.stringify({ v: 1, models: { "p/m": { cls: "explicit", bins: { "6": [4, 0], "7": [4, 0] }, n: 8 } } }));
 		try {
 			const r = await rig(undefined, { file: template(380_000), tui: true, native: false, idle: false, start: false }); // 380 s: past 300 s
-			expect(r.inputListeners.size).toBe(0); // old code: 1 (armed on the declared TTL)
+			// the return is warm: no cold summary is armed. Rule A arms the summary the WARM plan makes (this context is big enough for one),
+			// and the warm prompt then uses it (old code: a summary planned at P(warm) = 0, thrown away by the warm prompt)
+			expect(r.inputListeners.size).toBe(1);
 			r.typeKey("h");
 			await sleep(150);
-			expect(r.narrativeCalls.length).toBe(0); // old code: 1, a summary planned at P(warm) = 0
+			expect(r.narrativeCalls.length).toBe(1);
+			await r.beforeAgentStart("hello");
+			sendPrompt(r.sm, "hello");
+			const req = await r.request();
+			expect(req.some((m) => m.role === "compactionSummary")).toBe(true); // the summary the key started, adopted
+			expect(r.narrativeCalls.length).toBe(1); // ... not written a second time
 			// the same session past the learned window (bin 8, 420-480 s, never observed: the declared TTL's prior decides): armed, and typing starts it
 			const late = await rig(undefined, { file: template(2 * 3_600_000), tui: true, native: false, idle: false, start: false });
 			expect(late.inputListeners.size).toBe(1);
@@ -488,9 +495,11 @@ describe("real Pi: a summary prepared while the user was away goes in through Pi
 		const summaries = req1.filter((m) => m.role === "compactionSummary");
 		expect(summaries).toHaveLength(1);
 		expect(JSON.stringify(summaries[0])).toContain("narrative"); // pi-zip's summary of the new context, prepared while away (old code: Pi's, then a second call while the user waits)
-		expect(r.narrativeCalls.length).toBe(1); // one call, made while away
+		// two calls, both while away: rule A's early one at settle (a warm return would have summarised the old context too), dropped when
+		// the timer found the context rewritten, and the away timer's, adopted (0.3.0: the timer's only)
+		expect(r.narrativeCalls.length).toBe(2);
 		// ... for the context as it is: what Pi's compaction replaced (the first prompts) is not in what the call reads (old code: it is)
-		const read = JSON.stringify(r.narrativeCalls[0]);
+		const read = JSON.stringify(r.narrativeCalls.at(-1));
 		expect(read).toContain("request 4");
 		expect(read).not.toContain("request 1");
 		expect(read).not.toContain("request 2");
@@ -572,6 +581,7 @@ describe("item 5: a run an extension's message starts (sendMessage with triggerT
 		await prompted.beforeAgentStart("next request");
 		sendPrompt(prompted.sm, "next request");
 		const pReq = await prompted.request();
+		await new Promise((res) => setTimeout(res, 50)); // a summary either starts in the background (rule B): its call is made off the request path
 		expect(driven.narrativeCalls.length).toBe(prompted.narrativeCalls.length);
 		expect(dReq.some(isFolded)).toBe(pReq.some(isFolded));
 		expect(dReq.some((m) => m.role === "compactionSummary")).toBe(pReq.some((m) => m.role === "compactionSummary"));
@@ -586,5 +596,116 @@ describe("the notice's why line says the cache was judged cold, as the warm one 
 		await new Promise((res) => setTimeout(res, 5));
 		const notice = (r.sm.getBranch().filter((e: Any) => e.type === "custom" && e.customType === "pi-zip/notice" && !e.data?.kind).at(-1) as Any)?.data;
 		expect(notice?.why).toMatch(/^cache cold · away [\d.]+ (s|min|h)$/); // old code: "away 3.0 h"
+	});
+});
+
+// Round 5: the incident (0.3.0, a warm prompt 1 min 48 s after a run that ended at 111.5K; the user waited 39 s for a summary, which went in
+// as a draft whose "Compacted from N" Pi took from the post-summary request). Rules A and B against Pi's own session and draft code.
+describe("round 5 on real Pi: rule A starts the warm summary early, rule B never makes the user wait for it while the cache is warm", () => {
+	const sleep = (ms: number) => new Promise((res) => setTimeout(res, ms));
+	const template = (agoMs: number) => {
+		const sm = SessionManager.inMemory(CWD);
+		populate(sm, 6000); // long prose: folds alone cannot reach the cap, so a warm return would summarise too
+		const file = [sm.getHeader() as Any, ...sm.getEntries()];
+		const newest = Math.max(...file.map((e) => e.message?.timestamp ?? 0));
+		const shift = Date.now() - agoMs - newest;
+		for (const e of file) {
+			if (typeof e.message?.timestamp === "number") e.message.timestamp += shift;
+			if (typeof e.timestamp === "string" && e.type !== undefined && e.type !== "session") e.timestamp = new Date(Date.parse(e.timestamp) + shift).toISOString();
+		}
+		return file;
+	};
+	const noticeOf = (r: Any) => (r.sm.getBranch().filter((e: Any) => e.type === "custom" && e.customType === "pi-zip/notice" && !e.data?.kind).at(-1) as Any)?.data;
+	const prompt = async (r: Any, text = "next request") => {
+		const t0 = performance.now();
+		await r.beforeAgentStart(text);
+		r.sm.appendMessage(user(text, Date.now() - T0));
+		const req = await r.request();
+		return { req, waited: performance.now() - t0 };
+	};
+	beforeEach(() => { process.env.PI_ZIP_TTL_SECS = "300"; });
+
+	test("A after a restart: a reopened session whose cache is alive and whose warm plan cuts starts that summary on the first key; opening alone costs nothing", async () => {
+		const r = await rig(undefined, { file: template(60_000), tui: true, native: false, idle: false, start: false }); // 1 min after the run: warm
+		await sleep(200);
+		expect(r.narrativeCalls.length).toBe(0); // opened, nothing typed
+		expect(r.inputListeners.size).toBe(1); // 0.3.0: 0 (only a dead cache armed the key)
+		r.typeKey("h");
+		await sleep(100);
+		expect(r.narrativeCalls.length).toBe(1);
+		const shut = await rig(undefined, { file: template(60_000), tui: true, native: false, idle: false, start: false });
+		await shut.shutdown(); // opened and closed without typing
+		await sleep(100);
+		expect(shut.narrativeCalls.length).toBe(0);
+		expect(shut.inputListeners.size).toBe(0);
+	});
+
+	test("warm native adoption: an early summary goes in through Pi's compaction before the prompt, Pi's 'Compacted from N' is the notice's before, no wait", async () => {
+		const r = await rig(undefined, { file: template(60_000), tui: true, native: true, idle: true, start: false, latencyMs: 300 });
+		await r.settle(); // the run ends: rule A starts the warm return's summary now
+		await sleep(400);
+		expect(r.narrativeCalls.length).toBe(1); // 0.3.0: 0 here, then a 300 ms wait at the prompt
+		const { req, waited } = await prompt(r);
+		expect(waited).toBeLessThan(250);
+		expect(r.narrativeCalls.length).toBe(1);
+		expect(r.compactCalls.n).toBe(1); // 0.3.0: 0 (a warm return never took the native path)
+		expect(r.compactions).toHaveLength(1);
+		const branch = r.sm.getBranch() as Any[];
+		const at = branch.findIndex((e) => e.type === "compaction");
+		const promptAt = branch.findIndex((e) => e.type === "message" && e.message.role === "user" && e.message.content === "next request");
+		expect(at).toBeGreaterThan(-1);
+		expect(at).toBeLessThan(promptAt); // one place, before the prompt
+		expect(branch[at].details).toMatchObject({ by: "pi-zip", via: "native", trigger: "valve" });
+		expect(req.some((m: Any) => m.role === "compactionSummary")).toBe(true);
+		await sleep(5);
+		const n = noticeOf(r);
+		expect(n.before).toBe(branch[at].tokensBefore);
+		expect(n.native).toBe("ok");
+		expect(n.desc).toMatch(/ready while you were away$/);
+	});
+
+	test("B on real Pi: no wait at the warm prompt, nothing applied; a later turn_end commits the summary as a draft the next request first carries, so Pi's tokensBefore is the size before", async () => {
+		const r = await rig(undefined, { file: template(60_000), tui: true, native: true, idle: true, start: false, latencyMs: 600 });
+		const raw = r.projectionMessages().length + 1;
+		const { req, waited } = await prompt(r); // no settle ran in this process and no key was typed: nothing was started
+		expect(waited).toBeLessThan(300); // 0.3.0: the whole 600 ms call (39 s in the incident)
+		expect(req === undefined || (!req.some(isFolded) && !req.some((m: Any) => m.role === "compactionSummary"))).toBe(true);
+		expect(r.projectionMessages().length).toBe(raw);
+		await sleep(20);
+		expect(r.narrativeCalls.length).toBe(1); // started in the background
+		const big = (input: number): Any => ({ ...usage, input, totalTokens: input });
+		// the first turn: the summary is still being written: turn_end persists nothing and does not wait
+		const a1 = r.sm.appendMessage({ ...asst([call("w1")], "toolUse", 20_000_001), usage: big(110_000) });
+		r.sm.appendMessage(result("w1", "small", 20_000_002));
+		const t1 = performance.now();
+		expect((await r.turnEnd(a1, { ...asst([call("w1")], "toolUse"), usage: big(110_000) })).filter((d: Any) => d.type === "compaction")).toEqual([]);
+		expect(performance.now() - t1).toBeLessThan(200);
+		await sleep(700);
+		// a later turn, once it is done: the valve adopts it at turn_end
+		const a2 = r.sm.appendMessage({ ...asst([call("w2")], "toolUse", 20_000_003), usage: big(111_500) });
+		r.sm.appendMessage(result("w2", "y".repeat(2_000), 20_000_004));
+		const piBefore = estimateProjectedContextTokens(r.sm.buildSessionProjection(), r.sm.getBranch()).tokens;
+		const drafts = await r.turnEnd(a2, { ...asst([call("w2")], "toolUse"), usage: big(111_500) });
+		expect(drafts.filter((d: Any) => d.type === "compaction")).toHaveLength(1);
+		const comp = r.sm.getBranch().find((e: Any) => e.type === "compaction") as Any;
+		expect(comp.tokensBefore).toBe(piBefore); // the size before (0.3.0's run-plan draft got the size after: "Compacted from 52,519")
+		expect(comp.tokensBefore).toBe(111_500 + 500);
+		expect(r.narrativeCalls.length).toBe(1);
+		const next = await r.request();
+		expect(next === undefined || next.some((m: Any) => m.role === "compactionSummary")).toBe(true);
+		await sleep(5);
+		const n = noticeOf(r);
+		expect(n.desc).toMatch(/summarized \d+ requests in [\d.]+ m?s · written while you worked$/);
+		expect(Math.abs(n.before - comp.tokensBefore) / comp.tokensBefore).toBeLessThan(0.05); // the notice's before is pi-zip's estimate of the same request
+	});
+
+	test("no UI on real Pi (pi -p, json, rpc): the warm prompt waits for the summary in the request, as in 0.3.0", async () => {
+		const r = await rig(undefined, { file: template(60_000), tui: false, native: true, idle: true, start: false, latencyMs: 300 });
+		const { req, waited } = await prompt(r);
+		expect(waited).toBeGreaterThanOrEqual(280);
+		expect(req.some((m: Any) => m.role === "compactionSummary")).toBe(true);
+		expect(r.compactCalls.n).toBe(0);
+		const ui = await rig(undefined, { file: template(60_000), tui: true, native: true, idle: true, start: false, latencyMs: 300 });
+		expect((await prompt(ui)).waited).toBeLessThan(250); // 0.3.0: the same 300 ms
 	});
 });

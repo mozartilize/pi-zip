@@ -7,7 +7,7 @@ import { record } from "../src/learn.ts";
 import { buildBlocks, planContext, applyPlanToMessages, reserveTokensFor, type Block, type RunPlan } from "../src/plan.ts";
 import { handleFor } from "../src/placeholder.ts";
 import { skeleton } from "../src/summary.ts";
-import { NATIVE_MARKER } from "../src/run.ts";
+import { NATIVE_MARKER, Zip } from "../src/run.ts";
 import { A, AX, fakeCtx, fakePi, flat, longTurn, project, R, U, withK, type Any } from "./helpers.ts";
 
 const ENV = ["PI_ZIP_TTL_SECS", "PI_ZIP_COLD_CAP", "PI_ZIP_OFF", "PI_ZIP_LEDGER", "PI_ZIP_MIN_GAIN", "PI_ZIP_INTURN_AGE"];
@@ -161,12 +161,21 @@ describe("F12 summary prepared while the user is away (timer at 0.8 x TTL)", () 
 		return r.fire("context_with_system", { messages: flat(back) });
 	};
 	beforeEach(() => { process.env.PI_ZIP_COLD_CAP = "6000"; process.env.PI_ZIP_TTL_SECS = "0.1"; });
+	/** The away timer's own tests: a summary was already made in this warm stretch (restored from the branch at session_start), so a
+	 *  warm return would not summarise again and settle starts nothing early (rule A); only the cold plan has a cut. */
+	const coldOnly = async <T extends Any>(r: T): Promise<T> => {
+		const sm = (r as Any).ctx.sessionManager, branch = sm.getBranch;
+		sm.getBranch = () => [...branch(), { type: "compaction", id: "prior", details: { by: "pi-zip" } }];
+		await (r as Any).fire("session_start", {});
+		sm.getBranch = branch;
+		return r;
+	};
 	// the summary loads Pi's serializer lazily; cold, that import alone outlasts the 120 ms these tests leave the away timer
 	beforeAll(async () => { await import("@earendil-works/pi-coding-agent"); });
 
 	test("settle only plans: no model call yet; the timer builds the summary at 0.8 x TTL; the next cold return adopts it with no second call", async () => {
 		const st = { calls: 0 };
-		const r = await rig(done, COLD_TS(), { modelRegistry: { complete: mkComplete(st) } });
+		const r = await coldOnly(await rig(done, COLD_TS(), { modelRegistry: { complete: mkComplete(st) } }));
 		const settled = await settle(r);
 		expect(settled.entries.at(-1).customType).toBe("pi-zip/plan");
 		expect(st.calls).toBe(0); // nothing is started at settle itself
@@ -197,7 +206,7 @@ describe("F12 summary prepared while the user is away (timer at 0.8 x TTL)", () 
 
 	test("the user returns before the timer: before_agent_start cancels it and no summary call is ever made", async () => {
 		const st = { calls: 0 };
-		const r = await rig(done, WARM_TS(), { modelRegistry: { complete: mkComplete(st) } });
+		const r = await coldOnly(await rig(done, WARM_TS(), { modelRegistry: { complete: mkComplete(st) } }));
 		const settled = await settle(r);
 		await r.fire("before_provider_request", { payload: {} }); // the cache clock: a request just went out
 		await r.fire("before_agent_start", {});
@@ -211,7 +220,7 @@ describe("F12 summary prepared while the user is away (timer at 0.8 x TTL)", () 
 		const timers: Any[] = [];
 		(globalThis as Any).setTimeout = (...a: Any[]) => { const h = (realSet as Any)(...a); timers.push(h); return h; };
 		try {
-			const r = await rig(done, COLD_TS(), { modelRegistry: { complete: mkComplete({ calls: 0 }) } });
+			const r = await coldOnly(await rig(done, COLD_TS(), { modelRegistry: { complete: mkComplete({ calls: 0 }) } }));
 			process.env.PI_ZIP_TTL_SECS = "3600";
 			await settle(r);
 			await r.fire("before_agent_start", {}); // cancel before it could fire
@@ -311,7 +320,7 @@ describe("F12 summary prepared while the user is away (timer at 0.8 x TTL)", () 
 
 	test("/zip off cancels a pending timer", async () => {
 		const st = { calls: 0 };
-		const r = await rig(done, COLD_TS(), { modelRegistry: { complete: mkComplete(st) } });
+		const r = await coldOnly(await rig(done, COLD_TS(), { modelRegistry: { complete: mkComplete(st) } }));
 		await settle(r);
 		await r.handlers.get("cmd:zip").handler("off", r.ctx);
 		await sleep(200);
@@ -328,7 +337,7 @@ describe("F12 summary prepared while the user is away (timer at 0.8 x TTL)", () 
 
 		test("Pi decides stop: the summary is prepared at once, as without warming; the decision is never answered", async () => {
 			const st = { calls: 0 };
-			const r = await rig(done, COLD_TS(), { modelRegistry: { complete: mkComplete(st) } }, idle);
+			const r = await coldOnly(await rig(done, COLD_TS(), { modelRegistry: { complete: mkComplete(st) } }, idle));
 			await settle(r);
 			await sleep(100);
 			expect(st.calls).toBe(0); // waiting for Pi's decision
@@ -356,7 +365,7 @@ describe("F12 summary prepared while the user is away (timer at 0.8 x TTL)", () 
 			const unblocked = () => rows("away_unblocked").map((x) => x.reason);
 
 			test("while Pi keeps deciding warm (and refreshing), no summary; once it falls silent, the summary is prepared", async () => {
-				const r = await rig(done, COLD_TS(), { modelRegistry: { complete: mkComplete({ calls: 0 }) } }, idle);
+				const r = await coldOnly(await rig(done, COLD_TS(), { modelRegistry: { complete: mkComplete({ calls: 0 }) } }, idle));
 				jest.useFakeTimers();
 				await settle(r);
 				const base = r.ctx.sessionManager.getBranch();
@@ -376,7 +385,7 @@ describe("F12 summary prepared while the user is away (timer at 0.8 x TTL)", () 
 			});
 
 			test("a warm decision with no refresh after it (another extension answered stop): the summary is prepared at the refresh check", async () => {
-				const r = await rig(done, COLD_TS(), { modelRegistry: { complete: mkComplete({ calls: 0 }) } }, idle);
+				const r = await coldOnly(await rig(done, COLD_TS(), { modelRegistry: { complete: mkComplete({ calls: 0 }) } }, idle));
 				jest.useFakeTimers();
 				await settle(r);
 				await decide(r, "warm");
@@ -387,7 +396,7 @@ describe("F12 summary prepared while the user is away (timer at 0.8 x TTL)", () 
 			});
 
 			test("Pi never decides (it is not warming this request after all): the summary starts just after the decision was due, not at 0.8 x TTL", async () => {
-				const r = await rig(done, COLD_TS(), { modelRegistry: { complete: mkComplete({ calls: 0 }) } }, idle);
+				const r = await coldOnly(await rig(done, COLD_TS(), { modelRegistry: { complete: mkComplete({ calls: 0 }) } }, idle));
 				jest.useFakeTimers();
 				await settle(r);
 				jest.advanceTimersByTime(1_150);
@@ -397,7 +406,7 @@ describe("F12 summary prepared while the user is away (timer at 0.8 x TTL)", () 
 			});
 
 			test("a refresh slower than the margin: Pi's next decision is expected a warming delay after the refresh finished, not after the decision", async () => {
-				const r = await rig(done, COLD_TS(), { modelRegistry: { complete: mkComplete({ calls: 0 }) } }, idle);
+				const r = await coldOnly(await rig(done, COLD_TS(), { modelRegistry: { complete: mkComplete({ calls: 0 }) } }, idle));
 				jest.useFakeTimers();
 				await settle(r);
 				const base = r.ctx.sessionManager.getBranch();
@@ -418,7 +427,7 @@ describe("F12 summary prepared while the user is away (timer at 0.8 x TTL)", () 
 
 			test("idle warming set only in the project settings (Pi reads cacheWarming from the global ones only): no decision is waited for", async () => {
 				writeFileSync(settings(), JSON.stringify({ defaultModel: "m" })); // the global settings: Pi warms during runs only
-				const r = await rig(done, COLD_TS(), { modelRegistry: { complete: mkComplete({ calls: 0 }) } }, idle); // merged: "idle"
+				const r = await coldOnly(await rig(done, COLD_TS(), { modelRegistry: { complete: mkComplete({ calls: 0 }) } }, idle)); // merged: "idle"
 				jest.useFakeTimers();
 				await settle(r);
 				jest.advanceTimersByTime(8_000); // a due decision (0.2 s) and its margin (1 s) are long past; 0.8 x 10.2 s is not yet
@@ -429,7 +438,7 @@ describe("F12 summary prepared while the user is away (timer at 0.8 x TTL)", () 
 
 			test("idle warming in the global settings: decisions are waited for", async () => {
 				writeFileSync(settings(), JSON.stringify({ cacheWarming: "idle" }));
-				const r = await rig(done, COLD_TS(), { modelRegistry: { complete: mkComplete({ calls: 0 }) } }, idle);
+				const r = await coldOnly(await rig(done, COLD_TS(), { modelRegistry: { complete: mkComplete({ calls: 0 }) } }, idle));
 				jest.useFakeTimers();
 				await settle(r);
 				jest.advanceTimersByTime(1_100);
@@ -441,7 +450,7 @@ describe("F12 summary prepared while the user is away (timer at 0.8 x TTL)", () 
 
 		test("without idle warming a decision changes nothing (no summary waits for one)", async () => {
 			const st = { calls: 0 };
-			const r = await rig(done, COLD_TS(), { modelRegistry: { complete: mkComplete(st) } });
+			const r = await coldOnly(await rig(done, COLD_TS(), { modelRegistry: { complete: mkComplete(st) } }));
 			await settle(r);
 			expect(await decide(r, "stop")).toBeUndefined();
 			await sleep(100);
@@ -611,6 +620,212 @@ describe("F12 summary prepared while the user is away (timer at 0.8 x TTL)", () 
 		expect(n.compactCalls).toBe(0);
 		expect(n.req.messages[0].role).toBe("compactionSummary");
 		expect(st.calls).toBe(1);
+	});
+});
+
+// =============================================================================================================
+// Round 5 (the 39 s warm wait of 0.3.0): rule A starts a summary a warm return would make when the run ends; rule B never makes the
+// user wait for one while the cache is warm (unless the context is at Pi's compaction room), and only with a UI.
+describe("round 5: rules A (start early) and B (never wait while warm)", () => {
+	const done = [U("u1", "one"), A("a1", ["c1"]), R("r1", "c1", 44_000), AX("a2", 120_000), U("u2", "two"), A("a3", ["c3"]), R("r3", "c3", 44_000), AX("a4", 120_000), U("u3", "three"), A("a5")];
+	const back = [...done, U("u4", "back")];
+	const tail = [A("a6", ["c6"]), R("r6", "c6", 400)];
+	const mkComplete = (state: { calls: number; delay?: number; signals?: Any[] }) => async (_m: Any, _c: Any, o: Any) => {
+		state.calls++;
+		state.signals?.push(o?.signal);
+		if (state.delay) await sleep(state.delay);
+		return { stopReason: "stop", content: [{ type: "text", text: "## Decisions\nnarrative" }], usage: { input: 11, output: 22, cacheRead: 0, cacheWrite: 0, cost: { total: 0.02 } } };
+	};
+	let ledger = "";
+	beforeEach(() => {
+		process.env.PI_ZIP_COLD_CAP = "6000";
+		process.env.PI_ZIP_TTL_SECS = "300"; // a return within minutes is warm
+		ledger = `/tmp/pi-zip-r5-${process.pid}-${Math.random().toString(36).slice(2)}.jsonl`;
+		process.env.PI_ZIP_LEDGER = ledger;
+	});
+	afterEach(() => { if (process.env.R5_KEEP) console.error("LEDGER", ledger); else rmSync(ledger, { force: true }); });
+	beforeAll(async () => { await import("@earendil-works/pi-coding-agent"); });
+	const rows = (type: string): Any[] => (existsSync(ledger) ? readFileSync(ledger, "utf8").trim().split("\n").map((l) => JSON.parse(l)).filter((x) => x.type === type) : []);
+	const settle = (r: Any) => r.fire("agent_before_settle", { context: { contextEntries: done }, entries: [] });
+	/** The user comes back: before_agent_start, then the first request (Pi appended the prompt). */
+	const prompt = async (r: Any, settled?: Any) => {
+		r.ctx.sessionManager.getBranch = () => [...branchOf(done, WARM_TS()), ...(settled?.entries?.length ? [settled.entries.at(-1)] : [])];
+		r.ctx.sessionManager.buildSessionProjection = () => ({ entries: back });
+		await r.fire("before_agent_start", {});
+		return r.fire("context_with_system", { messages: flat(back) });
+	};
+	const noticeOf = (r: Any) => r.appended.filter((x: Any) => x.customType === "pi-zip/notice" && !x.data?.kind).at(-1)?.data;
+	/** The Zip instance behind a rig (index.ts keeps it private): only to put it in a state a test needs (justEdited after a warm edit). */
+	const zipOf = async (r: Any): Promise<Any> => {
+		const orig = Zip.prototype.sessionStart;
+		let z: Any = null;
+		Zip.prototype.sessionStart = function (this: Any, ...a: Any[]) { z = this; return (orig as Any).apply(this, a); };
+		try { await r.fire("session_start", {}); } finally { Zip.prototype.sessionStart = orig; }
+		return z;
+	};
+	const R5 = { registerEntryRenderer: () => {} }; // notices go to the transcript (r.appended)
+
+	test("A: settle starts the summary a warm return would make at once (not at 0.8 x TTL); the warm return takes it, no second call, no wait", async () => {
+		const st = { calls: 0 };
+		const r = await rig(done, WARM_TS(), { modelRegistry: { complete: mkComplete(st) } }, R5);
+		const settled = await settle(r);
+		await sleep(20);
+		expect(st.calls).toBe(1); // 0.3.0: 0 (the away timer would start one 240 s later, and the warm return wrote its own while the user waited)
+		expect(rows("settle_plan")[0]).toMatchObject({ warmCut: "u3", early: true });
+		const t0 = Date.now();
+		const req = await prompt(r, settled);
+		expect(Date.now() - t0).toBeLessThan(150);
+		expect(req.messages[0].role).toBe("compactionSummary");
+		expect(st.calls).toBe(1);
+		await sleep(5);
+		expect(noticeOf(r).desc).toMatch(/ready while you were away$/);
+	});
+
+	test("A: nothing early right after a request that carried an edit (a warm return then makes none, b2b), nor without a UI", async () => {
+		const st = { calls: 0 };
+		const quiet = await rig(done, WARM_TS(), { hasUI: false, mode: "json", modelRegistry: { complete: mkComplete(st) } });
+		expect(await settle(quiet)).toBeUndefined();
+		await sleep(20);
+		expect(st.calls).toBe(0);
+		// the b2b case: the newest response answered a request that carried a fresh edit (justEdited)
+		const b2b = await rig(done, WARM_TS(), { modelRegistry: { complete: mkComplete(st) } });
+		(await zipOf(b2b)).justEdited = true;
+		await settle(b2b);
+		await sleep(20);
+		expect(rows("settle_plan").at(-1)?.warmCut).toBeUndefined();
+		expect(rows("away_summary_start").filter((x) => x.origin === "early")).toEqual([]);
+		expect(st.calls).toBe(0);
+		// ... while the same session without that state starts it (0.3.0: never)
+		const plain = await rig(done, WARM_TS(), { modelRegistry: { complete: mkComplete(st) } });
+		await settle(plain);
+		await sleep(20);
+		expect(st.calls).toBe(1);
+	});
+
+	test("B at the prompt: no finished summary for the warm cut: no wait, nothing applied (not even the folds), the summary starts in the background", async () => {
+		const st = { calls: 0, delay: 300 };
+		const r = await rig(done, WARM_TS(), { modelRegistry: { complete: mkComplete(st) } }, R5); // a fresh process: no settle ran
+		const t0 = Date.now();
+		const req = await prompt(r);
+		expect(Date.now() - t0).toBeLessThan(150); // 0.3.0: the whole call (300 ms here; 39 s in the incident)
+		expect(req).toBeUndefined(); // nothing applied: the law priced folds and summary together
+		await sleep(20);
+		expect(st.calls).toBe(1); // ... and the summary is being written
+		expect(rows("warm_defer")[0]).toMatchObject({ where: "run", key: "u3", running: false });
+		// the first turn_end: still being written: no wait there either, nothing persisted
+		const t1 = Date.now();
+		expect(await r.fire("turn_end", turnEnd([...back, ...tail], "r6"))).toBeUndefined();
+		expect(Date.now() - t1).toBeLessThan(150);
+		expect(st.calls).toBe(1);
+		// a later turn_end, once it is done: the valve adopts it (a draft the next request first carries)
+		await sleep(350);
+		const te = await r.fire("turn_end", turnEnd([...back, ...tail, A("a7")], "a7"));
+		expect(te.entries.map((e: Any) => e.type)).toEqual(["compaction", "custom"]);
+		expect(te.entries[0]).toMatchObject({ firstKeptEntryId: "u3", details: { trigger: "valve", carried: false } });
+		expect(st.calls).toBe(1);
+		await sleep(5);
+		expect(noticeOf(r).desc).toMatch(/written while you worked$/);
+	});
+
+	test("B waits at Pi's compaction room (Pi would compact, lossily, otherwise); below it, the same warm return does not", async () => {
+		const run = async (contextWindow: number) => {
+			const st = { calls: 0, delay: 200 };
+			const r = await rig(done, WARM_TS(), { model: { provider: "p", id: "m", contextWindow, cost: { cacheWrite: 3, cacheRead: 0.3 }, promptCache: { short: 300 } }, modelRegistry: { complete: mkComplete(st) } });
+			const t0 = Date.now();
+			const req = await prompt(r);
+			const ms = Date.now() - t0;
+			await sleep(20);
+			return { ms, summary: req?.messages?.[0]?.role === "compactionSummary", calls: st.calls };
+		};
+		const room = await run(100_000); // ~80K tokens against a room of 75K: atRoom
+		expect(room.summary).toBe(true);
+		expect(room.ms).toBeGreaterThanOrEqual(190); // waited for the whole call, as 0.3.0
+		const roomy = await run(1_000_000);
+		expect(roomy.summary).toBe(false); // 0.3.0: true, after the same wait
+		expect(roomy.ms).toBeLessThan(150);
+		expect(roomy.calls).toBe(1);
+	});
+
+	test("no UI (print, json, rpc): the warm return waits for the summary as in 0.3.0; with a UI the same return does not", async () => {
+		const st = { calls: 0, delay: 200 };
+		const quiet = await rig(done, WARM_TS(), { hasUI: false, mode: "json", modelRegistry: { complete: mkComplete(st) } });
+		expect(await settle(quiet)).toBeUndefined();
+		const t0 = Date.now();
+		const req = await prompt(quiet);
+		expect(Date.now() - t0).toBeGreaterThanOrEqual(190);
+		expect(req.messages[0].role).toBe("compactionSummary");
+		expect(rows("warm_defer")).toEqual([]);
+		const st2 = { calls: 0, delay: 200 };
+		const ui = await rig(done, WARM_TS(), { modelRegistry: { complete: mkComplete(st2) } });
+		expect(await prompt(ui)).toBeUndefined(); // 0.3.0: the summary, after the wait
+	});
+
+	test("runAway never leaks a background summary: one for its cut is kept (no second call); a context rewritten while away drops the early one (aborted, booked)", async () => {
+		process.env.PI_ZIP_TTL_SECS = "0.3"; // the timer fires at 240 ms
+		// (1) the cold plan cuts where the early summary cuts: the timer keeps it
+		const st = { calls: 0, delay: 400, signals: [] as Any[] };
+		const r = await rig(done, Date.now(), { modelRegistry: { complete: mkComplete(st) } });
+		await settle(r);
+		await sleep(10);
+		expect(st.calls).toBe(1); // rule A, at settle
+		await sleep(300); // the timer fired at 240 ms, the call still runs
+		expect(st.calls).toBe(1);
+		expect(st.signals[0].aborted).toBe(false);
+		// (2) something rewrote the context while away (Pi's compaction, another extension's edit): the early summary read a context that is
+		// gone: aborted, booked as unused, and the timer's own summary for the context as it is replaces it
+		const s2 = { calls: 0, delay: 400, signals: [] as Any[] };
+		const q = await rig(done, Date.now(), { modelRegistry: { complete: mkComplete(s2) } });
+		await settle(q);
+		await sleep(10);
+		const base = q.ctx.sessionManager.getBranch();
+		q.ctx.sessionManager.getBranch = () => [...base, { type: "compaction", id: "pc", summary: "another", firstKeptEntryId: "u2", details: {} }];
+		await sleep(300);
+		expect(s2.calls).toBe(2);
+		expect(s2.signals[0].aborted).toBe(true); // 0.3.0 never started the first one; its final startBg replaced a live summary without aborting it
+		expect(s2.signals[1].aborted).toBe(false);
+		await sleep(450);
+		expect(q.appended.filter((x: Any) => x.customType === "pi-zip/unused-summary").map((x: Any) => x.data)).toEqual([{ usd: 0.02, ab: true }]);
+	});
+
+	test("anti-thrash: once a background summary went unused in a warm stretch, a moved cut is written while the user waits; no new call per turn", async () => {
+		const st = { calls: 0, delay: 200 };
+		const r = await rig(done, WARM_TS(), { modelRegistry: { complete: mkComplete(st) } });
+		expect(await prompt(r)).toBeUndefined(); // B: deferred, the summary for u3 is being written
+		await sleep(20);
+		expect(st.calls).toBe(1);
+		// the session as the next turn_end sees it no longer has u3 (another branch of the same size): the plan cuts elsewhere and the
+		// running summary cannot be pinned to it
+		const other = back.map((pe: Any) => ({ sourceEntry: { ...pe.sourceEntry, id: `x${pe.sourceEntry.id}` }, messages: pe.messages }));
+		const t0 = Date.now();
+		const te = await r.fire("turn_end", turnEnd([...other, A("xa6")], "xa6"));
+		expect(Date.now() - t0).toBeGreaterThanOrEqual(190); // written while the user waits (0.3.0's behaviour), not one more background call
+		expect(te.entries[0]).toMatchObject({ type: "compaction", firstKeptEntryId: "xu3" });
+		expect(st.calls).toBe(2); // the unused one and the one adopted: no third
+		expect(rows("unused_summary")).toMatchObject([{ origin: "defer", key: "u3", unused: 1 }]);
+		expect(rows("warm_wait")).toMatchObject([{ where: "turn_end", key: "xu3" }]);
+		// a later turn_end of the same stretch starts nothing more
+		await r.fire("turn_end", turnEnd(project([...other, A("xa6"), U("xu5", "more"), A("xa7")], te.entries), "xa7")); // the session with the summary in
+		await sleep(250);
+		expect(st.calls).toBe(2);
+	});
+
+	test("anti-thrash across a restart: the unused one is in the session (pi-zip/unused-summary, ab), so a restarted process keeps the bound", async () => {
+		const run = async (extra: Any[]) => {
+			const st = { calls: 0, delay: 200 };
+			const r = await rig(done, WARM_TS(), { modelRegistry: { complete: mkComplete(st) } });
+			const base = r.ctx.sessionManager.getBranch;
+			r.ctx.sessionManager.getBranch = () => [...base(), ...extra];
+			await r.fire("session_start", {});
+			const t0 = Date.now();
+			const req = await prompt(r);
+			return { ms: Date.now() - t0, summary: req?.messages?.[0]?.role === "compactionSummary" };
+		};
+		const spent = await run([{ type: "custom", customType: "pi-zip/unused-summary", data: { usd: 0.02, ab: true } }]);
+		expect(spent.summary).toBe(true); // the budget of this warm stretch is spent: written while the user waits, as 0.3.0
+		expect(spent.ms).toBeGreaterThanOrEqual(190);
+		const away = await run([{ type: "custom", customType: "pi-zip/unused-summary", data: { usd: 0.02 } }]); // the away timer's: not counted
+		expect(away.summary).toBe(false);
+		expect(away.ms).toBeLessThan(150);
 	});
 });
 
