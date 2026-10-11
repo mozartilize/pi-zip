@@ -703,15 +703,10 @@ export class Zip implements ZipControl {
 		this.cancelTimer();
 		const b = this.bg;
 		this.bg = null;
-		if (!b) return;
-		b.controller.abort();
-		// a finished one is lost with the process (a restarted process cannot adopt it): book its cost. Not counted against AB_UNUSED_MAX:
-		// the restarted process must still be able to do what this one would have (rule A on the first key)
-		if (b.done) {
-			try {
-				this.pi.appendEntry(UNUSED_SUMMARY_CUSTOM, { usd: b.done.costUsd, lost: "shutdown" });
-			} catch {}
-		}
+		// lost with the process (a restarted process cannot adopt it), finished or still running: booked as unused (a running one at the
+		// input it is billed for). Not counted against AB_UNUSED_MAX: the restarted process must still be able to do what this one would
+		// have (rule A on the first key); README: one such summary per exit
+		if (b) this.bookUnused(b, false, { lost: "shutdown" });
 	}
 
 	/** True from before_agent_start to the agent_start that follows it: that run's start has been handled (Pi's prompt() path). A run started
