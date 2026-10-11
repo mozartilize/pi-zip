@@ -733,10 +733,12 @@ describe("round 5 on real Pi: rule A starts the warm summary early, rule B never
 // Round 5: without a UI (pi -p, --mode json; rpc binds one on Pi 1.1) nothing runs in the background, so rules A and B change nothing there. Every request
 // and every session entry of three no-UI scenarios (a warm return that summarises, a warm turn_end valve that summarises, a cold return
 // that summarises), normalised only for what differs from run to run (entry ids and the handles made from them, timestamps, measured
-// durations), hash to the digest 0.3.0 (d7d6ff5) gives: run this test there with R5_PRINT_DIGEST=1 to print it. The claim covers the
-// session and the requests only: the ledger's waitedMs changed as a fix (README, CHANGELOG; test "ledger fix" in invariants.test.ts).
+// durations), hash to the digest 0.3.0's decision code gives with 0.3.1's summary and placeholder format: the sumfmt branch (0.3.0 plus
+// the format changes, without rules A/B; head 343615f) with this test copied in, run with R5_PRINT_DIGEST=1. Before the format merge
+// the same scenarios hashed to 0.3.0's own digest (d7d6ff5: bb2e4238ae92a40c61f71564ae7a465d). The claim covers the session and the
+// requests only: the ledger's waitedMs changed as a fix (README, CHANGELOG; test "ledger fix" in invariants.test.ts).
 describe("round 5: no UI (pi -p, json) sends the same requests and writes the same session as 0.3.0, byte for byte", () => {
-	const NOUI_DIGEST_030 = "bb2e4238ae92a40c61f71564ae7a465d"; // printed by this test on d7d6ff5 (R5_PRINT_DIGEST=1)
+	const NOUI_DIGEST_030 = "480672293e26b667b810b57c38e54431"; // printed by this test on sumfmt 343615f (0.3.0 + 0.3.1 format; R5_PRINT_DIGEST=1)
 	const sleep = (ms: number) => new Promise((res) => setTimeout(res, ms));
 	const shifted = (agoMs: number, prose: number) => {
 		const sm = SessionManager.inMemory(CWD);
