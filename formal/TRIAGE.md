@@ -780,9 +780,10 @@ bridge, spec and suites for both columns; the old column is re-run, not copied f
   does through Pi's compaction. `onTurnEnd`'s warm path waits only at the room. Without a UI nothing changes (a test pins the bytes).
 * **Anti-thrash.** A warm plan whose cut moved is planned again cutting where the background summary cuts (`plan.ts cutAt`, run.ts
   `pinned`), if the law accepts it. At most one summary rules A/B started goes unused per warm stretch (`AB_UNUSED_MAX`), counted
-  across restarts (`pi-zip/unused-summary` with `ab`); once spent, a warm summary whose cut moved is waited for, as in 0.3.0.
-* `startBg` never overwrites a live summary (it keeps one for the same cut, discards and books any other); `shutdown` books a
-  finished summary the process loses.
+  across restarts (`pi-zip/unused-summary` with `ab`); once spent, a warm plan whose cut moved applies nothing and starts nothing
+  until the room (review fix, option (b), below). pi-zip's own away timer replacing one does not count.
+* `startBg` never overwrites a live summary (it keeps one for the same cut, discards and books any other); `shutdown` books the
+  summary the process loses, finished or still running.
 
 ### The measurement behind the anti-thrash rule
 
@@ -805,12 +806,37 @@ plan wanted another cut, mostly one request later (`summarise()` takes the first
 each move (naive) wastes up to 14 calls in one stretch. "pin" keeps the pending cut whenever the law still accepts it, and caps the
 rest at one unused call per stretch; it halves the waits below the room in set A (1,195 s → 567 s) and removes them in set B.
 
+### The review of 32bf804 (ship after fixes) and what changed
+
+| finding | fix (commit) | test (fails before the fix) |
+|---|---|---|
+| P1 #1 the away timer replacing an early summary spent the A/B budget, so a warm return whose pin failed waited | `runAway`/`startBg(away)` discard without counting (booked, no `ab`) (07cf031) | early cut ≠ cold cut, timer fires, warm prompt whose pin fails: defers, `unusedAB` 0 |
+| P1 #2 a warm wait below the room once the budget was spent; A3 had been loosened to excuse it | option (b): budget spent → apply nothing, start nothing, until the room (2caf307); A3 strict again | anti-thrash tests: no call, no wait, nothing applied |
+| P2 #3 a summary running at shutdown was not booked | booked at its estimated input, `lost: shutdown`, not counted against the bound (309319d) | in-flight early summary at `session_shutdown` |
+| P2 #4 the `ab` entry was appended after the aborted call settled | booked synchronously at discard (c2d762a) | entry present while the aborted call settles 5 s later |
+| P2 #5 the warm native plan held only by `regrowAt` equality | the plan carrying a native summary is made in the state `nativeSummary` planned it in (dbf7a34) | warm native adoption, same prompt and a smaller real prompt: `onPre`, no `native_mismatch` (the same-prompt case failed too on Pi's real session) |
+| P2 #6 RPC binds a UI | README, comments, test names (45c66da) | - |
+| P2 #7 the ledger's `waitedMs` differs from 0.3.0 | kept as a fix; README, new CHANGELOG.md; the digest claim covers session and requests (45c66da) | no-UI cold return with a prepared plan records the wait (0 on d7d6ff5) |
+| found by this round's seed-7 run (trace 12204) | rule B judged the room after the plan's folds while it sends the request unchanged: a 244K request went out above a 175K room; now judged on the unedited context too (`atRoomUnedited`), as the spec's `at_room` does | room between the sizes before and after folds: the warm prompt waits |
+
+**Option (b) measured before it went in** (keymove.ts policy `pinB` vs `pin`, with P1 #1's accounting, the room fix, and a price
+model as replay.ts: every request at the cache-class prices plus every summary call started, used or not, at full price):
+
+| set A (9 sessions) / set B (295) | pin (first v031) | pinB (shipped) |
+|---|---|---|
+| cost (input-token equivalents) | 1 | **−0.079% / ±0.000%** |
+| waits below the room | 6 / 240 s ; 0 | **0 ; 0** |
+| waits at the room | 65 / 5,008 s ; 1 / 27 s | 65 / 5,027 s ; 1 / 27 s |
+| unused A/B summary calls | 7 ; 0 | 4 ; 0 |
+| summary calls started / warm decisions skipped | 172 / 0 ; 27 / 0 | 170 / 39 ; 27 / 0 |
+
+(Before the room fix the same comparison gave +0.086% / ±0.000%, 11 / 567 s → 0 waits below the room.)
+
 ### Spec and bridge changes (where the policy changed)
 
-* **A3** now reads □(user_waits → at_room ∨ switched ∨ (warm_summary ∧ bg_budget_spent)). The round-2 excuse for any wait in the
-  warm valve at a turn_end is withdrawn (rule B writes that summary in the background); a warm wait, at a prompt or a turn_end, is
-  excused only once the stretch's unused background summary is spent (the policy's documented fallback to 0.3.0). The old column
-  is measured under the same statement, so it gains the turn_end waits round 4 excused (suite 24 → 27).
+* **A3** is the strict rule again: □(user_waits → at_room ∨ switched). Round 4's excuse for a wait in the warm valve at a turn_end is
+  withdrawn (rule B writes that summary in the background), and the first v031's excuse once the budget was spent is gone with
+  option (b). The old column is measured under the same statement, so it gains the turn_end waits round 4 excused (suite 24 → 27).
 * **RDr** knows a new root cause: the live process pinned its warm plan to a summary only it held in memory; a restarted process
   lost that summary and makes its unpinned plan. Both plans pass the law; the live one reuses a call already paid. RD still counts it.
 * **RD** accepts a fresh process that, with no background summary, defers the very cut the live request carries (`deferredSame`).
@@ -824,7 +850,8 @@ rest at one unused call per stretch; it halves the waits below the room in set A
 ### Checker table
 
 `--suite standard --random 3000 --seed 1 --workers 26 --shrink 40` (36,924 traces, 307,635 requests) and
-`--suite none --random 15000 --seed 7`, both sources under this round's checker:
+`--suite none --random 15000 --seed 7`, both sources under the final checker (strict A3), v031 at the review fixes (`out/r5b` for
+d7d6ff5, `out/r5c` for v031; the first v031's columns, `out/r5`, were identical but for one suite NR trace):
 
 | property | suite d7d6ff5 | suite v031 | seed 7 d7d6ff5 | seed 7 v031 |
 |---|---|---|---|---|
@@ -840,15 +867,16 @@ rest at one unused call per stretch; it halves the waits below the room in set A
 
 Compared trace by trace (`--verdicts`):
 * **A3**: suite 10 fixed (7 B2 warm returns, 3 warm turn_end waits), 0 new; seed 7 58 fixed, 0 new. The 17 / 76 left are all cold
-  returns (after a restart, before the away timer, an away summary not used), untouched by these rules. A warm wait once the
-  stretch's budget is spent (one suite trace before the spec's A3 was finished) is excused by the new A3.
+  returns (after a restart, before the away timer, an away summary not used), untouched by these rules; no warm wait below the room
+  is left. Before the room fix, option (b) moved one wait (seed 7 trace 12204): the skipped warm summary was needed at a later cold
+  return after a restart (an existing class); with the fix the warm wait happens at the room, where it is excused.
 * **RD +1 / +5**: suite 1 and seed 7 4 are the pinning class above (RDr 0). Seed 7's fifth (trace 3414, RDr +1) shrinks to the
   existing 35-event "not explained" counterexample, which fails identically on d7d6ff5 (a cold return after a switch adopting a summary
   prepared before it): an existing class reached by a path shift.
 * **NR −3** on seed 7 ("smallest cut only"); everything else is identical trace for trace.
 
-Tests at this commit: `bun test` 485 pass, 0 fail (470 before; 15 new tests, each failing on d7d6ff5, checked by running them in a
-d7d6ff5 worktree; the no-UI digest test passes its digest half there by design and fails its UI half); `tsc` clean;
+Tests after the review fixes: `bun test` 491 pass, 0 fail (470 at d7d6ff5); every new test fails on the commit before its fix (or on
+d7d6ff5); the no-UI digest test passes its digest half on d7d6ff5 by design and fails its UI half; `tsc` clean;
 `bun run build-check` clean; `cargo test --release`: 10 unit + 1 bridge + 31 mutants pass; `cargo clippy --release --all-targets` clean.
 
 ### The TUI check (Pi 1.1.0 in tmux, fake provider, summary call 40 s)
@@ -874,4 +902,8 @@ context counts the tool call's own tokens at the calibrated scale. The live row 
 * Pinning makes a live and a restarted process cut differently (RD above); a restart also loses any background summary.
 * An early summary is sized by the warm plan; a cold return adopting it (same cut) keeps that size.
 * Worst case of unused summary calls per session: one per warm stretch from rules A/B (counted across restarts), plus 0.3.0's away
-  timer (at most one per away period), plus one finished summary per pi exit.
+  timer (at most one per away period), plus one per pi exit (finished or running; not counted, so a restarted process can still
+  start rule A's summary on the first key).
+* Option (b) lets the context grow while warm until the room once the budget is spent; on the replays that costs nothing measurable,
+  but the request stays bigger than the law wanted for that stretch.
+* The TUI evidence above predates the review fixes (P2 #5 now applies the folds priced with a warm native summary).
