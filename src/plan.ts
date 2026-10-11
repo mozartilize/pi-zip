@@ -34,7 +34,7 @@ export const WARM_SUMMARY_GATE = true;
  *  inside the previous user turn up to that turn's final assistant answer, which stays verbatim with everything after it. PlanOpts.lookahead. */
 export const LOOKAHEAD = false;
 /** F3: the summary gates price the call the code makes (summary.ts narrative): uncached input of the prefix the narrative reads plus the
- *  previous summary's narrative it merges (bounded: summary.ts PREV_NARRATIVE_CHARS; the previous summary's lists are not sent, code
+ *  previous summary's narrative it merges (an upper bound: summary.ts PREV_NARRATIVE_CHARS; the previous summary's lists are not sent, code
  *  carries them forward), plus output of at most the narrative budget, instead of w x the prefix + out x the whole planned summary
  *  (which counts the carried-forward previous summary as model output). PlanOpts.narrativePrice. */
 export const NARRATIVE_PRICE = true;

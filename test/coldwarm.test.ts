@@ -101,7 +101,7 @@ describe("F3: the summary call is priced as the narrative call it is", () => {
 			planContext([mk(narr), ...older.slice(1)], o);
 			return o.trace.find((t: Any) => t.where === "summary")!;
 		};
-		const small = step(240), big = step(20_040);
-		expect(big.K - small.K).toBeCloseTo(ANTH.input * (Math.ceil(20_040 / 4) - Math.ceil(240 / 4)), 0);
+		const small = step(240), big = step(10_040);
+		expect(big.K - small.K).toBeCloseTo(ANTH.input * (Math.ceil(10_040 / 4) - Math.ceil(240 / 4)), 0);
 	});
 });
