@@ -14,6 +14,7 @@
 // context_with_system -> before_provider_request -> assistant message_end -> tool_call -> tool results -> turn_end, then
 // agent_before_settle), the provider (a prefix cache with a TTL that produces usage reports), the narrative model call (a fixed text),
 // the clock and timers (virtual), and pi-zip's index.ts is called as is (only the Zip instance is captured to read its state).
+import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
@@ -96,7 +97,7 @@ const TOOL_MS = 1_000;
 let phase: "present" | "away" = "present";
 let sink: Any[] = []; // the ledger of the instance being driven
 let optsSink: Any[] | null = null; // opts() calls of the instance being driven (the P-grid probe)
-let narrativeCalls: { phase: string; at: number; input: number; output: number }[] = [];
+let narrativeCalls: { phase: string; at: number; input: number; output: number }[] = []; // phase: present (waited for), away, background, probe
 let captured: Any = null;
 const origSessionStart = Zip.prototype.sessionStart;
 Zip.prototype.sessionStart = function (this: Any, ctx: Any) {
@@ -105,6 +106,13 @@ Zip.prototype.sessionStart = function (this: Any, ctx: Any) {
 };
 Zip.prototype.ledger = function (rec: Any) {
 	(this.__sink ?? sink).push(rec);
+};
+// a summary written in the background (Zip.startBg: the away timer, the first key, rules A and B) is no wait, whenever it runs: its model
+// call is tagged through the async context it was started in (the bridge's narrative model answers at once, so timing cannot tell)
+const bgCall = new AsyncLocalStorage<boolean>();
+const origStartBg = (Zip.prototype as Any).startBg;
+(Zip.prototype as Any).startBg = function (this: Any, ...a: Any[]) {
+	return bgCall.run(true, () => origStartBg.apply(this, a));
 };
 const origOpts = Zip.prototype.opts;
 Zip.prototype.opts = function (this: Any, ...a: Any[]) {
@@ -254,7 +262,7 @@ async function runTrace(tr: Any): Promise<Any> {
 				complete: async (_m: Any, req: Any) => {
 					const r = narrativeOf(req);
 					// the call's real tokens (the world's c per chars/4 token): an uncached read of the prompt, the narrative written
-					narrativeCalls.push({ phase: probe ? "probe" : phase, at: clock, input: Math.ceil(w.c * r.usage.input), output: Math.ceil(w.c * r.usage.output) });
+					narrativeCalls.push({ phase: probe ? "probe" : bgCall.getStore() && phase === "present" ? "background" : phase, at: clock, input: Math.ceil(w.c * r.usage.input), output: Math.ceil(w.c * r.usage.output) });
 					return r;
 				},
 			},
@@ -424,6 +432,27 @@ async function runTrace(tr: Any): Promise<Any> {
 	// pi-zip's state just before the run's before_agent_start: what a WARM return would have planned with (a cold return resets
 	// summarizedWarm, and the b2b rule applies only to warm returns)
 	let preRun: { sw: boolean; je: boolean } | null = null;
+	/** The decisions of one hook, as run.ts made them. A warm plan whose cut moved away from a summary written in the background is
+	 *  planned once more with `cutAt` (run.ts pinned): when that plan cuts there, it is the decision and the first plan is not; when it does
+	 *  not, the first plan stands and the pinned attempt is dropped. */
+	function decisions(caps: Any[]): Any[] {
+		const out: Any[] = [];
+		for (const c of caps) {
+			if (c.o.cutAt === undefined) {
+				out.push(c);
+				continue;
+			}
+			let r: Any = null;
+			try {
+				r = plan.planContext(c.entries, { ...c.o, trace: [] });
+			} catch {}
+			if (r?.firstKeptEntryId !== c.o.cutAt) continue;
+			const k = out.findLastIndex((x: Any) => x.pending === c.pending && x.mode === c.mode && x.o.cutAt === undefined);
+			if (k >= 0) out.splice(k, 1);
+			out.push(c);
+		}
+		return out;
+	}
 	function gridFor(cap: Any) {
 		const out: Any[] = [];
 		const actual = Number(cap.o.law?.pWarm ?? (cap.mode === "cold" ? 0 : 1));
@@ -604,9 +633,11 @@ async function runTrace(tr: Any): Promise<Any> {
 		clock: ["lastReqMs", "lastModelKey", "prevTotal", "prevKey"],
 	};
 	const KNOWN = ["g", "justEdited", "summarizedWarm"]; // TRIAGE (a) 1: the three fields the session does not carry
+	let liveCut: string | null = null;
+	let unusedAbSeen = 0; // pi-zip/unused-summary entries marked ab (a summary rules A/B started, dropped unused) in the session so far // the cut the live request being probed carries (its run plan's, or the native summary's)
 	async function freshProbe(snapshot: Any[], userMsg: Any, liveDesc: Any[], liveState?: Any) {
 		const base = await freshOnce(snapshot, userMsg, liveDesc, null);
-		if (base.same || !liveState) return base;
+		if (base.same || base.deferredSame || !liveState) return base;
 		const fixedBy: string[] = [];
 		for (const [name, fields] of Object.entries(TRANSPLANT)) {
 			const r = await freshOnce(snapshot, userMsg, liveDesc, Object.fromEntries(fields.map((f) => [f, liveState[f]])));
@@ -666,7 +697,11 @@ async function runTrace(tr: Any): Promise<Any> {
 			const desc = describeView(view, sm2);
 			const a = liveDesc.map((d) => d.h).join(","), b = desc.map((d: Any) => d.h).join(",");
 			const ledger = inst.zip?.__sink ?? [];
-			return { same: a === b, live: liveDesc.length, fresh: desc.length, liveMods: [...mods(liveDesc)].length, freshMods: [...mods(desc)].length, freshPlan: ledger.filter((r: Any) => r.type === "cold_plan" || r.type === "b2b_skip").map(slim) };
+			// rule B: a fresh process has no summary written in the background, so at a warm return whose plan summarises it applies nothing and
+			// starts that summary (warm_defer). It made the live process's decision when it deferred the very cut the live request carries
+			const defer = ledger.find((r: Any) => r.type === "warm_defer" && r.where === "run");
+			const deferredSame = !!defer && !ledger.some((r: Any) => r.type === "cold_plan") && defer.key === liveCut;
+			return { same: a === b, deferredSame, live: liveDesc.length, fresh: desc.length, liveMods: [...mods(liveDesc)].length, freshMods: [...mods(desc)].length, freshPlan: ledger.filter((r: Any) => r.type === "cold_plan" || r.type === "b2b_skip" || r.type === "warm_defer").map(slim) };
 		} finally {
 			await fire(inst, "session_shutdown", {});
 			({ sink, optsSink, phase } = saved);
@@ -722,7 +757,7 @@ async function runTrace(tr: Any): Promise<Any> {
 		// every run start, and after anything someone else changed
 		const lossIssues = probes.lossless ? await lossless(desc, view, guardRewrote, zipNew.length > 0 || runStart || envSince.some((e) => e === "compact" || e === "edit" || e === "foreign")) : [];
 		const runPlan = z?.runPlan;
-		const planGrids = optsSink.filter((c: Any) => !c.pending).map((c: Any) => gridFor({ ...c, at: "run" }));
+		const planGrids = decisions(optsSink.filter((c: Any) => !c.pending)).map((c: Any) => gridFor({ ...c, at: "run" }));
 		const runLedger = sink.map(slim);
 		// Pi's cache warmer restarts from every session request (sdk.ts streamFn): it keeps this request's prefix warm while the
 		// session still extends it and the model is the same
@@ -809,7 +844,7 @@ async function runTrace(tr: Any): Promise<Any> {
 		const rp = z?.runPlan, rpWasPersisted = !!rp?.persisted, rpSent = !!rp?.sent;
 		const te = await fire(live, "turn_end", { type: "turn_end", turnIndex: reqInRun, message: asst, toolResults, messageEntryId: aid, toolResultEntryIds: [], context: boundaryCtx(sm), entries: [] });
 		const drafts: Any[] = te?.entries ?? [];
-		const teGrids = optsSink.filter((c: Any) => !c.pending).map((c: Any) => gridFor({ ...c, at: "turn_end" }));
+		const teGrids = decisions(optsSink.filter((c: Any) => !c.pending)).map((c: Any) => gridFor({ ...c, at: "turn_end" }));
 		const teLedger = sink.map(slim);
 		optsSink = null;
 		applyDrafts(sm, drafts);
@@ -837,6 +872,10 @@ async function runTrace(tr: Any): Promise<Any> {
 		};
 		ncSeen = nc1;
 		probeAt = T0 + t0 * 1000;
+		liveCut = t.runPlan?.cut ?? null;
+		const unusedAb = sm.getEntries().filter((e: Any) => e.type === "custom" && e.customType === "pi-zip/unused-summary" && e.data?.ab).length;
+		t.unusedAb = unusedAb - unusedAbSeen;
+		unusedAbSeen = unusedAb;
 		if (firstProbe && probes.fresh) t.fresh = await freshProbe(firstProbe.snapshot, firstProbe.userMsg, desc, firstProbe.liveState);
 		envSince = [];
 		lastView = view;

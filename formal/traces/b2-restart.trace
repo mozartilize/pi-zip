@@ -1,0 +1,23 @@
+# Round 5, rule B at a warm prompt (the 08:14 incident): a run ends at ~155K, pi restarts, a prompt 60 s later finds the cache warm and
+# no summary prepared (the bridge types no key). 0.3.0 makes the user wait for the warm run plan's summary (A3 at req 14); rule B
+# sends the request unchanged and writes the summary in the background.
+world explicit known ttl=300 true=300 survival=none c=1 sys=3000 window=200000 native interactive
+prompt
+say 150K
+prompt +1h
+call npm 100
+call npm 100
+call npm 100
+call npm 100
+call npm 100
+call npm 100
+call npm 100
+call npm 100
+call npm 100
+call npm 100
+call npm 100
+call npm 100
+say 100
+restart
+prompt +60s
+say 100
