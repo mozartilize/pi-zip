@@ -85,10 +85,14 @@ pub struct World {
     /// pays, and asks extensions first)
     #[serde(default)]
     pub warming: bool,
+    /// a summary call in the background takes 2 minutes of the clock (else it answers at once): a restart, or a return, can come while
+    /// one runs; waiting for one (pi-zip says so in Pi's working line) ends it at once
+    #[serde(default)]
+    pub slow: bool,
 }
 impl Default for World {
     fn default() -> Self {
-        World { cls: Class::Explicit, known: true, ttl: 300, ttl_true: 300, survival: Survival::None, c: 1.0, sys: 3000, window: 200_000, native: true, interactive: true, tier: Tier::Short, tools: Tools::Full, warming: false }
+        World { cls: Class::Explicit, known: true, ttl: 300, ttl_true: 300, survival: Survival::None, c: 1.0, sys: 3000, window: 200_000, native: true, interactive: true, tier: Tier::Short, tools: Tools::Full, warming: false, slow: false }
     }
 }
 impl World {
@@ -191,7 +195,7 @@ impl fmt::Display for World {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "world {} {} ttl={} true={} survival={} c={} sys={} window={}{}{}{}{}{}",
+            "world {} {} ttl={} true={} survival={} c={} sys={} window={}{}{}{}{}{}{}",
             match self.cls { Class::Explicit => "explicit", Class::Automatic => "automatic" },
             if self.known { "known" } else { "unknown" },
             self.ttl,
@@ -204,7 +208,8 @@ impl fmt::Display for World {
             if self.interactive { " interactive" } else { " print" },
             if self.tier == Tier::Long { " long" } else { "" },
             match self.tools { Tools::Full => "", Tools::File => " tools=file", Tools::Reread => " tools=reread" },
-            if self.warming { " warming" } else { "" }
+            if self.warming { " warming" } else { "" },
+            if self.slow { " slow" } else { "" }
         )
     }
 }
@@ -284,6 +289,7 @@ impl Trace {
                             "long" => world.tier = Tier::Long,
                             "short" => world.tier = Tier::Short,
                             "warming" => world.warming = true,
+                            "slow" => world.slow = true,
                             _ => {
                                 let (key, val) = t.split_once('=').ok_or(format!("bad world token {t:?}"))?;
                                 match key {

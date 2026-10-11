@@ -155,11 +155,12 @@ fn a3_warm_turn_end_does_not_wait() {
     caught("r5b", "core.ts", "if (!hasUI || p.atRoom || p.atRoomUnedited) return \"wait\";", "return \"wait\";", "A3", &trace_file("a3-warm-turn-end.trace"));
 }
 
-/// Round 5, rule B at a warm prompt: a warm return after a restart, nothing prepared (b2-restart.trace); with rule B it waits for
+/// Round 5, rule B at a warm prompt: a warm return after a restart that lost the summary call still running (rd-restart-mid-call.trace;
+/// since 0.4.0 a summary finished before the restart is in the session, so b2-restart.trace finds it ready); with rule B it waits for
 /// nothing (the summary is written in the background), while the mutant (warm returns never defer) is 0.3.0's B2 wait.
 #[test]
 fn a3_warm_return_does_not_wait() {
-    caught("r5b2", "run.ts", "if (!this.cold && !native && p && p.cutIdx !== null && this.warmSummary(p, ctx, \"run\") === \"defer\") return;", "", "A3", &trace_file("b2-restart.trace"));
+    caught("r5b2", "run.ts", "if (!this.cold && !native && p && p.cutIdx !== null && this.warmSummary(p, ctx, \"run\") === \"defer\") return;", "", "A3", &trace_file("rd-restart-mid-call.trace"));
 }
 
 #[test]

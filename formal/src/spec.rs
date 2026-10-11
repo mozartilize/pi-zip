@@ -120,10 +120,15 @@ fn pays() -> F<R> {
 fn user_waits() -> F<R> {
     atom("user_waits", |r: &R, i, _| r.trace.world.interactive && (r.tick(i).wait_run > 0 || (i > 0 && r.tick(i - 1).wait_te > 0)))
 }
-/// Round 5: the live process's warm plan at this return cut where a summary it held in memory (written in the background) cuts, the
-/// law accepting that cut (run.ts pinned, the anti-thrash rule). A restarted process has lost that summary and makes its unpinned plan.
+/// The live process's plan at this return cut where a summary call it still had running cuts, the law accepting that cut (core.ts
+/// adopt with `running`). Since 0.4.0 a finished summary is a pi-zip/summary entry a fresh process reads too; only a call in flight
+/// lives in the process (the RD residual of a restart while it runs).
 pub fn pinned_live(r: &R, i: usize) -> bool {
-    r.ledger(i, "pin").iter().any(|p| p.get("ok").and_then(serde_json::Value::as_bool) == Some(true) && matches!(p.get("where").and_then(serde_json::Value::as_str), Some("run") | Some("native")))
+    r.ledger(i, "pin").iter().any(|p| {
+        p.get("ok").and_then(serde_json::Value::as_bool) == Some(true)
+            && p.get("running").and_then(serde_json::Value::as_bool) == Some(true)
+            && matches!(p.get("where").and_then(serde_json::Value::as_str), Some("run") | Some("native"))
+    })
 }
 /// The model was switched since the previous request: the cache dies at the prompt, nothing could be prepared while away.
 fn switched() -> F<R> {
@@ -257,8 +262,7 @@ pub fn axioms() -> Vec<Prop> {
             from: &[],
             why: "README rule 3: a summary model call is prepared while the user is away, or (round 5, rules A/B) written in the background \
                   while the cache is warm; the user waits for one only at Pi's compaction room, or at a return a model switch made cold \
-                  (no away time to prepare it in). A warm wait below the room is never excused (review P1 #2, option (b): once the warm \
-                  stretch's unused background summary is spent, a warm plan applies nothing and starts nothing until the room).",
+                  (no away time to prepare it in). A warm wait below the room is never excused.",
             evidence: Evidence::Conformance,
             f: always(user_waits() >> (at_room() | switched())),
         },
@@ -284,7 +288,8 @@ pub fn derived() -> Vec<Prop> {
             name: "restart determinism",
             from: &["A2", "A3"],
             why: "decisions are functions of the session: a restart must not plan differently (else the law, the b2b rule and the \
-                  one-summary rule are evaluated on state the session does not carry).",
+                  one-summary rule are evaluated on state the session does not carry). Produced summaries are pi-zip/summary entries, so \
+                  a fresh process takes them too; what a restart may lose is a summary call still in flight (RDr excuses only that).",
             evidence: Evidence::Conformance,
             f: always(run_start() >> fresh_plans_alike()),
         },
@@ -365,8 +370,9 @@ pub fn derived() -> Vec<Prop> {
             id: "TR",
             name: "target reachability",
             from: &["A2"],
-            why: "a cold return is the one free rewrite: it must reach the cold target unless the protected turns forbid it or the law \
-                  refuses the summary call.",
+            why: "a cold return is the one free rewrite: it must reach the cold target unless the protected turns forbid it, the law \
+                  refuses the summary call, or it takes a summary produced earlier that cuts short of its own cut (restated in 0.4.0: \
+                  a paid summary is used, never deeper than the plan's cut; the target is reached once the deeper one is ready).",
             evidence: Evidence::Conformance,
             f: always(cold_plan() >> target_reached_or_excused()),
         },
@@ -901,6 +907,13 @@ pub fn withheld(r: &R, i: usize) -> Option<String> {
     None
 }
 
+/// The run decision at this request took a produced summary (a pi-zip/summary, or the call in flight) cutting short of its own plan's
+/// cut (core.ts adopt: never deeper than the plan's cut).
+pub fn adopted_produced(r: &R, i: usize) -> bool {
+    r.ledger(i, "pin").iter().any(|p| {
+        p.get("ok").and_then(serde_json::Value::as_bool) == Some(true) && matches!(p.get("where").and_then(serde_json::Value::as_str), Some("run") | Some("native"))
+    })
+}
 pub fn target_miss(r: &R, i: usize) -> Option<String> {
     let s = &r.st[i];
     let g = r.tick(i).grids.iter().find(|g| g.at == "run")?;
@@ -911,6 +924,11 @@ pub fn target_miss(r: &R, i: usize) -> Option<String> {
         return None; // the protected turns and the previous summary alone fill the target
     }
     let refused = g.actual().is_some_and(|p| p.law.iter().any(|l| l.at == "summary" && !l.ok));
+    // 0.4.0 (architecture section 8, TR restated): the return took a summary produced earlier whose cut is not deeper than its own
+    // plan's (core.ts adopt): the call is already paid; the target is reached at a decision after the deeper one is ready
+    if adopted_produced(r, i) {
+        return None;
+    }
     let legacy = g.pr.as_ref().is_none_or(|p| p.r.is_nan() || p.r <= 0.0); // class unknown: the legacy summary rule decides
     if refused || legacy {
         return None;
@@ -1224,7 +1242,7 @@ pub fn classify(id: &str, r: &R, v: &Violation) -> String {
         "RD" | "RDr" if r.tick(v.at).fresh.as_ref().is_some_and(|f| !f.fixed_by_all) && r.tick(v.at).env.iter().any(|e| e == "away-summary") && r.tick(v.at).env.iter().any(|e| e == "edit" || e == "compact") => {
             "the summary prepared while away was planned before another context change (an extension's edit, Pi's compaction)".into()
         }
-        "RD" | "RDr" if pinned_live(r, v.at) => "the live process pinned its warm plan to a summary only it held in memory (round 5 anti-thrash)".into(),
+        "RD" | "RDr" if pinned_live(r, v.at) => "the live process took a summary call still running in it (in flight: a restart loses it)".into(),
         "RD" | "RDr" => match r.tick(v.at).fresh.as_ref() {
             Some(f) if !f.fixed_by.is_empty() => format!("in-memory state a restart loses: {}", f.fixed_by.join("+")),
             Some(f) if f.fixed_by_all => "in-memory state a restart loses: several fields together".into(),

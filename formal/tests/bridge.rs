@@ -32,3 +32,18 @@ fn b1_and_b2_are_fixed() {
         }
     }
 }
+
+/// 0.4.0 step 2: produced summaries are pi-zip/summary entries. A restart after the call finished (b2-restart.trace) and a restart
+/// while it runs (rd-restart-mid-call.trace, a slow world): the restarted process decides as a fresh one would (RD, RDr), and the
+/// warm return makes nobody wait (A3).
+#[test]
+fn restart_with_a_summary_finished_or_running() {
+    for file in ["b2-restart.trace", "rd-restart-mid-call.trace"] {
+        let Some(v) = verdicts(&src(), file) else { return };
+        for (id, ok) in &v {
+            if ["RD", "RDr", "A3", "A1", "I1"].contains(id) {
+                assert!(ok, "{file}: {id} must hold: {v:?}");
+            }
+        }
+    }
+}

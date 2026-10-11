@@ -165,6 +165,8 @@ pub fn world_preset(name: &str) -> Option<World> {
         "reread" => World { tools: Tools::Reread, ..d },
         // Pi's idle cache warming on (and a model expensive enough that refreshing a large context pays)
         "warming" => World { warming: true, ..d },
+        // a summary call takes 2 minutes of the clock: a restart or a return can come while one runs (not in the standard suite)
+        "slow" => World { slow: true, ..d },
         _ => return None,
     })
 }
@@ -262,6 +264,7 @@ pub fn random_trace(rng: &mut Rng) -> Trace {
         tier: if rng.chance(0.15) { Tier::Long } else { Tier::Short },
         tools: if rng.chance(0.08) { Tools::File } else if rng.chance(0.05) { Tools::Reread } else { Tools::Full },
         warming: rng.chance(0.15),
+        slow: false, // no draw: the random stream (and every seed's traces) stay as they were
     };
     let world = World { survival: if world.ttl_true > world.ttl && rng.chance(0.7) { Survival::Outlives } else { Survival::None }, ..world };
     let runs = 3 + rng.below(8);
