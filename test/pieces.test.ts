@@ -191,10 +191,10 @@ describe("handles and placeholders", () => {
 		expect(handleRowsOf(text)).toEqual([
 			{ handle: a, tool: "read", args: "src/a (b).ts" },
 			{ handle: b, tool: "edit", args: "src/a (b).ts" },
-			{ handle: c, tool: "bash", args: "bun test", turn: 4 },
-			{ handle: d, tool: "web_fetch", args: '{"url":"https://x"}', turn: 2 },
-			{ handle: e, tool: "bash", args: "cat f", turn: 7 },
-			{ handle: b, tool: "read", args: "src/z.ts", turn: 3 },
+			{ handle: c, tool: "bash", args: "bun test", when: "turn 4" },
+			{ handle: d, tool: "web_fetch", args: '{"url":"https://x"}', when: "turn 2" },
+			{ handle: e, tool: "bash", args: "cat f", when: "turn 7" },
+			{ handle: b, tool: "read", args: "src/z.ts", when: "turn 3" },
 		]);
 		expect(handleRowsOf(null)).toEqual([]);
 	});

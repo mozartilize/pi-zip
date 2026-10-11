@@ -2,7 +2,7 @@
 import { createHash } from "node:crypto";
 import type { Block, Calls } from "./plan.ts";
 import { type FileRecall, fileRecallHow } from "./recallfile.ts";
-import { type Any, clip, textOf } from "./util.ts";
+import { type Any, clip, fmtWhen, textOf } from "./util.ts";
 
 export const PH_MARK = "[folded by pi-zip";
 export const RECALL_TOOL = "zip_recall";
@@ -162,8 +162,17 @@ export function outcomeHint(text: string, tool: string, isError?: boolean): stri
 	return parts.join(", ");
 }
 
+/** When a block's message was written (ms), if it says: tool results carry Pi's timestamp. */
+export function blockTime(b: Block): number | undefined {
+	const t = Number(b.raw?.timestamp ?? b.msg?.timestamp);
+	return Number.isFinite(t) && t > 0 ? t : undefined;
+}
+/** The time label of an output: its local time (MM-DD HH:MM), else (no timestamp) its user turn as counted in the projection. */
+export const whenLabel = (at?: number, turn?: number): string => (at ? fmtWhen(at) : turn ? `turn ${turn}` : "");
+
 export interface PlaceholderMeta {
-	turn?: number; // user turn the output belongs to (1-based, as seen in the projection when it was folded)
+	at?: number; // when the output arrived (ms): shown as local MM-DD HH:MM (a turn count restarts at every compaction)
+	turn?: number; // user turn the output belongs to (1-based, as seen in the projection when it was folded): shown only without `at`
 	isError?: boolean;
 	noRecall?: boolean; // zip_recall is not declared to the model (`--tools` allowlist): point at re-reading instead
 	file?: FileRecall; // ... but read, grep or bash is: point at the recall file (written on demand from the session)
@@ -178,7 +187,7 @@ export function makePlaceholder(text: string, tool: string, args: string, handle
 	const body = keys.map((k) => `${k.no}: ${clip(k.text, 160)}`).join("\n");
 	const outcome = outcomeHint(text, tool, meta.isError);
 	return (
-		`${PH_MARK} · ${tool}${args ? " " + args : ""}${meta.turn ? ` · turn ${meta.turn}` : ""}${outcome ? ` · ${outcome}` : ""} · ${text.length} chars, ${lines} lines · handle ${handle}]\n` +
+		`${PH_MARK} · ${tool}${args ? " " + args : ""}${whenLabel(meta.at, meta.turn) ? ` · ${whenLabel(meta.at, meta.turn)}` : ""}${outcome ? ` · ${outcome}` : ""} · ${text.length} chars, ${lines} lines · handle ${handle}]\n` +
 		(keys.length ? `key lines kept (original line numbers; up to ${keep}):\n${body}\n` : "") +
 		(meta.file
 			? `Original kept byte for byte, even after summaries or compaction, in ${meta.file.dir}/${handle}.txt: ${fileRecallHow(meta.file)}; prefer that to re-running or re-reading the source (output may differ). Do not guess its content.`
@@ -194,5 +203,5 @@ export function makePlaceholderFor(b: Block, calls: Calls, keep = 8, noRecall = 
 	if (Array.isArray(content) && content.some((c: Any) => c?.type !== "text")) return null;
 	if (!b.entryId) return null;
 	const call = calls.get(b.msg.toolCallId);
-	return makePlaceholder(textOf(content), call?.name ?? b.msg.toolName ?? "tool", call ? shortArgs(call.args) : "", handleFor(b.entryId), keep, { turn: b.userTurn, isError: !!b.msg.isError, noRecall, file });
+	return makePlaceholder(textOf(content), call?.name ?? b.msg.toolName ?? "tool", call ? shortArgs(call.args) : "", handleFor(b.entryId), keep, { at: blockTime(b), turn: b.userTurn, isError: !!b.msg.isError, noRecall, file });
 }
