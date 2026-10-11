@@ -641,6 +641,7 @@ export interface PlanResult {
 	fileRecall?: FileRecall; // the summary of this plan names recall files instead of zip_recall (PlanOpts.fileRecall)
 	ahead?: boolean; // F2: the cut was decided by the lookahead (it may lie inside the previous user turn, before its final answer)
 	atRoom?: boolean; // the context after the plan's folds is at Pi's compaction room: Pi would compact (lossy) if nothing is done now
+	atRoomUnedited?: boolean; // the context as it is (no fold, no cut applied) is at Pi's compaction room: a request sent unchanged would trigger it
 }
 
 /** Index of the final assistant message of user turn `turn` (the answer the user saw), -1 if none. */
@@ -787,6 +788,7 @@ export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
 	const floor = prevSum + blocks.reduce((a, b) => a + (protectedTurn(b) ? (tokOverride.get(b.idx) ?? b.tokens) : 0), 0);
 	const target = Math.max(coldCap, floor + SUMMARY_FLOOR);
 	const atRoom = room !== null && real(ctxAfterFolds) >= room;
+	const atRoomUnedited = room !== null && real(ctxEst) >= room;
 	const noSummary = !!o.noSummary && !(o.regrowAt !== undefined && o.regrowAt > 0 && real(ctxAfterFolds) >= o.regrowAt);
 	const sumTrigger: "cold" | "valve" | null = ctxAfterFolds > target && (!noSummary || atRoom) ? trig : null;
 	let cutIdx: number | null = null;
@@ -884,7 +886,7 @@ export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
 		if (mode === "cold" && !o.warmStyle && law.pr && law.pWarm > 0 && law.pWarm < 0.5) return planContext(entries, { ...o, warmStyle: true });
 		return null;
 	}
-	return { blocks, calls, folds, cutIdx, firstKeptEntryId: cutIdx !== null ? blocks[cutIdx].entryId : null, prefixTokens, summaryTokensPlanned, sumTrigger: cutIdx !== null ? (sumTrigger ?? trig) : sumTrigger, scale: o.scale ?? UNIT, ctxTokens: real(ctxEst), ctxAfterFolds: real(ctxAfterFolds), userTurns, cutVisibleIdx, cutKeptFirstMsg, ...(o.fileRecall ? { fileRecall: o.fileRecall } : {}), ...(ahead ? { ahead } : {}), ...(atRoom ? { atRoom } : {}) };
+	return { blocks, calls, folds, cutIdx, firstKeptEntryId: cutIdx !== null ? blocks[cutIdx].entryId : null, prefixTokens, summaryTokensPlanned, sumTrigger: cutIdx !== null ? (sumTrigger ?? trig) : sumTrigger, scale: o.scale ?? UNIT, ctxTokens: real(ctxEst), ctxAfterFolds: real(ctxAfterFolds), userTurns, cutVisibleIdx, cutKeptFirstMsg, ...(o.fileRecall ? { fileRecall: o.fileRecall } : {}), ...(ahead ? { ahead } : {}), ...(atRoom ? { atRoom } : {}), ...(atRoomUnedited ? { atRoomUnedited } : {}) };
 }
 
 const sameMsg = (a: Any, b: Any): boolean =>

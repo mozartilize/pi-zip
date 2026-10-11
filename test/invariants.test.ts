@@ -766,6 +766,18 @@ describe("round 5: rules A (start early) and B (never wait while warm)", () => {
 		expect(sum.waitedMs).toBeGreaterThanOrEqual(190); // the session and the request are 0.3.0's; only this ledger figure (and /zip's) changed
 	});
 
+	test("B waits when the request as it is (nothing applied) is at the room, even though the plan's folds alone would bring it below", async () => {
+		// done: about 123K real before the plan, 91K after its folds (the outputs before the cut). Room between the two: 131,576 - 24,576
+		const st = { calls: 0, delay: 200 };
+		const r = await rig(done, WARM_TS(), { model: { provider: "p", id: "m", contextWindow: 131_576, cost: { cacheWrite: 3, cacheRead: 0.3 }, promptCache: { short: 300 } }, modelRegistry: { complete: mkComplete(st) } });
+		const t0 = Date.now();
+		const req = await prompt(r);
+		// before: deferred, so the 123K request went out unchanged above Pi's compaction room (Pi would compact it, lossily)
+		expect(req?.messages?.[0]?.role).toBe("compactionSummary");
+		expect(Date.now() - t0).toBeGreaterThanOrEqual(190);
+		expect(rows("warm_defer")).toEqual([]);
+	});
+
 	test("no UI (print, json): the warm return waits for the summary as in 0.3.0; with a UI the same return does not", async () => {
 		const st = { calls: 0, delay: 200 };
 		const quiet = await rig(done, WARM_TS(), { hasUI: false, mode: "json", modelRegistry: { complete: mkComplete(st) } });

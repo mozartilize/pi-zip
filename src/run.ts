@@ -1159,10 +1159,11 @@ export class Zip implements ZipControl {
 	 * the folds alone do not go either); the summary for this cut is written in the background (one running is left to run), unless
 	 * AB_UNUSED_MAX background summaries went unused in this warm stretch: then none is started either (a running one is left alone).
 	 * "wait": written now while the user waits, as in 0.3.0: without a UI (print, json: nothing runs in the background; rpc binds a
-	 * UI), or at Pi's compaction room (Pi would compact, lossily, otherwise).
+	 * UI), or at Pi's compaction room (Pi would compact, lossily, otherwise). The room is judged on the context as it is: "defer" sends
+	 * the request unchanged, so a plan whose folds alone would bring it below the room still finds the request above it.
 	 */
 	private warmSummary(p: PlanResult, ctx: Any, where: "run" | "turn_end"): "take" | "defer" | "wait" {
-		if (!ctx?.hasUI || p.atRoom) return "wait";
+		if (!ctx?.hasUI || p.atRoom || p.atRoomUnedited) return "wait";
 		const b = this.bg, key = p.firstKeptEntryId;
 		if (b && b.key === key && !b.failed) {
 			if (b.done) return "take";
