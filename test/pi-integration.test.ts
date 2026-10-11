@@ -179,7 +179,7 @@ async function rig(setup: (sm: SessionManager) => void = populate, opts: RigOpts
 }
 
 const saved: Record<string, string | undefined> = {};
-const ENV = { PI_ZIP_COLD_CAP: "3000", PI_ZIP_MIN_GAIN: "1000", PI_ZIP_TTL_SECS: "300" };
+const ENV = { PI_ZIP_COLD_CAP: "3000", PI_ZIP_TTL_SECS: "300" };
 beforeEach(() => { for (const [k, v] of Object.entries(ENV)) { saved[k] = process.env[k]; process.env[k] = v; } });
 afterEach(() => { for (const k of Object.keys(ENV)) { if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k]; } });
 

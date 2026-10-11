@@ -688,6 +688,5 @@ export async function buildCut(p: PlanResult, ctx: Any, signal?: AbortSignal): P
 		costUsd: nar.costUsd,
 		usage: nar.usage,
 		ms: Math.round(performance.now() - t0),
-		...(p.ahead ? { ahead: true } : {}),
 	};
 }

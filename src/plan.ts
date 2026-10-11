@@ -4,18 +4,9 @@ import { handleFor, makePlaceholderFor, pickKeyLines, RECALL_TOOL, shortArgs } f
 import { createHash } from "node:crypto";
 import { type Any, COMMIT_CUSTOM, PRODUCT, clamp, envInt, piTokensOf, textOf, tok4, tokensOf } from "./util.ts";
 import { PH_MARK } from "./placeholder.ts";
-import { MIN_EXPECT, type Prices } from "./learn.ts";
+import { lawPrices, MIN_EXPECT, type Prices } from "./learn.ts";
 import { commandNamesRecall, parseRecallPath, type FileRecall } from "./recallfile.ts";
 import { previousNarrative } from "./summary.ts"; // a cycle (summary.ts imports this module): both use the other's exports only when called
-
-/** Default: when a COLD plan (P(warm) < 0.5) is still above the cap, also fold REREADABLE outputs of the previous user turn, biggest
- *  first. A warm plan does so only at a user return after the declared TTL (PlanOpts.pastTtl): the very returns where the TTL rule
- *  always folded that turn, so the quality stays the TTL rule's while the law, with the learned P(warm), still decides whether the
- *  rewrite pays (a provider whose cache outlives its declared TTL otherwise keeps the whole previous turn at every return: live GLM
- *  1.15x the TTL rule's bill). Any other warm plan never does: the user comes back to a warm cache and refers to the turn just
- *  finished (final model: +4.0 / +5.8 lost items with it). false = no relax fold of the previous user turn, but the
- *  in-turn rule (INTURN_AGE) still folds old outputs there; set PI_ZIP_INTURN_AGE=0 as well for a fully protected previous turn. */
-export const RELAX_PREV_TURN = true;
 
 /** Default age, in assistant requests, from which ANY foldable output (every recoverability class) inside the protected user turns may
  *  still be folded. A sub-agent session is one user turn with hundreds of tool rounds, so without this its candidate set is empty for
@@ -24,20 +15,11 @@ export const RELAX_PREV_TURN = true;
  *  constant (largest saving with lost <= prod in every stratum); the old rereadable-only filter cost 1.026 / 1.018x at -0.6 lost items. */
 export const INTURN_AGE = 60;
 
-const PROTECT_USER_TURNS = 2; // the latest user turn and the one before it are never summarised (but see LOOKAHEAD); folded only by relax (cold plan, previous turn, rereadable) or in-turn (old enough)
+const PROTECT_USER_TURNS = 2; // the latest user turn and the one before it are never summarised; their outputs fold only after a pause (previous turn, re-readable) or when old enough (INTURN_AGE)
 
-/** F1: a warm (valve) summary passes the same summary gate as a cold one, the call priced in (before: a warm plan skipped it, so a
- *  summary the cold gate had just refused was written one request later anyway). PlanOpts.warmSummaryGate. */
-export const WARM_SUMMARY_GATE = true;
-/** F2: a cold plan that does not summarise looks one user turn ahead: if the warm valve would summarise at the next user turn, once the
- *  protected window has slid past the previous turn, the cold plan summarises now (the rewrite is free now, not then), its cut allowed
- *  inside the previous user turn up to that turn's final assistant answer, which stays verbatim with everything after it. PlanOpts.lookahead. */
-export const LOOKAHEAD = false;
-/** F3: the summary gates price the call the code makes (summary.ts narrative): uncached input of the prefix the narrative reads plus the
- *  previous summary's narrative it merges (an upper bound: summary.ts PREV_NARRATIVE_CHARS; the previous summary's lists are not sent, code
- *  carries them forward), plus output of at most the narrative budget, instead of w x the prefix + out x the whole planned summary
- *  (which counts the carried-forward previous summary as model output). PlanOpts.narrativePrice. */
-export const NARRATIVE_PRICE = true;
+/** A summary call is priced as the call summary.ts makes (its narrative): uncached input of the prefix the narrative reads plus the
+ *  previous summary's narrative it merges (an upper bound: summary.ts PREV_NARRATIVE_CHARS; the previous summary's lists are not sent,
+ *  code carries them forward), plus output of at most the narrative budget. */
 /** The narrative's token budget (chars/4), summary.ts buildCut: clamp(planned - skeleton, 300, NARRATIVE_MAX). */
 export const NARRATIVE_MAX = 4000;
 let prevNarrMemo: { text: string; tokens: number } | null = null;
@@ -66,15 +48,6 @@ export function reserveTokensFor(settings: Any, model: Any): number {
 export function compactionRoom(model: Any, reserve = DEFAULT_RESERVE_TOKENS): number | null {
 	const w = Number(model?.contextWindow);
 	return w > 0 ? Math.max(MIN_TARGET, w - reserve - COMPACT_MARGIN) : null;
-}
-
-// Legacy rule, only when nothing at all is known about prices (cache class unknown: no response from this model yet): a warm edit must cut at least half
-// of the context, or, inside Pi's compaction danger zone (before >= room), merely reduce it.
-export const VALVE_MIN_REDUCTION = 0.5;
-export function legacyValve(before: number, after: number, room: number | null): boolean {
-	if (!(after < before)) return false;
-	if (room !== null && before >= room) return true;
-	return after <= (1 - VALVE_MIN_REDUCTION) * before;
 }
 
 export const PI_KEEP_RECENT = 20_000; // Pi's compaction keepRecentTokens default
@@ -130,8 +103,9 @@ export function spliceNative(pre: Any[], now: Any[], compactionId: string): Any[
 }
 export const G0 = 2_500; // growth per request before the session's own EWMA has data
 
-/** What the law knows at a decision: prices (null = legacy rule), growth per request g (real tokens), P(the cache is warm). */
-export interface Law { pr: Prices | null; g: number; pWarm: number }
+/** What the law knows at a decision: prices (the class ratios; the explicit ones while the class is not learned yet), growth per
+ *  request g (real tokens), P(the cache is warm). P enters the planner here and nowhere else. */
+export interface Law { pr: Prices; g: number; pWarm: number }
 export interface LawTerms { ok: boolean; B: number; A: number; T: number; P: number; K: number; eta: number; phi: number; Tsuf?: number }
 
 /**
@@ -141,12 +115,12 @@ export interface LawTerms { ok: boolean; B: number; A: number; T: number; P: num
  * the earliest edit, ~0.42 A, fires warm edits earlier and costs +0.9 / +4.6 lost items for -0.6 / -0.3% $; the suffix is logged as Tsuf,
  * a measurement only). T is clamped to A. P = P(warm) at this gap: 1 = the verdict's warm valve, 0 = known dead (K < 0: always fire). The expected form is
  * linear in P because a warm next request costs (w - r) T - r D more with the edit and a cold one w D less, plus the r D read credit.
- * eta = 0 below Pi's compaction room, else Pi's own price per token of room (window term). Prices per token; no prices = legacy rule.
+ * eta = 0 below Pi's compaction room, else Pi's own price per token of room (window term). Prices per token; without prices nothing
+ * is allowed (the planner always has the class ratios).
  */
 export function lawTerms(B: number, A: number, P: number, room: number | null, pr: Prices | null, g: number, call = 0, T = A, keep = PI_KEEP_RECENT): LawTerms {
 	const t: LawTerms = { ok: false, B, A, T, P, K: NaN, eta: 0, phi: NaN };
-	if (!(A < B)) return t;
-	if (!pr || !(pr.r > 0)) return { ...t, ok: legacyValve(B, A, room) };
+	if (!(A < B) || !pr || !(pr.r > 0)) return t;
 	const { r, w, out } = pr;
 	const D = B - A, K = (w - r) * (P * Math.min(T, A) - (1 - P) * D) + call;
 	let eta = 0;
@@ -448,14 +422,8 @@ export const settings = () => ({
 	coldCap: envInt("COLD_CAP", 40_000), // cold: fold, then summarise, down to this many real tokens of the whole context, but never below O + half of it (coldTarget)
 	foldMin: envInt("FOLD_MIN", 500), // outputs below this many tokens are never folded
 	keepLines: envInt("KEEP_LINES", 8),
-	minGain: envInt("MIN_GAIN", 10_000), // legacy rule only (no prices): a summary must remove at least max(minGain, 15% of the context)
 	inturnAge: envInt("INTURN_AGE", INTURN_AGE), // outputs (any class) of the protected turns at least this many assistant requests old may fold; 0 = never
 });
-
-/** Legacy summary gate (no prices): a summary only pays when it removes a real share of the context. */
-export function summaryGainOk(prefixTokens: number, summaryTokens: number, totalTokens: number, minGain = settings().minGain): boolean {
-	return prefixTokens - summaryTokens >= Math.max(minGain, 0.15 * totalTokens);
-}
 
 // ---------------------------------------------------------------------------------------------------------------
 // blocks: the model-visible context, one block per projected session entry
@@ -585,7 +553,6 @@ export interface Cut {
 	costUsd: number; // what the narrative model call cost (0 when unknown)
 	usage?: Any;
 	ms: number; // total production time (the narrative model call included)
-	ahead?: boolean; // F2: a lookahead cut (inside the previous user turn, before its final answer; guard.ts)
 	prepared?: boolean; // written in the background (a pi-zip/summary entry): its cost was counted when it was produced
 }
 
@@ -612,8 +579,8 @@ export interface RunPlan {
 }
 
 export interface PlanOpts {
-	mode?: "cold" | "warm"; // cold: cache believed gone (default). warm: only when the context is above the cold cap and the law fires; then the cold plan without the previous-turn relax (kept only when pastTtl).
-	law?: Law; // prices, g and P(warm); default: no prices (legacy rule), P = 0 cold / 1 warm
+	law?: Law; // prices, g and P(warm): the only input that depends on P; default: the explicit class ratios at P = 0
+	pause?: boolean; // a return after a pause (the absence outlived the requested cache lifetime) or a model switch: the previous user turn's re-readable outputs may fold
 	trace?: (LawTerms & { where: "summary" | "plan" })[]; // every law evaluation is pushed here (ledger)
 	reserve?: number; // Pi's compaction reserveTokens (default 16384)
 	steerIds?: Set<string>; // user entries that are mid-run steering or follow-up messages, not new user turns
@@ -625,22 +592,13 @@ export interface PlanOpts {
 	recalled?: Set<string>;
 	model?: Any;
 	promptPending?: boolean; // true at settle: the upcoming prompt is NOT in `entries` yet but counts as a new user turn
-	relax?: boolean; // default RELAX_PREV_TURN
-	minGain?: number;
 	inturnAge?: number; // default settings().inturnAge (PI_ZIP_INTURN_AGE, 60); 0 = outputs of the protected turns never fold on age
 	noSummary?: boolean; // a summary was already made while this cache stayed warm: no second one unless the context is at/above the compaction room
 	regrowAt?: number; // with noSummary: the real context (after folds) the last summary started from; once the context has grown back to it (the
 	// growth since that summary is at least what it removed), a second summary gains what the first did and the law alone decides again
 	rereadOnly?: boolean; // zip_recall is not available to the model: fold only outputs that can be re-read (classify "rereadable")
 	fileRecall?: FileRecall; // zip_recall is hidden but read, grep or bash is active: fold as in full mode, placeholders name the recall file
-	pastTtl?: boolean; // a user return after the declared TTL: a warm plan may relax into the previous user turn too (RELAX_PREV_TURN)
-	warmSummaryGate?: boolean; // F1, default WARM_SUMMARY_GATE
-	lookahead?: boolean; // F2, default LOOKAHEAD (cold plans only)
-	narrativePrice?: boolean; // F3, default NARRATIVE_PRICE
-	slide?: number; // internal (F2): plan as if this many more user turns had started (the protected window slid)
-	valveB?: number; // internal (F2): the real context the slid warm plan's law sees (the cold plan's folds already applied)
 	cutAt?: string; // cut at this entry or not at all (a summary for that cut is produced or being produced: core.ts adopt)
-	warmStyle?: boolean; // internal: a cold plan at 0 < P(warm) < 0.5 that the law refused is planned once more the way a warm plan is (no relax folds unless pastTtl, the summary gated)
 }
 
 export interface PlanResult {
@@ -659,19 +617,8 @@ export interface PlanResult {
 	cutVisibleIdx: number;
 	cutKeptFirstMsg: Any;
 	fileRecall?: FileRecall; // the summary of this plan names recall files instead of zip_recall (PlanOpts.fileRecall)
-	ahead?: boolean; // F2: the cut was decided by the lookahead (it may lie inside the previous user turn, before its final answer)
 	atRoom?: boolean; // the context after the plan's folds is at Pi's compaction room: Pi would compact (lossy) if nothing is done now
 	atRoomUnedited?: boolean; // the context as it is (no fold, no cut applied) is at Pi's compaction room: a request sent unchanged would trigger it
-}
-
-/** Index of the final assistant message of user turn `turn` (the answer the user saw), -1 if none. */
-export function finalAnswerIdx(blocks: Block[], turn: number): number {
-	for (let i = blocks.length - 1; i >= 0; i--) {
-		const b = blocks[i];
-		if (b.userTurn < turn) break;
-		if (b.userTurn === turn && b.kind === "assistant" && b.entryId && b.msg?.stopReason !== "error" && b.msg?.stopReason !== "aborted") return i;
-	}
-	return -1;
 }
 
 /** Estimated content before the earliest edited block: what stays cached through the edit with O (real: O + c x it). A cut edits from the start. */
@@ -688,25 +635,23 @@ export const contentKeyOf = (content: Any): string => {
 	return `${createHash("sha1").update(t).digest("hex")}:${t.length}`;
 };
 
-/** The planner. Cold: fold everything outside the protected window, relax into the previous turn if still above the cap,
- *  summarise only if folds cannot reach the cap and the law prices the summary call in. Warm: null unless the context is above the
- *  cold cap and the law fires for the plan; its summary passes the same summary gate (WARM_SUMMARY_GATE); then the cold plan minus the previous-turn relax (a warm plan
- *  folds the previous user turn by relax only at a return after the declared TTL, o.pastTtl). A cold plan with P(warm) > 0
- *  passes the same law (expected cost). The cap never exceeds Pi's compaction room. Returns null when there is nothing to plan on
- *  or the law says no. */
+/** The planner: one plan, whatever the cache is believed to be. Below the working view W (the cold target) it plans nothing. Above
+ *  it, eligible outputs fold biggest first, class by class, until the view is at W: those of user turns older than the previous one;
+ *  after a pause (PlanOpts.pause), the previous turn's re-readable outputs; those of the protected turns at least INTURN_AGE requests
+ *  old. If the folds cannot reach W, one summary: the first cut from the one reaching W whose summary pays with its call, and with
+ *  which the whole plan pays (folds inside the prefix are void). Then the whole plan must pay. P(warm) enters only the law (o.law), so
+ *  a lower P never plans less. The target never exceeds Pi's compaction room. null: nothing to plan, or the law refuses. */
 export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
 	const s = settings();
-	const mode = o.mode ?? "cold";
-	const warmLike = mode === "warm" || o.warmStyle === true; // plans the way a warm plan does (the label of the trigger stays the mode's)
 	// limits are in real tokens; the plan works in content estimate units (real = O + c x estimate), so they are converted once, here.
 	// The cold cap is on the whole context, but leaves at least half of itself for the conversation above O (coldTarget): a cap the
-	// fixed prefix alone fills is out of reach, and every cold return then folds all it may and summarises. The compaction room is
-	// Pi's trigger on the whole context.
+	// fixed prefix alone fills is out of reach, and every return then folds all it may and summarises. The compaction room is Pi's
+	// trigger on the whole context.
 	const { O, c } = o.scale ?? UNIT;
 	const real = (est: number) => O + c * est;
 	const room = compactionRoom(o.model, o.reserve);
 	const coldCap = (coldTarget(o.coldCap ?? s.coldCap, O, room) - O) / c;
-	const law: Law = o.law ?? { pr: null, g: G0, pWarm: mode === "cold" ? 0 : 1 };
+	const law: Law = o.law ?? { pr: lawPrices(undefined, false), g: G0, pWarm: 0 };
 	// `cut`: a whole-plan step records whether the plan it judges has a cut (and so carries its summary call); the formal checker pins the
 	// call to 0 for a folds-only plan and to the summary step's call for a cut
 	const gate = (where: "summary" | "plan", B: number, A: number, r: number | null, call: number, T: number, Tsuf?: number, cut?: boolean): boolean => {
@@ -714,20 +659,17 @@ export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
 		o.trace?.push({ where, ...t, ...(Tsuf !== undefined ? { Tsuf } : {}), ...(cut !== undefined ? { cut } : {}) });
 		return t.ok;
 	};
-	const minGain = o.minGain ?? s.minGain;
 	const foldMin = o.foldMin ?? s.foldMin;
 	const keepLines = o.keepLines ?? s.keepLines;
-	const relax = o.relax ?? RELAX_PREV_TURN;
 	const inturnAge = o.inturnAge ?? s.inturnAge;
 	const blocks = buildBlocks(entries, o.steerIds);
 	if (!blocks.length) return null;
-	const userTurns = countUserTurns(blocks) + (o.promptPending && !openStarter(blocks) ? 1 : 0) + (o.slide ?? 0); // the upcoming prompt is a new user turn (unless it joins an open starter)
-	const f1 = o.warmSummaryGate ?? WARM_SUMMARY_GATE, f2 = mode === "cold" && !o.warmStyle && (o.lookahead ?? LOOKAHEAD), f3 = o.narrativePrice ?? NARRATIVE_PRICE;
+	const userTurns = countUserTurns(blocks) + (o.promptPending && !openStarter(blocks) ? 1 : 0); // the upcoming prompt is a new user turn (unless it joins an open starter)
 	const calls = toolCallIndex(blocks);
 	const recalled = o.recalled ?? new Set<string>();
 	const ctxEst = blocks.reduce((a, b) => a + b.tokens, 0); // content
-	if (warmLike && !(ctxEst > coldCap)) return null; // I6: warm cache below the cold cap -> never edit
-	const trig = mode === "warm" ? "valve" : "cold";
+	if (!(ctxEst > coldCap)) return null; // below the working view nothing is planned (I6)
+	const trig = law.pWarm < 0.5 ? "cold" : "valve"; // a label for the ledger and the summary's trigger only
 	const tokOverride = new Map<number, number>();
 	const folds: FoldTarget[] = [];
 	const visOfBlock: number[] = []; // block idx -> index among the non-system projected messages (the numbering a request view uses)
@@ -767,41 +709,30 @@ export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
 	// is an uncensored survival sample (learn.ts sample). Without it every idle return folded into the first 1-7K tokens and its sample was
 	// censored, so the learned curve never saw a return (live GLM bench). Explicit caches are exempt: the provider looks back only ~20
 	// blocks from the last breakpoint, a far head is not read either way. A cut replaces the prefix from the first message: exempt too.
-	const head = law.pr?.cls === "automatic" ? (MIN_EXPECT - O) / c : 0; // MIN_EXPECT counts from the first token, O included
+	const head = law.pr.cls === "automatic" ? (MIN_EXPECT - O) / c : 0; // MIN_EXPECT counts from the first token, O included
 	const start: number[] = [];
 	blocks.reduce((acc, b) => ((start[b.idx] = acc), acc + b.tokens), 0);
 	const foldable = (b: Block) => b.kind === "toolResult" && !b.edited && !!b.entryId && b.tokens > foldMin && !isRecall(b) && start[b.idx] >= head && (!o.rereadOnly || classify(b) === "rereadable");
 	const protectedTurn = (b: Block) => b.userTurn >= userTurns - PROTECT_USER_TURNS + 1;
 	const savings = () => folds.reduce((a, t) => a + t.entryTokens - t.phTokens, 0);
-	const cands = blocks.filter((b) => foldable(b) && !protectedTurn(b));
-	for (const b of cands) addFold(b, trig);
-	if (relax && ((mode === "cold" && !o.warmStyle) || o.pastTtl === true)) {
-		// the protected window = the new prompt + the previous user turn; that turn's big reads are what makes a cold return
-		// expensive. Rereadable ones can be recalled exactly: fold them biggest-first until the cap; never the latest turn's own.
-		// Cold plans, and warm plans at a return after the declared TTL; any other warm plan keeps the previous user turn visible.
-		let est = ctxEst - savings();
-		if (est > coldCap) {
-			const prev = blocks.filter((b) => foldable(b) && protectedTurn(b) && b.userTurn < userTurns && classify(b) === "rereadable");
-			for (const b of prev.sort((x, y) => y.tokens - x.tokens)) {
-				if (est <= coldCap) break;
-				if (addFold(b, `${trig}(relax)`)) est -= b.tokens - (tokOverride.get(b.idx) ?? 0);
-			}
+	// the eligible outputs, class by class, each biggest first, until the view is at the working size: inside one rewrite a fold beyond
+	// it would hide work for no saving the law asked for
+	let est = ctxEst;
+	const take = (list: Block[], tag: string) => {
+		for (const b of list.sort((x, y) => y.tokens - x.tokens)) {
+			if (est <= coldCap) return;
+			if (addFold(b, tag)) est -= b.tokens - (tokOverride.get(b.idx) ?? 0);
 		}
-	}
-	if (inturnAge > 0) {
-		// in-turn: a protected turn (the new prompt's, the previous one, or the one a mid-run cold return / valve is inside) still holds
-		// outputs that are many requests old; they fold biggest-first until the cap, whatever their recoverability class (every fold
-		// stays recallable). Age = assistant requests since the call was issued (the newest outputs, age < inturnAge, always stay).
-		let est = ctxEst - savings();
-		if (est > coldCap) {
-			const aged = blocks.filter((b) => foldable(b) && protectedTurn(b) && b.age >= inturnAge);
-			for (const b of aged.sort((x, y) => y.tokens - x.tokens)) {
-				if (est <= coldCap) break;
-				if (addFold(b, `${trig}(inturn)`)) est -= b.tokens - (tokOverride.get(b.idx) ?? 0);
-			}
-		}
-	}
-	let ctxAfterFolds = ctxEst - savings();
+	};
+	// outputs of the user turns before the previous one
+	take(blocks.filter((b) => foldable(b) && !protectedTurn(b)), trig);
+	// the protected window = the new prompt + the previous user turn; after a pause (or a model switch) the user comes back to a cache
+	// that is gone, and that turn's big re-readable reads are what makes the return expensive: they come back exactly
+	if (o.pause) take(blocks.filter((b) => foldable(b) && protectedTurn(b) && b.userTurn < userTurns && classify(b) === "rereadable"), `${trig}(relax)`);
+	// in-turn: outputs of the protected turns that are many requests old, whatever their recoverability class (every fold stays
+	// recallable). Age = assistant requests since the call was issued (the newest outputs, age < inturnAge, always stay).
+	if (inturnAge > 0) take(blocks.filter((b) => foldable(b) && protectedTurn(b) && b.age >= inturnAge), `${trig}(inturn)`);
+	const ctxAfterFolds = ctxEst - savings();
 	// what no summary can remove (besides O): the protected turns (after their folds) and the previous summary, which the next one
 	// carries forward; the cap is never chased below it (a context that is mostly this floor would be re-summarised for nothing)
 	const prevSum = blocks[0]?.kind === "summary" ? blocks[0].tokens : 0;
@@ -815,24 +746,22 @@ export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
 	let cutIdx: number | null = null;
 	let prefixTokens = 0;
 	let summaryTokensPlanned = 0;
-	let ahead = false;
 	const minCut = blocks[0].kind === "summary" ? 2 : 1; // never re-summarise a prefix that is only the previous summary
 	const pre: number[] = [];
 	const S = (x: number) => Math.max(clamp(SUMMARY_RATIO * x, SUMMARY_FLOOR, SUMMARY_CAP), prevSum); // the next summary carries the previous one forward
 	// Block index of every fold: the folds a cut voids are those before it
 	const foldAt = folds.map((t) => blocks.findIndex((b) => b.entryId === t.entryId));
-	/** The whole plan's law (F10): B is the context as it is (or as the slid valve saw it), A what the plan leaves, `call` the summary call
-	 *  a cut makes; `untouched` is the content before the earliest edit (ledger only). A cold plan with some chance of a warm cache is
-	 *  priced by expectation (no prices: a cold plan always fires). T = A (the whole post-edit context, O included, as tuned: the cheaper
-	 *  A - O fires warm edits earlier and loses items offline). */
-	const planGate = (after: number, untouched: number, call: number, planned: boolean, cut: boolean): boolean =>
-		!(warmLike || (planned && law.pr)) || gate("plan", Math.max(o.valveB ?? real(ctxEst), real(after)), real(after), room, call, real(after), c * (after - untouched), cut);
-	/** The cut for cut points minCut..maxCut: the first that brings the context to the cap, else the deepest; gated = the summary law
-	 *  (no prices: the legacy gain rule) must pass. When the minimal cut's summary or the whole plan with it is refused, the deeper cuts
-	 *  are tried in turn (the gain grows as D^2, the call only with the prefix read). The whole plan's law prices the summary call too.
-	 *  Applies the first cut both laws accept (folds in the prefix are void) and returns true, or changes nothing. */
+	/** The whole plan's law (F10): B is the context as it is, A what the plan leaves, `call` the summary call a cut makes; `untouched` is
+	 *  the content before the earliest edit (ledger only). T = A (the whole post-edit context, O included, as tuned: the cheaper A - O
+	 *  fires warm edits earlier and loses items offline). */
+	const planGate = (after: number, untouched: number, call: number, cut: boolean): boolean =>
+		gate("plan", real(ctxEst), real(after), room, call, real(after), c * (after - untouched), cut);
+	/** The cut for cut points minCut..maxCut: the first that brings the context to the cap, else the deepest; its summary must pay with
+	 *  its call (the summary step's law). When the minimal cut's summary or the whole plan with it is refused, the deeper cuts are tried
+	 *  in turn (the gain grows as D^2, the call only with the prefix read). The whole plan's law prices the summary call too. Applies
+	 *  the first cut both laws accept (folds in the prefix are void) and returns true, or changes nothing. */
 	const pinned = o.cutAt;
-	const summarise = (maxCut: number, gated: boolean): boolean => {
+	const summarise = (maxCut: number): boolean => {
 		const cuts: number[] = [];
 		for (let i = minCut; i < blocks.length && i <= maxCut; i++) if (isCutBlock(blocks[i]) && (pinned === undefined || blocks[i].entryId === pinned)) cuts.push(i);
 		if (!cuts.length) return false;
@@ -846,19 +775,14 @@ export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
 		for (let k = 0; k < cuts.length; k++) if (total - pre[cuts[k]] + S(pre[cuts[k]]) <= coldCap) { first = k; break; }
 		for (const pick of cuts.slice(first)) {
 			const X = c * pre[pick], Sr = c * S(pre[pick]);
-			// the call is the narrative call summary.ts makes (F3, NARRATIVE_PRICE): uncached input of the prefix without the previous
-			// summary, plus that summary's narrative, which it merges (not its lists), + output of at most the narrative budget; without
-			// F3 the verdict's w X + out S (the carried summary as output)
-			const call = !law.pr ? 0 : f3 ? law.pr.input * c * (Math.max(pre[pick] - prevSum, 0) + prevNarr) + law.pr.out * c * Math.min(S(pre[pick]), NARRATIVE_MAX) : law.pr.w * X + law.pr.out * Sr;
-			if (gated) {
-				// the summary call must pay for itself, cold or warm (F1, WARM_SUMMARY_GATE; before, a warm plan skipped the gate)
-				const ok = !law.pr ? summaryGainOk(X, Sr, real(total), minGain) : (warmLike && !f1) || gate("summary", X, Sr, null, call, Sr);
-				if (!ok) continue;
-			}
+			// the call is the narrative call summary.ts makes: uncached input of the prefix without the previous summary, plus that
+			// summary's narrative, which it merges (not its lists), + output of at most the narrative budget
+			const call = law.pr.input * c * (Math.max(pre[pick] - prevSum, 0) + prevNarr) + law.pr.out * c * Math.min(S(pre[pick]), NARRATIVE_MAX);
+			if (!gate("summary", X, Sr, null, call, Sr)) continue; // the summary call must pay for itself
 			if (!(pre[pick] >= 2 * S(pre[pick]))) continue;
 			// what the plan leaves: the context with its folds (those inside the prefix too: the prefix is measured as folded, `pre`) minus
-			// what the summary replaces plus the summary. (Counting the voided folds' savings back, as before, overstated it by them.)
-			if (!planGate(ctxAfterFolds - (pre[pick] - S(pre[pick])), 0, call, true, true)) continue;
+			// what the summary replaces plus the summary
+			if (!planGate(ctxAfterFolds - (pre[pick] - S(pre[pick])), 0, call, true)) continue;
 			cutIdx = pick;
 			prefixTokens = pre[pick];
 			summaryTokensPlanned = S(pre[pick]);
@@ -869,15 +793,7 @@ export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
 	};
 	if (sumTrigger) {
 		const limit = blocks.findIndex((b) => protectedTurn(b));
-		summarise(limit >= 0 ? limit : blocks.length - 1, true);
-	}
-	if (f2 && cutIdx === null && law.pr && ctxAfterFolds > coldCap && (!noSummary || atRoom)) {
-		// F2 lookahead: the warm valve's plan at the next user turn (this context, its folds applied, the window slid by one turn). If it
-		// would summarise, the summary is written now, at the cold return, where the rewrite costs nothing extra (and at settle it is
-		// prepared while the user is away), instead of one turn later as a warm rewrite the user waits for.
-		const next = planContext(entries, { ...o, mode: "warm", slide: (o.slide ?? 0) + 1, lookahead: false, pastTtl: false, noSummary: false, trace: undefined, law: { ...law, pWarm: 1 }, valveB: real(ctxAfterFolds) });
-		const fa = finalAnswerIdx(blocks, userTurns - 1);
-		if (next && next.cutIdx !== null && fa >= minCut && summarise(fa, false)) ahead = true;
+		summarise(limit >= 0 ? limit : blocks.length - 1);
 	}
 	// where the kept part starts among the projected non-system messages (the request-local view drops everything before it)
 	let cutVisibleIdx = -1;
@@ -896,18 +812,10 @@ export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
 			bi++;
 		}
 	}
-	// the untouched prefix: everything before the earliest edited block (a cut edits from the first block on)
-	const untouched = untouchedEst(blocks, folds, cutIdx !== null);
-	const after = ctxAfterFolds - (cutIdx !== null ? prefixTokens - summaryTokensPlanned : 0);
-	const planned = folds.length > 0 || cutIdx !== null;
 	// a plan with a cut passed the whole plan's law with its call inside summarise; folds only (no summary wanted, or none the laws
 	// accepted: the deeper cuts and the cut-free plan both stand) is judged here
-	if (cutIdx === null && !planGate(after, untouched, 0, planned, false)) {
-		// a cold plan with some chance of a warm cache: the plan a warm cache would make may pay where this one does not
-		if (mode === "cold" && !o.warmStyle && law.pr && law.pWarm > 0 && law.pWarm < 0.5) return planContext(entries, { ...o, warmStyle: true });
-		return null;
-	}
-	return { blocks, calls, folds, cutIdx, firstKeptEntryId: cutIdx !== null ? blocks[cutIdx].entryId : null, prefixTokens, summaryTokensPlanned, sumTrigger: cutIdx !== null ? (sumTrigger ?? trig) : sumTrigger, scale: o.scale ?? UNIT, ctxTokens: real(ctxEst), ctxAfterFolds: real(ctxAfterFolds), userTurns, cutVisibleIdx, cutKeptFirstMsg, ...(o.fileRecall ? { fileRecall: o.fileRecall } : {}), ...(ahead ? { ahead } : {}), ...(atRoom ? { atRoom } : {}), ...(atRoomUnedited ? { atRoomUnedited } : {}) };
+	if (cutIdx === null && (!folds.length || !planGate(ctxAfterFolds, untouchedEst(blocks, folds, false), 0, false))) return null;
+	return { blocks, calls, folds, cutIdx, firstKeptEntryId: cutIdx !== null ? blocks[cutIdx].entryId : null, prefixTokens, summaryTokensPlanned, sumTrigger: cutIdx !== null ? (sumTrigger ?? trig) : sumTrigger, scale: o.scale ?? UNIT, ctxTokens: real(ctxEst), ctxAfterFolds: real(ctxAfterFolds), userTurns, cutVisibleIdx, cutKeptFirstMsg, ...(o.fileRecall ? { fileRecall: o.fileRecall } : {}), ...(atRoom ? { atRoom } : {}), ...(atRoomUnedited ? { atRoomUnedited } : {}) };
 }
 
 const sameMsg = (a: Any, b: Any): boolean =>

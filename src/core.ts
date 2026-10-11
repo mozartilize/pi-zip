@@ -69,15 +69,23 @@ export function checkEdits(blocks: Block[], userTurns: number, folds: FoldTarget
 	const live = folds.filter((t) => byId.has(t.entryId));
 	const cutBlock = cut ? byId.get(cut.firstKeptEntryId) : undefined;
 	if (cut && !cutBlock) return `cut target ${cut.firstKeptEntryId} is not in the projection`;
-	return validateEdits(blocks, { folds: new Map(live.map((t) => [byId.get(t.entryId)!.idx, t.ph])), recover: new Map(live.map((t) => [byId.get(t.entryId)!.idx, t.recover])), cut: cutBlock ? cutBlock.idx : null, ahead: !!cut?.ahead }, userTurns);
+	return validateEdits(blocks, { folds: new Map(live.map((t) => [byId.get(t.entryId)!.idx, t.ph])), recover: new Map(live.map((t) => [byId.get(t.entryId)!.idx, t.recover])), cut: cutBlock ? cutBlock.idx : null }, userTurns);
 }
 
 // ---- clock --------------------------------------------------------------------------------------------------------------------
 
-/** The return a request sent at `nowMs` would be: cold or warm, P(warm), the gap and whether it lies past the declared TTL.
+/** The return a request sent at `nowMs` would be: P(warm) (cold = P < 0.5), the gap and whether the absence was a pause.
  *  `last`: the shell's own clock of the newest request and its model (0 and "" read both from the branch). */
 export const clock = (branch: Any[], lam: Pick<Learned, "model" | "ent" | "tier">, nowMs: number, last: { reqMs: number; modelKey: string } = { reqMs: 0, modelKey: "" }): ColdInfo =>
 	detectCold(lam.model, last.reqMs, branch, nowMs, last.modelKey, (g, prior) => pWarm(lam.ent, g, prior), lam.tier);
+
+/** P(warm) inside a run, at a turn_end: the same learned curve, at the gap since the newest response (the last touch of the cache;
+ *  the tool results after it touched nothing), so a long tool call counts as the absence it is. Never a pause (nobody left). */
+export function inRunClock(branch: Any[], lam: Pick<Learned, "model" | "ent" | "tier">, nowMs: number, last: { reqMs: number; modelKey: string }): ColdInfo {
+	let n = branch.length;
+	while (n > 0 && !(branch[n - 1]?.type === "message" && branch[n - 1].message?.role === "assistant")) n--;
+	return { ...clock(branch.slice(0, n), lam, nowMs, last), pause: false };
+}
 
 /** stopReasons of an assistant message that does not end a run (buildBlocks' afterAnswer: a failed or aborted request ends it too). */
 const STOP_NOT_FINAL = new Set(["toolUse"]);
@@ -196,11 +204,13 @@ export const lawOf = (branch: Any[], lam: Learned, pWarm: number): Law => ({ pr:
 
 // ---- plan ---------------------------------------------------------------------------------------------------------------------
 
-/** Plan options for `entries` (`pending`: the next prompt is not in them yet), with the token scale read from the branch. */
-export function planOpts(entries: Any[], branch: Any[], env: Env, lam: Learned, pending: boolean, mode: "cold" | "warm", pWarm = mode === "cold" ? 0 : 1, cutAt?: string): { o: PlanOpts; cal: Scale } {
+/** Plan options for `entries` (`pending`: the next prompt is not in them yet) at P(warm) `pWarm`, after a pause or not, with the token
+ *  scale read from the branch. P goes into the law only; the one exception until it is dropped is the one summary per warm stretch
+ *  (noSummary: at P >= 0.5, once a summary was made since the last cold return, until the context has grown back). */
+export function planOpts(entries: Any[], branch: Any[], env: Env, lam: Learned, pending: boolean, pWarm: number, pause: boolean, cutAt?: string): { o: PlanOpts; cal: Scale } {
 	const cal = scaleOf(entries, branch, env.sys, env.model ? modelKey(env.model) : undefined);
-	const warmAgain = mode === "warm" && lam.summarizedWarm;
-	return { cal, o: { mode, scale: cal, cwd: env.cwd, recalled: env.recalled, model: env.model, promptPending: pending, rereadOnly: env.rereadOnly, ...(env.fileRecall ? { fileRecall: env.fileRecall } : {}), noSummary: warmAgain, ...(warmAgain && lam.summaryRegrow ? { regrowAt: lam.summaryRegrow } : {}), reserve: env.reserve, steerIds: env.steerIds, law: lawOf(branch, lam, pWarm), trace: [], ...(cutAt !== undefined ? { cutAt } : {}) } };
+	const warmAgain = pWarm >= 0.5 && lam.summarizedWarm;
+	return { cal, o: { pause, scale: cal, cwd: env.cwd, recalled: env.recalled, model: env.model, promptPending: pending, rereadOnly: env.rereadOnly, ...(env.fileRecall ? { fileRecall: env.fileRecall } : {}), noSummary: warmAgain, ...(warmAgain && lam.summaryRegrow ? { regrowAt: lam.summaryRegrow } : {}), reserve: env.reserve, steerIds: env.steerIds, law: lawOf(branch, lam, pWarm), trace: [], ...(cutAt !== undefined ? { cutAt } : {}) } };
 }
 
 /** A summary a plan may take: produced and ready (`running` false), or still being written. */
@@ -241,12 +251,12 @@ export interface NativeIn { key: string; pre: Any[]; entryId: string }
 
 /**
  * The run plan decision at a run's first request (one plan per edit run). `opts` gives the plan options of this run for some entries
- * (the shell's mode and P(warm)). b2b: a warm return right after an edited request makes no edit (unless Pi's compaction already put
+ * (the shell's P(warm) and pause). b2b: a warm return right after an edited request makes no edit (unless Pi's compaction already put
  * this run's summary in). Otherwise the plan, taking the summary in the session (`nat`) or a produced one (`avail`, adopt);
  * a summary Pi's compaction put in is planned on the projection before it (`onPre`), or on the session as it is when that plan cuts
  * elsewhere. `foreign`: another extension's compaction just went in: folds only.
  */
-export function decideRun(x: { cold: boolean; pastTtl: boolean; justEdited: boolean; nat: NativeIn | null; foreign: boolean; now: Any[]; avail: readonly Avail[]; opts: (entries: Any[], cutAt?: string) => { o: PlanOpts; cal: Scale } }):
+export function decideRun(x: { cold: boolean; justEdited: boolean; nat: NativeIn | null; foreign: boolean; now: Any[]; avail: readonly Avail[]; opts: (entries: Any[], cutAt?: string) => { o: PlanOpts; cal: Scale } }):
 	{ kind: "b2b" } | { kind: "plan"; o: PlanOpts; cal: Scale; p: PlanResult | null; onPre: boolean; notes: Note[] } {
 	const { cold, nat } = x;
 	const spliced = nat ? spliceNative(nat.pre, x.now, nat.entryId) : null;
@@ -254,7 +264,6 @@ export function decideRun(x: { cold: boolean; pastTtl: boolean; justEdited: bool
 	const notes: Note[] = [];
 	const plan = (entries: Any[], cutAt?: string, asNative = false) => {
 		const { o, cal } = x.opts(entries, cutAt);
-		o.pastTtl = x.pastTtl;
 		// the plan that carries the summary Pi's compaction just put in is made in the state nativeSummary planned it in: before that
 		// summary, so it is not "a second summary in this warm stretch" (noSummary, regrowAt). Otherwise a real prompt a token smaller
 		// than before_agent_start's estimate falls below regrowAt, the plan does not cut and the folds priced with it are dropped
@@ -316,11 +325,12 @@ export function runPlanOf(x: { p: PlanResult | null; cal: Scale; cold: boolean; 
 	return { plan, folds, cut, ...(drop ? { drop } : {}) };
 }
 
-/** The warm decision at a turn_end that has no run plan to persist: none after a failed turn or right after an edited request (b2b),
- *  else the warm plan (P = 1 in-run), taking a produced summary (adopt); `p` null when it changes nothing. */
-export function decideTurnEnd(x: { failed: boolean; justEdited: boolean; avail: readonly Avail[]; opts: (cutAt?: string) => { o: PlanOpts }; entries: Any[] }): { kind: "none" } | { kind: "b2b" } | { kind: "plan"; o: PlanOpts; p: PlanResult | null; notes: Note[] } {
+/** The decision at a turn_end that has no run plan to persist: none after a failed turn, nothing right after an edited request while
+ *  the cache is believed warm (b2b), else the plan at the in-run P(warm) `pWarm` (core.ts inRunClock), taking a produced summary
+ *  (adopt); `p` null when it changes nothing. */
+export function decideTurnEnd(x: { failed: boolean; justEdited: boolean; pWarm: number; avail: readonly Avail[]; opts: (cutAt?: string) => { o: PlanOpts }; entries: Any[] }): { kind: "none" } | { kind: "b2b" } | { kind: "plan"; o: PlanOpts; p: PlanResult | null; notes: Note[] } {
 	if (x.failed) return { kind: "none" };
-	if (x.justEdited) return { kind: "b2b" };
+	if (x.justEdited && x.pWarm >= 0.5) return { kind: "b2b" };
 	const mk = (cutAt?: string) => {
 		const { o } = x.opts(cutAt);
 		return { o, p: planContext(x.entries, o) };
@@ -336,8 +346,8 @@ export const valvePlanOf = (p: PlanResult, cut: Cut | null, adopted: boolean, bg
 	untouched: sizeOf(p.scale, untouchedEst(p.blocks, p.folds, !!cut)), ...(cut ? { waitMs: adopted ? bgWaitMs : cut.ms } : {}), ...(cut && adopted ? { ready: "background" as const } : {}),
 });
 
-/** The plans at settle: the cold return's (`cold`) and, unless the newest request carried an edit (b2b), the warm return's (`warm`),
- *  each taking a produced summary (adopt). */
+/** The plans at settle: the return after a pause (`cold`: P = 0, pause) and, unless the newest request carried an edit (b2b), the
+ *  return within the cache life (`warm`: P = 1), each taking a produced summary (adopt). */
 export function decideSettle(x: { justEdited: boolean; avail: readonly Avail[]; entries: Any[]; cold: (cutAt?: string) => { o: PlanOpts; cal: Scale }; warm: (cutAt?: string) => { o: PlanOpts } }): { p: PlanResult | null; cal: Scale; w: PlanResult | null; notes: Note[] } {
 	const notes: Note[] = [];
 	const mc = (cutAt?: string) => {

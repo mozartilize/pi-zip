@@ -157,7 +157,7 @@ pub fn describe_tick(r: &Run, i: usize) -> String {
         let _ = write!(out, "first prompt, ");
     } else if t.n == 0 {
         if let Some(s0) = &t.state0 {
-            let _ = write!(out, "{} return{} (P(warm) {:.2}{}), ", if s0.cold { "cold" } else { "warm" }, t.gap.map(|g| format!(" after {:.0}s", g)).unwrap_or_default(), s0.p_warm.unwrap_or(1.0), if s0.past_ttl { ", past TTL" } else { "" });
+            let _ = write!(out, "{} return{} (P(warm) {:.2}{}), ", if s0.cold { "cold" } else { "warm" }, t.gap.map(|g| format!(" after {:.0}s", g)).unwrap_or_default(), s0.p_warm.unwrap_or(1.0), if s0.pause { ", a pause" } else { "" });
         }
     }
     let _ = write!(out, "cache {}, sends {}", if s.warm { "warm" } else { "cold" }, kt(s.view_tok));

@@ -48,19 +48,6 @@ pub struct Terms {
     pub gain: f64,
 }
 
-/// plan.ts legacyValve (no prices: before the first response of a model).
-// `!(a < b)` is the TypeScript's own test, kept as is: a NaN size refuses the edit, as it does in plan.ts.
-#[allow(clippy::neg_cmp_op_on_partial_ord)]
-pub fn legacy_valve(b: f64, a: f64, room: Option<f64>) -> bool {
-    if !(a < b) {
-        return false;
-    }
-    if room.is_some_and(|r| b >= r) {
-        return true;
-    }
-    a <= 0.5 * b
-}
-
 /// plan.ts lawTerms, line for line (`!(a < b)` as in the TypeScript: a NaN size refuses).
 #[allow(clippy::too_many_arguments, clippy::neg_cmp_op_on_partial_ord)]
 pub fn law(b: f64, a: f64, p: f64, room: Option<f64>, pr: Option<Prices>, g: f64, call: f64, t: f64) -> Terms {
@@ -68,8 +55,10 @@ pub fn law(b: f64, a: f64, p: f64, room: Option<f64>, pr: Option<Prices>, g: f64
     if !(a < b) {
         return none;
     }
+    // no prices: nothing is allowed (since 0.4.0 the planner always has prices: the class ratios, the explicit ones before the class
+    // is learned; the legacy rule is gone)
     let Some(pr) = pr.filter(|pr| pr.r > 0.0) else {
-        return Terms { ok: legacy_valve(b, a, room), ..none };
+        return none;
     };
     let d = b - a;
     let k = (pr.w - pr.r) * (p * t.min(a) - (1.0 - p) * d) + call;
@@ -217,10 +206,9 @@ mod tests {
     }
 
     #[test]
-    fn legacy_rule_without_prices() {
-        assert!(law(100.0, 40.0, 1.0, None, None, 1.0, 0.0, 40.0).ok);
-        assert!(!law(100.0, 60.0, 1.0, None, None, 1.0, 0.0, 60.0).ok);
-        assert!(law(100.0, 99.0, 1.0, Some(90.0), None, 1.0, 0.0, 99.0).ok);
-        assert!(!law(100.0, 100.0, 0.0, None, None, 1.0, 0.0, 100.0).ok);
+    fn nothing_without_prices() {
+        for (b, a, p, room) in [(100.0, 40.0, 1.0, None), (100.0, 99.0, 1.0, Some(90.0)), (100.0, 40.0, 0.0, None)] {
+            assert!(!law(b, a, p, room, None, 1.0, 0.0, a).ok);
+        }
     }
 }

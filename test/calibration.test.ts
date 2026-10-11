@@ -5,7 +5,7 @@ import { buildBlocks, C0, C_MAX, C_MIN, calibrate, coldTarget, planContext, R0, 
 import { lawPrices } from "../src/learn.ts";
 import { A, AX, fakeCtx, fakePi, flat, R, U, type Any } from "./helpers.ts";
 
-const ENV = ["PI_ZIP_TTL_SECS", "PI_ZIP_COLD_CAP", "PI_ZIP_OFF", "PI_ZIP_LEDGER", "PI_ZIP_MIN_GAIN"];
+const ENV = ["PI_ZIP_TTL_SECS", "PI_ZIP_COLD_CAP", "PI_ZIP_OFF", "PI_ZIP_LEDGER"];
 let saved: Record<string, string | undefined> = {};
 beforeEach(() => { saved = Object.fromEntries(ENV.map((k) => [k, process.env[k]])); ENV.forEach((k) => delete process.env[k]); process.env.PI_ZIP_TTL_SECS = "1"; });
 afterEach(() => ENV.forEach((k) => (saved[k] === undefined ? delete process.env[k] : (process.env[k] = saved[k]))));
@@ -314,7 +314,7 @@ describe("every limit and every number on the right scale", () => {
 	test("a warm plan is considered only above the target: with a small O the whole context counts, with a large O half the cap of conversation", () => {
 		const model = { provider: "p", id: "m", contextWindow: 1_000_000 };
 		const law = { pr: lawPrices("explicit", false), g: 2_500, pWarm: 0 }; // P = 0: the law always fires, only the cap decides
-		const warm = (entries: Any[], O: number) => planContext(entries, { mode: "warm", cwd: ".", promptPending: false, model, coldCap: 40_000, law, scale: { ...UNIT, O, c: 1 } });
+		const warm = (entries: Any[], O: number) => planContext(entries, { cwd: ".", promptPending: false, model, coldCap: 40_000, law, scale: { ...UNIT, O, c: 1 } });
 		const view = (chars: number) => [...turns(3, chars), U("uN", "now")];
 		const [v15, v25, v35, v38] = [19_500, 32_800, 46_000, 50_500].map(view);
 		for (const [v, lo, hi] of [[v15, 14_000, 16_000], [v25, 24_000, 26_000], [v35, 34_000, 36_000], [v38, 37_500, 39_000]] as const) {
@@ -339,13 +339,13 @@ describe("every limit and every number on the right scale", () => {
 		prev.push(A("pe"), U("u3", "now"));
 		const out = buildBlocks(prev).find((b) => b.entryId === "r1")!.tokens;
 		expect(content(prev)).toBeGreaterThan(6 * out); // six re-readable outputs of the previous turn, ~10K each
-		const cold = planContext(prev, { mode: "cold", cwd: ".", promptPending: false, model, coldCap: 40_000, scale: { ...UNIT, O: 50_000, c: 1 } })!;
+		const cold = planContext(prev, { pause: true, cwd: ".", promptPending: false, model, coldCap: 40_000, scale: { ...UNIT, O: 50_000, c: 1 } })!;
 		expect(cold.cutIdx).toBeNull(); // the target is reachable by folding: no summary
 		expect(cold.folds.length).toBe(5); // the cap on content folded 3 (stopping at O + 40K), 0.2.9's 40K total all 6
 		expect(cold.ctxAfterFolds).toBeLessThanOrEqual(50_000 + 20_000);
 		expect(cold.ctxAfterFolds).toBeGreaterThan(50_000 + 20_000 - out); // it stops as soon as it is under
 		// with a small O the same view is planned against the whole-context cap, as before the affine scale
-		const small = planContext(prev, { mode: "cold", cwd: ".", promptPending: false, model, coldCap: 40_000, scale: { ...UNIT, O: 3_000, c: 1 } })!;
+		const small = planContext(prev, { pause: true, cwd: ".", promptPending: false, model, coldCap: 40_000, scale: { ...UNIT, O: 3_000, c: 1 } })!;
 		expect(small.ctxAfterFolds).toBeLessThanOrEqual(40_000);
 		expect(small.ctxAfterFolds).toBeGreaterThan(40_000 - out);
 	});
@@ -353,7 +353,7 @@ describe("every limit and every number on the right scale", () => {
 	test("the compaction room is Pi's trigger on the whole context: O counts toward it", () => {
 		const model = { provider: "p", id: "m", contextWindow: 200_000 }; // room = 200000 - 16384 - 8192 = 175424
 		const view = [U("u0", "q"), AX("x0", 200_000), U("u1", "q"), AX("x1", 200_000), U("u9", "next"), A("a9"), U("uN", "now")]; // ~100K of prose no fold can touch
-		const plan = (O: number) => planContext(view, { mode: "warm", cwd: ".", promptPending: false, model, coldCap: 40_000, noSummary: true, scale: { ...UNIT, O, c: 1 } });
+		const plan = (O: number) => planContext(view, { cwd: ".", promptPending: false, model, coldCap: 40_000, noSummary: true, law: { pr: lawPrices("explicit", false), g: 2_500, pWarm: 1 }, scale: { ...UNIT, O, c: 1 } });
 		expect(plan(0)?.cutIdx ?? null).toBeNull(); // below the room: one summary per warm stretch holds
 		expect(plan(80_000)!.cutIdx).not.toBeNull(); // the same content with 80K of system and tools is past Pi's trigger: the summary is allowed
 	});
@@ -465,6 +465,7 @@ describe("stats and notices use the plan's scale", () => {
 	test("the fold ledger line carries O and c and real sizes: ctxBefore = O + c x content", async () => {
 		const ledger = `/tmp/pi-zip-test-calibration-fold-${process.pid}.jsonl`;
 		process.env.PI_ZIP_LEDGER = ledger;
+		process.env.PI_ZIP_COLD_CAP = "8000"; // a small session: a working view it is above, so the cold return folds r1 (and only r1)
 		try { unlinkSync(ledger); } catch {}
 		const prevRun = [U("u1", "one"), A("a1", ["c1"]), R("r1", "c1", 20_000), A("a2"), U("u2", "two"), A("a3", ["c2"]), R("r2", "c2"), A("a4")];
 		const cold = provider([...prevRun, U("u3", "back after the idle")], 0, 2, ["a4"]);

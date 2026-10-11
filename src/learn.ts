@@ -8,7 +8,7 @@ import { type Any, clamp } from "./util.ts";
 export type CacheClass = "explicit" | "automatic";
 
 /** Prices of one prefix token in units of the input price: r = cache read, w = rewrite, out = output. */
-export interface Prices { r: number; w: number; input: number; out: number; cls: CacheClass; src: "class" }
+export interface Prices { r: number; w: number; input: number; out: number; cls: CacheClass; src: "class" | "default" }
 
 /** Price ratios to input per cache class. explicit = Anthropic list multipliers (read 0.1, 5-min write 1.25, 1-h write 2: kappa = w/r - 1
  *  = 11.5 / 19); automatic: r = 0.2 (kappa = 4: GLM's own ratio 0.186 -> 4.38 is the only automatic provider measured; the class spans
@@ -17,12 +17,14 @@ export const CLASS_RATIOS: Record<CacheClass, { r: number; w: number }> = { expl
 
 /** The class ratios, never Pi's price table (model.cost): the law is homogeneous in prices, so ratios are all it needs, and true prices
  *  instead of the class ratios moved the bill by 0.0-1.0%. w: explicit 1.25, or 2 on the 1-h tier; automatic 1. The class comes from the
- *  usage reports (learned, persisted); unknown before the first response = null (the legacy rule). */
-export function lawPrices(cls: CacheClass | undefined, longTier: boolean): Prices | null {
-	if (!cls) return null;
-	const d = CLASS_RATIOS[cls];
-	const w = cls === "explicit" && longTier ? 2 : d.w;
-	return { r: d.r, w, input: 1, out: 4 * d.w, cls, src: "class" };
+ *  usage reports (learned, persisted). Before the first response of a model the class is not known: the explicit ratios (src
+ *  "default"), the conservative side for a warm decision (the larger rewrite premium); the first request to a model is cold anyway
+ *  (P = 0), where the law allows any fold whatever the premium. */
+export function lawPrices(cls: CacheClass | undefined, longTier: boolean): Prices {
+	const k: CacheClass = cls ?? "explicit";
+	const d = CLASS_RATIOS[k];
+	const w = k === "explicit" && longTier ? 2 : d.w;
+	return { r: d.r, w, input: 1, out: 4 * d.w, cls: k, src: cls ? "class" : "default" };
 }
 
 // ---- cache survival ------------------------------------------------------------------------------------------------

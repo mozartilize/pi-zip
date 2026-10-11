@@ -191,8 +191,8 @@ fn world_agrees() -> F<R> {
 fn law_as_specified() -> F<R> {
     atom("law_as_specified", |r: &R, i, _| law_mismatch(r, i).is_none())
 }
-/// The first request of a run after the cache is gone (a model switch; or the declared TTL and the kept TTL both passed since the
-/// last response or refresh) is planned cold, and a return after the declared TTL is marked past it.
+/// The first request of a run after the cache is gone (a model switch; or the requested and the kept TTL both passed since the
+/// last response or refresh) is planned cold, and a return after the requested TTL, or a switch, is marked a pause.
 fn gone_is_cold() -> F<R> {
     atom("gone_is_cold", |r: &R, i, _| gone_but_warm(r, i).is_none())
 }
@@ -306,8 +306,9 @@ pub fn derived() -> Vec<Prop> {
             id: "PW",
             name: "protection windows",
             from: &["A1"],
-            why: "the model works on the latest two user turns: their outputs fold only when re-readable in the previous turn at a \
-                  cold return or after the declared TTL, or when 60 requests old; a summary never cuts into them.",
+            why: "the model works on the latest two user turns: their outputs fold only when re-readable in the previous turn after a \
+                  pause (an absence of at least the requested cache lifetime) or a model switch, whatever P(warm), or when 60 requests \
+                  old; a summary never cuts into them.",
             evidence: Evidence::Conformance,
             f: always(protection_respected()),
         },
@@ -325,7 +326,7 @@ pub fn derived() -> Vec<Prop> {
             name: "monotone in P(warm)",
             from: &["A2"],
             why: "an edit is never cheaper at a warm cache than at a cold one: whatever fires at P must fire, or be dominated, at \
-                  every lower P, with the same prices and context.",
+                  every lower P, with the same prices and context. Structural since 0.4.0: one planner, P enters only the law.",
             evidence: Evidence::Conformance,
             f: always(monotone_in_p()),
         },
@@ -371,7 +372,7 @@ pub fn derived() -> Vec<Prop> {
             name: "target reachability",
             from: &["A2"],
             why: "a cold return is the one free rewrite: it must reach the cold target unless the protected turns forbid it, the law \
-                  refuses the summary call, or it takes a summary produced earlier that cuts short of its own cut (restated in 0.4.0: \
+                  refuses the summary call (or, at P(warm) > 0, the plan: the rewrite is then a priced one), or it takes a summary produced earlier that cuts short of its own cut (restated in 0.4.0: \
                   a paid summary is used, never deeper than the plan's cut; the target is reached once the deeper one is ready).",
             evidence: Evidence::Conformance,
             f: always(cold_plan() >> target_reached_or_excused()),
@@ -381,8 +382,8 @@ pub fn derived() -> Vec<Prop> {
             name: "a gone cache gets a cold plan",
             from: &["A2"],
             why: "README rule 2: after the TTL, or after switching model, pi-zip folds: a return to a cache that is gone (a switch, or both \
-                  the declared and the kept lifetime passed since the last response or refresh) is planned cold, and a return after the \
-                  declared TTL is marked past it (the previous turn becomes eligible).",
+                  the requested and the kept lifetime passed since the last response or refresh) is planned cold, and a return after the \
+                  requested TTL, or a switch, is marked a pause (the previous turn becomes eligible).",
             evidence: Evidence::Conformance,
             f: always(gone_is_cold()),
         },
@@ -416,8 +417,8 @@ pub fn derived() -> Vec<Prop> {
             id: "MPr",
             name: "monotone in P(warm), residual",
             from: &["MP"],
-            why: "MP breaches outside the planner paths TRIAGE (a) 3 and 6 name (B1, smallest cut only, the summary voids better folds, \
-                  cold mode at 0 < P < 0.5, F2): what is left is a new mechanism.",
+            why: "MP breaches outside the planner paths TRIAGE (a) 3 and 6 name (B1, smallest cut only, the summary voids better folds): \
+                  what is left is a new mechanism.",
             evidence: Evidence::Conformance,
             f: always(mp_residual()),
         },
@@ -514,19 +515,18 @@ pub fn protection_breaches(r: &R, i: usize) -> Vec<String> {
                 continue; // outside the window
             }
             let age = r.age_at(b, i, &g.at);
-            let relax_ok = b.turn == prev && prev >= 1 && b.recover == Recover::Rereadable && (g.mode == "cold" || g.past_ttl);
+            // 0.4.0 (architecture section 8, PW restated): the previous turn's re-readable outputs only after a pause (an absence of at
+            // least the requested lifetime tau) or a model switch, whatever P
+            let relax_ok = b.turn == prev && prev >= 1 && b.recover == Recover::Rereadable && g.pause;
             if age < INTURN_AGE && !relax_ok {
-                bad.push(format!("{} folds {f} (turn {}, {:?}, age {age}) inside the protected turns {}..{u} ({} plan, pastTtl {})", g.at, b.turn, b.recover, prev.max(1), g.mode, g.past_ttl));
+                bad.push(format!("{} folds {f} (turn {}, {:?}, age {age}) inside the protected turns {}..{u} (P={}, pause {})", g.at, b.turn, b.recover, prev.max(1), g.p, g.pause));
             }
         }
         if let Some(cut) = &p.cut {
             let first_protected = r.blocks.iter().position(|b| b.starts_turn() && b.turn == prev.max(1));
-            // a lookahead cut (F2) may lie inside the previous turn, up to that turn's final answer (its last assistant message)
-            let final_answer = r.blocks.iter().rposition(|b| b.kind == "assistant" && b.turn == prev);
             if let (Some(c), Some(fp)) = (r.order(cut), first_protected) {
-                let ahead_ok = p.ahead && g.mode == "cold" && final_answer.is_some_and(|fa| c <= fa);
-                if u >= 2 && c > fp && !ahead_ok {
-                    bad.push(format!("{} summary keeps from {cut}, after the start of protected turn {prev}{}", g.at, if p.ahead { " (a lookahead cut past the turn's final answer)" } else { "" }));
+                if u >= 2 && c > fp {
+                    bad.push(format!("{} summary keeps from {cut}, after the start of protected turn {prev}", g.at));
                 }
             }
         }
@@ -592,8 +592,10 @@ pub fn monotonicity_breaches(r: &R, i: usize) -> Vec<String> {
     mp_breaches(r, i).into_iter().map(|(_, d)| d).collect()
 }
 
-/// The MP mechanisms TRIAGE.md (a) 3 and 6 name (MPr is MP without them).
-pub const MP_KNOWN: &[&str] = &["B1, the warm summary", "smallest cut only", "the summary voids better folds", "cold mode at 0 < P < 0.5", "lookahead (F2)"];
+/// The MP mechanisms TRIAGE.md (a) 3 and 6 name (MPr is MP without them). Since 0.4.0 step 3 (one planner: the candidates do not
+/// depend on P, which enters only the law) MP is structural: none of them can occur, and neither can the two step 3 removed (the cold
+/// mode at 0 < P < 0.5 with its warm-style re-plan, the lookahead).
+pub const MP_KNOWN: &[&str] = &["B1, the warm summary", "smallest cut only", "the summary voids better folds"];
 /// The A2 classes TRIAGE.md names (A2r is A2 without them).
 pub const A2_KNOWN: &[&str] = &["B1, a warm summary whose call no gate prices", "the call is not in the plan gate"];
 
@@ -602,11 +604,12 @@ fn prices(g: &Grid) -> Option<Prices> {
 }
 
 /// The prices of the law at a decision: the class ratios of the TRUE cache class and tier (learn.ts CLASS_RATIOS, law.rs
-/// class_prices), when pi-zip knows the class at all (None: the legacy rule, before the first response of a model). LW checks that
-/// the planner used exactly these.
+/// class_prices) once pi-zip has learned the class; before the first response of a model (the planner's prices marked "default") the
+/// explicit ratios, the conservative side (architecture D6: the legacy rules are gone). LW checks that the planner used exactly these.
 pub fn spec_prices(r: &R, g: &Grid) -> Option<Prices> {
     prices(g)?;
-    Some(class_prices(r.trace.world.cls, r.trace.world.tier == Tier::Long))
+    let long = r.trace.world.tier == Tier::Long;
+    Some(if g.pr.as_ref().is_some_and(|p| p.src == "default") { class_prices(Class::Explicit, long) } else { class_prices(r.trace.world.cls, long) })
 }
 
 /// The real sizes of what request i carries new, read from the requests themselves (the provider's scale), not from the planner:
@@ -660,7 +663,7 @@ pub fn pays_fully(r: &R, i: usize) -> Result<(), String> {
     if g.actual().is_none() {
         return Err("no actual plan in the decision".into());
     }
-    let Some(pr) = spec_prices(r, g) else { return Ok(()) }; // legacy rule (class unknown): nothing to price
+    let Some(pr) = spec_prices(r, g) else { return Ok(()) }; // no law recorded (a source without prices)
     let Some(e) = edit_sizes(r, i) else { return Ok(()) };
     let room = Some(r.st[i].room);
     let gg = g.g.unwrap_or(2500.0);
@@ -759,14 +762,14 @@ pub fn gone_but_warm(r: &R, i: usize) -> Option<String> {
     let s = &r.st[i];
     let w = &r.trace.world;
     if s.switched {
-        return (!s.believed_cold || s.p > 0.0).then(|| format!("the model switched ({} -> {}) and the return was planned with P(warm) {:.2}", r.tick(i - 1).model, t.model, s.p));
+        return (!s.believed_cold || s.p > 0.0 || !s.pause).then(|| format!("the model switched ({} -> {}) and the return was planned with P(warm) {:.2}{}", r.tick(i - 1).model, t.model, s.p, if s.pause { "" } else { ", not as a pause" }));
     }
     let gap = s.touch_gap?;
-    if gap > w.ttl_decl() + 1.0 && !s.past_ttl {
-        return Some(format!("{gap:.0} s since the cache was last touched, past the declared TTL {:.0} s, and the return is not marked past it", w.ttl_decl()));
+    if gap > w.ttl_decl() + 1.0 && !s.pause {
+        return Some(format!("{gap:.0} s since the cache was last touched, past the requested lifetime {:.0} s, and the return is not marked a pause", w.ttl_decl()));
     }
     if gap > w.ttl_decl() + 1.0 && gap > w.ttl_kept() + 1.0 && !s.believed_cold {
-        return Some(format!("{gap:.0} s since the cache was last touched, past the declared ({:.0} s) and the kept ({:.0} s) TTL, and the return was planned warm (P(warm) {:.2})", w.ttl_decl(), w.ttl_kept(), s.p));
+        return Some(format!("{gap:.0} s since the cache was last touched, past the requested ({:.0} s) and the kept ({:.0} s) TTL, and the return was planned warm (P(warm) {:.2})", w.ttl_decl(), w.ttl_kept(), s.p));
     }
     None
 }
@@ -923,14 +926,15 @@ pub fn target_miss(r: &R, i: usize) -> Option<String> {
     if s.floor + SUMMARY_FLOOR * r.trace.world.c >= s.target * (1.0 - TOL) {
         return None; // the protected turns and the previous summary alone fill the target
     }
-    let refused = g.actual().is_some_and(|p| p.law.iter().any(|l| l.at == "summary" && !l.ok));
+    // the law refused the summary call, or (0.4.0, one planner) refused the plan at a return believed cold with P(warm) > 0: a cache
+    // that may still be there makes the rewrite a priced one, not the free one (at P = 0 the law refuses nothing)
+    let refused = g.actual().is_some_and(|p| p.law.iter().any(|l| !l.ok && (l.at == "summary" || p.p > 0.0)));
     // 0.4.0 (architecture section 8, TR restated): the return took a summary produced earlier whose cut is not deeper than its own
     // plan's (core.ts adopt): the call is already paid; the target is reached at a decision after the deeper one is ready
     if adopted_produced(r, i) {
         return None;
     }
-    let legacy = g.pr.as_ref().is_none_or(|p| p.r.is_nan() || p.r <= 0.0); // class unknown: the legacy summary rule decides
-    if refused || legacy {
+    if refused {
         return None;
     }
     Some(format!("cold plan leaves {:.0} tokens, target {:.0}, floor {:.0}, and no law refused a summary", s.view_tok, s.target, s.floor))
@@ -969,8 +973,11 @@ pub fn law_mismatch(r: &R, i: usize) -> Option<String> {
     for g in r.grids(i) {
         let Some(pr) = prices(g) else { continue };
         // the prices are the class ratios of the true class and tier (README rule 2; the lemmas' premise w >= r)
-        let want = class_prices(r.trace.world.cls, r.trace.world.tier == Tier::Long);
-        let cls = match r.trace.world.cls {
+        // before the first response of a model the class is not known: the explicit ratios, marked "default" (architecture D6)
+        let default = g.pr.as_ref().is_some_and(|p| p.src == "default");
+        let cls_of = if default { Class::Explicit } else { r.trace.world.cls };
+        let want = class_prices(cls_of, r.trace.world.tier == Tier::Long);
+        let cls = match cls_of {
             Class::Explicit => "explicit",
             Class::Automatic => "automatic",
         };
@@ -993,7 +1000,7 @@ pub fn law_mismatch(r: &R, i: usize) -> Option<String> {
         for pt in &g.grid {
             // a plan with a cut ends in an accepted whole-plan step that carries its cut (and so the summary call); a plan without one
             // has no such accepted step (it would have applied the cut). Only for a source that reports the flag.
-            if reports_cut && !pt.law.is_empty() && !pt.ahead {
+            if reports_cut && !pt.law.is_empty() {
                 let last = pt.law.iter().rev().find(|x| x.at == "plan");
                 let cut_ok = last.map(|x| x.ok && x.cut == Some(true)).unwrap_or(false);
                 if pt.cut.is_some() && !cut_ok {
@@ -1011,7 +1018,7 @@ pub fn law_mismatch(r: &R, i: usize) -> Option<String> {
                     // ways, by the flag the planner records on the step. A cut's step carries the call of the summary step recorded just
                     // before it (the same cut), to the token; a folds-only plan's step has no call, so K is checked exactly as before the
                     // call was priced into the plan (a source that does not report the flag has no call in any plan step, same rule).
-                    ("plan", Some(k)) if s.cut == Some(true) && !pt.ahead => {
+                    ("plan", Some(k)) if s.cut == Some(true) => {
                         let call = call_of(pr, s.b, s.a, pt.p, t, k);
                         let prev = pt.law.iter().position(|x| std::ptr::eq(x, s)).and_then(|j| j.checked_sub(1)).map(|j| &pt.law[j]).filter(|x| x.at == "summary");
                         match prev.and_then(|x| x.k.map(|pk| (x, pk))) {
@@ -1025,7 +1032,6 @@ pub fn law_mismatch(r: &R, i: usize) -> Option<String> {
                         }
                         call
                     }
-                    ("plan", Some(k)) if pt.ahead && s.cut == Some(true) => call_of(pr, s.b, s.a, pt.p, t, k), // a lookahead summary passes no summary gate
                     _ => 0.0,
                 };
                 if call < -1e-6 * s.b.max(1.0) {
@@ -1137,12 +1143,6 @@ fn mp_mechanism(g: &Grid, p: &GridPt, q: &GridPt) -> String {
     if !p.plan && p.law.iter().any(|l| l.at == "summary" && l.ok) && p.law.iter().any(|l| l.at == "plan" && !l.ok) {
         return format!("{}: the summary voids better folds and the plan gate then refuses all; no folds-only fallback (plan.ts:716)", g.at);
     }
-    if !p.plan && p.mode == "cold" && p.p > 0.0 && p.law.iter().any(|l| l.at == "plan" && !l.ok) {
-        return format!("{}: cold mode at 0 < P < 0.5: the plan gate refuses the folds, no fallback to the warm plan's summary (plan.ts:716)", g.at);
-    }
-    if p.ahead || q.ahead {
-        return format!("{}: lookahead (F2) changes the plan with the mode", g.at);
-    }
     format!("{}: {}", g.at, if p.plan { "fewer edits at the lower P" } else { "no plan at the lower P" })
 }
 
@@ -1187,8 +1187,8 @@ pub fn classify(id: &str, r: &R, v: &Violation) -> String {
             let restart = r.tick(v.at).env.iter().any(|e| e == "restart");
             let why = if s.switched {
                 "a model switch planned warm"
-            } else if !s.past_ttl && s.touch_gap.is_some_and(|g| g > r.trace.world.ttl_decl() + 1.0) {
-                "a return after the declared TTL not marked past it"
+            } else if !s.pause && s.touch_gap.is_some_and(|g| g > r.trace.world.ttl_decl() + 1.0) {
+                "a return after the requested lifetime not marked a pause"
             } else {
                 "a gone cache planned warm"
             };
@@ -1233,8 +1233,6 @@ pub fn classify(id: &str, r: &R, v: &Violation) -> String {
                 "cold return after a restart: the resumed process never armed the away timer".into()
             } else if env.iter().any(|e| e == "away-summary") {
                 "cold return: an away summary was prepared but not used".into()
-            } else if r.decision_for(v.at).is_some_and(|g| g.actual().is_some_and(|p| p.ahead)) {
-                "cold return: a lookahead summary no away timer prepared".into()
             } else {
                 "cold return: no away summary was prepared".into()
             }
@@ -1278,10 +1276,7 @@ pub fn classify(id: &str, r: &R, v: &Violation) -> String {
             Some(_) => "the flag never lapses: the context grew back past the size the stretch's summary started from".into(),
             None => "other".into(),
         },
-        "PW" => {
-            let ahead = r.grids(v.at).iter().any(|g| g.actual().is_some_and(|p| p.ahead));
-            if ahead { "a lookahead cut past the previous turn's final answer".into() } else { "edit inside the protected turns".into() }
-        }
+        "PW" => "edit inside the protected turns".into(),
         _ => String::new(),
     }
 }

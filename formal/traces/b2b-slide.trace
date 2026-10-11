@@ -1,0 +1,24 @@
+world automatic known ttl=300 true=300 survival=none c=1.7 sys=3000 window=200000 native interactive
+prompt +0s
+call npm 1K
+say 216
+prompt +60s
+call npm 1.5K
+call npm 254
+call npm 100
+say 100
+prompt +60s
+say 321
+prompt +60s
+call npm 211
+say 100
+prompt +60s
+call npm 381
+call npm 100
+call cat 1K
+call npm 13.4K
+say 372
+prompt +1h
+say 100
+prompt +60s
+say 100

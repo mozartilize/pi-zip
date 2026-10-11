@@ -1,0 +1,10 @@
+world explicit known ttl=300 true=300 survival=none c=1.7 sys=2000 window=200000 native interactive tools=file
+prompt +0s
+call npm 27.2K
+call npm 13.1K
+say 100
+prompt +60s
+say 100
+prompt +60s
+call recall
+say 100

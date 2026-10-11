@@ -56,6 +56,8 @@ pub enum Tools {
 
 /// The 1-hour tier's declared lifetime.
 pub const LONG_TTL: u32 = 3600;
+/// The short tier: the lifetime the requests ask for without `PI_CACHE_RETENTION=long` (tau0, pi-zip cache.ts SHORT_TTL_MS).
+pub const SHORT_TTL: u32 = 300;
 
 /// The world: provider, cache and session setup. `ttl` is declared, `ttl_true` is what the provider really keeps (on the long tier
 /// both scale to the hour: declared 3600 s, kept 3600 x ttl_true / ttl).
@@ -99,10 +101,11 @@ impl World {
     pub fn room(&self) -> f64 {
         (self.window as f64 - 16_384.0 - 8_192.0).max(4_096.0)
     }
-    /// The lifetime pi-zip is told (the model's promptCache for the tier in use).
+    /// The lifetime the requests ask for (tau: 300 s on the short tier, the hour on the long one). Since 0.4.0 pi-zip reads no
+    /// model catalogue (`ttl`, the model's promptCache, is only the provider's declaration the kept lifetime scales from).
     pub fn ttl_decl(&self) -> f64 {
         match self.tier {
-            Tier::Short => self.ttl as f64,
+            Tier::Short => SHORT_TTL as f64,
             Tier::Long => LONG_TTL as f64,
         }
     }
@@ -404,7 +407,7 @@ pub struct Msg {
 pub struct State0 {
     pub cold: bool,
     pub p_warm: Option<f64>,
-    pub past_ttl: bool,
+    pub pause: bool,
     pub summarized_warm: bool,
 }
 
@@ -424,6 +427,8 @@ pub struct Prices {
     pub w: f64,
     pub out: f64,
     pub cls: String,
+    /// "class" (learned from usage) or "default" (before the first response of a model: the explicit ratios)
+    pub src: String,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -453,8 +458,6 @@ pub struct GridPt {
     pub actual: bool,
     pub mode: String,
     pub plan: bool,
-    /// a lookahead summary (coldwarm F2): its cut may lie inside the previous user turn, before that turn's final answer
-    pub ahead: bool,
     /// a warm plan at an actual cold return whose warm twin would have been skipped by the b2b rule (no plan)
     pub b2b: bool,
     pub folds: Vec<String>,
@@ -482,7 +485,7 @@ pub struct Grid {
     pub at: String,
     pub mode: String,
     pub p: f64,
-    pub past_ttl: bool,
+    pub pause: bool,
     pub no_summary: bool,
     /// with no_summary: the real context (after folds) at which the flag lapses (the size the stretch's summary started from)
     pub regrow_at: Option<f64>,
@@ -669,10 +672,11 @@ pub struct St {
     pub switched: bool,
     /// the first request of a run, at a cache that is gone (by the spec's clock)
     pub cold_start: bool,
-    /// what pi-zip believed when it planned this request: cold (P(warm) < 0.5) and P(warm); in a run P = 1
+    /// what pi-zip believed when it planned this request: cold (P(warm) < 0.5) and P(warm) (in a run: 1 here; the decision records
+    /// its own, learned in-run P), and whether the return came after a pause (gap >= tau) or a model switch
     pub believed_cold: bool,
     pub p: f64,
-    pub past_ttl: bool,
+    pub pause: bool,
     /// user turns so far (the run's own prompt included)
     pub user_turns: u32,
     /// blocks zip_recall returned before this request
@@ -753,7 +757,7 @@ impl Run {
             let warm = touch_gap.is_some_and(|g| g < kept - 1e-6);
             let switched = i > 0 && self.obs.ticks[i - 1].model != t.model;
             let s0 = t.state0.as_ref();
-            let (believed_cold, p, past_ttl) = if t.n == 0 { s0.map(|s| (s.cold, s.p_warm.unwrap_or(1.0), s.past_ttl)).unwrap_or((false, 1.0, false)) } else { (false, 1.0, false) };
+            let (believed_cold, p, pause) = if t.n == 0 { s0.map(|s| (s.cold, s.p_warm.unwrap_or(1.0), s.pause)).unwrap_or((false, 1.0, false)) } else { (false, 1.0, false) };
             let user_turns = self.blocks.iter().filter(|b| b.starts_turn() && b.req <= i as i64).count() as u32;
             let recalled = self.blocks.iter().filter(|b| b.recover == Recover::RecallResult && b.req < i as i64).filter_map(|b| b.recall_of.clone()).collect();
             let appended = self
@@ -776,7 +780,7 @@ impl Run {
             let protected_from = user_turns.saturating_sub(PROTECT_USER_TURNS - 1);
             let protected: f64 = t.view.iter().filter(|m| m.id.as_ref().and_then(|id| self.block(id)).is_some_and(|b| b.turn >= protected_from && b.kind != "system")).map(|m| m.tok).sum();
             let target = (COLD_CAP.max(sys + COLD_CAP / 2.0)).min(room);
-            out.push(St { warm, touch_gap, switched, cold_start: t.n == 0 && !warm, believed_cold, p, past_ttl, user_turns, recalled, appended, new_info, view_tok, floor: sys + prev_sum + protected, prev_sum, target, room });
+            out.push(St { warm, touch_gap, switched, cold_start: t.n == 0 && !warm, believed_cold, p, pause, user_turns, recalled, appended, new_info, view_tok, floor: sys + prev_sum + protected, prev_sum, target, room });
             if t.failed.as_deref() != Some("error") {
                 last_resp.insert(t.model.as_str(), t.t1);
             }
