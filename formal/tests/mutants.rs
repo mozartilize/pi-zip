@@ -144,8 +144,8 @@ fn lw_summary_call_is_priced() {
 /// both through: the old LW only compared a call it found with the summary step's.)
 #[test]
 fn lw_plan_step_call_is_pinned_both_ways() {
-    caught_all("lw1", "plan.ts", &[("if (!planGate(ctxAfterFolds - (pre[pick] - S(pre[pick])), 0, call, true, true)) continue;", "if (!planGate(ctxAfterFolds - (pre[pick] - S(pre[pick])), 0, 0, true, true)) continue;", 1)], &["LW"], &summary_prepared_away("prompt +1h"));
-    caught_all("lw2", "plan.ts", &[("!planGate(after, untouched, 0, planned, false)", "!planGate(after, untouched, 1000, planned, false)", 1)], &["LW"], &fold_and_recall());
+    caught_all("lw1", "plan.ts", &[("if (!planGate(ctxAfterFolds - (pre[pick] - S(pre[pick])), 0, call, true)) continue;", "if (!planGate(ctxAfterFolds - (pre[pick] - S(pre[pick])), 0, 0, true)) continue;", 1)], &["LW"], &summary_prepared_away("prompt +1h"));
+    caught_all("lw2", "plan.ts", &[("!planGate(ctxAfterFolds, untouchedEst(blocks, folds, false), 0, false)", "!planGate(ctxAfterFolds, untouchedEst(blocks, folds, false), 1000, false)", 1)], &["LW"], &fold_and_recall());
 }
 
 /// Round 5, rule B: the warm valve at a turn_end writes its summary in the background (adopted at a later turn_end) instead of making
@@ -172,7 +172,8 @@ fn a3_away_timer() {
 #[test]
 fn gc_gone_cache_gets_a_cold_plan() {
     let ttl = lines(&[W, "prompt", "call npm 30K", "say 100", "prompt +330s", "say 100"]);
-    caught("m18", "cache.ts", "nowMs - lastActivityMs > ttlMs;", "nowMs - lastActivityMs > 4 * ttlMs;", "GC", &ttl);
+    // 0.4.0: the TTL marks a pause (the learned survival decides cold): the mutant marks it only after 4 x the requested lifetime
+    caught("m18", "cache.ts", "pause: nowMs - last >= ttl.ms };", "pause: nowMs - last >= 4 * ttl.ms };", "GC", &ttl);
     caught("m18b", "cache.ts", "return { cold: s.p < 0.5, reason,", "return { cold: s.p < 0.5 && gapS > 1200, reason,", "GC", &ttl);
     let switch = lines(&[W, "prompt", "call npm 30K", "say 100", "switch", "prompt +60s", "say 100"]);
     caught("m19", "cache.ts", "if (prev && modelKey(model) && prev !== modelKey(model)) return", "if (false) return", "GC", &switch);
@@ -181,19 +182,21 @@ fn gc_gone_cache_gets_a_cold_plan() {
 #[test]
 fn wb_warm_does_nothing_below_the_target() {
     let t = lines(&[W, "prompt", "call npm 30K", "say 100", "prompt +60s", "say 100", "prompt +60s", "say 100"]);
-    caught("m26", "plan.ts", "if (warmLike && !(ctxEst > coldCap)) return null;", "if (false) return null;", "WB", &t);
+    // one planner (0.4.0): below the working view nothing is planned, and the folds stop at it; the mutant drops both
+    caught_all("m26", "plan.ts", &[("if (!(ctxEst > coldCap)) return null;", "if (false) return null;", 1), ("if (est <= coldCap) return;", "if (false) return;", 1)], &["WB"], &t);
 }
 
 #[test]
 fn mh_automatic_head() {
-    let t = lines(&["world automatic known ttl=300 true=600 survival=outlives c=1 sys=3000 window=200000 native interactive", "prompt", "call npm 30K", "say 100", "prompt +60s", "say 100", "prompt +1h", "say 100"]);
-    caught("m20", "plan.ts", "const head = law.pr?.cls === \"automatic\" ? (MIN_EXPECT - O) / c : 0;", "const head = 0;", "MH", &t);
+    // 0.4.0: a 45K output (one planner: below the working view nothing is planned, so the context must pass it)
+    let t = lines(&["world automatic known ttl=300 true=600 survival=outlives c=1 sys=3000 window=200000 native interactive", "prompt", "call npm 45K", "say 100", "prompt +60s", "say 100", "prompt +1h", "say 100"]);
+    caught("m20", "plan.ts", "const head = law.pr.cls === \"automatic\" ? (MIN_EXPECT - O) / c : 0;", "const head = 0;", "MH", &t);
 }
 
 #[test]
 fn lw_class_ratios_and_the_long_tier() {
     let t = lines(&[&format!("{W} long"), "prompt", "call npm 30K", "say 100", "prompt +60s", "say 100", "prompt +2h", "say 100"]);
-    caught("m21", "learn.ts", "const w = cls === \"explicit\" && longTier ? 2 : d.w;", "const w = d.w;", "LW", &t);
+    caught("m21", "learn.ts", "const w = k === \"explicit\" && longTier ? 2 : d.w;", "const w = d.w;", "LW", &t);
     caught("m06", "learn.ts", "explicit: { r: 0.1, w: 1.25 }", "explicit: { r: 0.1, w: 0.3 }", "LW", &t);
 }
 
@@ -211,41 +214,44 @@ const WC: &str = "world explicit known ttl=300 true=300 survival=none c=1.7 sys=
 
 #[test]
 fn i1_persisted_equals_sent() {
-    let t = trace_of(&[W, "prompt", "call npm 1K", "say 100", "prompt +60s", "say 100", "prompt +1h", "call npm 100", "say 100"]);
+    let t = trace_of(&[W, "prompt", "call npm 45K", "say 100", "prompt +60s", "say 100", "prompt +1h", "call npm 100", "say 100"]);
     caught("m09", "run.ts", "const live = plan.folds.filter((t) => byId.has(t.entryId) && wasApplied(t));", "const live = plan.folds.filter((t) => byId.has(t.entryId) && wasApplied(t)).slice(plan.source === \"valve\" ? 0 : 1);", "I1", &t);
 }
 
 #[test]
 fn b2b_no_back_to_back() {
-    let t = trace_of(&["world explicit known ttl=300 true=300 survival=none c=1 sys=3000 window=128000 native interactive", "prompt", "call npm 5K", "call npm 10K", "call npm 11.2K", "call npm 9.6K", "say 100", "prompt +60s", "call npm 28.4K", "call npm 23.3K", "call npm 5K", "call npm 5.7K", "say 100", "prompt +60s", "say 100", "prompt +60s", "say 100"]);
-    caught_all("m10", "core.ts", &[("if (!cold && x.justEdited && !nat) return { kind: \"b2b\" };", "", 1), ("if (x.justEdited) return { kind: \"b2b\" };", "", 1)], &["B2B"], &t);
+    // 0.4.0: the folds stop at the working view, so a second rewrite needs new candidates: the window slides at the next prompt.
+    // traces/b2b-slide.trace is the shrunk counterexample of `check --suite standard --random 3000 --seed 1 --only B2B` on the mutant
+    let t = trace_file("b2b-slide.trace");
+    caught_all("m10", "core.ts", &[("if (!cold && x.justEdited && !nat) return { kind: \"b2b\" };", "", 1), ("if (x.justEdited && x.pWarm >= 0.5) return { kind: \"b2b\" };", "", 1)], &["B2B"], &t);
 }
 
 #[test]
 fn rc_recall_is_never_refolded() {
     let rec = |gaps: &[&str]| {
-        let mut v = vec![W, "prompt", "call npm 1K", "say 100", "prompt +60s", "call recall", "say 100"];
+        let mut v = vec![W, "prompt", "call npm 45K", "say 100", "prompt +60s", "call recall", "say 100"];
         for g in gaps {
             v.extend([*g, "say 100"]);
         }
         trace_of(&v)
     };
-    caught("m11", "plan.ts", "if (tokOverride.has(b.idx) || recalled.has(handleFor(b.entryId!))) return false;", "if (tokOverride.has(b.idx)) return false;", "RC", &rec(&["prompt +330s"]));
+    caught("m11", "plan.ts", "if (tokOverride.has(b.idx) || recalled.has(handleFor(b.entryId!))) return false;", "if (tokOverride.has(b.idx)) return false;", "RC", &rec(&["prompt +60s", "prompt +330s"]));
     caught("m12", "plan.ts", "b.tokens > foldMin && !isRecall(b) && start[b.idx] >= head", "b.tokens > foldMin && start[b.idx] >= head", "RC", &rec(&["prompt +60s", "prompt +330s"]));
-    let restart = trace_of(&[W, "prompt", "call npm 1K", "say 100", "prompt +60s", "call recall", "say 100", "restart", "prompt +330s", "say 100"]);
-    caught_all("m23", "run.ts", &[("for (const h of recalledHandlesFromBranch(branch)) this.recalled.add(h);", "void 0;", 2)], &["RC"], &restart);
+    let restart = trace_of(&[W, "prompt", "call npm 45K", "say 100", "prompt +60s", "call recall", "say 100", "restart", "prompt +330s", "say 100"]);
+    caught_all("m23", "run.ts", &[("\t\tfor (const h of recalledHandlesFromBranch(branch)) this.recalled.add(h);\n", "\t\tvoid 0;\n", 3)], &["RC"], &restart);
 }
 
 #[test]
 fn pw_protection_windows() {
-    caught("m13", "plan.ts", "if (relax && ((mode === \"cold\" && !o.warmStyle) || o.pastTtl === true)) {", "if (relax) {", "PW", &trace_of(&[WC, "prompt", "call cat 20K", "say 100", "prompt +60s", "say 100"]));
+    caught("m13", "plan.ts", "if (o.pause) take(", "if (true) take(", "PW", &trace_of(&[WC, "prompt", "call cat 20K", "say 100", "prompt +60s", "say 100"]));
     caught("m14", "plan.ts", "const PROTECT_USER_TURNS = 2;", "const PROTECT_USER_TURNS = 1;", "PW", &trace_of(&[W, "prompt", "say 100", "prompt +60s", "say 60K", "prompt +60s", "say 100"]));
 }
 
 #[test]
 fn mp_residual_new_mechanism() {
     let t = trace_of(&[WC, "prompt", "call cat 26.3K", "say 100", "prompt +60s", "say 100"]);
-    caught_all("m28", "plan.ts", &[("if (relax && ((mode === \"cold\" && !o.warmStyle) || o.pastTtl === true)) {", "if (relax && mode === \"warm\") {", 1)], &["MP", "MPr"], &t);
+    // the previous turn's candidates depend on P (v0.3.1's warm-only relax, inverted): MP is structural only while P stays in the law
+    caught_all("m28", "plan.ts", &[("if (o.pause) take(", "if (law.pWarm >= 0.5) take(", 1)], &["MP", "MPr"], &t);
 }
 
 /// N6: a cold return right after a model switch to a model of the same provider planned in O = R0 x system, c = C0 (the session had
@@ -273,7 +279,9 @@ fn tr_target_reachability() {
 
 #[test]
 fn rd_residual_new_cause() {
-    let t = trace_of(&[W, "prompt", "call npm 1K", "say 100", "prompt +60s", "say 100", "prompt +1h", "say 100"]);
+    // 0.4.0: the fresh process takes the return for a session's first request (P = 0, no pause): it differs from the live one only by
+    // the pause, so the previous turn holds a re-readable output the pause folds, and the older turn is prose only a summary removes
+    let t = trace_of(&[W, "prompt", "say 30K", "prompt +60s", "call cat 30K", "say 100", "prompt +1h", "say 100"]);
     caught_all("m27", "cache.ts", &[("const last = Math.max(lastReqMs, lastMessageMs(branch));", "const last = lastReqMs;", 1)], &["RDr"], &t);
 }
 
@@ -312,6 +320,14 @@ fn harness_checks_can_fail() {
 }
 
 // ---- review round 4: the model's blind spots (runs an extension's message starts, nextTurn messages, completeness) -------------
+
+/// RC with file recall: a read of a recall file made inside a run is in the branch only; the turn_end after it must know the handle.
+/// traces/rc-file-recall-in-run.trace is the shrunk seed-7 counterexample on 0.4.0 step 3 before the fix (its RC rose by 1 there).
+#[test]
+fn rc_file_recall_inside_a_run() {
+    let t = trace_file("rc-file-recall-in-run.trace");
+    caught("rcf", "run.ts", "\t\tfor (const h of recalledHandlesFromBranch(branch)) this.recalled.add(h);\n\t\tconst touch", "\t\tconst touch", "RC", &t);
+}
 
 fn trace_file(name: &str) -> String {
     std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("traces").join(name)).unwrap()

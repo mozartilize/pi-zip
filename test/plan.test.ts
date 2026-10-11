@@ -1,17 +1,20 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { applyPlanToMessages, buildBlocks, compactionRoom, contentKeyOf, planContext, rebaseFolds, RELAX_PREV_TURN, settings, spliceNative, summaryGainOk, legacyValve, VALVE_MIN_REDUCTION, type Cut, type FoldTarget, type PlanOpts, type RunPlan } from "../src/plan.ts";
+import { applyPlanToMessages, buildBlocks, compactionRoom, contentKeyOf, planContext, rebaseFolds, settings, spliceNative, type Cut, type FoldTarget, type PlanOpts, type RunPlan } from "../src/plan.ts";
+import { lawPrices } from "../src/learn.ts";
 import { A, AX, flat, longTurn, R, U, type Any } from "./helpers.ts";
 import { validateEdits } from "../src/guard.ts";
 const blockIdx = (blocks: { entryId: string | null }[], id: string) => blocks.findIndex((b) => b.entryId === id);
 
-const opts = (over: Partial<PlanOpts> = {}): PlanOpts => ({ coldCap: 60_000, cwd: process.cwd(), promptPending: true, ...over });
+// a small working view: these sessions are a few thousand tokens, and below the working view nothing is planned
+const opts = (over: Partial<PlanOpts> = {}): PlanOpts => ({ coldCap: 1000, cwd: process.cwd(), promptPending: true, ...over });
+/** The law at P(warm) `p` with the explicit class ratios (the planner's default is P = 0). */
+const at = (p: number, g = 2_500) => ({ pr: lawPrices("explicit", false), g, pWarm: p });
+const foldIds = (p: { folds: FoldTarget[] } | null) => p?.folds.map((t) => t.entryId) ?? [];
 
 // settle view of a finished run: 2 user turns, big outputs in both
 const prevRun = [U("u1", "one"), A("a1", ["c1"]), R("r1", "c1"), A("a2"), U("u2", "two"), A("a3", ["c2"]), R("r2", "c2"), A("a4")];
 
 describe("cold plan", () => {
-	test("RELAX_PREV_TURN defaults to true", () => expect(RELAX_PREV_TURN).toBe(true));
-
 	test("settle plan is non-empty once an older turn has big outputs; the newest turn's outputs stay protected", () => {
 		const p = planContext(prevRun, opts());
 		expect(p!.folds.map((t) => t.entryId)).toEqual(["r1"]);
@@ -19,8 +22,12 @@ describe("cold plan", () => {
 
 	test("a one-user-turn session plans nothing (that turn is protected once the prompt arrives)", () => {
 		const one = [U("u1", "one"), A("a1", ["c1"]), R("r1", "c1"), A("a2")];
-		expect(planContext(one, opts())!.folds).toHaveLength(0);
-		expect(planContext(one, opts({ promptPending: false }))!.folds).toHaveLength(0);
+		expect(planContext(one, opts())).toBeNull();
+		expect(planContext(one, opts({ promptPending: false }))).toBeNull();
+	});
+	test("below the working view nothing is planned, whatever P (one planner: P enters only the law)", () => {
+		for (const p of [0, 0.3, 1]) expect(planContext(prevRun, opts({ coldCap: 60_000, law: at(p) }))).toBeNull();
+		expect(foldIds(planContext(prevRun, opts({ law: at(0) })))).toEqual(["r1"]);
 	});
 
 	test("run-start view (prompt in context) selects the identical set with byte-identical placeholders (F8)", () => {
@@ -36,7 +43,7 @@ describe("cold plan", () => {
 		expect(planContext(ctx, opts({ promptPending: false }))!.folds.map((t) => t.entryId)).toEqual(["r1"]);
 		const h = planContext(ctx, opts({ promptPending: false }))!.folds[0];
 		const { handleFor } = require("../src/placeholder.ts");
-		expect(planContext(ctx, opts({ promptPending: false, recalled: new Set([handleFor("r1")]) }))!.folds).toHaveLength(0);
+		expect(planContext(ctx, opts({ promptPending: false, recalled: new Set([handleFor("r1")]) }))).toBeNull();
 		expect(h.recover).toBe("rereadable");
 	});
 
@@ -44,40 +51,32 @@ describe("cold plan", () => {
 		const img = R("r1", "c1");
 		(img.messages[0] as any).content = [{ type: "text", text: "y".repeat(9000) }, { type: "image", data: "x", mimeType: "image/png" }];
 		const ctx = [U("u1", "one"), A("a1", ["c1"]), img, A("a2"), U("u2", "two"), A("a3"), U("u3", "three"), A("a4")];
-		expect(planContext(ctx, opts({ promptPending: false }))!.folds).toHaveLength(0);
+		expect(planContext(ctx, opts({ promptPending: false }))).toBeNull();
 	});
 });
 
-describe("relax (previous user turn)", () => {
+describe("after a pause (previous user turn)", () => {
 	const ctx = [U("u1", "one"), A("a1", ["c1"]), R("r1", "c1"), A("a2"), U("u2", "back")];
-	test("relax off: the previous turn is protected ", () => {
-		expect(planContext(ctx, opts({ coldCap: 1000, promptPending: false, relax: false }))!.folds).toHaveLength(0);
+	test("no pause: the previous turn is protected, at any P", () => {
+		for (const p of [0, 1]) expect(planContext(ctx, opts({ promptPending: false, law: at(p) }))).toBeNull();
 	});
-	test("relax on: a rereadable previous-turn output folds while above the cap", () => {
-		const p = planContext(ctx, opts({ coldCap: 1000, promptPending: false, relax: true }))!;
+	test("after a pause: a rereadable previous-turn output folds while above the working view", () => {
+		const p = planContext(ctx, opts({ promptPending: false, pause: true }))!;
 		expect(p.folds.map((f) => f.trig)).toEqual(["cold(relax)"]);
 	});
-	test("relax is the default", () => {
-		expect(planContext(ctx, opts({ coldCap: 1000, promptPending: false }))!.folds).toHaveLength(1);
+	test("after a pause but under the working view: nothing folds", () => {
+		expect(planContext(ctx, opts({ coldCap: 60_000, promptPending: false, pause: true }))).toBeNull();
 	});
-	test("relax on but under the cap: nothing folds", () => {
-		expect(planContext(ctx, opts({ coldCap: 60_000, promptPending: false, relax: true }))!.folds).toHaveLength(0);
-	});
-	test("relax never takes the latest user turn's own outputs, nor non-rereadable ones", () => {
+	test("a pause never takes the latest user turn's own outputs, nor non-rereadable ones", () => {
 		const own = [U("u1", "one"), A("a1"), U("u2", "back"), A("a2", ["c1"]), R("r1", "c1")];
-		expect(planContext(own, opts({ coldCap: 1000, promptPending: false, relax: true }))!.folds).toHaveLength(0);
+		expect(planContext(own, opts({ promptPending: false, pause: true }))).toBeNull();
 		const mutating = [U("u1", "one"), A("a1", ["c1"]), R("r1", "c1"), A("a2"), U("u2", "back")];
 		(mutating[1].messages[0] as any).content[1].arguments = { command: "npm test" };
-		expect(planContext(mutating, opts({ coldCap: 1000, promptPending: false, relax: true }))!.folds).toHaveLength(0);
+		expect(planContext(mutating, opts({ promptPending: false, pause: true }))).toBeNull();
 	});
 });
 
-describe("summary gain gate", () => {
-	test("a ~3K summary of 180K is skipped; 60K of 180K is allowed; below 10K absolute is skipped", () => {
-		expect(summaryGainOk(3_797, 1_240, 180_340)).toBe(false);
-		expect(summaryGainOk(70_000, 7_000, 180_000)).toBe(true);
-		expect(summaryGainOk(12_000, 3_000, 40_000)).toBe(false);
-	});
+describe("summary gate", () => {
 	const sumCtx = [U("u1", "one"), A("a1", ["c1"]), R("r1", "c1", 44_000), AX("a2", 120_000), U("u2", "two"), A("a3", ["c3"]), R("r3", "c3", 44_000), AX("a4", 120_000), U("u3", "three"), A("a5")];
 	test("a big prefix plans the same cut in the settle and run-start views; folds before the cut are void", () => {
 		const s = planContext(sumCtx, opts({ coldCap: 6000 }))!;
@@ -90,31 +89,31 @@ describe("summary gain gate", () => {
 	});
 	test("one summary per warm stretch: noSummary blocks a second cut below the compaction room, not at it", () => {
 		const view = [...sumCtx, U("u4", "back")];
-		expect(planContext(view, opts({ coldCap: 6000, promptPending: false, mode: "warm" }))!.cutIdx).not.toBeNull();
-		expect(planContext(view, opts({ coldCap: 6000, promptPending: false, mode: "warm", noSummary: true }))?.cutIdx ?? null).toBeNull();
+		expect(planContext(view, opts({ coldCap: 6000, promptPending: false, law: at(1, 500) }))!.cutIdx).not.toBeNull();
+		expect(planContext(view, opts({ coldCap: 6000, promptPending: false, law: at(1, 500), noSummary: true }))?.cutIdx ?? null).toBeNull();
 		const tiny = { contextWindow: 60_000 }; // ~83K estimated context is above this room
-		expect(planContext(view, opts({ coldCap: 6000, promptPending: false, mode: "warm", noSummary: true, model: tiny }))!.cutIdx).not.toBeNull();
+		expect(planContext(view, opts({ coldCap: 6000, promptPending: false, law: at(1, 500), noSummary: true, model: tiny }))!.cutIdx).not.toBeNull();
 	});
 	// review P0-1 (design): "one summary per warm stretch" never expired; it now lapses once the context has grown back to the size the
 	// last summary started from (the growth since is at least what it removed: a second summary gains what the first did)
 	test("noSummary lapses at regrowAt: a context grown back to the size the last summary started from may be summarised again", () => {
 		const view = [...sumCtx, U("u4", "back")];
-		const p = planContext(view, opts({ coldCap: 6000, promptPending: false, mode: "warm" }))!;
+		const p = planContext(view, opts({ coldCap: 6000, promptPending: false, law: at(1, 500) }))!;
 		const now = p.ctxAfterFolds; // the real context after folds the regrow rule compares
-		expect(planContext(view, opts({ coldCap: 6000, promptPending: false, mode: "warm", noSummary: true, regrowAt: now + 1 }))?.cutIdx ?? null).toBeNull();
-		expect(planContext(view, opts({ coldCap: 6000, promptPending: false, mode: "warm", noSummary: true, regrowAt: now }))!.cutIdx).toBe(p.cutIdx);
-		expect(planContext(view, opts({ coldCap: 6000, promptPending: false, mode: "warm", noSummary: false, regrowAt: now + 1 }))!.cutIdx).toBe(p.cutIdx); // no flag: nothing to lapse
+		expect(planContext(view, opts({ coldCap: 6000, promptPending: false, law: at(1, 500), noSummary: true, regrowAt: now + 1 }))?.cutIdx ?? null).toBeNull();
+		expect(planContext(view, opts({ coldCap: 6000, promptPending: false, law: at(1, 500), noSummary: true, regrowAt: now }))!.cutIdx).toBe(p.cutIdx);
+		expect(planContext(view, opts({ coldCap: 6000, promptPending: false, law: at(1, 500), noSummary: false, regrowAt: now + 1 }))!.cutIdx).toBe(p.cutIdx); // no flag: nothing to lapse
 	});
 	test("the next summary is planned at least as big as the previous one it carries (no re-summary of a small new prefix)", () => {
 		const SUM = "S".repeat(48_000); // previous summary ~12K tokens, as in a real migrated session
 		const comp = { sourceEntry: { id: "cmp", type: "compaction", summary: SUM, firstKeptEntryId: "k1" }, messages: [{ role: "compactionSummary", summary: SUM, content: SUM }] };
 		const view = [comp, U("k1", "one"), A("a1", ["c1"]), R("r1", "c1", 14_000), AX("a2", 8_000), U("u2", "two"), A("a3"), U("u3", "three"), A("a4")];
-		// legacy gate: prefix ~18K, a 1.8K planned summary would "gain" 16K; planned at >= 12K the gain is ~6K: no summary
-		expect(planContext(view, opts({ coldCap: 6000, promptPending: false, relax: false }))!.cutIdx).toBeNull();
+		// prefix ~18K: a 1.8K planned summary would remove 16K; planned at >= 12K it removes ~6K, which does not pay for its call
+		expect(planContext(view, opts({ coldCap: 6000, promptPending: false }))?.cutIdx ?? null).toBeNull();
 	});
-	test("no summary when the gain gate fails (small context)", () => {
+	test("no summary when it does not pay for its call (small context)", () => {
 		const small = [U("u1", "one"), A("a1", ["c1"]), R("r1", "c1", 3000), A("a2"), U("u2", "two"), A("a3"), U("u3", "three"), A("a4")];
-		expect(planContext(small, opts({ coldCap: 100, promptPending: false, relax: false }))!.cutIdx).toBeNull();
+		expect(planContext(small, opts({ coldCap: 100, promptPending: false }))?.cutIdx ?? null).toBeNull();
 	});
 });
 
@@ -167,8 +166,7 @@ describe("recall results and reused tool call ids", () => {
 		(call.messages[0] as any).content[1].name = "zip_recall";
 		const ctx = [U("u1", "one"), call, rec, R("r2", "c2"), A("a2"), U("u2", "two"), A("a3"), U("u3", "three"), A("a4")];
 		ctx.splice(3, 1, { ...R("r2", "c2"), messages: [{ ...R("r2", "c2").messages[0], toolCallId: "c2" }] });
-		const folds = planContext(ctx, opts({ promptPending: false }))!.folds.map((t) => t.entryId);
-		expect(folds).not.toContain("r1");
+		expect(foldIds(planContext(ctx, opts({ promptPending: false })))).not.toContain("r1");
 	});
 	test("a server that reuses tool call ids (call_0): each result is folded by its own position and content", () => {
 		const mk = (id: string, ch: string) => R(id, "call_0", 9000, `${ch} `.repeat(4500));
@@ -236,32 +234,12 @@ describe("cold cap default", () => {
 		expect(p.ctxTokens).toBeGreaterThan(40_000);
 		expect(p.ctxTokens).toBeLessThan(60_000);
 		expect(p.sumTrigger).toBe("cold");
-		expect(planContext(prose, { cwd: ".", promptPending: false, coldCap: 60_000 })!.sumTrigger).toBeNull();
+		expect(planContext(prose, { cwd: ".", promptPending: false, coldCap: 60_000 })).toBeNull(); // below the working view: no plan at all
 	});
 });
 
 // =============================================================================================================
-describe("warm valve gate (VALVE_MIN_REDUCTION)", () => {
-	test("the rule is one pure function: fire only when after <= 0.5 x before", () => {
-		expect(VALVE_MIN_REDUCTION).toBe(0.5);
-		expect(legacyValve(183_000, 131_000, null)).toBe(false); // a 28% cut does not pay back the rewrite of a warm cache
-		expect(legacyValve(200_000, 90_000, null)).toBe(true); // 55%
-		expect(legacyValve(200_000, 100_000, null)).toBe(true); // exactly r = 0.5
-		expect(legacyValve(200_000, 100_001, null)).toBe(false);
-		expect(legacyValve(200_000, 200_000, null)).toBe(false); // nothing removed
-		expect(legacyValve(200_000, 210_000, null)).toBe(false);
-	});
-
-	test("hard floor: at or above Pi's compaction room any reduction fires, nothing still does not", () => {
-		const room = compactionRoom({ contextWindow: 200_000 })!; // 200000 - 16384 - 8192
-		expect(room).toBe(175_424);
-		expect(legacyValve(room, room - 1, room)).toBe(true);
-		expect(legacyValve(180_000, 170_000, room)).toBe(true);
-		expect(legacyValve(180_000, 180_000, room)).toBe(false);
-		expect(legacyValve(room - 1, room - 10_000, room)).toBe(false); // just below the danger zone the ordinary rule applies
-		expect(legacyValve(183_000, 131_000, null)).toBe(false); // unknown window: no floor
-	});
-
+describe("the law at P = 1 (a warm cache)", () => {
 	// old turns: `oldOutputs` foldable 9000-char reads; the previous user turn holds one `bigChars` write result that can never be folded
 	// (not re-readable), so it stays and decides how much of the context a plan can remove
 	const session = (oldOutputs: number, bigChars: number) => {
@@ -274,7 +252,7 @@ describe("warm valve gate (VALVE_MIN_REDUCTION)", () => {
 		e.push(U("uw", "write it"), call, big, A("zw"), U("uN", "now"));
 		return e;
 	};
-	const warm = (entries: Any[], contextWindow?: number) => planContext(entries, { mode: "warm", cwd: ".", promptPending: false, model: contextWindow ? { provider: "p", id: "m", contextWindow } : undefined });
+	const warm = (entries: Any[], contextWindow?: number) => planContext(entries, { law: at(1), cwd: ".", promptPending: false, model: contextWindow ? { provider: "p", id: "m", contextWindow } : undefined });
 
 	test("planner: 183K -> 131K is blocked, 200K -> 90K fires (unknown window, V = 160K)", () => {
 		const blocked = session(24, 512_000); // ~54K of foldable reads + a ~128K protected write
@@ -291,16 +269,6 @@ describe("warm valve gate (VALVE_MIN_REDUCTION)", () => {
 		expect(p.ctxTokens).toBeGreaterThan(195_000);
 		expect(p.ctxAfterFolds).toBeLessThan(0.5 * p.ctxTokens);
 		expect(p.folds.length).toBe(49);
-	});
-
-	test("planner: inside the danger zone (window 200K) a 15% cut still fires; the same context at a 1M window is blocked", () => {
-		const entries = session(13, 600_000); // ~29K of foldable reads + a 150K protected write: ~180K, above room 175,424
-		const p = warm(entries, 200_000)!;
-		expect(p).not.toBeNull();
-		expect(p.ctxTokens).toBeGreaterThanOrEqual(compactionRoom({ contextWindow: 200_000 })!);
-		expect(p.ctxAfterFolds).toBeGreaterThan(0.5 * p.ctxTokens); // small reduction: the ordinary rule would block it
-		expect(p.folds.length).toBe(13);
-		expect(warm(entries, 1_000_000)).toBeNull(); // V = 160K is passed, but nothing makes the cut worth a rewrite
 	});
 
 	test("planner: in the danger zone with nothing to remove the valve has nothing to do", () => {
@@ -335,7 +303,7 @@ describe("in-turn folds (PI_ZIP_INTURN_AGE)", () => {
 		expect(p.folds.every((f) => f.trig === "cold(inturn)")).toBe(true);
 		expect(p.folds.filter((f) => f.recover !== "rereadable").map((f) => f.entryId).sort()).toEqual(["r10", "r3"]);
 		expect(p.cutIdx).toBeNull(); // the whole session is the protected turn: nothing to summarise
-		expect(planContext(s, opts({ coldCap: 8000, promptPending: false, inturnAge: 0 }))!.folds).toHaveLength(0);
+		expect(planContext(s, opts({ coldCap: 8000, promptPending: false, inturnAge: 0 }))).toBeNull();
 	});
 
 	test("the boundary is exact: age 20 folds, age 19 stays; a larger setting moves it", () => {
@@ -357,7 +325,7 @@ describe("in-turn folds (PI_ZIP_INTURN_AGE)", () => {
 
 	test("under the cap nothing folds; the settle view and the run-start view agree", () => {
 		const s = longTurn(60);
-		expect(planContext(s, opts({ coldCap: 1_000_000, promptPending: false }))!.folds).toHaveLength(0);
+		expect(planContext(s, opts({ coldCap: 1_000_000, promptPending: false }))).toBeNull();
 		const settle = planContext(s, opts({ coldCap: 8000 }))!; // prompt pending: the finished turn is the previous one
 		const run = planContext([...s, U("u2", "next")], opts({ coldCap: 8000, promptPending: false }))!;
 		expect(ids(settle)).toEqual(ids(run));
@@ -367,21 +335,20 @@ describe("in-turn folds (PI_ZIP_INTURN_AGE)", () => {
 	test("recalled outputs and outputs below foldMin are never folded in-turn either", () => {
 		const { handleFor } = require("../src/placeholder.ts");
 		const s = longTurn(60);
-		const p = planContext(s, opts({ coldCap: 8000, promptPending: false, recalled: new Set([handleFor("r1")]) }))!;
-		expect(ids(p)).not.toContain("r1");
+		expect(foldIds(planContext(s, opts({ coldCap: 8000, promptPending: false, recalled: new Set([handleFor("r1")]) })))).not.toContain("r1");
 		const small = longTurn(60, { chars: 400 });
-		expect(planContext(small, opts({ coldCap: 100, promptPending: false }))!.folds).toHaveLength(0);
+		expect(planContext(small, opts({ coldCap: 100, promptPending: false }))).toBeNull();
 	});
 
 	test("warm valve: a long single-turn session above V folds old outputs when that halves the context", () => {
 		const s = longTurn(60, { chars: 24_000 }); // ~4K tokens per output, ~240K estimated (V = 160K)
-		const p = planContext(s, opts({ coldCap: 40_000, promptPending: false, mode: "warm", inturnAge: 20 }))!;
+		const p = planContext(s, opts({ coldCap: 40_000, promptPending: false, law: at(1, 500), inturnAge: 20 }))!;
 		expect(p).not.toBeNull();
 		expect(p.folds.length).toBeGreaterThan(0);
 		expect(p.folds.every((f) => f.trig === "valve(inturn)")).toBe(true);
 		expect(p.ctxAfterFolds).toBeLessThanOrEqual(0.5 * p.ctxTokens);
 		// ... and not when the age rule is off (nothing else is foldable in one turn)
-		expect(planContext(s, opts({ coldCap: 40_000, promptPending: false, mode: "warm", inturnAge: 0 }))).toBeNull();
+		expect(planContext(s, opts({ coldCap: 40_000, promptPending: false, law: at(1, 500), inturnAge: 0 }))).toBeNull();
 	});
 
 	test("a tool call id reused by the server counts its age from the latest call that used it", () => {
@@ -478,7 +445,7 @@ describe("driven runs (an extension's triggerTurn message): turn boundaries", ()
 	test("the protected tail with a nextTurn message after each prompt is still the current prompt and the previous one", () => {
 		const e: Any[] = [];
 		for (let i = 1; i <= 4; i++) e.push(U(`u${i}`, `p${i}`), C(`k${i}`), A(`a${i}`, [`c${i}`]), R(`r${i}`, `c${i}`, 20_000), AX(`e${i}`, 30_000));
-		const p = planContext(e, { cwd: process.cwd(), coldCap: 3000, promptPending: false })!;
+		const p = planContext(e, { cwd: process.cwd(), coldCap: 3000, promptPending: false, law: at(0, 100) })!;
 		// the latest two user turns are prompts 3 and 4: nothing of turn 3 may be cut (old code: turns 6..8 were 3's and 4's, so the
 		// window covered only prompt 4 and its nextTurn message, and prompt 3's turn was summarised)
 		expect(p.cutIdx).not.toBeNull();
@@ -493,7 +460,7 @@ describe("driven runs (an extension's triggerTurn message): turn boundaries", ()
 	// final answer (29K of prose kept at a cold return)
 	test("a summary before a driven run keeps from the custom message that started it, not from the previous final answer", () => {
 		const e = [U("u1", "the one real prompt"), A("a1", ["c1"]), R("r1", "c1", 30_000), AX("a2", 60_000), C("k2"), AX("a3", 400)];
-		const p = planContext(e, { cwd: process.cwd(), coldCap: 3000, promptPending: true })!;
+		const p = planContext(e, { cwd: process.cwd(), coldCap: 3000, promptPending: true, law: at(0, 100) })!;
 		expect(p.cutIdx).not.toBeNull();
 		expect(p.firstKeptEntryId).toBe("k2"); // old code: "a2" (the 60K answer stayed)
 		expect(validateEdits(p.blocks, { folds: new Map(p.folds.map((f) => [blockIdx(p.blocks, f.entryId), f.ph])), recover: new Map(p.folds.map((f) => [blockIdx(p.blocks, f.entryId), f.recover])), cut: p.cutIdx }, p.userTurns)).toBeNull();

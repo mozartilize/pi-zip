@@ -147,7 +147,7 @@ pub fn world_preset(name: &str) -> Option<World> {
         "explicit" => d,
         // GLM-like: automatic prefix cache that outlives its declared 5 minutes, and pi-zip has learned that
         "glm" => World { cls: Class::Automatic, ttl_true: 600, survival: Survival::Outlives, ..d },
-        // the class is not known yet (first session with this model): the legacy rule until the first response
+        // the class is not known yet (first session with this model): the explicit ratios until the first response
         "fresh" => World { known: false, ..d },
         // a large tool set: the fixed prefix O is above half the cap
         "tools" => World { sys: 30_000, ..d },

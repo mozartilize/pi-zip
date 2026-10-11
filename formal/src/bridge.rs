@@ -17,7 +17,7 @@ pub struct Pool {
     src: PathBuf,
     script: PathBuf,
     pi: Option<PathBuf>,
-    /// planner options merged into every planContext call (PZF_PLAN_OPTS), e.g. {"lookahead":true}
+    /// planner options merged into every planContext call (PZF_PLAN_OPTS), e.g. {"inturnAge":20}
     pub plan_opts: Option<String>,
     workers: Vec<Mutex<Option<Worker>>>,
     next_id: AtomicU64,

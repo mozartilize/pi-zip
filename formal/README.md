@@ -113,14 +113,14 @@ that the next turn_end valve could make (B2). The first round excused any decisi
 | I1 | run stability | A2 | □(¬run_start ∧ ¬zip_edit ∧ ¬env → prefix_kept) ∧ □ persisted_as_sent | a byte change no priced edit explains is an unpriced rewrite; persisting something other than what was sent rewrites at the next request |
 | RD | restart determinism | A2, A3 | □(run_start → fresh_plans_alike) | the law, b2b and one-summary rules must be functions of the session, or a restart re-decides on different state; produced summaries are pi-zip/summary entries (0.4.0), so only a call in flight at the restart is the process's own |
 | RC | recall is never refolded | A1, A2 | □ recall_kept | refolding what the model asked for hides it again and invites the same recall: a rewrite each time |
-| PW | protection windows | A1 | □ protection_respected | the latest two user turns stay: their outputs fold only if re-readable in the previous turn at a cold return or past the declared TTL, or ≥ 60 requests old; a summary never cuts into them, except coldwarm's F2 lookahead cut, which may reach the previous turn's final answer |
+| PW | protection windows | A1 | □ protection_respected | the latest two user turns stay: their outputs fold only if re-readable in the previous turn after a pause (an absence ≥ the requested TTL τ) or a model switch, whatever P (0.4.0), or ≥ 60 requests old; a summary never cuts into them |
 | B2B | no back-to-back warm rewrites | A2 | □(zip_edit → ¬○(zip_edit ∧ cache_warm ∧ planned_warm)) | the second rewrite pays the write twice for one saving |
-| MP | monotone in P(warm) | A2 | □ monotone_in_p | an edit is never cheaper at a warm cache than at a cold one: at every decision point, re-planned on a grid of P with everything else fixed, the plan at a lower P covers or beats (smaller context, or the cold target reached) the plan at a higher P |
+| MP | monotone in P(warm) | A2 | □ monotone_in_p | an edit is never cheaper at a warm cache than at a cold one: at every decision point, re-planned on a grid of P with everything else fixed, the plan at a lower P covers or beats (smaller context, or the cold target reached) the plan at a higher P; structural since 0.4.0 (one planner: P enters only the law) |
 | NR | time consistency (no regret) | A2, A3 | □(cold_plan → [i0:=i] ¬(quiet U≤10 (i > i0 ∧ zip_edit ∧ planned_warm))) | an edit is free cold and paid warm: a warm edit within 10 requests of a cold plan with no new information means the cold plan was dominated |
 | NT | no thrash | A2, A3 | □(zip_summary → [s0:=start] ¬○(¬cold_plan U (zip_summary ∧ ¬cold_plan ∧ ¬at_room ∧ start < s0·(1−TOL)))) ∧ □(zip_summary → summary_worth_it) | two summaries in one warm stretch are two uncached calls for one saving, unless the context has grown back to the size the first one started from (then the second gains what the first did); a summary that removes less than it writes, or works within a minimal summary of the floor (system prompt + previous summary + protected turns), is a summary for nothing |
 | WL | a warm summary that pays is not withheld | A2, A3 | □ warm_summary_not_withheld | **completeness** (every other property is safety, and a pi-zip that never summarises passes them): (a) every warm turn_end of a request that did not fail asks the valve, unless b2b or the run plan is persisted there; (b) a warm decision the one-summary flag constrained, re-planned with the flag lifted, withholds a summary whose summary step and whole-plan step (call priced) pass with Φ ≥ 1.25 only while a pi-zip summary (or a foreign compaction) was made since the last cold plan and the context has not grown back past the size it started from (10%) |
-| TR | target reachability | A2 | □(cold_plan → target_reached_or_excused) | the cold return is the one free rewrite: it reaches the cold target (±15%) unless the floor fills it, the law refused the summary, the class is not known yet, or (0.4.0) it took a summary produced earlier that cuts short of its own cut (never deeper: the paid call is used; the target is reached once the deeper one is ready) |
-| GC | a gone cache gets a cold plan | A2 | □ gone_is_cold | README rule 2, "after the TTL, or after switching model, pi-zip folds": a run after a model switch is planned at P = 0; a run whose cache was last touched (a response that reached the provider, or Pi's refresh) longer ago than the declared TTL is marked past it, and longer ago than both the declared and the kept TTL is planned cold |
+| TR | target reachability | A2 | □(cold_plan → target_reached_or_excused) | the cold return is the one free rewrite: it reaches the cold target (±15%) unless the floor fills it, the law refused the summary (or, at P > 0, the plan: then the rewrite is priced, not free), or (0.4.0) it took a summary produced earlier that cuts short of its own cut (never deeper: the paid call is used; the target is reached once the deeper one is ready) |
+| GC | a gone cache gets a cold plan | A2 | □ gone_is_cold | README rule 2, "after the TTL, or after switching model, pi-zip folds": a run after a model switch is planned at P = 0; a run whose cache was last touched (a response that reached the provider, or Pi's refresh) longer ago than the requested TTL τ, or a switch, is marked a pause, and longer ago than both τ and the kept TTL is planned cold |
 | WB | warm does nothing below the target | A2 | □(zip_edit ∧ planned_warm → warm_above_target) | README rule 2, "while the cache is warm it does nothing" except the valve above the target: a new edit planned at P ≥ 0.5 comes from a request (real size) above the cold target (15% tolerance) |
 | MH | an automatic cache keeps its head | A2 | □ head_kept | README: on an automatic prefix cache every edit leaves the first 8K tokens alone, so the response right after a fold still says whether the cache survived (folds only; a cut replaces the prefix, and the first request to a new model is no sample) |
 | RDr, MPr, A2r | residuals | RD, MP, A2 | the property, minus the known root causes | RD after transplanting the three fields TRIAGE (a) 1 names together (g, justEdited, summarizedWarm), or where the live process took a summary call still in flight (0.4.0: a finished one is a pi-zip/summary entry the fresh process reads too); MP outside the mechanisms TRIAGE (a) 3 and 6 name; A2 outside B1 and the plan gate without the call (TRIAGE (a) 2). RD, MP and A2 fail in thousands of traces on 0.2.8 and affine; a new bug of their kind shows up only here (and in the per-trace verdicts) |
@@ -136,8 +136,8 @@ first, so a cold plan that could not summarise only because the window had not s
 prompt later.
 
 **Monotonicity** is checked at every decision point of every trace by re-planning with the real `planContext` and the captured
-options (entries, scale, prices, g, recalled set, pastTtl), varying only P over {0, .25, .49, .51, .75, 1} plus the actual P, with
-the mode derived from P exactly as run.ts derives it (cold iff P < 0.5). At an actual cold return, a warm probe sees the state a
+options (entries, scale, prices, g, recalled set, pause), varying only P over {0, .25, .49, .51, .75, 1} plus the actual P (since
+0.4.0 P enters only the law; the one summary per warm stretch and b2b still read P ≥ 0.5). At an actual cold return, a warm probe sees the state a
 warm return would have seen: `summarizedWarm` as it stood before the return (a cold return resets it), and the b2b rule (a warm
 return right after an edited request plans nothing). Property G checks that the probe reproduces the actual decision.
 
@@ -152,7 +152,7 @@ Let D = B − A, T' = min(T, A), K(P) = (w − r)(P·T' − (1 − P)·D) + call
 * **M (monotone in P).** dK/dP = (w − r)(T' + D). The code guarantees D > 0 (`if (!(A < B)) return none`, the first line of
   lawTerms), T' ≥ 0 (T ≥ 0 and A ≥ 0: every call site passes T = A, the post-edit context size, at least O; lawTerms itself does
   not check T, so a call site with T < 0 would void M), and w ≥ r (`learn.ts CLASS_RATIOS`: 1.25 > 0.1, 2 > 0.1 on the
-  long tier, 1 > 0.2; and `pr.r > 0` is required, else the P-free legacy rule applies). So T' + D > 0 and K is non-decreasing
+  long tier, 1 > 0.2; and `pr.r > 0` is required, else nothing is allowed at any P). So T' + D > 0 and K is non-decreasing
   in P, while gain does not depend on P. Both disjuncts of ok are preserved when P decreases: ok is antitone in P. ∎
 * **G (gain ≥ 0).** r > 0, D > 0 make the read term ≥ 0. η > 0 only when B ≥ room; its numerator is
   w(B − keep) + out·s + (w − r)(keep + s) = w·B + out·s + (w − r)·s − r·keep with s ≥ 1000. The out·s term is ≥ 0 (out > 0), so
@@ -218,7 +218,7 @@ in rc030 are other candidate-set effects (TRIAGE.md).
   then `agent_before_settle`); the provider and its usage reports; Pi's `AgentSession.compact()` around the real
   `prepareCompaction`; the clock and timers (virtual `Date` and `setTimeout`); the payload pi-ai would build (Anthropic shape
   only: the guard's OpenAI, Responses, Google and Bedrock paths do not run). Called for real: pi-zip's `index.ts` wiring and
-  everything below it (run.ts cold detection, run plan, valve, b2b skip, summarizedWarm, pastTtl, away timer, native
+  everything below it (run.ts cold detection, run plan, valve, b2b skip, summarizedWarm, pause, away timer, native
   compaction, persistence at turn_end, learning, steering marks, the `tool_call` hook, the payload tier, `guard.ts`
   `repairPayload`, the `zip_recall` tool's `execute`), Pi's `SessionManager`, `AgentSession._applyBoundaryDrafts`,
   `prepareCompaction`, `convertToLlm` and `CacheWarmer`.
@@ -227,8 +227,8 @@ in rc030 are other candidate-set effects (TRIAGE.md).
   and to name the cause transplants the live in-memory fields into it (g, justEdited, summarizedWarm, clock; the learned class
   and survival are not transplanted: `beforeAgentStart` reloads them from disk). A1's recall round trips run on a third pi-zip
   instance on the live session, so they never touch the live instance's state.
-* **Options.** `--plan-opts '{"lookahead":true}'` merges planner options into every `planContext` call (how coldwarm's F2 is
-  turned on without editing src).
+* **Options.** `--plan-opts '{"inturnAge":20}'` merges planner options into every `planContext` call (an ablation without
+  editing src; coldwarm's F2 lookahead was turned on this way until 0.4.0 removed it).
 * The checker never writes outside a per-worker temp dir (stats, recall files, flags); the session under test is in memory but
   reports a session file, as every session started without `--no-session` does (rc030 turns recall through files off without
   one). `--no-session` itself is not modelled.

@@ -31,7 +31,7 @@ mkdirSync(WORK, { recursive: true });
 const STATS = join(WORK, "cache-survival.json");
 // isolation: nothing the extension writes leaves WORK (stats, welcome flag, recall copies); the ledger is tapped in memory
 Object.assign(process.env, { PI_ZIP_CACHE_STATS: STATS, PI_ZIP_LEDGER: "/dev/null", XDG_CACHE_HOME: join(WORK, "xdg"), PI_CODING_AGENT_DIR: join(WORK, "agent") });
-for (const k of ["PI_ZIP_TTL_SECS", "PI_ZIP_COLD_CAP", "PI_ZIP_FOLD_MIN", "PI_ZIP_KEEP_LINES", "PI_ZIP_MIN_GAIN", "PI_ZIP_INTURN_AGE", "PI_ZIP_OFF", "PI_CACHE_RETENTION"]) delete process.env[k];
+for (const k of ["PI_ZIP_TTL_SECS", "PI_ZIP_COLD_CAP", "PI_ZIP_FOLD_MIN", "PI_ZIP_KEEP_LINES", "PI_ZIP_INTURN_AGE", "PI_ZIP_OFF", "PI_CACHE_RETENTION"]) delete process.env[k];
 
 type Any = any;
 const { SessionManager } = await import(join(PI, "dist/core/session-manager.js"));
@@ -120,10 +120,12 @@ const origStartBg = (Zip.prototype as Any).startBg;
 const origOpts = Zip.prototype.opts;
 Zip.prototype.opts = function (this: Any, ...a: Any[]) {
 	const r = origOpts.apply(this, a);
-	// planner options a run may set (PZF_PLAN_OPTS, e.g. {"lookahead":true} for coldwarm's F2): merged into what run.ts passes to planContext
+	// planner options a run may set (PZF_PLAN_OPTS, e.g. {"inturnAge":20}): merged into what run.ts passes to planContext
 	if (PLAN_OPTS) Object.assign(r.o, PLAN_OPTS);
-	// the P-grid re-plans in exactly this state: the recalled set is a snapshot (the live one grows when zip_recall runs later)
-	if (optsSink && !this.__probe) optsSink.push({ pending: a[1], mode: a[2], entries: a[3], o: { ...r.o, recalled: new Set(r.o.recalled ?? []) }, live: r.o });
+	// the P-grid re-plans in exactly this state: the recalled set is a snapshot (the live one grows when zip_recall runs later). opts is
+	// (ctx, pending, entries, pWarm, pause, cutAt): P enters the law only; `mode` is a label (P < 0.5: "cold"), and the one summary per
+	// warm stretch (summarizedWarm, summaryRegrow: the flag a plan at P >= 0.5 gets) is captured for the grid's higher P
+	if (optsSink && !this.__probe) optsSink.push({ pending: a[1], entries: a[2], mode: Number(a[3]) < 0.5 ? "cold" : "warm", sw: !!this.summarizedWarm, regrow: this.summaryRegrow, o: { ...r.o, recalled: new Set(r.o.recalled ?? []) }, live: r.o });
 	return r;
 };
 
@@ -469,19 +471,22 @@ async function runTrace(tr: Any): Promise<Any> {
 	}
 	function gridFor(cap: Any) {
 		const out: Any[] = [];
-		const actual = Number(cap.o.law?.pWarm ?? (cap.mode === "cold" ? 0 : 1));
+		const actual = Number(cap.o.law?.pWarm ?? 0);
 		const ps = [...new Set([...(probes.pgrid as number[]), actual])].sort((a, b) => a - b);
-		const pre = cap.at === "run" && cap.mode === "cold" ? preRun : null;
+		const pre = cap.at === "run" && actual < 0.5 ? preRun : null;
+		// one planner (0.4.0): everything but P is the captured decision's (the pause too); P enters the law, and the two rules that read
+		// P >= 0.5 outside it: b2b and the one summary per warm stretch
+		const sw = pre ? !!pre.sw : !!cap.sw;
 		for (const p of ps) {
-			// mode is a function of P exactly as run.ts derives it (detectCold: cold = P(warm) < 0.5); at the actual P it is the actual mode
-			const mode = p === actual ? cap.mode : p < 0.5 ? "cold" : "warm";
+			const mode = p < 0.5 ? "cold" : "warm"; // a label (run.ts: cold = P(warm) < 0.5)
 			// a warm plan at an actual cold return: the state a warm return would have seen (summarizedWarm not reset; b2b skip)
 			if (pre && mode === "warm" && pre.je) {
 				out.push({ p, actual: false, mode, plan: false, b2b: true, folds: [], cut: null, prefix: 0, sum: 0, before: null, afterFolds: null, after: null, law: [] });
 				continue;
 			}
-			const noSummary = mode !== "warm" ? false : cap.mode === "warm" ? !!cap.o.noSummary : !!pre?.sw;
-			const o = { ...cap.o, pastTtl: cap.live?.pastTtl ?? cap.o.pastTtl, mode, law: { ...cap.o.law, pWarm: p }, noSummary, trace: [] };
+			const noSummary = mode !== "warm" ? false : actual >= 0.5 ? !!cap.o.noSummary : sw;
+			const regrowAt = noSummary ? (actual >= 0.5 ? cap.o.regrowAt : cap.regrow || undefined) : undefined;
+			const o = { ...cap.o, law: { ...cap.o.law, pWarm: p }, noSummary, regrowAt, trace: [] };
 			let r: Any = null;
 			try {
 				r = plan.planContext(cap.entries, o);
@@ -491,13 +496,13 @@ async function runTrace(tr: Any): Promise<Any> {
 			}
 			const c = r ? (r.scale?.c ?? r.k ?? 1) : 1;
 			const after = r ? r.ctxAfterFolds - (r.cutIdx !== null ? c * (r.prefixTokens - r.summaryTokensPlanned) : 0) : null;
-			out.push({ p, actual: p === actual, mode, plan: !!r, ahead: !!r?.ahead, folds: r ? r.folds.map((f: Any) => f.entryId) : [], cut: r?.firstKeptEntryId ?? null, prefix: r ? c * r.prefixTokens : 0, sum: r ? c * r.summaryTokensPlanned : 0, before: r?.ctxTokens ?? null, afterFolds: r ? r.ctxAfterFolds : null, after, law: o.trace.map((t: Any) => ({ at: t.where, ok: t.ok, B: t.B, A: t.A, T: t.T, K: t.K, phi: t.phi, eta: t.eta, ...(t.cut !== undefined ? { cut: t.cut } : {}) })) });
+			out.push({ p, actual: p === actual, mode, plan: !!r, folds: r ? r.folds.map((f: Any) => f.entryId) : [], cut: r?.firstKeptEntryId ?? null, prefix: r ? c * r.prefixTokens : 0, sum: r ? c * r.summaryTokensPlanned : 0, before: r?.ctxTokens ?? null, afterFolds: r ? r.ctxAfterFolds : null, after, law: o.trace.map((t: Any) => ({ at: t.where, ok: t.ok, B: t.B, A: t.A, T: t.T, K: t.K, phi: t.phi, eta: t.eta, ...(t.cut !== undefined ? { cut: t.cut } : {}) })) });
 		}
 		// WL's oracle: a warm decision the one-summary-per-warm-stretch flag constrained, planned again at the actual P with the flag lifted
 		// (everything else as captured): the summary the flag kept out, if any, and the law's verdict on it
 		let free: Any = null;
-		if (cap.mode === "warm" && cap.o.noSummary) {
-			const o = { ...cap.o, pastTtl: cap.live?.pastTtl ?? cap.o.pastTtl, law: { ...cap.o.law, pWarm: actual }, noSummary: false, regrowAt: undefined, trace: [] };
+		if (actual >= 0.5 && cap.o.noSummary) {
+			const o = { ...cap.o, law: { ...cap.o.law, pWarm: actual }, noSummary: false, regrowAt: undefined, trace: [] };
 			try {
 				const r = plan.planContext(cap.entries, o);
 				free = { plan: !!r, cut: r?.firstKeptEntryId ?? null, folds: r ? r.folds.map((f: Any) => f.entryId) : [], afterFolds: r ? r.ctxAfterFolds : null, law: o.trace.map((t: Any) => ({ at: t.where, ok: t.ok, B: t.B, A: t.A, T: t.T, K: t.K, phi: t.phi, eta: t.eta, ...(t.cut !== undefined ? { cut: t.cut } : {}) })) };
@@ -505,7 +510,7 @@ async function runTrace(tr: Any): Promise<Any> {
 				free = { error: String(err) };
 			}
 		}
-		return { at: cap.at, mode: cap.mode, p: actual, pastTtl: !!(cap.live?.pastTtl ?? cap.o.pastTtl), noSummary: !!cap.o.noSummary, regrowAt: cap.o.regrowAt ?? null, g: cap.o.law?.g ?? null, pr: cap.o.law?.pr ?? null, grid: out, free };
+		return { at: cap.at, mode: cap.mode, p: actual, pause: !!cap.o.pause, noSummary: !!cap.o.noSummary, regrowAt: cap.o.regrowAt ?? null, g: cap.o.law?.g ?? null, pr: cap.o.law?.pr ?? null, grid: out, free };
 	}
 
 	// A second pi-zip instance on the live session, never driven: the model's way back to a folded output (its zip_recall, its
@@ -748,7 +753,7 @@ async function runTrace(tr: Any): Promise<Any> {
 		const gapMs = lastResp ? clock - lastResp : null;
 		const t0 = (clock - T0) / 1000;
 		const runStart = reqInRun === 0;
-		const state0 = runStart ? { cold: !!z?.cold, pWarm: z?.pWarm ?? null, pastTtl: !!z?.pastTtl, summarizedWarm: !!z?.summarizedWarm } : null;
+		const state0 = runStart ? { cold: !!z?.cold, pWarm: z?.pWarm ?? null, pause: !!z?.pause, summarizedWarm: !!z?.summarizedWarm } : null;
 		envSince.push(...envNext.splice(0));
 		sink = [];
 		optsSink = [];

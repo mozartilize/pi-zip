@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { repairPayload } from "../src/guard.ts";
-import { cacheTtlMs, detectCold, isColdByTtl, lastMessageMs, observedTier, payloadRetention, resolveTtl } from "../src/cache.ts";
+import { detectCold, isColdByTtl, lastMessageMs, observedTier, payloadRetention, resolveTtl } from "../src/cache.ts";
 import { classifyRecoverability, isReadOnlyBash } from "../src/classify.ts";
 import { colorTail, fmtK, noticeText, renderNotice, splitDesc, type NoticeAction, type NoticeData } from "../src/notice.ts";
 import { clipMid, handleFor, makePlaceholder, makePlaceholderFor, outcomeHint, pickKeyLines, shortArgs } from "../src/placeholder.ts";
@@ -548,23 +548,13 @@ describe("classify", () => {
 });
 
 describe("cache", () => {
-	test("promptCache is in SECONDS (reading it as ms would make every prompt cold)", () => {
-		expect(cacheTtlMs({ short: 300 }, 1)).toBe(300_000);
-		expect(cacheTtlMs(undefined, 300_000)).toBe(300_000);
+	test("the lifetime is the one the request asks for (short 300 s, PI_CACHE_RETENTION=long 1 h), never the model catalogue", () => {
+		const pc = { short: 60, long: 120 }; // a catalogue entry is not read
+		expect(resolveTtl({ promptCache: pc }, []).ms).toBe(300_000);
+		expect(resolveTtl({ promptCache: pc }, [], "long").ms).toBe(3_600_000);
 		const t0 = 1_000_000;
-		expect(isColdByTtl(t0, t0 + 9_000, cacheTtlMs({ short: 300 }))).toBe(false);
-		expect(isColdByTtl(t0, t0 + 360_000, cacheTtlMs({ short: 300 }))).toBe(true);
-	});
-	test("the TTL tier follows Pi's getPromptCacheTtlMs: cacheRetention, else PI_CACHE_RETENTION=long, else short; no fallthrough between tiers", () => {
-		const pc = { short: 300, long: 3600 };
-		expect(cacheTtlMs(pc, 1, { env: {} })).toBe(300_000);
-		expect(cacheTtlMs(pc, 1, { env: { PI_CACHE_RETENTION: "long" } })).toBe(3_600_000);
-		expect(cacheTtlMs(pc, 1, { env: { PI_CACHE_RETENTION: "short" } })).toBe(300_000);
-		expect(cacheTtlMs(pc, 1, { env: { PI_CACHE_RETENTION: "long" }, cacheRetention: "short" })).toBe(300_000); // the request option beats the env
-		expect(cacheTtlMs(pc, 1, { env: {}, cacheRetention: "long" })).toBe(3_600_000);
-		expect(cacheTtlMs(pc, 1, { env: {}, cacheRetention: "none" })).toBe(0);
-		expect(cacheTtlMs({ long: 3600 }, 7, { env: {} })).toBe(7); // short is not declared: not the long tier's value
-		expect(cacheTtlMs({ short: 300 }, 7, { env: { PI_CACHE_RETENTION: "long" } })).toBe(7);
+		expect(isColdByTtl(t0, t0 + 9_000, 300_000)).toBe(false);
+		expect(isColdByTtl(t0, t0 + 360_000, 300_000)).toBe(true);
 		process.env.PI_CACHE_RETENTION = "long";
 		try {
 			expect(detectCold({ promptCache: pc }, 0, [{ type: "message", message: { timestamp: 10_000_000 - 1_000_000 } }], 10_000_000).cold).toBe(false); // 1000 s < 3600 s
@@ -584,30 +574,30 @@ describe("cache", () => {
 		expect(detectCold(model, 0, [old, { type: "usage", kind: "other", timestamp: new Date(now - 100_000).toISOString() }], now).cold).toBe(true);
 		const fresh = { type: "message", message: { role: "assistant", provider: "p", model: "m", stopReason: "stop", timestamp: now - 1000 } };
 		expect(detectCold(model, 0, [fresh], now)).toMatchObject({ cold: false });
-		expect(detectCold(model, 0, [fresh], now)).toMatchObject({ pastTtl: false });
-		expect(detectCold(model, 0, [old], now)).toMatchObject({ cold: true, pastTtl: true });
-		const warmLearned = () => ({ p: 0.8, src: "learned" }); // a provider that outlives its declared TTL: warm, yet past the TTL
-		expect(detectCold(model, 0, [old], now, "", warmLearned)).toMatchObject({ cold: false, pWarm: 0.8, pastTtl: true });
-		expect(detectCold({ provider: "p", id: "other", promptCache: { short: 300 } }, 0, [fresh], now)).toMatchObject({ cold: true, reason: expect.stringContaining("model switch") });
+		expect(detectCold(model, 0, [fresh], now)).toMatchObject({ pause: false });
+		expect(detectCold(model, 0, [old], now)).toMatchObject({ cold: true, pause: true });
+		const warmLearned = () => ({ p: 0.8, src: "learned" }); // a provider that outlives the lifetime asked for: warm, yet a pause
+		expect(detectCold(model, 0, [old], now, "", warmLearned)).toMatchObject({ cold: false, pWarm: 0.8, pause: true });
+		expect(detectCold({ provider: "p", id: "other", promptCache: { short: 300 } }, 0, [fresh], now)).toMatchObject({ cold: true, pause: true, reason: expect.stringContaining("model switch") });
 		expect(detectCold({ provider: "q", id: "m", promptCache: { short: 300 } }, 0, [fresh], now).cold).toBe(true);
 		expect(detectCold({ provider: "p", id: "other" }, now - 1000, [], now, "p/m").cold).toBe(true); // in-process memory of the last request's model
-		expect(detectCold(model, 0, [], now).cold).toBe(false); // no prior request
+		expect(detectCold(model, 0, [], now)).toMatchObject({ cold: true, pWarm: 0, pause: false }); // no prior request: nothing is cached, nobody left
 	});
-	test("exactly the TTL is still warm; no prior request is warm", () => {
+	test("exactly the TTL is still warm by the prior (and already a pause); no prior request is never cold by the TTL", () => {
 		expect(isColdByTtl(1000, 4001, 3000)).toBe(true);
 		expect(isColdByTtl(1000, 4000, 3000)).toBe(false);
 		expect(isColdByTtl(0, 999_999, 3000)).toBe(false);
 	});
 	afterEach(() => delete process.env.PI_ZIP_TTL_SECS);
-	test("detectCold reads the model's TTL, the branch clock, and PI_ZIP_TTL_SECS", () => {
+	test("detectCold reads the requested lifetime, the branch clock, and PI_ZIP_TTL_SECS", () => {
 		const now = 10_000_000;
 		const branch = [{ type: "message", message: { timestamp: now - 100_000 } }];
 		expect(detectCold({ promptCache: { short: 300 } }, 0, branch, now).cold).toBe(false);
-		expect(detectCold({ promptCache: { short: 60 } }, 0, branch, now).cold).toBe(true);
+		expect(detectCold({ promptCache: { short: 60 } }, 0, branch, now).cold).toBe(false); // the catalogue's 60 s is not read
 		process.env.PI_ZIP_TTL_SECS = "20";
 		expect(detectCold({ promptCache: { short: 300 } }, now - 5000, branch, now).cold).toBe(false);
 		expect(detectCold({ promptCache: { short: 300 } }, 0, branch, now).cold).toBe(true);
-		expect(detectCold({}, 0, [], now)).toMatchObject({ cold: false, reason: "no prior request" });
+		expect(detectCold({}, 0, [], now)).toMatchObject({ cold: true, reason: "no prior request" });
 	});
 });
 
@@ -633,7 +623,7 @@ describe("the cache clock ignores a request the provider refused (GC)", () => {
 	});
 	test("a model switch after a request the provider refused: the new model's cache is not the refused one's, so the return is cold", () => {
 		expect(detectCold({ provider: "p", id: "m2", promptCache: { short: 300 } }, 0, [m("user", 0), refused(10)], 60_000, "p/m1").cold).toBe(true);
-		expect(detectCold({ provider: "p", id: "m2", promptCache: { short: 300 } }, 0, [m("user", 0)], 60_000, "").cold).toBe(false); // nothing was ever sent
+		expect(detectCold({ provider: "p", id: "m2", promptCache: { short: 300 } }, 0, [m("user", 0)], 60_000, "")).toMatchObject({ cold: true, pWarm: 0, pause: false, src: "no prior request" }); // nothing was ever sent: no touch, no pause
 	});
 	test("a return after a refused request is cold by the last real touch", () => {
 		const branch = [m("user", 0), ok(1_000), m("user", 290_000), refused(291_000)];
@@ -658,7 +648,7 @@ describe("observed TTL tier", () => {
 		expect(observedTier([a(500, 500)], "p/m")).toBeUndefined();
 		expect(observedTier([a(5000, 5000), a(5000, 0), a(5000, 0), a(5000, 0)], "p/m")).toBe("5m"); // only the newest 3
 	});
-	test("detectCold: long requested but 5m written -> 5m TTL, once-noticeable; short requested but 1h written -> 1h if declared", () => {
+	test("detectCold: long requested but 5m written -> 5m TTL, once-noticeable; short requested but 1h written -> 1h", () => {
 		const now = 10_000_000;
 		const model = { provider: "p", id: "m", promptCache: { short: 300, long: 3600 } };
 		const gap = { type: "message", message: { timestamp: now - 1_000_000 } };
@@ -675,7 +665,7 @@ describe("observed TTL tier", () => {
 			delete process.env.PI_ZIP_TTL_SECS;
 		}
 		expect(detectCold(model, 0, [a(5000, 5000), gap], now).ttl).toMatchObject({ ms: 3_600_000, source: "observed" });
-		expect(detectCold({ ...model, promptCache: { short: 300 } }, 0, [a(5000, 5000), gap], now).ttl).toMatchObject({ ms: 300_000, source: "declared" });
+		expect(detectCold({ ...model, promptCache: { short: 300 } }, 0, [a(5000, 5000), gap], now).ttl).toMatchObject({ ms: 3_600_000, source: "observed" }); // the catalogue is not read
 	});
 });
 

@@ -1,27 +1,11 @@
 // Cache temperature (F7): "cold" is a fact about real time, never a guess.
 import { type Any, PRODUCT, envInt } from "./util.ts";
 
-export const DEFAULT_TTL_MS = 300_000;
-
-export type CacheRetention = "none" | "short" | "long";
-
-/**
- * Lifetime of the prompt cache entry a request writes, mirroring Pi's getPromptCacheTtlMs (core/cache-warmer.js): the tier is the
- * request's cacheRetention, else "long" when PI_CACHE_RETENTION=long, else "short"; the model's promptCache holds SECONDS for
- * that tier only. Pi sends no explicit cacheRetention, so in practice the environment decides. "none" = no cache at all = 0.
- * A model that declares no lifetime for the tier gets fallbackMs. An explicit PI_ZIP_TTL_SECS (tests) wins in ttlFor.
- */
-export function cacheTtlMs(
-	pc: { short?: number; long?: number } | undefined,
-	fallbackMs: number = DEFAULT_TTL_MS,
-	opts: { cacheRetention?: CacheRetention; env?: Record<string, string | undefined> } = {},
-): number {
-	const env = opts.env ?? process.env;
-	const retention: CacheRetention = opts.cacheRetention ?? (env.PI_CACHE_RETENTION === "long" ? "long" : "short");
-	if (retention === "none") return 0;
-	const secs = pc?.[retention];
-	return typeof secs === "number" && secs > 0 ? secs * 1000 : fallbackMs;
-}
+/** The cache lifetimes a request can ask for (Pi's tiers): the short one, and the 1-hour one (`PI_CACHE_RETENTION=long`, an Anthropic
+ *  `cache_control` ttl of 1h, OpenAI's prompt_cache_retention). No per-model table: pi-zip uses the lifetime the request asks for, and
+ *  learns how long the provider really keeps it (learn.ts). */
+export const SHORT_TTL_MS = 300_000;
+export const LONG_TTL_MS = 3_600_000;
 
 /**
  * TTL tier the provider really wrote, from the newest <=3 usable assistant messages of this model (real run, cacheWrite >= MIN_WRITE):
@@ -64,19 +48,17 @@ export function payloadRetention(p: Any): "short" | "long" | null {
 	return seen ? "short" : null;
 }
 
-/** Declared TTL, corrected by what the provider was seen to write. PI_ZIP_TTL_SECS wins. `note` = the one-time mismatch notice text.
- *  `tier` = the retention the request used (the provider-scoped PI_CACHE_RETENTION, or the request payload itself; run.ts); without it,
- *  the process environment decides, as before. */
+/** The lifetime the request asks for (its tier: the provider-scoped PI_CACHE_RETENTION or the request payload itself, run.ts; without
+ *  one the process environment decides), corrected by the tier the provider was seen to write. PI_ZIP_TTL_SECS wins (tests). `note`
+ *  = the one-time mismatch notice text. */
 export function resolveTtl(model: Any, branch: Any[] = [], tier?: "short" | "long"): TtlInfo {
 	if (process.env.PI_ZIP_TTL_SECS) return { ms: envInt("TTL_SECS", 300) * 1000, source: "declared" };
-	const pc = model?.promptCache;
 	const long = tier ? tier === "long" : process.env.PI_CACHE_RETENTION === "long";
-	const declared = cacheTtlMs(pc, DEFAULT_TTL_MS, { cacheRetention: long ? "long" : "short" });
-	const seen = declared > 0 ? observedTier(branch, modelKey(model)) : undefined;
+	const seen = observedTier(branch, modelKey(model));
 	const mismatch = (req: string, got: string, ms: number): TtlInfo => ({ ms, source: "observed", note: `${PRODUCT} · requested ${req} prompt cache, provider wrote ${got} · using ${got}` });
-	if (long && seen === "5m") return mismatch("1h", "5m", cacheTtlMs(pc, DEFAULT_TTL_MS, { cacheRetention: "short" }));
-	if (!long && seen === "1h" && pc?.long > 0) return mismatch("5m", "1h", pc.long * 1000);
-	return { ms: declared, source: "declared" };
+	if (long && seen === "5m") return mismatch("1h", "5m", SHORT_TTL_MS);
+	if (!long && seen === "1h") return mismatch("5m", "1h", LONG_TTL_MS);
+	return { ms: long ? LONG_TTL_MS : SHORT_TTL_MS, source: "declared" };
 }
 
 export const ttlFor = (model: Any, branch: Any[] = [], tier?: "short" | "long"): number => resolveTtl(model, branch, tier).ms;
@@ -134,21 +116,23 @@ export function lastPrompt(branch: Any[]): { key: string; total: number } {
 export const lastModelInBranch = (branch: Any[]): string => lastPrompt(branch).key;
 
 export type Survival = (gapS: number, priorS: number) => { p: number; src: string };
-/** pastTtl: the idle gap exceeds the declared TTL (the shipped rule's "cold"), whatever the learned P(warm) says. */
-export interface ColdInfo { cold: boolean; reason: string; ttl: TtlInfo; pWarm: number; src: string; gapS: number | null; pastTtl: boolean }
+/** pause: the absence outlived the lifetime the requests ask for (gap >= TTL), or the model changed: a fact about the user, whatever
+ *  the learned P(warm) says (the previous user turn's re-readable outputs may fold: plan.ts PlanOpts.pause). */
+export interface ColdInfo { cold: boolean; reason: string; ttl: TtlInfo; pWarm: number; src: string; gapS: number | null; pause: boolean }
 
 /** Cold by time, or because the model changed: a cache entry belongs to one provider and model. `learned` = P(warm) after a gap from the
- *  survival the provider was seen to have (learn.ts); without it, or under PI_ZIP_TTL_SECS (tests), the TTL decides. cold = P(warm) < 0.5. */
+ *  survival the provider was seen to have (learn.ts); without it, or under PI_ZIP_TTL_SECS (tests), the TTL decides. cold = P(warm) < 0.5.
+ *  No request before (a new session): P = 0, no pause (nothing is cached, and there was no absence). */
 export function detectCold(model: Any, lastReqMs: number, branch: Any[], nowMs = Date.now(), lastModel = "", learned?: Survival, tier?: "short" | "long"): ColdInfo {
 	const ttl = resolveTtl(model, branch, tier);
 	const last = Math.max(lastReqMs, lastMessageMs(branch));
 	const prev = lastModel || lastModelInBranch(branch);
 	// a request that went out, even one the provider refused, was made on another model: the new model's cache is not that one
-	if (prev && modelKey(model) && prev !== modelKey(model)) return { cold: true, reason: `model switch ${prev} -> ${modelKey(model)}`, ttl, pWarm: 0, src: "model switch", gapS: null, pastTtl: false };
-	if (!last) return { cold: false, reason: "no prior request", ttl, pWarm: 1, src: "no prior request", gapS: null, pastTtl: false };
+	if (prev && modelKey(model) && prev !== modelKey(model)) return { cold: true, reason: `model switch ${prev} -> ${modelKey(model)}`, ttl, pWarm: 0, src: "model switch", gapS: null, pause: true };
+	if (!last) return { cold: true, reason: "no prior request", ttl, pWarm: 0, src: "no prior request", gapS: null, pause: false };
 	const gapS = (nowMs - last) / 1000;
 	const byTtl = isColdByTtl(last, nowMs, ttl.ms);
 	const s = learned && !process.env.PI_ZIP_TTL_SECS ? learned(gapS, ttl.ms / 1000) : { p: byTtl ? 0 : 1, src: "prior" };
 	const reason = `ttl gap ${Math.round(gapS)}s ${byTtl ? ">" : "<="} ${Math.round(ttl.ms / 1000)}s${s.src === "prior" ? "" : `, learned P(warm) ${s.p.toFixed(2)}`}`;
-	return { cold: s.p < 0.5, reason, ttl, pWarm: s.p, src: s.src, gapS, pastTtl: byTtl };
+	return { cold: s.p < 0.5, reason, ttl, pWarm: s.p, src: s.src, gapS, pause: nowMs - last >= ttl.ms };
 }

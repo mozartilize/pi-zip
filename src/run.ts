@@ -6,7 +6,7 @@ import { dirname, join } from "node:path";
 import { lastMessageMs, lastPrompt, modelKey, payloadRetention, refused, ttlFor } from "./cache.ts";
 import { agentDir, curve, describe, lawPrices, loadStats, pWarm, record, sample, statsPath, GAP_EDGES, type Entry } from "./learn.ts";
 import { repairPayload } from "./guard.ts";
-import { adopt, checkEdits, clock, decideRun, decideSettle, decideTurnEnd, grow, headOf, lastRegrow, planOpts, readyOf, ruleB, runPlanOf, scaleOf, summarizedSince, unusedOf, valvePlanOf, SUMMARY_CUSTOM, type Artifact, type Avail, type Env, type Learned } from "./core.ts";
+import { adopt, checkEdits, clock, decideRun, inRunClock, decideSettle, decideTurnEnd, grow, headOf, lastRegrow, planOpts, readyOf, ruleB, runPlanOf, scaleOf, summarizedSince, unusedOf, valvePlanOf, SUMMARY_CUSTOM, type Artifact, type Avail, type Env, type Learned } from "./core.ts";
 import { fmtK, Stats, noticeDesc, noticeText, type NoticeAction, type NoticeData, type ZipControl } from "./notice.ts";
 import { applyPlanToMessages, buildBlocks, countUserTurns, G0, keepRecentTokensFor, piCanCompact, planContext, reserveTokensFor, sizeOf, UNIT, type Block, type Cut, type FoldTarget, type PlanOpts, type PlanResult, type RunPlan, type Scale, type SysInfo } from "./plan.ts";
 import { handleFor, PH_MARK, RECALL_TOOL } from "./placeholder.ts";
@@ -113,7 +113,7 @@ export class Zip implements ZipControl {
 	private steerIds = new Set<string>(); // marked: user entries that are NOT new user turns
 	// the law's inputs (round 5): P(warm) of this run's return, growth g, and the free cache signal of every response
 	private pWarm = 1;
-	private pastTtl = false; // this run is a user return after the declared TTL (the previous user turn is eligible: plan.ts PlanOpts.pastTtl)
+	private pause = false; // this run is a return after a pause or a model switch (the previous user turn's re-readables may fold: plan.ts PlanOpts.pause)
 	private survSrc = "no prior request";
 	private ent: Entry | undefined; // learned class + survival of the current model (learn.ts)
 	private g = G0; // EWMA(0.1) of real-token growth between consecutive responses, capped at the p90 of the last 20 deltas
@@ -400,9 +400,9 @@ export class Zip implements ZipControl {
 		return { model: m, ent: this.entKey === modelKey(m) ? this.ent : undefined, tier: this.tier(m), g: this.g, justEdited: this.justEdited, summarizedWarm: this.summarizedWarm, summaryRegrow: this.summaryRegrow };
 	}
 
-	/** Plan options with the token scale read from the branch (core.ts planOpts). */
-	private opts(ctx: Any, pending: boolean, mode: "cold" | "warm", entries: Any[], pWarm = mode === "cold" ? 0 : 1, cutAt?: string): { o: PlanOpts; cal: Scale } {
-		return planOpts(entries, this.branch(ctx), this.env(ctx), this.lam(ctx), pending, mode, pWarm, cutAt);
+	/** Plan options at P(warm) `pWarm`, after a pause or not, with the token scale read from the branch (core.ts planOpts). */
+	private opts(ctx: Any, pending: boolean, entries: Any[], pWarm: number, pause: boolean, cutAt?: string): { o: PlanOpts; cal: Scale } {
+		return planOpts(entries, this.branch(ctx), this.env(ctx), this.lam(ctx), pending, pWarm, pause, cutAt);
 	}
 
 	private entKey = "";
@@ -415,7 +415,7 @@ export class Zip implements ZipControl {
 	private lawLedger(where: string, o: PlanOpts) {
 		const l = o.law!, pr = l.pr, rd = (x: number) => (Number.isFinite(x) ? Math.round(x * 1000) / 1000 : x > 0 ? "inf" : null);
 		this.ledger({
-			type: "law", where, g: Math.round(l.g), pWarm: rd(l.pWarm), survSrc: where === "run" ? this.survSrc : "in-run", cls: pr?.cls ?? null, wr: pr ? rd(pr.w / pr.r) : null, prSrc: pr?.src ?? "legacy",
+			type: "law", where, g: Math.round(l.g), pWarm: rd(l.pWarm), survSrc: where === "run" ? this.survSrc : "in-run", cls: pr.cls, wr: rd(pr.w / pr.r), prSrc: pr.src,
 			steps: (o.trace ?? []).map((t) => ({ at: t.where, ok: t.ok, B: Math.round(t.B), A: Math.round(t.A), T: Math.round(t.T), ...(t.Tsuf !== undefined ? { Tsuf: Math.round(t.Tsuf) } : {}), phi: rd(t.phi), K: rd(t.K), eta: rd(t.eta) })),
 		});
 	}
@@ -496,7 +496,7 @@ export class Zip implements ZipControl {
 			const entries = ((ctx.sessionManager.buildSessionProjection() as Any)?.entries ?? []) as Any[];
 			if (!entries.length) return;
 			this.loadEnt(modelKey(ctx.model));
-			const { o } = this.opts(ctx, true, "cold", entries);
+			const { o } = this.opts(ctx, true, entries, 0, true);
 			const p = planContext(entries, o);
 			const now = this.judgeNow(ctx, branch);
 			let delayMs: number | null = null;
@@ -662,7 +662,7 @@ export class Zip implements ZipControl {
 		this.disarmKey();
 		this.model = ctx?.model;
 		this.cold = false;
-		this.pastTtl = false;
+		this.pause = false;
 		this.runChecked = true;
 		this.runEdits = false;
 		this.runPlan = null;
@@ -682,13 +682,13 @@ export class Zip implements ZipControl {
 		this.branchLastMs = lastMessageMs(branch);
 		if (!this.prevKey) ({ key: this.prevKey, total: this.prevTotal } = lastPrompt(branch)); // fresh process: the session's newest response
 		await this.resolveRetention(ctx);
-		const { cold, reason, ttl, pWarm: p, src, gapS, pastTtl } = clock(branch, { model: ctx.model, ent: this.ent, tier: this.tier(ctx.model) }, Date.now(), { reqMs: this.lastReqMs, modelKey: this.lastModelKey });
+		const { cold, reason, ttl, pWarm: p, src, gapS, pause } = clock(branch, { model: ctx.model, ent: this.ent, tier: this.tier(ctx.model) }, Date.now(), { reqMs: this.lastReqMs, modelKey: this.lastModelKey });
 		this.cold = cold;
 		if (cold) {
 			this.summarizedWarm = false; // a cold return may summarise again
 			this.summaryRegrow = undefined;
 		}
-		this.pastTtl = pastTtl;
+		this.pause = pause;
 		this.pWarm = p;
 		this.survSrc = src;
 		this.runChecked = false; // the first request decides (cold: the cold plan; warm: only above the cap, if the law fires)
@@ -808,10 +808,8 @@ export class Zip implements ZipControl {
 		// the law accepts that: computeRunPlan adopts it the same way), with the prompt Pi is about to append
 		const pending = pendingPrompt(e);
 		const entries = pending ? [...pre, pending] : pre;
-		const mode = this.cold ? "cold" : "warm";
 		const mk = (cutAt?: string) => {
-			const { o } = this.opts(ctx, !pending, mode, entries, this.pWarm, cutAt);
-			o.pastTtl = this.pastTtl;
+			const { o } = this.opts(ctx, !pending, entries, this.pWarm, this.pause, cutAt);
 			return { p: planContext(entries, o) };
 		};
 		const p = this.adopted(mk(), mk, "native", this.avail(branch)).p;
@@ -918,19 +916,18 @@ export class Zip implements ZipControl {
 	}
 
 	/** The return a prompt typed now would be, judged as beginRun judges it (learned survival, the request's tier). */
-	private judgeNow(ctx: Any, branch: Any[]): { cold: boolean; pWarm: number; pastTtl: boolean } {
+	private judgeNow(ctx: Any, branch: Any[]): { cold: boolean; pWarm: number; pause: boolean } {
 		this.loadEnt(modelKey(ctx.model));
 		const d = clock(branch, { model: ctx.model, ent: this.ent, tier: this.tier(ctx.model) }, Date.now(), { reqMs: this.lastReqMs, modelKey: this.lastModelKey });
-		return { cold: d.cold, pWarm: d.pWarm, pastTtl: d.pastTtl };
+		return { cold: d.cold, pWarm: d.pWarm, pause: d.pause };
 	}
 
 	/** The plan a warm prompt typed now would make, when it summarises (null: it makes none, or no edit at all right after an edited
-	 *  request), with the P(warm) and pastTtl that prompt's run plan will use. */
-	private warmCutNow(ctx: Any, entries: Any[], now: { pWarm: number; pastTtl: boolean }): PlanResult | null {
+	 *  request), with the P(warm) and pause that prompt's run plan will use. */
+	private warmCutNow(ctx: Any, entries: Any[], now: { pWarm: number; pause: boolean }): PlanResult | null {
 		if (this.justEdited) return null;
 		const mk = (cutAt?: string) => {
-			const { o } = this.opts(ctx, true, "warm", entries, now.pWarm, cutAt);
-			o.pastTtl = now.pastTtl;
+			const { o } = this.opts(ctx, true, entries, now.pWarm, now.pause, cutAt);
 			return { p: planContext(entries, o) };
 		};
 		const p = this.adopted(mk(), mk, "key", this.avail(this.branch(ctx))).p;
@@ -976,7 +973,7 @@ export class Zip implements ZipControl {
 	}
 
 	/** The user is typing a prompt: plan the return again on the session as it is now (a /model or /tree before it may have changed
-	 *  it), judged cold or warm as the prompt will judge it, with the P(warm) and pastTtl its own run plan will use, and, when that plan
+	 *  it), judged cold or warm as the prompt will judge it, with the P(warm) and pause its own run plan will use, and, when that plan
 	 *  has a cut, write the summary in the background, as the away timer (cold) or the end of the run (warm, rule A) would have. */
 	private startOnKey(ctx: Any) {
 		try {
@@ -991,8 +988,7 @@ export class Zip implements ZipControl {
 				this.ledger({ type: "key_start", key: w.firstKeptEntryId, warm: true });
 				return;
 			}
-			const { o } = this.opts(ctx, true, "cold", entries, now.pWarm);
-			o.pastTtl = now.pastTtl;
+			const { o } = this.opts(ctx, true, entries, now.pWarm, now.pause);
 			const p = planContext(entries, o);
 			if (!p || p.cutIdx === null) return;
 			this.awaySig = this.contextSig(ctx);
@@ -1156,8 +1152,8 @@ export class Zip implements ZipControl {
 		this.nativeRun = null;
 		this.foreignRun = false;
 		const d = decideRun({
-			cold: this.cold, pastTtl: this.pastTtl, justEdited: this.justEdited, nat, foreign, now, avail: this.avail(this.branch(ctx)),
-			opts: (entries, cutAt) => this.opts(ctx, false, this.cold ? "cold" : "warm", entries, this.pWarm, cutAt),
+			cold: this.cold, justEdited: this.justEdited, nat, foreign, now, avail: this.avail(this.branch(ctx)),
+			opts: (entries, cutAt) => this.opts(ctx, false, entries, this.pWarm, this.pause, cutAt),
 		});
 		// no warm edit on the request right after an edited one (no back-to-back warm rewrites); a summary Pi's compaction already put in
 		// the session (nativeSummary skips such a return, so only defensively) is never dropped here: the run plan below carries it
@@ -1197,7 +1193,7 @@ export class Zip implements ZipControl {
 		cut = r.cut;
 		this.runPlan = r.plan;
 		const { source, ctxBefore, ctxAfter } = r.plan;
-		this.ledger({ type: "cold_plan", trigger, source, folds: folds.length, summary: !!(cut ?? native), ...(p?.ahead ? { ahead: true } : {}), ...(native ? { via: "native", onPre } : {}), ...this.calOf(cal), ctxBefore: Math.round(ctxBefore), ctxAfter: Math.round(ctxAfter), ms: Math.round(foldMs), ...(cut ? { summaryMs: cut.ms, llmOk: cut.llmOk, waitedMs: Math.round(adopted ? this.bgWaitMs : cut.ms), ...this.usageOf(cut) } : {}) });
+		this.ledger({ type: "cold_plan", trigger, source, folds: folds.length, summary: !!(cut ?? native), ...(native ? { via: "native", onPre } : {}), ...this.calOf(cal), ctxBefore: Math.round(ctxBefore), ctxAfter: Math.round(ctxAfter), ms: Math.round(foldMs), ...(cut ? { summaryMs: cut.ms, llmOk: cut.llmOk, waitedMs: Math.round(adopted ? this.bgWaitMs : cut.ms), ...this.usageOf(cut) } : {}) });
 	}
 
 	/** Ledger form of a calibration; ctxBefore/ctxAfter next to it are already real (O + c x estimate). */
@@ -1232,10 +1228,9 @@ export class Zip implements ZipControl {
 			// the summary is needed whether the user comes back warm or not at all soon, so it is written now, not at 0.8 x TTL
 			const { p, cal, w, notes } = decideSettle({
 				justEdited: this.justEdited, avail: this.avail(this.branch(ctx)), entries,
-				cold: (cutAt) => this.opts(ctx, true, "cold", entries, undefined, cutAt), warm: (cutAt) => this.opts(ctx, true, "warm", entries, undefined, cutAt),
+				cold: (cutAt) => this.opts(ctx, true, entries, 0, true, cutAt), warm: (cutAt) => this.opts(ctx, true, entries, 1, false, cutAt),
 			});
 			for (const n of notes) this.ledger(n);
-			if (!p && !w) return undefined;
 			this.cancelTimer();
 			const cKey = p && p.cutIdx !== null ? p.firstKeptEntryId : null;
 			const wKey = w && w.cutIdx !== null ? w.firstKeptEntryId : null;
@@ -1243,11 +1238,11 @@ export class Zip implements ZipControl {
 			if (this.bg && this.bg.key !== cKey && this.bg.key !== wKey) this.discardBg("replaced");
 			const early = !!wKey && this.startBg(w!, ctx);
 			// the away timer, always: for a cold plan with a cut no summary covers yet it starts that summary; for one an early summary
-			// already covers it does nothing (startBg keeps it); for one without a cut it does nothing either. In every case, if Pi's own
-			// compaction or another extension's edit rewrites the context while the user is away, runAway plans again on the context as it
-			// is and drops a summary (an early one too) written for the old one
-			const scheduledMs = this.scheduleSummary((p ?? w)!, ctx);
-			this.ledger({ type: "settle_plan", folds: p?.folds.length ?? 0, summary: cKey !== null, ...(p?.ahead ? { ahead: true } : {}), timerMs: scheduledMs, ...(cKey ? { coldCut: cKey } : {}), ...(wKey ? { warmCut: wKey, early } : {}), ...this.calOf(cal), ctxBefore: Math.round(p?.ctxTokens ?? w?.ctxTokens ?? 0), ms: Math.round(performance.now() - t0) });
+			// already covers it does nothing (startBg keeps it); for one without a cut, or no plan at all (below the working view), it does
+			// nothing either. In every case, if Pi's own compaction or another extension's edit rewrites the context while the user is away,
+			// runAway plans again on the context as it is and drops a summary (an early one too) written for the old one
+			const scheduledMs = this.scheduleSummary(p ?? w, ctx);
+			this.ledger({ type: "settle_plan", folds: p?.folds.length ?? 0, summary: cKey !== null, timerMs: scheduledMs, ...(cKey ? { coldCut: cKey } : {}), ...(wKey ? { warmCut: wKey, early } : {}), ...this.calOf(cal), ctxBefore: Math.round(p?.ctxTokens ?? w?.ctxTokens ?? 0), ms: Math.round(performance.now() - t0) });
 			if (!p || (!p.folds.length && p.cutIdx === null)) return undefined;
 			// ids only: placeholders and summary text are recomputed (they are pure functions of the session), never stored a second time
 			const data = { policy: PRODUCT, ts: Date.now(), targets: p.folds.map((t) => t.entryId), cutKey: p.firstKeptEntryId };
@@ -1261,7 +1256,7 @@ export class Zip implements ZipControl {
 	/** Start the away-timer for a summary; returns the delay in ms (-1: `alive` was asked for and the cache is already dead, nothing is armed).
 	 *  `alive` (a resumed process): arm only while the last request's cache has not expired yet (now < last + TTL; the delay is 0 from the
 	 *  0.8 mark on, where the live process's timer would already have fired). unref'd: it never keeps the process alive. */
-	private scheduleSummary(p: PlanResult, ctx: Any, lastMs?: number, alive = false): number {
+	private scheduleSummary(p: PlanResult | null, ctx: Any, lastMs?: number, alive = false): number {
 		const ttl = ttlFor(ctx.model, this.branch(ctx), this.tier(ctx.model));
 		const last = lastMs ?? (this.lastReqMs || Date.now());
 		const warm = this.idleWarming() ? warmingDelayMs(ttl) : undefined;
@@ -1310,7 +1305,7 @@ export class Zip implements ZipControl {
 	}
 
 	// ---- Pi's own idle cache warming (research pi-tricks §3.3): observed, never answered ----------------------------------------
-	private awayPlan: { p: PlanResult; ctx: Any } | null = null; // a summary waiting for Pi's warming decision
+	private awayPlan: { p: PlanResult | null; ctx: Any } | null = null; // a summary (or none: a re-plan if the context changes) waiting for Pi's warming decision
 	/** Does Pi refresh the cache between runs by itself? (settings cacheWarming "idle"; the default "streaming" warms only during a run)
 	 *  Pi reads it from the global settings only (settings-manager getCacheWarmingMode: warming costs money), so a project-level "idle"
 	 *  in the merged settings warms nothing: the global file decides; only when it cannot be read do the merged settings. */
@@ -1367,18 +1362,18 @@ export class Zip implements ZipControl {
 		return undefined;
 	}
 
-	private async runAway(p0: PlanResult, ctx: Any) {
+	private async runAway(p0: PlanResult | null, ctx: Any) {
 		if (!this.active()) return;
 		let p = p0;
-		if (this.contextSig(ctx) === this.awaySig && p0.cutIdx === null) return; // nothing was planned and nothing changed
+		if (this.contextSig(ctx) === this.awaySig && (!p0 || p0.cutIdx === null)) return; // nothing was planned and nothing changed
 		if (this.contextSig(ctx) !== this.awaySig) {
 			// something rewrote the context since the plan was made (Pi's own compaction, another extension's edit): the summary prepared
 			// for the old plan would be discarded at the return (its cut is not this plan's). Plan again on the session as it is now.
 			try {
 				const entries = ((ctx.sessionManager.buildSessionProjection() as Any)?.entries ?? []) as Any[];
-				const { o } = this.opts(ctx, true, "cold", entries);
+				const { o } = this.opts(ctx, true, entries, 0, true);
 				const q = entries.length ? planContext(entries, o) : null;
-				this.ledger({ type: "away_replan", from: p0.firstKeptEntryId, to: q?.firstKeptEntryId ?? null });
+				this.ledger({ type: "away_replan", from: p0?.firstKeptEntryId ?? null, to: q?.firstKeptEntryId ?? null });
 				// a call started before (an early one, rule A) reads a context that no longer exists: never used, whatever its cut
 				this.discardBg("replaced");
 				if (!q || q.cutIdx === null) return;
@@ -1388,7 +1383,7 @@ export class Zip implements ZipControl {
 				return;
 			}
 		}
-		this.startBg(p, ctx); // keeps a summary for this very cut (an early one, say); ends any other call
+		if (p) this.startBg(p, ctx); // keeps a summary for this very cut (an early one, say); ends any other call
 	}
 
 	/** Write the summary for `p` in the background (its own abort signal: nothing is running, so the run's would be stale). Nothing
@@ -1473,13 +1468,20 @@ export class Zip implements ZipControl {
 			// the run has carried its plan since the first request: persist EXACTLY it, even when this turn failed (the prefix was sent and cached)
 			return this.commit(e, ctx, this.runPlan, o);
 		}
-		const d = decideTurnEnd({ failed, justEdited: this.justEdited, avail: this.avail(this.branch(ctx)), entries: e.context.contextEntries, opts: (cutAt) => this.opts(ctx, false, "warm", e.context.contextEntries, undefined, cutAt) });
+		// P(warm) in-run: the learned curve at the time since the newest response (a long tool call is an absence like any other)
+		const m = ctx?.model ?? this.model, branch = this.branch(ctx);
+		// a recall made in this run by a built-in tool on a recall file (file recall) is in the branch only: zip_recall's own hook
+		// marks its handles at once, a read, grep or bash of a recall file would otherwise be folded again at this turn_end (RC)
+		for (const h of recalledHandlesFromBranch(branch)) this.recalled.add(h);
+		const touch = Math.max(this.lastReqMs, msg?.stopReason === "error" ? 0 : Number(msg?.timestamp) || 0); // the response that ended this turn is the newest touch
+		const pIn = inRunClock(branch, { model: m, ent: this.entKey === modelKey(m) ? this.ent : undefined, tier: this.tier(m) }, Date.now(), { reqMs: touch, modelKey: this.lastModelKey }).pWarm;
+		const d = decideTurnEnd({ failed, justEdited: this.justEdited, pWarm: pIn, avail: this.avail(branch), entries: e.context.contextEntries, opts: (cutAt) => this.opts(ctx, false, e.context.contextEntries, pIn, false, cutAt) });
 		if (d.kind === "none") return undefined;
 		if (d.kind === "b2b") { // the request that just ended carried a fresh edit: no warm edit on the very next one (no back-to-back warm rewrites)
 			this.ledger({ type: "b2b_skip", where: "turn_end" });
 			return undefined;
 		}
-		// warm cache (in-run, P = 1): nothing, unless the context is above the cold cap and the law fires (I6, F10): then the warm plan, from the next request on
+		// nothing below the working view; above it the plan the law accepts at the in-run P (I6, F10), from the next request on
 		for (const n of d.notes) this.ledger(n);
 		if (d.o.trace?.length) this.lawLedger("turn_end", d.o);
 		const p = d.p;
@@ -1749,8 +1751,8 @@ export class Zip implements ZipControl {
 		const state = this.off ? "off" : this.conflict ? `paused ("${this.conflict}" also manages context; only the request guard is on)` : "on";
 		const key = modelKey(this.model), ttl = ttlFor(this.model, [], this.tier()), ent = loadStats().models[key];
 		const pr = lawPrices(ent?.cls, ttl >= 3_600_000);
-		const cache = !key ? "" : `\ncache ${key}: ${pr ? `${pr.cls} (from usage)` : "class unknown until the first response"}` +
-			`, ${pr ? `read ${+pr.r.toFixed(4)} / write ${+pr.w.toFixed(4)} / output ${+pr.out.toFixed(4)} x input (class ratios)` : "no prices (legacy rule)"}` +
+		const cache = !key ? "" : `\ncache ${key}: ${pr.src === "class" ? `${pr.cls} (from usage)` : "class unknown until the first response (explicit ratios meanwhile)"}` +
+			`, read ${+pr.r.toFixed(4)} / write ${+pr.w.toFixed(4)} / output ${+pr.out.toFixed(4)} x input (class ratios)` +
 			`, ${describe(ent, ttl / 1000)}, growth ${(this.g / 1000).toFixed(1)}K/request`;
 		return `${PRODUCT}: ${state}, cache TTL ${Math.round(ttl / 1000)} s, ${this.quiet ? "notices off, " : ""}${this.sessionTotals(ctx)}${cache}`;
 	}

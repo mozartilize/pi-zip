@@ -4,7 +4,7 @@ import { readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { lawPrices, loadStats, MIN_EXPECT, pWarm, record, sample, type Prices } from "../src/learn.ts";
-import { compactionRoom, editAllowed, lawTerms, legacyValve, planContext, settings, sizeOf, UNIT, untouchedEst, type Law } from "../src/plan.ts";
+import { buildBlocks, compactionRoom, editAllowed, lawTerms, planContext, settings, sizeOf, UNIT, untouchedEst, type Law } from "../src/plan.ts";
 import { Zip } from "../src/run.ts";
 import { A, AX, fakeCtx, fakePi, flat, longTurn, project, R, U, type Any } from "./helpers.ts";
 
@@ -40,11 +40,10 @@ describe("verdict section 8 tests", () => {
 		expect(settings().inturnAge).toBe(60);
 		const s = longTurn(56, { chars: 11_500 }); // ~1.9K tokens per output (+ ~60 of tool-call id and framing per round), ~110K in one user turn
 		const o = { cwd: ".", promptPending: false, model: { contextWindow: 1_000_000 }, law: { pr: ANTH, g: 2_400, pWarm: 1 } as Law };
-		const ctx = planContext(s, { ...o, mode: "cold" })!;
-		expect(Math.abs(ctx.ctxTokens - 109_500)).toBeLessThan(2_000);
-		expect(ctx.folds).toHaveLength(0);
-		expect(planContext(s, { ...o, mode: "warm" })).toBeNull();
-		expect(planContext(s, { ...o, mode: "warm", inturnAge: 20 })!.folds.length).toBeGreaterThan(0); // the old age 20 did fold here
+		expect(Math.abs(buildBlocks(s).reduce((a, b) => a + b.tokens, 0) - 109_500)).toBeLessThan(2_000);
+		expect(planContext(s, { ...o, law: { ...o.law, pWarm: 0 } })).toBeNull(); // nothing is eligible, at any P
+		expect(planContext(s, o)).toBeNull();
+		expect(planContext(s, { ...o, inturnAge: 20 })!.folds.length).toBeGreaterThan(0); // the old age 20 did fold here
 	});
 
 	test("5. summary step at ctx 100K, Anthropic 5 min, S = 0.1 X, shared call: K <= 0 iff dS >= 16.8K (17.7K with 500 instruction tokens)", () => {
@@ -61,9 +60,10 @@ describe("verdict section 8 tests", () => {
 		expect(ok(10_000)).toBe(false);
 	});
 
-	test("6. class unknown (no response yet) -> the legacy rule; a known class always uses the class ratios", () => {
-		expect(lawPrices(undefined, false)).toBeNull();
-		for (const [B, A, room] of [[200_000, 90_000, null], [183_000, 131_000, null], [180_000, 170_000, 175_424]] as const) expect(editAllowed(B, A, 1, room, null, 2_400)).toBe(legacyValve(B, A, room));
+	test("6. class unknown (no response yet) -> the explicit ratios, marked as a default; a known class always uses the class ratios", () => {
+		expect(lawPrices(undefined, false)).toEqual({ r: 0.1, w: 1.25, input: 1, out: 5, cls: "explicit", src: "default" });
+		expect(lawPrices(undefined, true)).toMatchObject({ w: 2, src: "default" });
+		expect(editAllowed(200_000, 90_000, 0, null, null, 2_400)).toBe(false); // without prices the law allows nothing
 		expect(lawPrices("explicit", false)).toEqual({ r: 0.1, w: 1.25, input: 1, out: 5, cls: "explicit", src: "class" });
 		expect(lawPrices("explicit", true)).toEqual({ r: 0.1, w: 2, input: 1, out: 5, cls: "explicit", src: "class" });
 		expect(lawPrices("automatic", false)).toEqual({ r: 0.2, w: 1, input: 1, out: 4, cls: "automatic", src: "class" });
@@ -95,7 +95,7 @@ describe("rewrite base T: the law accepts any T <= A; the planner passes T = A",
 		const outs = (n: number) => Array.from({ length: n }, (_, t) => [U(`u${t}`, `q${t}`), A(`a${t}`, [`c${t}`]), R(`r${t}`, `c${t}`, 12_000), A(`z${t}`)]).flat();
 		const tail = [U("uP", "prev"), A("aP"), U("uN", "now")];
 		const prose = [U("up", "talk"), AX("x0", 160_000)]; // ~40K tokens nothing can fold
-		const o = { mode: "warm" as const, cwd: ".", promptPending: false, coldCap: 45_000, model: { contextWindow: 1_000_000 }, law: { pr: ANTH, g: 2_400, pWarm: 1 }, trace: [] as Any[] };
+		const o = { cwd: ".", promptPending: false, coldCap: 45_000, model: { contextWindow: 1_000_000 }, law: { pr: ANTH, g: 2_400, pWarm: 1 }, trace: [] as Any[] };
 		expect(planContext([...prose, ...outs(10), ...tail], o)).toBeNull(); // folds start after the prose: the suffix ~3K would fire, T = A does not
 		const t = o.trace.at(-1);
 		expect(t.T).toBe(t.A);
@@ -200,35 +200,37 @@ describe("final model (research round 5, final-model.md section 8 tests 1-5)", (
 	test("1. a big rereadable read of the previous user turn: a warm plan keeps it, the same plan cold (P = 0) folds it", () => {
 		const older = Array.from({ length: 10 }, (_, t) => [U(`u${t}`, `q${t}`), A(`a${t}`, [`c${t}`]), R(`r${t}`, `c${t}`, 9_000), A(`z${t}`)]).flat();
 		const s = [...older, U("uP", "prev"), A("aP", ["cP"]), R("rP", "cP", 40_000), A("zP"), U("uN", "now")];
-		const cold = planContext(s, { ...base, coldCap: 1_000, mode: "cold" })!;
+		const cold = planContext(s, { ...base, coldCap: 1_000, pause: true })!;
 		expect(ids(cold)).toContain("rP");
 		expect(cold.folds.find((f) => f.entryId === "rP")!.trig).toBe("cold(relax)");
-		const warm = planContext(s, { ...base, coldCap: 1_000, mode: "warm", law: { pr: null, g: 2_400, pWarm: 1 } })!;
-		expect(warm).not.toBeNull(); // the older turns still fold (legacy rule: > 50% of the context)
+		const warm = planContext(s, { ...base, coldCap: 1_000, law: { pr: lawPrices("explicit", false), g: 500, pWarm: 1 } })!;
+		expect(warm).not.toBeNull(); // the older turns still fold (the law: a big saving at a slow growth)
 		expect(ids(warm)).not.toContain("rP");
 		expect(warm.folds).toHaveLength(10);
+		// the pause decides, not P: a return believed cold that comes within the cache lifetime keeps the turn too
+		expect(ids(planContext(s, { ...base, coldCap: 1_000, law: { pr: lawPrices("explicit", false), g: 2_400, pWarm: 0 } })!)).not.toContain("rP");
 	});
 
-	test("1b. the same warm plan at a return after the declared TTL (pastTtl) folds it: the TTL rule's eligibility, the law's timing", () => {
+	test("1b. the same warm plan at a return after a pause folds it: the pause decides the eligibility, the law the timing", () => {
 		const older = Array.from({ length: 10 }, (_, t) => [U(`u${t}`, `q${t}`), A(`a${t}`, [`c${t}`]), R(`r${t}`, `c${t}`, 9_000), A(`z${t}`)]).flat();
 		const s = [...older, U("uP", "prev"), A("aP", ["cP"]), R("rP", "cP", 40_000), A("zP"), U("uN", "now")];
-		const warm = planContext(s, { ...base, coldCap: 1_000, mode: "warm", pastTtl: true, law: { pr: null, g: 2_400, pWarm: 1 } })!;
+		const warm = planContext(s, { ...base, coldCap: 1_000, pause: true, law: { pr: lawPrices("explicit", false), g: 500, pWarm: 1 } })!;
 		expect(warm.folds.find((f) => f.entryId === "rP")!.trig).toBe("valve(relax)");
 		expect(warm.folds).toHaveLength(11);
-		// the law still decides: a warm explicit-class plan whose saving cannot pay the rewrite stays null with or without pastTtl
+		// the law still decides: a warm explicit-class plan whose saving cannot pay the rewrite stays null with or without a pause
 		const small = [U("uP", "prev"), A("aP", ["cP"]), R("rP", "cP", 4_000), A("zP"), U("uN", "now"), AX("xN", 400_000)]; // ~100K the plan cannot touch
 		const law = { pr: lawPrices("explicit", false), g: 2_400, pWarm: 1 };
-		for (const pastTtl of [false, true]) expect(planContext(small, { ...base, coldCap: 1_000, mode: "warm", pastTtl, law })).toBeNull();
-		expect(ids(planContext(small, { ...base, coldCap: 1_000, mode: "cold", law: { ...law, pWarm: 0 } })!)).toEqual(["rP"]); // cold: always
+		for (const pause of [false, true]) expect(planContext(small, { ...base, coldCap: 1_000, pause, law })).toBeNull();
+		expect(ids(planContext(small, { ...base, coldCap: 1_000, pause: true, law: { ...law, pWarm: 0 } })!)).toEqual(["rP"]); // a gone cache: always
 		// never the latest user turn's own outputs, never a non-rereadable output of the previous turn
 		const own = [...older, U("uP", "prev"), A("aP"), U("uN", "now"), A("aN", ["cN"]), R("rN", "cN", 40_000), A("zN")];
-		expect(ids(planContext(own, { ...base, coldCap: 1_000, mode: "warm", pastTtl: true, law: { pr: null, g: 2_400, pWarm: 1 } })!)).not.toContain("rN");
+		expect(ids(planContext(own, { ...base, coldCap: 1_000, pause: true, law: { pr: lawPrices("explicit", false), g: 500, pWarm: 1 } })!)).not.toContain("rN");
 	});
 
 	test("observability: on an automatic cache no fold starts inside the first MIN_EXPECT real tokens, so the next sample is uncensored", () => {
 		const older = Array.from({ length: 10 }, (_, t) => [U(`u${t}`, `q${t}`), A(`a${t}`, [`c${t}`]), R(`r${t}`, `c${t}`, 9_000), A(`z${t}`)]).flat();
 		const s = [...older, U("uP", "prev"), A("zP"), U("uN", "now")];
-		const o = { ...base, scale: { ...UNIT, O: 1_500, c: 1.5 }, coldCap: 1_000, mode: "cold" as const };
+		const o = { ...base, scale: { ...UNIT, O: 1_500, c: 1.5 }, coldCap: 1_000 };
 		const plan = (cls?: "automatic" | "explicit") => planContext(s, { ...o, law: { pr: lawPrices(cls, false), g: 2_400, pWarm: 0 } })!;
 		const auto = plan("automatic");
 		const head = sizeOf(o.scale, untouchedEst(auto.blocks, auto.folds, false)); // real tokens: O + c x the untouched content
@@ -239,7 +241,7 @@ describe("final model (research round 5, final-model.md section 8 tests 1-5)", (
 		// the next response: the head read = alive, not read = dead (an uncensored sample either way)
 		expect(sample(head, head, 30_000, true, "automatic")).toBe(true);
 		expect(sample(head, 1_792, 30_000, true, "automatic")).toBe(false);
-		for (const p of [plan("explicit"), plan()]) expect(p.folds).toHaveLength(10); // breakpoint caches and the legacy rule: unchanged
+		for (const p of [plan("explicit"), plan()]) expect(p.folds).toHaveLength(10); // breakpoint caches, and a class not learned yet (explicit ratios): unchanged
 	});
 
 	test("2. a protected-turn test output (not rereadable) folds at age 60, not at age 59", () => {
@@ -251,14 +253,14 @@ describe("final model (research round 5, final-model.md section 8 tests 1-5)", (
 		expect(ids(p)).toEqual(["r1"]);
 	});
 
-	test("3. T = A: with A ~ 40K, g = 2.4K and the explicit class ratios the first warm fire is at D ~ sqrt(2 g kappa A) ~ 47K, not ~ 30K", () => {
+	test("3. T = A: with A ~ 40K, g = 2.4K and the explicit class ratios the first warm fire is at D ~ sqrt(2 g kappa A), not ~ 30K", () => {
 		const pr = lawPrices("explicit", false)!;
 		const prose = [U("up", "talk"), AX("x0", 112_000)]; // ~28K tokens nothing can fold, BEFORE the outputs: the suffix after the first fold is small
 		const outs = (n: number) => Array.from({ length: n }, (_, t) => [U(`u${t}`, `q${t}`), A(`a${t}`, [`c${t}`]), R(`r${t}`, `c${t}`, 4_000), A(`z${t}`)]).flat();
 		const tail = [U("uP", "prev"), A("aP"), U("uN", "now")];
 		let first: Any = null, before: Any = null;
 		for (let n = 20; n <= 80 && !first; n++) {
-			const o = { ...base, mode: "warm" as const, coldCap: 45_000, law: { pr, g: 2_400, pWarm: 1 }, trace: [] as Any[] };
+			const o = { ...base, coldCap: 45_000, law: { pr, g: 2_400, pWarm: 1 }, trace: [] as Any[] };
 			const p = planContext([...prose, ...outs(n), ...tail], o);
 			const t = o.trace.at(-1);
 			if (p) first = t; else before = t;
@@ -268,8 +270,8 @@ describe("final model (research round 5, final-model.md section 8 tests 1-5)", (
 		const eoq = Math.sqrt(2 * 2_400 * 11.5 * first.A);
 		expect(first.B - first.A).toBeGreaterThanOrEqual(eoq);
 		expect(before.B - before.A).toBeLessThan(eoq);
-		expect(Math.abs(first.B - first.A - 47_000)).toBeLessThan(3_000);
-		expect(first.Tsuf).toBeLessThan(0.3 * first.A); // the suffix rule would have fired long before:
+		expect(Math.abs(first.B - first.A - eoq)).toBeLessThan(3_000); // ~50K: the folds stop at the working view (45K here), not ~30K
+		expect(first.Tsuf).toBeLessThan(0.4 * first.A); // the suffix rule would have fired long before:
 		expect(editAllowed(before.B, before.A, 1, null, pr, 2_400, 0, before.Tsuf)).toBe(true);
 	});
 

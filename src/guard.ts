@@ -1,5 +1,5 @@
 // Guard (F13, I5): validate an edit set before committing it, and repair orphan tool results in the outgoing payload.
-import { finalAnswerIdx, isCutBlock, RELAX_PREV_TURN, settings, type Block } from "./plan.ts";
+import { isCutBlock, settings, type Block } from "./plan.ts";
 import type { Any } from "./util.ts";
 
 const PROTECT_USER_TURNS = 2;
@@ -8,9 +8,7 @@ export interface EditSet {
 	folds: Map<number, string>; // block idx -> placeholder text
 	cut: number | null; // summarise blocks[0..cut-1]; blocks[cut] becomes firstKeptEntryId
 	recover?: Map<number, string | undefined>; // block idx -> "rereadable" | "nonrereadable" (needed for folds in the previous user turn)
-	relax?: boolean; // default RELAX_PREV_TURN
 	inturnAge?: number; // default settings().inturnAge: an output (any class) at least this many assistant requests old may fold in a protected turn (0 = never)
-	ahead?: boolean; // a lookahead cut (plan.ts LOOKAHEAD): it may lie inside the previous user turn, never past that turn's final answer
 }
 
 /**
@@ -48,7 +46,6 @@ function pairingIssues(blocks: Block[], from: number): Set<string> {
 
 /** null = legal. Otherwise the reason: bad targets, edits inside the protected user turns, or a tool_use/tool_result pairing the edits themselves would break. */
 export function validateEdits(blocks: Block[], plan: EditSet, userTurns: number): string | null {
-	const relax = plan.relax ?? RELAX_PREV_TURN;
 	const inturnAge = plan.inturnAge ?? settings().inturnAge;
 	const limit = blocks.findIndex((b) => b.userTurn >= userTurns - PROTECT_USER_TURNS + 1);
 	for (const [i, text] of plan.folds) {
@@ -58,13 +55,13 @@ export function validateEdits(blocks: Block[], plan: EditSet, userTurns: number)
 		const rereadable = plan.recover?.get(i) === "rereadable";
 		const aged = inturnAge > 0 && b.age >= inturnAge; // old enough: allowed anywhere, any class (same rule as the planner)
 		if (b.userTurn >= userTurns && !aged) return `fold target ${i} is inside the latest user turn`;
-		if (b.userTurn === userTurns - 1 && !aged && (!relax || !rereadable)) return `fold target ${i} is in the previous user turn and not re-readable`;
+		if (b.userTurn === userTurns - 1 && !aged && !rereadable) return `fold target ${i} is in the previous user turn and not re-readable`;
 		if (!b.entryId) return `fold target ${i} has no entry id`;
 		if (typeof text !== "string" || !text.trim()) return `empty placeholder for ${i}`;
 	}
 	if (plan.cut !== null) {
 		if (plan.cut < 1 || plan.cut >= blocks.length) return `bad cut ${plan.cut}`;
-		if (limit >= 0 && plan.cut > limit && !(plan.ahead && plan.cut <= finalAnswerIdx(blocks, userTurns - 1))) return `cut ${plan.cut} inside the last ${PROTECT_USER_TURNS} user turns`;
+		if (limit >= 0 && plan.cut > limit) return `cut ${plan.cut} inside the last ${PROTECT_USER_TURNS} user turns`;
 		const kb = blocks[plan.cut];
 		if (!isCutBlock(kb)) return `cut ${plan.cut} is not at a user, assistant or custom message`;
 		// only what the cut itself would create is our problem; a session that was already odd stays as odd as it was

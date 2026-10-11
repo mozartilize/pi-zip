@@ -1,6 +1,6 @@
 // The pure decision core (src/core.ts): view, clock, law, plan and decide as functions of (branch, Λ, now).
 import { describe, expect, test } from "bun:test";
-import { checkEdits, clock, coldReturnAfter, decideRun, decideSettle, decideTurnEnd, adopt, artifactsOf, grow, headOf, lastRegrow, lawOf, planOpts, readyOf, ruleB, unusedOf, runPlanOf, scaleOf, summarizedSince, valvePlanOf, type Env, type Learned } from "../src/core.ts";
+import { checkEdits, clock, coldReturnAfter, inRunClock, decideRun, decideSettle, decideTurnEnd, adopt, artifactsOf, grow, headOf, lastRegrow, lawOf, planOpts, readyOf, ruleB, unusedOf, runPlanOf, scaleOf, summarizedSince, valvePlanOf, type Env, type Learned } from "../src/core.ts";
 import { planContext, UNIT, type PlanResult } from "../src/plan.ts";
 import { replayGrowth } from "../src/state.ts";
 import { A, AX, R, U, type Any } from "./helpers.ts";
@@ -21,20 +21,27 @@ describe("core: view", () => {
 		expect(scaleOf(big, [], { text: "sys", tools: [] }, "p/m")).toEqual(scaleOf(big, [], { text: "sys", tools: [] }, "p/m"));
 	});
 	test("checkEdits: a cut whose first kept entry left the projection is refused; folds of entries that left are ignored", () => {
-		const p = planContext(big, planOpts(big, [], env(), lam(), false, "cold").o)!;
+		const p = planContext(big, planOpts(big, [], env(), lam(), false, 0, true).o)!;
 		expect(checkEdits(p.blocks, p.userTurns, p.folds, { firstKeptEntryId: "gone" } as Any)).toContain("not in the projection");
 		expect(checkEdits(p.blocks, p.userTurns, [...p.folds, { ...p.folds[0], entryId: "gone" }], null)).toBeNull();
 	});
 });
 
 describe("core: clock", () => {
-	test("no touch: warm at P = 1; a model switch: cold at P = 0; a gap past the TTL: cold and past the TTL", () => {
+	test("no touch: P = 0, no pause; a model switch: P = 0 and a pause; a gap past the TTL: cold and a pause", () => {
 		const l = { model: MODEL };
-		expect(clock([], l, T0)).toMatchObject({ cold: false, pWarm: 1, src: "no prior request" });
+		expect(clock([], l, T0)).toMatchObject({ cold: true, pWarm: 0, pause: false, src: "no prior request" });
 		const br = [msg("u1", "user", T0), asst("a1", T0 + 1000)];
-		expect(clock(br, l, T0 + 2000, { reqMs: 0, modelKey: "p/other" })).toMatchObject({ cold: true, pWarm: 0, src: "model switch" });
-		expect(clock(br, l, T0 + 60_000)).toMatchObject({ cold: false, pastTtl: false });
-		expect(clock(br, l, T0 + 1000 + 301_000)).toMatchObject({ cold: true, pastTtl: true });
+		expect(clock(br, l, T0 + 2000, { reqMs: 0, modelKey: "p/other" })).toMatchObject({ cold: true, pWarm: 0, pause: true, src: "model switch" });
+		expect(clock(br, l, T0 + 60_000)).toMatchObject({ cold: false, pause: false });
+		expect(clock(br, l, T0 + 1000 + 301_000)).toMatchObject({ cold: true, pause: true });
+	});
+	test("inRunClock: the gap runs from the newest response, not from the tool results after it; never a pause", () => {
+		const l = { model: MODEL };
+		const br = [msg("u1", "user", T0), asst("a1", T0 + 1000), msg("t1", "toolResult", T0 + 400_000)];
+		expect(clock(br, l, T0 + 401_000)).toMatchObject({ cold: false, pause: false }); // the tool result counts as a touch for a prompt
+		expect(inRunClock(br, l, T0 + 401_000, { reqMs: T0 + 1000, modelKey: "p/m" })).toMatchObject({ cold: true, pWarm: 0, pause: false });
+		expect(inRunClock(br, l, T0 + 2000, { reqMs: T0 + 1000, modelKey: "p/m" })).toMatchObject({ cold: false, pWarm: 1, pause: false });
 	});
 	test("learned survival decides, not the declared TTL: a cache read in full at 600 s is warm past 300 s", () => {
 		const bins: Record<string, [number, number]> = {};
@@ -42,7 +49,7 @@ describe("core: clock", () => {
 		bins[10] = [0, 8];
 		const br = [msg("u1", "user", T0), asst("a1", T0 + 1000)];
 		const c = clock(br, { model: MODEL, ent: { cls: "explicit", bins, n: 64 } }, T0 + 1000 + 400_000);
-		expect(c.pastTtl).toBe(true);
+		expect(c.pause).toBe(true);
 		expect(c.cold).toBe(false);
 	});
 	test("coldReturnAfter / summarizedSince: a summary stays this warm stretch's until a return the clock judges cold", () => {
@@ -72,26 +79,26 @@ describe("core: clock", () => {
 });
 
 describe("core: law", () => {
-	test("lawOf: class prices of Λ's entry, the 1-hour premium by tier, g and P passed through; no class, no prices", () => {
+	test("lawOf: class prices of Λ's entry, the 1-hour premium by tier, g and P passed through; no class yet: the explicit ratios", () => {
 		const short = lawOf([], lam({ g: 1234 }), 0.7), long = lawOf([], lam({ tier: "long" }), 0.7);
 		expect(short).toMatchObject({ g: 1234, pWarm: 0.7 });
 		expect(short.pr?.cls).toBe("explicit");
 		expect(long.pr!.w).toBeGreaterThan(short.pr!.w);
-		expect(lawOf([], lam({ ent: undefined }), 1).pr).toBeNull();
+		expect(lawOf([], lam({ ent: undefined }), 1).pr).toEqual({ ...short.pr, src: "default" });
 	});
 });
 
 describe("core: plan", () => {
-	test("planOpts: P defaults to 0 cold / 1 warm; noSummary and regrowAt only for a warm plan after a summary; cutAt only when asked", () => {
-		expect(planOpts(big, [], env(), lam(), true, "cold").o.law!.pWarm).toBe(0);
-		expect(planOpts(big, [], env(), lam(), true, "warm").o.law!.pWarm).toBe(1);
+	test("planOpts: P goes into the law only, pause as given; noSummary and regrowAt only at P >= 0.5 after a summary; cutAt only when asked", () => {
+		expect(planOpts(big, [], env(), lam(), true, 0.3, true).o).toMatchObject({ pause: true, law: { pWarm: 0.3 } });
+		expect(planOpts(big, [], env(), lam(), true, 1, false).o).toMatchObject({ pause: false, law: { pWarm: 1 } });
 		const after = lam({ summarizedWarm: true, summaryRegrow: 9999 });
-		expect(planOpts(big, [], env(), after, false, "cold").o).toMatchObject({ noSummary: false });
-		expect(planOpts(big, [], env(), after, false, "cold").o.regrowAt).toBeUndefined();
-		expect(planOpts(big, [], env(), after, false, "warm").o).toMatchObject({ noSummary: true, regrowAt: 9999 });
-		expect("cutAt" in planOpts(big, [], env(), lam(), false, "warm").o).toBe(false);
-		expect(planOpts(big, [], env(), lam(), false, "warm", 1, "u2").o.cutAt).toBe("u2");
-		expect(planOpts(big, [], env({ rereadOnly: true }), lam(), false, "cold").o.rereadOnly).toBe(true);
+		expect(planOpts(big, [], env(), after, false, 0.49, true).o).toMatchObject({ noSummary: false });
+		expect(planOpts(big, [], env(), after, false, 0, true).o.regrowAt).toBeUndefined();
+		expect(planOpts(big, [], env(), after, false, 0.5, false).o).toMatchObject({ noSummary: true, regrowAt: 9999 });
+		expect("cutAt" in planOpts(big, [], env(), lam(), false, 1, false).o).toBe(false);
+		expect(planOpts(big, [], env(), lam(), false, 1, false, "u2").o.cutAt).toBe("u2");
+		expect(planOpts(big, [], env({ rereadOnly: true }), lam(), false, 0, true).o.rereadOnly).toBe(true);
 	});
 	test("adopt: nothing available, no cut or the same cut keep the first plan; the deepest summary not deeper than the cut is taken if the plan for it cuts there", () => {
 		const blocks = ["s", "a", "b", "c", "d"].map((entryId) => ({ entryId }));
@@ -133,36 +140,36 @@ describe("core: decide", () => {
 		expect(ruleB(plan({}), true, [{ key: "other", running: false }])).toBe("start");
 		expect(ruleB(plan({}), true, [])).toBe("start");
 	});
-	const opts = (l: Learned, mode: "cold" | "warm", p: number) => (entries: Any[], cutAt?: string) => planOpts(entries, [], env(), l, false, mode, p, cutAt);
+	const opts = (l: Learned, p: number, pause: boolean) => (entries: Any[], cutAt?: string) => planOpts(entries, [], env(), l, false, p, pause, cutAt);
 	test("decideRun: b2b only for a warm return right after an edit without a native summary; a cold return plans on the session", () => {
 		const l = lam({ justEdited: true });
-		expect(decideRun({ cold: false, pastTtl: false, justEdited: true, nat: null, foreign: false, now: big, avail: [], opts: opts(l, "warm", 1) }).kind).toBe("b2b");
-		const d = decideRun({ cold: true, pastTtl: true, justEdited: true, nat: null, foreign: false, now: big, avail: [], opts: opts(l, "cold", 0) });
+		expect(decideRun({ cold: false, justEdited: true, nat: null, foreign: false, now: big, avail: [], opts: opts(l, 1, false) }).kind).toBe("b2b");
+		const d = decideRun({ cold: true, justEdited: true, nat: null, foreign: false, now: big, avail: [], opts: opts(l, 0, true) });
 		expect(d.kind).toBe("plan");
 		if (d.kind !== "plan") return;
-		expect(d.o.pastTtl).toBe(true);
+		expect(d.o.pause).toBe(true);
 		expect(d.p?.cutIdx).not.toBeNull();
 		expect(d.p!.folds.length).toBeGreaterThan(0);
 		expect(d.onPre).toBe(false);
 		expect(d.notes).toEqual([]);
 		// pure: the same inputs give the same decision
-		const again = decideRun({ cold: true, pastTtl: true, justEdited: true, nat: null, foreign: false, now: big, avail: [], opts: opts(l, "cold", 0) });
+		const again = decideRun({ cold: true, justEdited: true, nat: null, foreign: false, now: big, avail: [], opts: opts(l, 0, true) });
 		expect(again.kind === "plan" && again.p?.firstKeptEntryId).toBe(d.p!.firstKeptEntryId);
 	});
 	test("decideRun: another extension's compaction just went in: folds only (no summary)", () => {
-		const d = decideRun({ cold: true, pastTtl: true, justEdited: false, nat: null, foreign: true, now: big, avail: [], opts: opts(lam(), "cold", 0) });
+		const d = decideRun({ cold: true, justEdited: false, nat: null, foreign: true, now: big, avail: [], opts: opts(lam(), 0, true) });
 		expect(d.kind === "plan" && d.o.noSummary).toBe(true);
 		expect(d.kind === "plan" && d.p?.cutIdx).toBeNull();
 	});
 	test("decideRun: a native summary whose cut the plan does not reach: the session as it is, with a note", () => {
-		const d = decideRun({ cold: false, pastTtl: false, justEdited: true, nat: { key: "nowhere", pre: big, entryId: "c9" }, foreign: false, now: small, avail: [], opts: opts(lam(), "warm", 1) });
+		const d = decideRun({ cold: false, justEdited: true, nat: { key: "nowhere", pre: big, entryId: "c9" }, foreign: false, now: small, avail: [], opts: opts(lam(), 1, false) });
 		expect(d.kind).toBe("plan");
 		if (d.kind !== "plan") return;
 		expect(d.onPre).toBe(false);
 		expect(d.notes).toEqual([{ type: "native_mismatch", planned: d.p?.firstKeptEntryId ?? null, compacted: "nowhere" }]);
 	});
 	test("runPlanOf: source settle / runstart / valve; the guard drops a cut that left the projection; sizes count the summary", () => {
-		const d = decideRun({ cold: true, pastTtl: true, justEdited: false, nat: null, foreign: false, now: big, avail: [], opts: opts(lam(), "cold", 0) });
+		const d = decideRun({ cold: true, justEdited: false, nat: null, foreign: false, now: big, avail: [], opts: opts(lam(), 0, true) });
 		if (d.kind !== "plan" || !d.p) throw new Error("no plan");
 		const base = { p: d.p, cal: d.cal, cold: true, onPre: false, native: null, nat: null, folds: d.p.folds, cut: null, adopted: false, settleIds: [] as string[], ms: 1, bgWaitMs: 0 };
 		expect(runPlanOf(base).plan.source).toBe("runstart");
@@ -178,22 +185,23 @@ describe("core: decide", () => {
 		expect(gone.drop).toMatchObject({ type: "guard_drop", where: "run_plan", summary: true });
 		expect(gone.folds).toEqual(d.p.folds); // the folds alone pass
 	});
-	test("decideTurnEnd: none after a failed turn, b2b after an edited request, a warm plan only when it changes something", () => {
-		const o = (cutAt?: string) => planOpts(small, [], env(), lam(), false, "warm", 1, cutAt);
-		expect(decideTurnEnd({ failed: true, justEdited: false, avail: [], entries: small, opts: o }).kind).toBe("none");
-		expect(decideTurnEnd({ failed: false, justEdited: true, avail: [], entries: small, opts: o }).kind).toBe("b2b");
-		const d = decideTurnEnd({ failed: false, justEdited: false, avail: [], entries: small, opts: o });
+	test("decideTurnEnd: none after a failed turn, b2b after an edited request while warm, a plan only when it changes something", () => {
+		const o = (cutAt?: string) => planOpts(small, [], env(), lam(), false, 1, false, cutAt);
+		expect(decideTurnEnd({ failed: true, justEdited: false, pWarm: 1, avail: [], entries: small, opts: o }).kind).toBe("none");
+		expect(decideTurnEnd({ failed: false, justEdited: true, pWarm: 1, avail: [], entries: small, opts: o }).kind).toBe("b2b");
+		expect(decideTurnEnd({ failed: false, justEdited: true, pWarm: 0.2, avail: [], entries: small, opts: o }).kind).toBe("plan"); // a long tool call: the cache is believed gone
+		const d = decideTurnEnd({ failed: false, justEdited: false, pWarm: 1, avail: [], entries: small, opts: o });
 		expect(d.kind === "plan" && d.p).toBeNull();
 	});
 	test("valvePlanOf: a valve plan's sizes and the wait of its summary (adopted: the background wait)", () => {
-		const p = planContext(big, planOpts(big, [], env(), lam(), false, "cold").o)!;
+		const p = planContext(big, planOpts(big, [], env(), lam(), false, 0, true).o)!;
 		const cut = { prefixTokens: 1000, summaryTokens: 100, ms: 7 } as Any;
 		expect(valvePlanOf(p, null, false, 0, 1)).toMatchObject({ source: "valve", cut: null, ctxAfter: p.ctxAfterFolds, persisted: false });
 		expect(valvePlanOf(p, cut, true, 42, 1)).toMatchObject({ waitMs: 42, ready: "background" });
 		expect(valvePlanOf(p, cut, false, 42, 1).waitMs).toBe(7);
 	});
 	test("decideSettle: the cold plan always; the warm plan unless the newest request carried an edit", () => {
-		const x = (justEdited: boolean) => decideSettle({ justEdited, avail: [], entries: big, cold: () => planOpts(big, [], env(), lam(), true, "cold"), warm: (cutAt) => planOpts(big, [], env(), lam(), true, "warm", undefined, cutAt) });
+		const x = (justEdited: boolean) => decideSettle({ justEdited, avail: [], entries: big, cold: () => planOpts(big, [], env(), lam(), true, 0, true), warm: (cutAt) => planOpts(big, [], env(), lam(), true, 1, false, cutAt) });
 		expect(x(true).p).not.toBeNull();
 		expect(x(true).w).toBeNull();
 		expect(x(false).w).not.toBeNull();

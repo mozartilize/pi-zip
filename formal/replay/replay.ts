@@ -145,7 +145,8 @@ function run(path: string) {
 		let plan: any = null;
 		const mayPlan = coldPlan || !justEdited; // no warm edit on the request right after an edited one
 		if (mayPlan && view.length) {
-			const o: any = { mode: coldPlan ? "cold" : "warm", scale, cwd: header?.cwd ?? "/tmp", model, promptPending: false, steerIds: steer, law: { pr, g: gAt[i] ?? P.G0, pWarm: coldPlan ? 0 : 1 }, trace: [], pastTtl: coldPlan, noSummary: !coldPlan && summarizedWarm, ...(!coldPlan && summarizedWarm && regrow > 0 && !NO_REGROW ? { regrowAt: regrow } : {}), recalled: new Set<string>() };
+			// mode and pastTtl drive a source before 0.4.0 step 3 (one planner); pause (a return after the TTL) and P in the law drive a later one
+			const o: any = { mode: coldPlan ? "cold" : "warm", pause: coldPlan, scale, cwd: header?.cwd ?? "/tmp", model, promptPending: false, steerIds: steer, law: { pr, g: gAt[i] ?? P.G0, pWarm: coldPlan ? 0 : 1 }, trace: [], pastTtl: coldPlan, noSummary: !coldPlan && summarizedWarm, ...(!coldPlan && summarizedWarm && regrow > 0 && !NO_REGROW ? { regrowAt: regrow } : {}), recalled: new Set<string>() };
 			try { plan = P.planContext(view, o); } catch { out.planErrors++; }
 		}
 		const edited = !!plan && (plan.folds.length > 0 || plan.cutIdx !== null);
