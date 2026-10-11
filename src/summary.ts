@@ -4,7 +4,7 @@ import { randomUUID } from "node:crypto";
 import { handleFor, outcomeHint, pickKeyLines, RECALL_TOOL, shortArgs } from "./placeholder.ts";
 import { type Block, type Cut, type PlanResult, settings, toolCallIndex } from "./plan.ts";
 import { type FileRecall, fileRecallHow } from "./recallfile.ts";
-import { type Any, clamp, clip, textOf, tok4 } from "./util.ts";
+import { type Any, clamp, clip, fmtWhen, textOf, tok4 } from "./util.ts";
 
 export const SUMMARY_MARK = "[summary of earlier conversation by pi-zip]";
 const POLICY_BLOCK_RE = /violate|terms of service|usage polic|content polic|acceptable use/i;
@@ -141,6 +141,7 @@ export interface ParsedSummary {
 	errors: Items;
 	table: Items;
 	narrative: string[]; // model-written text and free text, oldest first
+	narrativeAt?: string; // a narrative carried forward unchanged (its call failed) says when it was written
 }
 
 const SECTIONS: Array<[RegExp, string]> = [
@@ -161,6 +162,9 @@ const USER_INDENT = "   ";
 const OMIT_ROW = /^\[… (\d+) [^\]]*?(?:omitted|not listed)[^\]]*…\]$/;
 const COVERS_ROW = /^Covers \d+ earlier messages\./;
 const NONE_ROW = "(none)";
+/** Heading of a previous narrative carried forward unchanged because the call for a new one failed (buildCut). */
+const narrCarriedHead = (at: string | undefined, why: string) => `## Narrative (carried forward from the summary of ${at ?? "an earlier time"}; possibly stale: a new one could not be written: ${why})`;
+const NARR_CARRIED_RE = /^## Narrative \(carried forward from the summary of ([^;]+);/;
 
 /** Parse any summary text: pi-zip's current and older formats (carried-forward blocks nested inside carried-forward blocks included), or free text. */
 export function parseSummary(text: string | null): ParsedSummary {
@@ -172,6 +176,8 @@ export function parseSummary(text: string | null): ParsedSummary {
 		if ((line.trim() === SUMMARY_MARK && !/^\s/.test(line)) || COVERS_ROW.test(line)) continue;
 		const hit = line.startsWith("## ") ? SECTIONS.find(([re]) => re.test(line)) : undefined;
 		if (hit) {
+			const at = NARR_CARRIED_RE.exec(line);
+			if (at) out.narrativeAt = at[1];
 			occ.push({ key: hit[1], lines: [], indented: hit[1] === "users" && line.trim() === USERS_HEAD });
 			if (hit[1] !== "free" && hit[1] !== "narr") out.structured = true;
 			continue;
@@ -299,12 +305,12 @@ function mergeItems(older: string[], newer: string[], omitted: number, maxItems:
 
 /** Per-section budgets (characters unless noted); the total stays near the old design's 12,000-char carry plus the new prefix's own lists. */
 const BUDGET = { users: 16000, files: 6000, cmds: 10000, others: 5000, errors: 4000, lines: 60, errorLines: 15 };
-/** The previous narrative is kept as a tail excerpt: the newest decisions, open todos and key facts sit at its end. */
-export const PREV_NARRATIVE_CHARS = 3000;
-/** A previous summary that is only free text (Pi's own compaction) has no lists to merge: its excerpt keeps a head (the goal) and a longer tail. */
-export const FOREIGN_SUMMARY_CHARS = 6000;
+/** The previous summary's narrative the narrative call merges (summary.ts narrative): at most this many characters, the clip a narrative
+ *  of the largest budget gets (NARRATIVE_MAX tokens x 6 chars, buildCut). A longer one (Pi's own free-text summary, an old summary's
+ *  narrative plus its earlier excerpt) keeps its head and its tail, so the chain cannot grow without limit. */
+export const PREV_NARRATIVE_CHARS = 24_000; // plan.ts NARRATIVE_MAX x 6 (a literal: plan.ts imports this module)
 
-function tailExcerpt(text: string, max: number, head = 0): string {
+function excerpt(text: string, max: number, head = 0): string {
 	if (text.length <= max) return text;
 	const cutAtLine = (t: string) => {
 		const nl = t.indexOf("\n"); // start on a line boundary, else on a word boundary: never mid-word
@@ -315,6 +321,26 @@ function tailExcerpt(text: string, max: number, head = 0): string {
 	const h = head ? text.slice(0, head).replace(/\s+\S*$/, "") : "";
 	const t = cutAtLine(text.slice(-(max - h.length)));
 	return (h ? h + "\n" : "") + "[… middle of the earlier narrative omitted …]\n" + t;
+}
+
+/** The narrative part of a previous summary, as the next narrative call reads it. */
+export interface PrevNarrative {
+	text: string; // bounded by PREV_NARRATIVE_CHARS
+	foreign: boolean; // the previous summary is free text (Pi's own compaction or another extension's), not pi-zip's sections
+	at?: string; // when it was written (local MM-DD HH:MM), if known
+}
+
+/**
+ * The previous summary's narrative only (not its lists): the model-written sections of pi-zip's summary (an older summary's carried
+ * excerpt included, so the first merge also settles what that excerpt said), or the whole text of a free-text summary. null: none.
+ * `at` = the previous summary's timestamp (ms), used when the text does not say when its narrative was written.
+ */
+export function previousNarrative(text: string | null, at?: number): PrevNarrative | null {
+	const p = parseSummary(text);
+	const t = p.narrative.join("\n\n").trim();
+	if (!t) return null;
+	const when = p.narrativeAt ?? (at && at > 0 ? fmtWhen(at) : undefined);
+	return { text: excerpt(t, PREV_NARRATIVE_CHARS, Math.floor(PREV_NARRATIVE_CHARS / 4)), foreign: !p.structured, ...(when ? { at: when } : {}) };
 }
 
 const list = (title: string, m: { kept: string[]; omitted: number }, marker: string): string[] => [title, m.kept.length ? [...(m.omitted ? [`[… ${m.omitted} ${marker} …]`] : []), ...m.kept].join("\n") : NONE_ROW];
@@ -396,9 +422,7 @@ export function skeleton(prefix: Block[], previous: string | null, tableText = "
 	out.push(...list("## Errors", me, "older omitted"));
 	const index = handleIndex(now, previous, out.join("\n") + "\n" + tableText, INDEX_TOKENS, file);
 	if (index) out.push(index);
-	const foreign = !prev.structured;
-	const narr = prev.narrative.join("\n\n");
-	if (narr) out.push(`## Earlier narrative (excerpt of the previous summary, newest part)`, foreign ? tailExcerpt(narr, FOREIGN_SUMMARY_CHARS, 1500) : tailExcerpt(narr, PREV_NARRATIVE_CHARS));
+	// the previous narrative is not carried here: the narrative call merges it into one (buildCut), or the fallback carries it whole
 	return { text: out.join("\n"), users: users.length };
 }
 
@@ -421,8 +445,12 @@ export interface Narrative {
 	error?: string;
 }
 
-/** Narrative sections written by the current model in a separate, uncached call. Never throws. */
-export async function narrative(prefix: Block[], ctx: Any, budgetTokens: number, ownSignal?: AbortSignal): Promise<Narrative> {
+/**
+ * Narrative sections written by the current model in a separate, uncached call. Never throws. `previous` = the previous summary's
+ * narrative: the call merges it with what the prefix adds into ONE narrative (newer values replace older ones, finished todos go,
+ * durable facts stay), so no stale copy of an earlier narrative is carried next to the new one.
+ */
+export async function narrative(prefix: Block[], ctx: Any, budgetTokens: number, ownSignal?: AbortSignal, previous: PrevNarrative | null = null): Promise<Narrative> {
 	const t0 = Date.now();
 	const model = ctx.model;
 	if (!model) return { text: null, ok: false, ms: 0, costUsd: 0, error: "no current model" };
@@ -436,12 +464,24 @@ export async function narrative(prefix: Block[], ctx: Any, budgetTokens: number,
 	try {
 		const conv = await serialize(msgs);
 		const words = Math.round(clamp(budgetTokens * 0.6, 120, 1500));
+		const prev = previous
+			? `<previous-narrative${previous.at ? ` written="${previous.at}"` : ""}>\n${previous.text}\n</previous-narrative>\n\n`
+			: "";
+		const merge = previous
+			? `The <previous-narrative> block is the narrative of the ${previous.foreign ? "earlier summary (written by another summariser)" : "previous summary"}: it covers everything before this conversation. ` +
+				`Write ONE updated narrative for the whole session, merging it with what the conversation adds: where the conversation gives a newer value ` +
+				`(a version, id, pid, count, status, plan, path), keep only the newer one; drop todos that are done or obsolete; keep the durable facts of the ` +
+				`previous narrative (paths, identifiers, rulings, results the work still depends on) unless the conversation superseded them. ` +
+				`Write the current state only; do not mention the previous narrative or list what changed.\n`
+			: "";
 		const prompt =
+			prev +
 			`<conversation>\n${conv}\n</conversation>\n\n` +
 			`Write the NARRATIVE part of a context summary for this conversation. A separate deterministic section already lists the user's ` +
 			`requests, files touched, commands with exit codes and errors, so do NOT repeat those. When you refer to a specific tool output, name it by its ` +
 			`tool and exact command or path (and turn) so that look-alike runs stay distinguishable; never merge similar runs into one. Output only these markdown sections:\n` +
 			`## Decisions and rationale\n## Current state of the work\n## Open todos / next steps\n## Key facts to remember (exact values, paths, identifiers, results the work still depends on)\n` +
+			merge +
 			`Be concrete and keep exact paths, names and numbers. Stay under about ${words} words. Do not call tools.`;
 		const signals: AbortSignal[] = [AbortSignal.timeout(240_000)];
 		// a background summary has its own signal (nothing is running, so the run's signal would be stale); a summary the user waits for follows the run's (Esc)
@@ -490,10 +530,15 @@ export async function buildCut(p: PlanResult, ctx: Any, signal?: AbortSignal): P
 	const table = handleTable(rows, prev, file);
 	const sk = skeleton(prefix.filter((b) => b.kind !== "summary"), prev, table ?? "", file);
 	const nb = clamp(p.summaryTokensPlanned - tok4(sk.text), 300, 4000);
-	const nar = await narrative(prefix, ctx, nb, signal);
+	const prevAt = prefix[0]?.kind === "summary" ? Number(prefix[0].msg.timestamp) || 0 : 0;
+	const prevNarr = previousNarrative(prev, prevAt);
+	const nar = await narrative(prefix, ctx, nb, signal, prevNarr);
 	let text = sk.text;
 	const how = file ? `read an output's file by its handle (${file.dir}/<handle>.txt)` : `${RECALL_TOOL} an output by its handle`;
-	text += nar.ok && nar.text ? `\n## Narrative (model-written)\n${nar.text.slice(0, nb * 6)}` : `\n## Narrative\n(unavailable: ${nar.error ?? "n/a"}; rely on the sections above and ${how} rather than re-running or re-reading)`;
+	if (nar.ok && nar.text) text += `\n## Narrative (model-written)\n${nar.text.slice(0, nb * 6)}`;
+	// no new narrative: the previous one is carried whole (up to the narrative's own budget), marked as possibly stale, with its time
+	else if (prevNarr) text += `\n${narrCarriedHead(prevNarr.at, clip(nar.error ?? "n/a", 120))}\n${excerpt(prevNarr.text, nb * 6, Math.floor((nb * 6) / 4))}`;
+	else text += `\n## Narrative\n(unavailable: ${nar.error ?? "n/a"}; rely on the sections above and ${how} rather than re-running or re-reading)`;
 	if (table) text += "\n" + table;
 	return {
 		firstKeptEntryId: p.blocks[p.cutIdx!].entryId!,

@@ -6,6 +6,7 @@ import { type Any, COMMIT_CUSTOM, PRODUCT, clamp, envInt, piTokensOf, textOf, to
 import { PH_MARK } from "./placeholder.ts";
 import { MIN_EXPECT, type Prices } from "./learn.ts";
 import { commandNamesRecall, parseRecallPath, type FileRecall } from "./recallfile.ts";
+import { previousNarrative } from "./summary.ts"; // a cycle (summary.ts imports this module): both use the other's exports only when called
 
 /** Default: when a COLD plan (P(warm) < 0.5) is still above the cap, also fold REREADABLE outputs of the previous user turn, biggest
  *  first. A warm plan does so only at a user return after the declared TTL (PlanOpts.pastTtl): the very returns where the TTL rule
@@ -32,12 +33,19 @@ export const WARM_SUMMARY_GATE = true;
  *  protected window has slid past the previous turn, the cold plan summarises now (the rewrite is free now, not then), its cut allowed
  *  inside the previous user turn up to that turn's final assistant answer, which stays verbatim with everything after it. PlanOpts.lookahead. */
 export const LOOKAHEAD = false;
-/** F3: the summary gates price the call the code makes (summary.ts narrative): uncached input of the prefix the narrative reads (the
- *  previous summary is not sent: its sections are carried forward by code) plus output of at most the narrative budget, instead of
- *  w x the prefix + out x the whole planned summary (which counts the carried-forward previous summary as model output). PlanOpts.narrativePrice. */
+/** F3: the summary gates price the call the code makes (summary.ts narrative): uncached input of the prefix the narrative reads plus the
+ *  previous summary's narrative it merges (bounded: summary.ts PREV_NARRATIVE_CHARS; the previous summary's lists are not sent, code
+ *  carries them forward), plus output of at most the narrative budget, instead of w x the prefix + out x the whole planned summary
+ *  (which counts the carried-forward previous summary as model output). PlanOpts.narrativePrice. */
 export const NARRATIVE_PRICE = true;
 /** The narrative's token budget (chars/4), summary.ts buildCut: clamp(planned - skeleton, 300, NARRATIVE_MAX). */
 export const NARRATIVE_MAX = 4000;
+let prevNarrMemo: { text: string; tokens: number } | null = null;
+/** Tokens (chars/4) of the previous summary's narrative the narrative call reads (summary.ts previousNarrative), memoised per text. */
+function prevNarrativeTokens(text: string): number {
+	if (prevNarrMemo?.text !== text) prevNarrMemo = { text, tokens: tok4(previousNarrative(text)?.text ?? "") };
+	return prevNarrMemo.tokens;
+}
 const SUMMARY_FLOOR = 1000;
 const SUMMARY_CAP = 8000;
 const SUMMARY_RATIO = 0.1;
@@ -781,6 +789,7 @@ export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
 	// what no summary can remove (besides O): the protected turns (after their folds) and the previous summary, which the next one
 	// carries forward; the cap is never chased below it (a context that is mostly this floor would be re-summarised for nothing)
 	const prevSum = blocks[0]?.kind === "summary" ? blocks[0].tokens : 0;
+	const prevNarr = blocks[0]?.kind === "summary" ? prevNarrativeTokens(String(blocks[0].msg?.summary ?? "")) : 0; // what the narrative call reads of it
 	const floor = prevSum + blocks.reduce((a, b) => a + (protectedTurn(b) ? (tokOverride.get(b.idx) ?? b.tokens) : 0), 0);
 	const target = Math.max(coldCap, floor + SUMMARY_FLOOR);
 	const atRoom = room !== null && real(ctxAfterFolds) >= room;
@@ -820,9 +829,9 @@ export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
 		for (const pick of cuts.slice(first)) {
 			const X = c * pre[pick], Sr = c * S(pre[pick]);
 			// the call is the narrative call summary.ts makes (F3, NARRATIVE_PRICE): uncached input of the prefix without the previous
-			// summary, which it never reads, + output of at most the narrative budget; without F3 the verdict's w X + out S (the carried
-			// summary as output)
-			const call = !law.pr ? 0 : f3 ? law.pr.input * c * Math.max(pre[pick] - prevSum, 0) + law.pr.out * c * Math.min(S(pre[pick]), NARRATIVE_MAX) : law.pr.w * X + law.pr.out * Sr;
+			// summary, plus that summary's narrative, which it merges (not its lists), + output of at most the narrative budget; without
+			// F3 the verdict's w X + out S (the carried summary as output)
+			const call = !law.pr ? 0 : f3 ? law.pr.input * c * (Math.max(pre[pick] - prevSum, 0) + prevNarr) + law.pr.out * c * Math.min(S(pre[pick]), NARRATIVE_MAX) : law.pr.w * X + law.pr.out * Sr;
 			if (gated) {
 				// the summary call must pay for itself, cold or warm (F1, WARM_SUMMARY_GATE; before, a warm plan skipped the gate)
 				const ok = !law.pr ? summaryGainOk(X, Sr, real(total), minGain) : (warmLike && !f1) || gate("summary", X, Sr, null, call, Sr);

@@ -21,7 +21,8 @@ pub struct Prices {
 }
 
 /// What a summary model call really costs, in the law's units (uncached input = 1): summary.ts narrative() reads the prefix without
-/// the previous summary (the code carries that forward verbatim) with cacheRetention "none", and writes the summary.
+/// the previous summary's lists (the code carries them forward verbatim) but with its narrative, which it merges, with cacheRetention
+/// "none", and writes the summary.
 pub fn summary_call(pr: Prices, read: f64, written: f64) -> f64 {
     read.max(0.0) + pr.out * written.max(0.0)
 }
