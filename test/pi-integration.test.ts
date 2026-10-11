@@ -738,7 +738,7 @@ describe("round 5 on real Pi: rule A starts the warm summary early, rule B never
 // the same scenarios hashed to 0.3.0's own digest (d7d6ff5: bb2e4238ae92a40c61f71564ae7a465d). The claim covers the session and the
 // requests only: the ledger's waitedMs changed as a fix (README, CHANGELOG; test "ledger fix" in invariants.test.ts).
 describe("round 5: no UI (pi -p, json) sends the same requests and writes the same session as 0.3.0, byte for byte", () => {
-	const NOUI_DIGEST_030 = "480672293e26b667b810b57c38e54431"; // printed by this test on sumfmt 343615f (0.3.0 + 0.3.1 format; R5_PRINT_DIGEST=1)
+	const NOUI_DIGEST_030 = "0907ceeacca2be4a8b8f684dd6a47a96"; // printed by this test on sumfmt 343615f (0.3.0 + 0.3.1 format; R5_PRINT_DIGEST=1)
 	const sleep = (ms: number) => new Promise((res) => setTimeout(res, ms));
 	const shifted = (agoMs: number, prose: number) => {
 		const sm = SessionManager.inMemory(CWD);
@@ -761,7 +761,8 @@ describe("round 5: no UI (pi -p, json) sends the same requests and writes the sa
 		r.sm.getEntries().forEach((e: Any, i: number) => {
 			s = s.split(e.id).join(`#${i}`).split(handleFor(e.id)).join(`@${i}`);
 		});
-		return s.replace(/\d+(\.\d+)? ?(ms|s)\b/g, "T").replace(/[0-9a-f]{8}-[0-9a-f-]{27}/g, "U");
+		// 0.3.1 rows and placeholders carry the local time of the output (MM-DD HH:MM), which moves with the clock
+		return s.replace(/\b\d\d-\d\d \d\d:\d\d\b/g, "D").replace(/\d+(\.\d+)? ?(ms|s)\b/g, "T").replace(/[0-9a-f]{8}-[0-9a-f-]{27}/g, "U");
 	};
 	const prompt = async (r: Any, log: (x: Any) => void, text: string) => {
 		await r.beforeAgentStart(text);
