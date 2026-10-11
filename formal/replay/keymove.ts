@@ -17,8 +17,13 @@
 //             warm decision that would start another one instead writes it while the user waits (0.3.0's behaviour)
 //   pin-naive naive, but a warm plan whose cut moved is first planned again cutting where the running summary cuts (plan.ts cutAt):
 //             taken when the law accepts it
-//   pin       pin + stretch1 (what run.ts does)
+//   pin       pin + stretch1 (v031 as first shipped)
+//   pinB      pin, and once the stretch's unused background summary is spent a warm decision that would summarise applies nothing and
+//             starts nothing (the context grows until Pi's compaction room, where the summary is waited for): review P1 #2, option (b)
 //   v030      0.3.0 for comparison: no early start, no deferral (every warm summary is written while the user waits)
+// cost: input-token equivalents at the session's cache-class prices, as replay.ts prices them: every request (a cold cache writes all
+// of it, a warm edit rewrites what follows the first edit, otherwise the growth is written and the rest read), plus every summary call
+// started (used or not, at its full price: an aborted one is billed at most that) at the uncached read of its prefix plus the narrative.
 // waitS: seconds the user waits for summaries below Pi's compaction room, waitRoomS at it (the latency fit; a running summary's
 // remainder). The counters starting with "wasted"
 // are discarded summaries by cause; unusedAB counts those rules A/B started, unusedAway the away timer's (0.3.0's own).
@@ -39,7 +44,8 @@ const flag = (name: string) => { const i = args.indexOf(name); return i >= 0 ? a
 const policy = flag("--policy") ?? "naive";
 const PIN = policy.startsWith("pin");
 const V030 = policy === "v030"; // 0.3.0: no early start, every warm summary written while the user waits (a finished away summary for its cut is taken)
-const BUDGET = policy === "stretch1" || policy === "pin";
+const BUDGET = policy === "stretch1" || policy === "pin" || policy === "pinB";
+const SKIP = policy === "pinB"; // review P1 #2 (b): once the budget is spent, a warm summary is neither waited for nor started: nothing is applied
 const latFlat = flag("--lat");
 const files = args;
 
@@ -99,20 +105,22 @@ function run(path: string) {
 		wastedMoved: 0, wastedNoCut: 0, wastedNoPlan: 0, wastedCold: 0, wastedEnd: 0, wastedTimer: 0,
 		firstFirings: 0, firingsMovedBeforeUse: 0, teSeenPending: 0, teMovedPending: 0, keyMoves: 0,
 		waits: 0, waitsAtRoom: 0, pinned: 0, pinFailed: 0, unusedAB: 0, unusedAway: 0, waitS: 0, waitRoomS: 0, maxWastedPerStretch: 0, deferredUnadoptedAtRunEnd: 0,
+		skips: 0, calls: 0, cost: 0, callCost: 0,
 	};
 	let summarizedWarm = false, regrow = 0, justEdited = false;
 	let bg: Bg | null = null;
 	let stretch = 0, wastedInStretch = 0;
 	// the budget counts summaries rules A and B started (at a run's end, or deferred at a warm decision); the away timer's (0.3.0's own)
 	// are reported apart
-	const waste = (kind: string) => {
+	const waste = (kind: string, count = true) => {
 		out[kind]++;
-		if (bg && bg.origin !== "away") {
+		if (count && bg && bg.origin !== "away") {
 			wastedInStretch++;
 			out.unusedAB++;
 			out.maxWastedPerStretch = Math.max(out.maxWastedPerStretch, wastedInStretch);
 		} else out.unusedAway++;
 	};
+	const estTokens = (entries: any[]) => entries.reduce((a, pe) => a + (pe.messages ?? []).reduce((b: number, m: any) => b + P.wireTokensOf(m), 0), 0);
 	const apply = (entries: any[]): any[] => {
 		let es = entries;
 		for (const c of cuts) {
@@ -147,7 +155,15 @@ function run(path: string) {
 		const o: any = { mode, scale, cwd: header?.cwd ?? "/tmp", model, promptPending: pending, steerIds: steer, law: { pr, g: gAt[i] ?? P.G0, pWarm: cold ? 0 : 1 }, trace: [], pastTtl: cold, noSummary: !cold && summarizedWarm, ...(!cold && summarizedWarm && regrow > 0 ? { regrowAt: regrow } : {}), recalled: new Set<string>(), ...(cutAt ? { cutAt } : {}) };
 		try { return { plan: P.planContext(view, o), scale, trace: o.trace }; } catch { return null; }
 	};
+	const pay = (plan: any, c: number) => {
+		const prevSum = plan.blocks[0]?.kind === "summary" ? plan.blocks[0].tokens : 0;
+		const call = pr.input * c * Math.max(plan.prefixTokens - prevSum, 0) + pr.out * c * Math.min(plan.summaryTokensPlanned, P.NARRATIVE_MAX ?? 4000);
+		out.callCost += call;
+		out.calls++;
+	};
+	let reqPlan: any = null; // the plan this request carries new (its edits), for the request's price
 	const adopt = (plan: any) => {
+		reqPlan = plan;
 		const calls = P.toolCallIndex(plan.blocks);
 		void calls;
 		if (plan.cutIdx !== null) {
@@ -159,6 +175,7 @@ function run(path: string) {
 		for (const t of plan.folds) folds.set(t.entryId, { ph: t.ph });
 	};
 	const start = (key: string, now: number, plan: any, c: number, origin: Bg["origin"]) => {
+		pay(plan, c);
 		bg = { key, readyAt: now + latOf(plan, c), origin, startedAt: now, seen: 0, moved: 0, stretch };
 		out.starts++;
 		out[{ early: "startsEarly", "defer-prompt": "startsDeferPrompt", "defer-te": "startsDeferTe", away: "startsAway" }[origin]]++;
@@ -171,11 +188,14 @@ function run(path: string) {
 		bg = null;
 	};
 
+	let prevSize = 0;
 	reqs.forEach((q, i) => {
 		const leaf = branch[q.bi - 1];
 		if (!leaf) return;
 		const cold = q.first && q.gap > TTL_S;
 		const now = q.leafTs;
+		reqPlan = null;
+		const usedCold0 = out.usedCold;
 		if (cold) {
 			out.coldReturns++;
 			summarizedWarm = false;
@@ -183,6 +203,7 @@ function run(path: string) {
 			const r = planAt(leaf.id, i, "cold", false, q.bi);
 			const plan = r?.plan;
 			if (bg) { if (plan && plan.cutIdx !== null && plan.firstKeptEntryId === bg.key) used("usedCold"); else { waste("wastedCold"); bg = null; } }
+			if (!bg && plan && plan.cutIdx !== null && out.usedCold === usedCold0) pay(plan, r!.scale.c); // not prepared: written at the return
 			if (i > 0) out.stretches++;
 			stretch++;
 			wastedInStretch = 0;
@@ -218,7 +239,7 @@ function run(path: string) {
 					if (plan.atRoom) out.waitsAtRoom++; else out.waits++;
 					const wk = plan.atRoom ? "waitRoomS" : "waitS";
 					if (bg && bg.key === K) { out[wk] += Math.max(0, bg.readyAt - now) / 1000; used(q.first ? "usedNative" : "usedTe"); }
-					else { if (bg) { waste("wastedMoved"); bg = null; } out[wk] += latOf(plan, r!.scale.c) / 1000; }
+					else { if (bg) { waste("wastedMoved"); bg = null; } out[wk] += latOf(plan, r!.scale.c) / 1000; pay(plan, r!.scale.c); }
 					adopt(plan);
 					edited = true;
 				} else if (bg && bg.key === K && now >= bg.readyAt) {
@@ -228,13 +249,32 @@ function run(path: string) {
 				} else if (bg && bg.key === K) {
 					// running for this key: let it run, apply nothing
 				} else {
-					if (bg) { waste("wastedMoved"); bg = null; }
-					const overBudget = BUDGET && wastedInStretch >= 1;
-					if (overBudget) { out.waits++; out.waitS += latOf(plan, r!.scale.c) / 1000; adopt(plan); edited = true; }
-					else start(K, now, plan, r!.scale.c, q.first ? "defer-prompt" : "defer-te");
+					// run.ts abRoom: the unused summaries of this stretch plus the A/B one a start would discard
+					const overBudget = BUDGET && wastedInStretch + (bg && bg.origin !== "away" ? 1 : 0) >= 1;
+					if (overBudget && SKIP) out.skips++; // (b): nothing applied, nothing started; a running summary is left alone
+					else {
+						if (bg) { waste("wastedMoved"); bg = null; }
+						if (overBudget) { out.waits++; out.waitS += latOf(plan, r!.scale.c) / 1000; pay(plan, r!.scale.c); adopt(plan); edited = true; }
+						else start(K, now, plan, r!.scale.c, q.first ? "defer-prompt" : "defer-te");
+					}
 				}
 			}
 			justEdited = edited; // a warm edit (prompt or turn_end) blocks the next request
+		}
+		// the request's price (replay.ts): the view with every adopted edit applied
+		{
+			const proj = PI.buildSessionProjection(all, leaf.id, byId);
+			const scale = P.calibrate(proj.entries, undefined, branch.slice(0, q.bi), q.key);
+			const size = P.sizeOf(scale, estTokens(apply(proj.entries)));
+			let cost: number;
+			if (i === 0 || q.gap > TTL_S) cost = pr.w * size;
+			else if (reqPlan) {
+				const untouched = P.sizeOf(scale, P.untouchedEst(reqPlan.blocks, reqPlan.folds, reqPlan.cutIdx !== null));
+				const keep = Math.min(untouched, prevSize, size);
+				cost = pr.r * keep + pr.w * (size - keep);
+			} else cost = pr.r * Math.min(prevSize, size) + pr.w * Math.max(0, size - prevSize);
+			out.cost += cost;
+			prevSize = size;
 		}
 		// the run's end: settle (A), then the away timer (cold plan elsewhere) if the user stays away past 0.8 x TTL
 		const next = reqs[i + 1];
@@ -263,13 +303,14 @@ function run(path: string) {
 				const c = planAt(endEntry.id, i + 1, "cold", true, q.bi + 1)?.plan;
 				const cKey = c && c.cutIdx !== null ? c.firstKeptEntryId : null;
 				if (cKey && bg?.key !== cKey) {
-					if (bg) { waste("wastedTimer"); bg = null; }
+					if (bg) { waste("wastedTimer", false); bg = null; } // review P1 #1: the away timer's replacement is not thrash
 					start(cKey, q.ts + 0.8 * TTL_S * 1000, c, 1, "away");
 				}
 			}
 		}
 	});
 	if (bg) waste("wastedEnd");
+	out.cost += out.callCost;
 	return out;
 }
 

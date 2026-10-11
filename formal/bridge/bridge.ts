@@ -633,8 +633,7 @@ async function runTrace(tr: Any): Promise<Any> {
 		clock: ["lastReqMs", "lastModelKey", "prevTotal", "prevKey"],
 	};
 	const KNOWN = ["g", "justEdited", "summarizedWarm"]; // TRIAGE (a) 1: the three fields the session does not carry
-	let liveCut: string | null = null;
-	let unusedAbSeen = 0; // pi-zip/unused-summary entries marked ab (a summary rules A/B started, dropped unused) in the session so far // the cut the live request being probed carries (its run plan's, or the native summary's)
+	let liveCut: string | null = null; // the cut the live request being probed carries (its run plan's, or the native summary's)
 	async function freshProbe(snapshot: Any[], userMsg: Any, liveDesc: Any[], liveState?: Any) {
 		const base = await freshOnce(snapshot, userMsg, liveDesc, null);
 		if (base.same || base.deferredSame || !liveState) return base;
@@ -873,9 +872,6 @@ async function runTrace(tr: Any): Promise<Any> {
 		ncSeen = nc1;
 		probeAt = T0 + t0 * 1000;
 		liveCut = t.runPlan?.cut ?? null;
-		const unusedAb = sm.getEntries().filter((e: Any) => e.type === "custom" && e.customType === "pi-zip/unused-summary" && e.data?.ab).length;
-		t.unusedAb = unusedAb - unusedAbSeen;
-		unusedAbSeen = unusedAb;
 		if (firstProbe && probes.fresh) t.fresh = await freshProbe(firstProbe.snapshot, firstProbe.userMsg, desc, firstProbe.liveState);
 		envSince = [];
 		lastView = view;

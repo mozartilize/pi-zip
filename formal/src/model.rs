@@ -575,9 +575,6 @@ pub struct Tick {
     /// narrative (summary) model calls the user waited for: in the run hook, at the turn_end after this request
     pub wait_run: u32,
     pub wait_te: u32,
-    /// summaries rules A/B started in the background that were dropped unused since the previous request (their pi-zip/unused-summary
-    /// entries, marked ab): once one is in a warm stretch, pi-zip may make the user wait for a warm summary again (the anti-thrash bound)
-    pub unused_ab: u32,
     pub grids: Vec<Grid>,
     pub zip: ZipState,
     pub fresh: Option<Fresh>,

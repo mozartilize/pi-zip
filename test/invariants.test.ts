@@ -833,31 +833,30 @@ describe("round 5: rules A (start early) and B (never wait while warm)", () => {
 		expect(req).toBeUndefined();
 		expect(Date.now() - t0).toBeLessThan(150);
 		expect(rows("pin").at(-1)).toMatchObject({ where: "run", to: "u1", ok: false });
-		expect(rows("warm_wait")).toEqual([]);
+		expect(rows("warm_skip")).toEqual([]); // before the fix: the budget spent by the timer (warm_wait in the first v031, warm_skip now)
 		expect(rows("warm_defer").at(-1)).toMatchObject({ where: "run", key: "u3", running: false });
 		expect(zip.unusedAB).toBe(0);
 	});
 
-	test("anti-thrash: once a background summary went unused in a warm stretch, a moved cut is written while the user waits; no new call per turn", async () => {
+	test("anti-thrash (option b): a warm cut that moves away from the running summary, the stretch's budget spent, applies nothing, starts nothing, waits for nothing", async () => {
 		const st = { calls: 0, delay: 200 };
 		const r = await rig(done, WARM_TS(), { modelRegistry: { complete: mkComplete(st) } });
 		expect(await prompt(r)).toBeUndefined(); // B: deferred, the summary for u3 is being written
 		await sleep(20);
 		expect(st.calls).toBe(1);
 		// the session as the next turn_end sees it no longer has u3 (another branch of the same size): the plan cuts elsewhere and the
-		// running summary cannot be pinned to it
+		// running summary cannot be pinned to it. Starting one for xu3 would make the u3 one the stretch's unused summary: the budget
 		const other = back.map((pe: Any) => ({ sourceEntry: { ...pe.sourceEntry, id: `x${pe.sourceEntry.id}` }, messages: pe.messages }));
-		const t0 = Date.now();
-		const te = await r.fire("turn_end", turnEnd([...other, A("xa6")], "xa6"));
-		expect(Date.now() - t0).toBeGreaterThanOrEqual(190); // written while the user waits (0.3.0's behaviour), not one more background call
-		expect(te.entries[0]).toMatchObject({ type: "compaction", firstKeptEntryId: "xu3" });
-		expect(st.calls).toBe(2); // the unused one and the one adopted: no third
-		expect(rows("unused_summary")).toMatchObject([{ origin: "defer", key: "u3", unused: 1 }]);
-		expect(rows("warm_wait")).toMatchObject([{ where: "turn_end", key: "xu3" }]);
-		// a later turn_end of the same stretch starts nothing more
-		await r.fire("turn_end", turnEnd(project([...other, A("xa6"), U("xu5", "more"), A("xa7")], te.entries), "xa7")); // the session with the summary in
+		for (const [n, all] of [[0, [...other, A("xa6")]], [1, [...other, A("xa6"), U("xu5", "more"), A("xa7")]]] as const) {
+			const t0 = Date.now();
+			expect(await r.fire("turn_end", turnEnd([...all], all.at(-1)!.sourceEntry.id))).toBeUndefined(); // nothing applied
+			expect(Date.now() - t0).toBeLessThan(150); // before (shipped v031): the xu3 summary written while the user waited
+			expect(rows("warm_skip")[n]).toMatchObject({ where: "turn_end", key: n === 0 ? "xu3" : "xu4", running: "u3" }); // the cut keeps moving
+		}
 		await sleep(250);
-		expect(st.calls).toBe(2);
+		expect(st.calls).toBe(1); // no call per turn, and none while the user waits
+		expect(rows("warm_wait")).toEqual([]);
+		expect(rows("unused_summary")).toEqual([]); // the running one is left alone (a later plan may still pin to it)
 	});
 
 	test("idle cache warming does not drop the early summary: Pi's warm and stop decisions leave it alone, the warm return takes it", async () => {
@@ -927,14 +926,18 @@ describe("round 5: rules A (start early) and B (never wait while warm)", () => {
 			await r.fire("session_start", {});
 			const t0 = Date.now();
 			const req = await prompt(r);
-			return { ms: Date.now() - t0, summary: req?.messages?.[0]?.role === "compactionSummary" };
+			const ms = Date.now() - t0;
+			await sleep(20);
+			return { ms, summary: req?.messages?.[0]?.role === "compactionSummary", calls: st.calls };
 		};
 		const spent = await run([{ type: "custom", customType: "pi-zip/unused-summary", data: { usd: 0.02, ab: true } }]);
-		expect(spent.summary).toBe(true); // the budget of this warm stretch is spent: written while the user waits, as 0.3.0
-		expect(spent.ms).toBeGreaterThanOrEqual(190);
+		expect(spent.summary).toBe(false); // the budget of this warm stretch is spent: nothing applied, nothing started, no wait
+		expect(spent.ms).toBeLessThan(150);
+		expect(spent.calls).toBe(0);
 		const away = await run([{ type: "custom", customType: "pi-zip/unused-summary", data: { usd: 0.02 } }]); // the away timer's: not counted
 		expect(away.summary).toBe(false);
 		expect(away.ms).toBeLessThan(150);
+		expect(away.calls).toBe(1); // deferred: written in the background
 	});
 });
 
