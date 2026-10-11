@@ -605,7 +605,8 @@ describe("F12 summary prepared while the user is away (timer at 0.8 x TTL)", () 
 			expect([name, n.compactCalls]).toEqual([name, name === "compaction failed" ? 1 : 0]);
 			expect([name, n.comp]).toEqual([name, null]);
 			expect([name, n.req?.messages?.[0]?.role]).toEqual([name, "compactionSummary"]); // the request carries it request-locally, as before
-			expect([name, st.calls]).toEqual([name, 1]); // the prepared summary is still the one used
+			// the prepared summary is still the one used; after a compaction that came later its range is gone (the head moved): written again
+			expect([name, st.calls]).toEqual([name, name === "already compacted" ? 2 : 1]);
 			const te = await r.fire("turn_end", turnEnd([...back, A("a6")], "a6"));
 			expect([name, te.entries.filter((e: Any) => e.type === "compaction").length]).toEqual([name, 1]); // ... and turn_end persists it
 		}
@@ -720,8 +721,9 @@ describe("round 5: rules A (start early) and B (never wait while warm)", () => {
 		// a later turn_end, once it is done: the valve adopts it (a draft the next request first carries)
 		await sleep(350);
 		const te = await r.fire("turn_end", turnEnd([...back, ...tail, A("a7")], "a7"));
-		expect(te.entries.map((e: Any) => e.type)).toEqual(["compaction", "custom"]);
+		expect(te.entries.map((e: Any) => e.customType ?? e.type)).toEqual(["compaction", "pi-zip/commit", "pi-zip/summary"]); // the record of the call, written with the drafts (it ended inside the run)
 		expect(te.entries[0]).toMatchObject({ firstKeptEntryId: "u3", details: { trigger: "valve", carried: false } });
+		expect(te.entries[2].data).toMatchObject({ key: "u3", head: "", usd: 0.02, cut: { text: te.entries[0].summary } });
 		expect(st.calls).toBe(1);
 		await sleep(5);
 		expect(noticeOf(r).desc).toMatch(/written while you worked$/);
@@ -815,60 +817,53 @@ describe("round 5: rules A (start early) and B (never wait while warm)", () => {
 		expect(s2.calls).toBe(2);
 		expect(s2.signals[0].aborted).toBe(true); // 0.3.0 never started the first one; its final startBg replaced a live summary without aborting it
 		expect(s2.signals[1].aborted).toBe(false);
-		// booked at once (the aborted call's input, estimated), not counted against the A/B bound: the context changed, nothing thrashed
-		const unused = q.appended.filter((x: Any) => x.customType === "pi-zip/unused-summary").map((x: Any) => x.data);
+		// recorded at once as an unused call (no summary, the aborted call's input, estimated)
+		const unused = q.appended.filter((x: Any) => x.customType === "pi-zip/summary").map((x: Any) => x.data);
 		expect(unused).toHaveLength(1);
-		expect(unused[0]).toMatchObject({ estimated: true });
+		expect(unused[0]).toMatchObject({ key: "u3", estimated: true, lost: "replaced" });
+		expect(unused[0].cut).toBeUndefined();
 		expect(unused[0].usd).toBeGreaterThan(0);
-		expect(unused[0].ab).toBeUndefined();
 	});
 
-	test("the away timer replacing an early summary (cold cut elsewhere) does not spend the A/B budget: a warm prompt whose pin fails defers, no wait", async () => {
+	test("an away call for another cut does not throw the early summary away: both are recorded, and the warm return takes the one its plan cuts at, no wait", async () => {
 		const st = { calls: 0 };
 		const r = await rig(done, WARM_TS(), { modelRegistry: { complete: mkComplete(st) } }, R5);
 		const zip = await zipOf(r);
 		const settled = await settle(r);
 		await sleep(20);
 		expect(rows("settle_plan")[0]).toMatchObject({ warmCut: "u3", early: true });
-		// the away timer fires with a cold plan that cuts elsewhere (u1): it replaces the early summary (0.3.0's own preparation)
+		// the away timer fires with a cold plan that cuts elsewhere (u1): a second call, the early summary stays ready (0.3.1: thrown away)
 		const cold = planContext(done, zip.opts(r.ctx, true, "cold", done).o)!;
 		await zip.runAway({ ...cold, firstKeptEntryId: "u1" }, r.ctx);
 		await sleep(20);
-		expect(rows("away_summary_start").map((x) => x.origin)).toEqual(["early", "away"]);
-		expect(zip.unusedAB).toBe(0); // 0.3.0-era bookkeeping of this branch: 1 (counted as A/B thrash)
-		const booked = r.appended.filter((x: Any) => x.customType === "pi-zip/unused-summary").map((x: Any) => x.data);
-		expect(booked).toHaveLength(1);
-		expect(booked[0].ab).toBeUndefined();
-		// a warm prompt (the cache outlives 0.8 x TTL): its plan cuts at u3, the away summary's u1 is not a cut it accepts
+		expect(rows("away_summary_start").map((x) => x.key)).toEqual(["u3", "u1"]);
+		expect(r.appended.filter((x: Any) => x.customType === "pi-zip/summary").map((x: Any) => [x.data.key, !!x.data.cut])).toEqual([["u3", true], ["u1", true]]);
+		// a warm prompt: its plan cuts at u3, which is ready
 		const t0 = Date.now();
 		const req = await prompt(r, settled);
-		expect(req).toBeUndefined();
 		expect(Date.now() - t0).toBeLessThan(150);
-		expect(rows("pin").at(-1)).toMatchObject({ where: "run", to: "u1", ok: false });
-		expect(rows("warm_skip")).toEqual([]); // before the fix: the budget spent by the timer (warm_wait in the first v031, warm_skip now)
-		expect(rows("warm_defer").at(-1)).toMatchObject({ where: "run", key: "u3", running: false });
-		expect(zip.unusedAB).toBe(0);
+		expect(req.messages[0].role).toBe("compactionSummary");
+		expect(st.calls).toBe(2);
+		expect(rows("warm_defer")).toEqual([]);
 	});
 
-	test("anti-thrash (option b): a warm cut that moves away from the running summary, the stretch's budget spent, applies nothing, starts nothing, waits for nothing", async () => {
-		const st = { calls: 0, delay: 200 };
+	test("a warm cut that moves to another branch: the call for the old one ends, recorded as unused at once; the new cut's starts in the background; nothing waits", async () => {
+		const st = { calls: 0, delay: 200, signals: [] as Any[] };
 		const r = await rig(done, WARM_TS(), { modelRegistry: { complete: mkComplete(st) } });
 		expect(await prompt(r)).toBeUndefined(); // B: deferred, the summary for u3 is being written
 		await sleep(20);
 		expect(st.calls).toBe(1);
-		// the session as the next turn_end sees it no longer has u3 (another branch of the same size): the plan cuts elsewhere and the
-		// running summary cannot be pinned to it. Starting one for xu3 would make the u3 one the stretch's unused summary: the budget
+		// the session as the next turn_end sees it no longer has u3 (another branch of the same size): the plan cuts elsewhere
 		const other = back.map((pe: Any) => ({ sourceEntry: { ...pe.sourceEntry, id: `x${pe.sourceEntry.id}` }, messages: pe.messages }));
-		for (const [n, all] of [[0, [...other, A("xa6")]], [1, [...other, A("xa6"), U("xu5", "more"), A("xa7")]]] as const) {
-			const t0 = Date.now();
-			expect(await r.fire("turn_end", turnEnd([...all], all.at(-1)!.sourceEntry.id))).toBeUndefined(); // nothing applied
-			expect(Date.now() - t0).toBeLessThan(150); // before (shipped v031): the xu3 summary written while the user waited
-			expect(rows("warm_skip")[n]).toMatchObject({ where: "turn_end", key: n === 0 ? "xu3" : "xu4", running: "u3" }); // the cut keeps moving
-		}
-		await sleep(250);
-		expect(st.calls).toBe(1); // no call per turn, and none while the user waits
-		expect(rows("warm_wait")).toEqual([]);
-		expect(rows("unused_summary")).toEqual([]); // the running one is left alone (a later plan may still pin to it)
+		const t0 = Date.now();
+		const te = await r.fire("turn_end", turnEnd([...other, A("xa6")], "xa6"));
+		expect(Date.now() - t0).toBeLessThan(150);
+		expect(te.entries.map((e: Any) => e.customType ?? e.type)).toEqual(["pi-zip/summary"]); // nothing applied; only the record of the ended call
+		expect(te.entries[0].data).toMatchObject({ key: "u3", estimated: true, lost: "replaced" });
+		expect(st.signals[0].aborted).toBe(true);
+		expect(rows("warm_defer").at(-1)).toMatchObject({ where: "turn_end", key: "xu3", running: false });
+		await sleep(20);
+		expect(st.calls).toBe(2); // one call in flight at a time
 	});
 
 	test("idle cache warming does not drop the early summary: Pi's warm and stop decisions leave it alone, the warm return takes it", async () => {
@@ -890,66 +885,68 @@ describe("round 5: rules A (start early) and B (never wait while warm)", () => {
 		expect(rows("unused_summary")).toEqual([]);
 	});
 
-	test("a discarded A/B summary is booked at discard time, in its stretch: the entry (ab, the estimated input) is there before the aborted call settles", async () => {
+	test("a call ended before it finishes is recorded at once (no summary, the estimated input), before the aborted call settles", async () => {
 		const st = { calls: 0, delay: 5_000 }; // the call ignores the abort and settles 5 s later
 		const r = await rig(done, WARM_TS(), { modelRegistry: { complete: mkComplete(st) } });
 		const zip = await zipOf(r);
 		await settle(r);
 		await sleep(10);
-		expect(zip.bg?.origin).toBe("early");
-		zip.discardBg();
-		// before: appended only once the aborted promise settled (5 s here), possibly after a cold return or in the next session
-		const unused = r.appended.filter((x: Any) => x.customType === "pi-zip/unused-summary").map((x: Any) => x.data);
-		expect(unused).toHaveLength(1);
-		expect(unused[0]).toMatchObject({ ab: true, estimated: true });
-		expect(unused[0].usd).toBeCloseTo(zip.stats.summaryUsd, 9);
-		expect(unused[0].usd).toBeGreaterThan(0);
+		expect(zip.bg?.key).toBe("u3");
+		zip.discardBg("replaced");
+		const recs = r.appended.filter((x: Any) => x.customType === "pi-zip/summary").map((x: Any) => x.data);
+		expect(recs).toHaveLength(1);
+		expect(recs[0]).toMatchObject({ key: "u3", head: "", estimated: true, lost: "replaced" });
+		expect(recs[0].usd).toBeCloseTo(zip.stats.summaryUsd, 9);
+		expect(recs[0].usd).toBeGreaterThan(0);
 	});
 
-	test("a summary still running when the process ends is booked as unused at the input it was billed for (not counted against the bound)", async () => {
+	test("a call still running when the process ends is one unused call: recorded at the input it was billed for, kept in the session totals", async () => {
 		const st = { calls: 0, delay: 5_000 };
 		const r = await rig(done, WARM_TS(), { modelRegistry: { complete: mkComplete(st) } });
 		await settle(r);
 		await sleep(10);
 		await r.fire("session_shutdown", {});
-		const unused = r.appended.filter((x: Any) => x.customType === "pi-zip/unused-summary").map((x: Any) => x.data);
-		expect(unused).toHaveLength(1); // before: nothing (only a finished one was booked)
-		expect(unused[0]).toMatchObject({ lost: "shutdown", estimated: true });
-		expect(unused[0].usd).toBeGreaterThan(0);
-		expect(unused[0].ab).toBeUndefined();
+		const recs = r.appended.filter((x: Any) => x.customType === "pi-zip/summary").map((x: Any) => x.data);
+		expect(recs).toHaveLength(1);
+		expect(recs[0]).toMatchObject({ key: "u3", lost: "shutdown", estimated: true });
+		expect(recs[0].cut).toBeUndefined();
+		expect(recs[0].usd).toBeGreaterThan(0);
+		// the restarted process: the lost call is in the totals, and it decides as with no summary at all (deferred, its own call, no wait)
+		const st2 = { calls: 0, delay: 200 };
+		const q = await rig(done, WARM_TS(), { modelRegistry: { complete: mkComplete(st2) } });
+		const base = q.ctx.sessionManager.getBranch;
+		q.ctx.sessionManager.getBranch = () => [...base(), { type: "custom", customType: "pi-zip/summary", data: recs[0] }];
+		await q.fire("session_start", {});
+		const t0 = Date.now();
+		expect(await prompt(q)).toBeUndefined();
+		expect(Date.now() - t0).toBeLessThan(150);
+		await sleep(20);
+		expect(st2.calls).toBe(1);
 	});
 
-	test("a finished early summary lost when the process ends is booked (its cost), but not counted against the bound: the restarted process starts its own", async () => {
+	test("a finished summary survives the process: recorded when it is done, and a restarted process takes it (no second call, no wait)", async () => {
 		const st = { calls: 0 };
 		const r = await rig(done, WARM_TS(), { modelRegistry: { complete: mkComplete(st) } });
 		await settle(r);
 		await sleep(20);
 		expect(st.calls).toBe(1);
 		await r.fire("session_shutdown", {});
-		expect(r.appended.filter((x: Any) => x.customType === "pi-zip/unused-summary").map((x: Any) => x.data)).toEqual([{ usd: 0.02, lost: "shutdown" }]); // 0.3.0: never booked
-	});
-
-	test("anti-thrash across a restart: the unused one is in the session (pi-zip/unused-summary, ab), so a restarted process keeps the bound", async () => {
-		const run = async (extra: Any[]) => {
-			const st = { calls: 0, delay: 200 };
-			const r = await rig(done, WARM_TS(), { modelRegistry: { complete: mkComplete(st) } });
-			const base = r.ctx.sessionManager.getBranch;
-			r.ctx.sessionManager.getBranch = () => [...base(), ...extra];
-			await r.fire("session_start", {});
-			const t0 = Date.now();
-			const req = await prompt(r);
-			const ms = Date.now() - t0;
-			await sleep(20);
-			return { ms, summary: req?.messages?.[0]?.role === "compactionSummary", calls: st.calls };
-		};
-		const spent = await run([{ type: "custom", customType: "pi-zip/unused-summary", data: { usd: 0.02, ab: true } }]);
-		expect(spent.summary).toBe(false); // the budget of this warm stretch is spent: nothing applied, nothing started, no wait
-		expect(spent.ms).toBeLessThan(150);
-		expect(spent.calls).toBe(0);
-		const away = await run([{ type: "custom", customType: "pi-zip/unused-summary", data: { usd: 0.02 } }]); // the away timer's: not counted
-		expect(away.summary).toBe(false);
-		expect(away.ms).toBeLessThan(150);
-		expect(away.calls).toBe(1); // deferred: written in the background
+		const recs = r.appended.filter((x: Any) => x.customType === "pi-zip/summary");
+		expect(recs.map((x: Any) => x.data)).toEqual([expect.objectContaining({ key: "u3", head: "", usd: 0.02, cut: expect.objectContaining({ firstKeptEntryId: "u3" }) })]); // 0.3.1: booked unused at exit
+		const st2 = { calls: 0 };
+		const q = await rig(done, WARM_TS(), { modelRegistry: { complete: mkComplete(st2) } }, R5);
+		const base = q.ctx.sessionManager.getBranch;
+		q.ctx.sessionManager.getBranch = () => [...base(), { type: "custom", ...recs[0] }];
+		await q.fire("session_start", {});
+		const t0 = Date.now();
+		const req = await q.fire("before_agent_start", {}).then(() => {
+			q.ctx.sessionManager.getBranch = () => [...branchOf(done, WARM_TS()), { type: "custom", ...recs[0] }];
+			q.ctx.sessionManager.buildSessionProjection = () => ({ entries: back });
+			return q.fire("context_with_system", { messages: flat(back) });
+		});
+		expect(Date.now() - t0).toBeLessThan(150);
+		expect(req.messages[0].role).toBe("compactionSummary");
+		expect(st2.calls).toBe(0);
 	});
 });
 

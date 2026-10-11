@@ -586,6 +586,7 @@ export interface Cut {
 	usage?: Any;
 	ms: number; // total production time (the narrative model call included)
 	ahead?: boolean; // F2: a lookahead cut (inside the previous user turn, before its final answer; guard.ts)
+	prepared?: boolean; // written in the background (a pi-zip/summary entry): its cost was counted when it was produced
 }
 
 /** What a run sends from its first request on and persists verbatim at turn_end (F8). */
@@ -638,7 +639,7 @@ export interface PlanOpts {
 	narrativePrice?: boolean; // F3, default NARRATIVE_PRICE
 	slide?: number; // internal (F2): plan as if this many more user turns had started (the protected window slid)
 	valveB?: number; // internal (F2): the real context the slid warm plan's law sees (the cold plan's folds already applied)
-	cutAt?: string; // warm plans only: cut at this entry or not at all (a summary for that cut is already being written: rules A/B, run.ts)
+	cutAt?: string; // cut at this entry or not at all (a summary for that cut is produced or being produced: core.ts adopt)
 	warmStyle?: boolean; // internal: a cold plan at 0 < P(warm) < 0.5 that the law refused is planned once more the way a warm plan is (no relax folds unless pastTtl, the summary gated)
 }
 
@@ -830,7 +831,7 @@ export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
 	 *  (no prices: the legacy gain rule) must pass. When the minimal cut's summary or the whole plan with it is refused, the deeper cuts
 	 *  are tried in turn (the gain grows as D^2, the call only with the prefix read). The whole plan's law prices the summary call too.
 	 *  Applies the first cut both laws accept (folds in the prefix are void) and returns true, or changes nothing. */
-	const pinned = mode === "warm" ? o.cutAt : undefined;
+	const pinned = o.cutAt;
 	const summarise = (maxCut: number, gated: boolean): boolean => {
 		const cuts: number[] = [];
 		for (let i = minCut; i < blocks.length && i <= maxCut; i++) if (isCutBlock(blocks[i]) && (pinned === undefined || blocks[i].entryId === pinned)) cuts.push(i);

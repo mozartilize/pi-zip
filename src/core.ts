@@ -8,7 +8,21 @@ import { calibrate, planContext, rebaseFolds, sizeOf, spliceNative, untouchedEst
 import type { FileRecall } from "./recallfile.ts";
 import { PRODUCT, type Any } from "./util.ts";
 
-export const UNUSED_SUMMARY_CUSTOM = "pi-zip/unused-summary"; // a background summary nobody adopted: its cost, so the session totals stay honest
+export const SUMMARY_CUSTOM = "pi-zip/summary"; // a summary call pi-zip made in the background: what it produced (or that it was lost) and its cost
+
+/** A `pi-zip/summary` entry: the summary written for the cut at entry `key` of the projection whose head is `head` (the id of the
+ *  branch's newest compaction, "" before any), and what the call cost. Without `cut`, a call that ended without a summary it could
+ *  hand over (aborted when it was replaced or pi-zip was switched off, or still running when the process exited): unused, its cost
+ *  `estimated` from the input it is billed for. A summary is READY while its head is the branch's head; using it (a compaction with its
+ *  text) or any other compaction moves the head, so it is never taken twice. */
+export interface Artifact {
+	head: string;
+	key: string;
+	cut?: Cut;
+	usd: number;
+	estimated?: boolean;
+	lost?: string;
+}
 
 /** Λ for the model a decision is about: its learned class and survival (learn.ts), the cache tier its requests ask for (when known),
  *  growth per request, and the facts of the session state.ts rebuilds from the branch. */
@@ -135,17 +149,36 @@ export const lastRegrow = (branch: Any[]): number | undefined => {
 	return undefined;
 };
 
-/** Summaries rules A/B started that went unused since the last cold return (their marker entries): what a process that never left
- *  would have counted. */
-export function unusedSince(branch: Any[], steerIds: Set<string>, models: Record<string, Entry>, tierOf: (model: Any) => "short" | "long" | undefined): number {
-	let n = 0;
-	for (let i = branch.length - 1; i >= 0; i--) {
-		const e = branch[i];
-		if (e?.type !== "custom" || e.customType !== UNUSED_SUMMARY_CUSTOM || !e.data?.ab) continue;
-		if (coldReturnAfter(branch, i, false, steerIds, models, tierOf) >= 0) break;
+/** The head of the projection the branch builds: the id of its newest compaction, "" before any. */
+export function headOf(branch: Any[]): string {
+	for (let i = branch.length - 1; i >= 0; i--) if (branch[i]?.type === "compaction") return String(branch[i].id ?? "");
+	return "";
+}
+
+/** The `pi-zip/summary` entries of the branch, oldest first. */
+export const artifactsOf = (branch: Any[]): Artifact[] =>
+	branch.filter((e) => e?.type === "custom" && e.customType === SUMMARY_CUSTOM && typeof e.data?.key === "string").map((e) => e.data as Artifact);
+
+/** The READY summaries: produced for the projection the branch builds now (its head), from the branch's entries and `extra` (those
+ *  this process produced, written or not yet), one per cut (the newest). */
+export function readyOf(branch: Any[], extra: readonly Artifact[] = []): Artifact[] {
+	const head = headOf(branch);
+	const byKey = new Map<string, Artifact>();
+	for (const a of [...artifactsOf(branch), ...extra]) if (a.cut && a.head === head) byKey.set(a.key, a);
+	return [...byKey.values()];
+}
+
+/** The summary calls of the branch that no compaction used (a summary nobody took, or a call that ended without one), and their cost:
+ *  what keeps the session totals honest. */
+export function unusedOf(branch: Any[]): { n: number; usd: number } {
+	const used = new Set(branch.filter((e) => e?.type === "compaction" && e.details?.by === PRODUCT).map((e) => `${e.firstKeptEntryId}\u0000${e.summary}`));
+	let n = 0, usd = 0;
+	for (const a of artifactsOf(branch)) {
+		if (a.cut && used.has(`${a.key}\u0000${a.cut.text}`)) continue;
 		n++;
+		usd += Number(a.usd) || 0;
 	}
-	return n;
+	return { n, usd };
 }
 
 /** One step of the growth estimate g: EWMA(0.1) of the prompt growth `d` between consecutive unedited responses of one model, each
@@ -170,31 +203,37 @@ export function planOpts(entries: Any[], branch: Any[], env: Env, lam: Learned, 
 	return { cal, o: { mode, scale: cal, cwd: env.cwd, recalled: env.recalled, model: env.model, promptPending: pending, rereadOnly: env.rereadOnly, ...(env.fileRecall ? { fileRecall: env.fileRecall } : {}), noSummary: warmAgain, ...(warmAgain && lam.summaryRegrow ? { regrowAt: lam.summaryRegrow } : {}), reserve: env.reserve, steerIds: env.steerIds, law: lawOf(branch, lam, pWarm), trace: [], ...(cutAt !== undefined ? { cutAt } : {}) } };
 }
 
-/** The warm plan `first`, or, when it cuts elsewhere than the summary for `key` (written or being written), the plan cutting there
- *  (plan.ts cutAt) if the law accepts it: the summary already paid for is used instead of a new one. `note`: the pin, for the ledger. */
-export function pin<T extends { p: PlanResult | null }>(first: T, mk: (cutAt: string) => T, key: string | null | undefined, where: string): { r: T; note?: Note } {
+/** A summary a plan may take: produced and ready (`running` false), or still being written. */
+export interface Avail { key: string; running: boolean }
+
+/** The plan `first`, or, when a summary produced or being produced (`avail`) cuts no deeper than its cut, the plan cutting at the
+ *  deepest such summary (plan.ts cutAt) if the law accepts it: a call already paid for is used instead of a new one, and never for a
+ *  cut deeper than the plan asks for. `note`: the adoption, for the ledger (`running`: the summary is not written yet). */
+export function adopt<T extends { p: PlanResult | null }>(first: T, mk: (cutAt: string) => T, avail: readonly Avail[], where: string): { r: T; note?: Note } {
 	const p = first.p;
-	if (!key || !p || p.cutIdx === null || p.firstKeptEntryId === key) return { r: first };
-	const q = mk(key);
-	const ok = !!q.p && q.p.cutIdx !== null && q.p.firstKeptEntryId === key;
-	return { r: ok ? q : first, note: { type: "pin", where, from: p.firstKeptEntryId, to: key, ok } };
+	if (!avail.length || !p || p.cutIdx === null) return { r: first };
+	let at = -1, pick: Avail | null = null;
+	for (const a of avail) {
+		const i = p.blocks.findIndex((b) => b.entryId === a.key);
+		if (i >= 0 && i <= p.cutIdx && i > at) [at, pick] = [i, a];
+	}
+	if (!pick || pick.key === p.firstKeptEntryId) return { r: first };
+	const q = mk(pick.key);
+	const ok = !!q.p && q.p.cutIdx !== null && q.p.firstKeptEntryId === pick.key;
+	return { r: ok ? q : first, note: { type: "pin", where, from: p.firstKeptEntryId, to: pick.key, ok, ...(pick.running ? { running: true } : {}) } };
 }
 
 // ---- decide -------------------------------------------------------------------------------------------------------------------
 
-/** The background summary as a decision sees it: the cut it was written for, finished or not, failed. */
-export interface BgView { key: string | null; done: unknown; failed: boolean }
-
 /**
- * Rule B: a warm plan that summarises, while the user is here. "take": a finished summary for this cut is there. "running": one for
- * it is being written: nothing now. "start": nothing now, the summary is written in the background. "spent": nothing now and nothing
- * started (the warm stretch's budget of unused background summaries is spent, `room` false). "wait": written now while the user
- * waits: without a UI, or at Pi's compaction room (judged on the context as it is: nothing applied sends the request unchanged).
+ * Rule B: a warm plan that summarises, while the user is here. "take": the summary for this cut is ready. "running": it is being
+ * written: nothing now. "start": nothing now, the summary is written in the background. "wait": written now while the user waits:
+ * without a UI, or at Pi's compaction room (judged on the context as it is: nothing applied sends the request unchanged).
  */
-export function ruleB(p: PlanResult, hasUI: boolean, bg: BgView | null, room: boolean): "wait" | "take" | "running" | "start" | "spent" {
+export function ruleB(p: PlanResult, hasUI: boolean, avail: readonly Avail[]): "wait" | "take" | "running" | "start" {
 	if (!hasUI || p.atRoom || p.atRoomUnedited) return "wait";
-	if (bg && bg.key === p.firstKeptEntryId && !bg.failed) return bg.done ? "take" : "running";
-	return room ? "start" : "spent";
+	const a = avail.find((x) => x.key === p.firstKeptEntryId);
+	return a ? (a.running ? "running" : "take") : "start";
 }
 
 /** The native summary of this run, as the run decision sees it: the projection right before Pi's compaction and that entry. */
@@ -203,11 +242,11 @@ export interface NativeIn { key: string; pre: Any[]; entryId: string }
 /**
  * The run plan decision at a run's first request (one plan per edit run). `opts` gives the plan options of this run for some entries
  * (the shell's mode and P(warm)). b2b: a warm return right after an edited request makes no edit (unless Pi's compaction already put
- * this run's summary in). Otherwise the plan, pinned to the summary in the session (`nat`) or in the background (`bgKey`) when warm;
+ * this run's summary in). Otherwise the plan, taking the summary in the session (`nat`) or a produced one (`avail`, adopt);
  * a summary Pi's compaction put in is planned on the projection before it (`onPre`), or on the session as it is when that plan cuts
  * elsewhere. `foreign`: another extension's compaction just went in: folds only.
  */
-export function decideRun(x: { cold: boolean; pastTtl: boolean; justEdited: boolean; nat: NativeIn | null; foreign: boolean; now: Any[]; bgKey: string | null; opts: (entries: Any[], cutAt?: string) => { o: PlanOpts; cal: Scale } }):
+export function decideRun(x: { cold: boolean; pastTtl: boolean; justEdited: boolean; nat: NativeIn | null; foreign: boolean; now: Any[]; avail: readonly Avail[]; opts: (entries: Any[], cutAt?: string) => { o: PlanOpts; cal: Scale } }):
 	{ kind: "b2b" } | { kind: "plan"; o: PlanOpts; cal: Scale; p: PlanResult | null; onPre: boolean; notes: Note[] } {
 	const { cold, nat } = x;
 	const spliced = nat ? spliceNative(nat.pre, x.now, nat.entryId) : null;
@@ -226,14 +265,13 @@ export function decideRun(x: { cold: boolean; pastTtl: boolean; justEdited: bool
 		if (x.foreign) o.noSummary = true; // another extension's compaction just went in: folds only (a summary only at Pi's compaction room)
 		return { o, cal, p: planContext(entries, o) };
 	};
-	const warmPlan = (entries: Any[]) => {
+	const adopted = (entries: Any[]) => {
 		const first = plan(entries, undefined, !!nat);
-		if (cold) return first;
-		const { r, note } = pin(first, (k) => plan(entries, k, !!nat), nat ? nat.key : x.bgKey, "run");
+		const { r, note } = adopt(first, (k) => plan(entries, k, !!nat), nat ? [{ key: nat.key, running: false }] : x.avail, "run");
 		if (note) notes.push(note);
 		return r;
 	};
-	let { o, cal, p } = warmPlan(spliced ?? x.now);
+	let { o, cal, p } = adopted(spliced ?? x.now);
 	const onPre = !!nat && !!spliced && !!p && p.cutIdx !== null && p.firstKeptEntryId === nat.key;
 	if (nat && !onPre) {
 		// the summary is in the session, but this plan would not cut there (the prompt, or what came with it, changed the plan): plan on
@@ -279,15 +317,15 @@ export function runPlanOf(x: { p: PlanResult | null; cal: Scale; cold: boolean; 
 }
 
 /** The warm decision at a turn_end that has no run plan to persist: none after a failed turn or right after an edited request (b2b),
- *  else the warm plan (P = 1 in-run), pinned to the background summary; `p` null when it changes nothing. */
-export function decideTurnEnd(x: { failed: boolean; justEdited: boolean; bgKey: string | null; opts: (cutAt?: string) => { o: PlanOpts }; entries: Any[] }): { kind: "none" } | { kind: "b2b" } | { kind: "plan"; o: PlanOpts; p: PlanResult | null; notes: Note[] } {
+ *  else the warm plan (P = 1 in-run), taking a produced summary (adopt); `p` null when it changes nothing. */
+export function decideTurnEnd(x: { failed: boolean; justEdited: boolean; avail: readonly Avail[]; opts: (cutAt?: string) => { o: PlanOpts }; entries: Any[] }): { kind: "none" } | { kind: "b2b" } | { kind: "plan"; o: PlanOpts; p: PlanResult | null; notes: Note[] } {
 	if (x.failed) return { kind: "none" };
 	if (x.justEdited) return { kind: "b2b" };
 	const mk = (cutAt?: string) => {
 		const { o } = x.opts(cutAt);
 		return { o, p: planContext(x.entries, o) };
 	};
-	const { r, note } = pin(mk(), mk, x.bgKey, "turn_end");
+	const { r, note } = adopt(mk(), mk, x.avail, "turn_end");
 	const p = r.p && (r.p.folds.length || r.p.cutIdx !== null) ? r.p : null;
 	return { kind: "plan", o: r.o, p, notes: note ? [note] : [] };
 }
@@ -298,16 +336,21 @@ export const valvePlanOf = (p: PlanResult, cut: Cut | null, adopted: boolean, bg
 	untouched: sizeOf(p.scale, untouchedEst(p.blocks, p.folds, !!cut)), ...(cut ? { waitMs: adopted ? bgWaitMs : cut.ms } : {}), ...(cut && adopted ? { ready: "background" as const } : {}),
 });
 
-/** The plans at settle: the cold return's (`cold`) and, unless the newest request carried an edit (b2b), the warm return's (`warm`,
- *  pinned to the background summary). */
-export function decideSettle(x: { justEdited: boolean; bgKey: string | null; entries: Any[]; cold: () => { o: PlanOpts; cal: Scale }; warm: (cutAt?: string) => { o: PlanOpts } }): { p: PlanResult | null; cal: Scale; w: PlanResult | null; notes: Note[] } {
-	const { o, cal } = x.cold();
-	const p = planContext(x.entries, o);
-	let w: PlanResult | null = null;
+/** The plans at settle: the cold return's (`cold`) and, unless the newest request carried an edit (b2b), the warm return's (`warm`),
+ *  each taking a produced summary (adopt). */
+export function decideSettle(x: { justEdited: boolean; avail: readonly Avail[]; entries: Any[]; cold: (cutAt?: string) => { o: PlanOpts; cal: Scale }; warm: (cutAt?: string) => { o: PlanOpts } }): { p: PlanResult | null; cal: Scale; w: PlanResult | null; notes: Note[] } {
 	const notes: Note[] = [];
+	const mc = (cutAt?: string) => {
+		const { o, cal } = x.cold(cutAt);
+		return { cal, p: planContext(x.entries, o) };
+	};
+	const c = adopt(mc(), mc, x.avail, "settle_cold");
+	if (c.note) notes.push(c.note);
+	const { p, cal } = c.r;
+	let w: PlanResult | null = null;
 	if (!x.justEdited) {
 		const mk = (cutAt?: string) => ({ p: planContext(x.entries, x.warm(cutAt).o) });
-		const { r, note } = pin(mk(), mk, x.bgKey, "settle");
+		const { r, note } = adopt(mk(), mk, x.avail, "settle");
 		if (note) notes.push(note);
 		w = r.p;
 	}
