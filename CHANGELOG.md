@@ -11,8 +11,8 @@
 - At most one background summary started this way goes unused per warm stretch; the away timer replacing one does not count. Once
   it is spent, a warm plan whose cut moved changes nothing until the context reaches Pi's compaction room (no call, no wait).
   Every discarded or lost summary is booked when it is discarded (`pi-zip/unused-summary`), a running one at its estimated input.
-- RPC mode (which binds a UI on Pi 1.1) gets these rules too; `-p` and `--mode json` behave as in 0.3.0, session and requests byte
-  for byte.
+- RPC mode (which binds a UI on Pi 1.1) gets these rules too; `-p` and `--mode json` decide as in 0.3.0: session and requests are byte
+  for byte those of 0.3.0 with the new summary and placeholder format below.
 - **Summaries: one merged narrative.** A summary of an earlier summary reads that summary's narrative next to the new
   conversation and writes one updated narrative (newer values replace older ones, finished todos are dropped), instead of
   carrying the old one as a clipped tail. On a 22-summary session, contradictions fell from 11 to 6 and superseded facts carried
