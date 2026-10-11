@@ -2,7 +2,7 @@
 // mechanical lists, short fold text, JSON key fields. Synthetic sessions only.
 import { describe, expect, test } from "bun:test";
 import { buildBlocks, toolCallIndex } from "../src/plan.ts";
-import { cmdLabel, distinctLines, handleFor, makePlaceholder, makePlaceholderFor, sharedCdDirs, shortArgs } from "../src/placeholder.ts";
+import { cmdLabel, distinctLines, handleFor, jsonKeyFields, makePlaceholder, makePlaceholderFor, sharedCdDirs, shortArgs } from "../src/placeholder.ts";
 import { BUDGET, buildCut, handleRowsOf, INDEX_TOKENS, skeleton, TABLE_ROWS } from "../src/summary.ts";
 import { A, type Any, U } from "./helpers.ts";
 
@@ -198,6 +198,50 @@ describe("smaller mechanical lists (2026-10-11 item 2, 2026-10-10 item 3)", () =
 		expect(text).toContain("\n200. REQUEST 200: please");
 		expect(text).toMatch(/\n\d+\. ≈ REQUEST \d+: please/);
 		expect(text).toContain('a leading "cd <dir> &&" is left out for: /work/repo');
+	});
+});
+
+describe("single-line JSON outputs (2026-10-10 item 1)", () => {
+	const jobs = Array.from({ length: 45 }, (_, i) => ({ wid: `w${i}`, name: `job-${i}`, status: i < 44 ? "done" : "running", phase: i < 44 ? "finished" : "review", error: null, result: `Result of job ${i}: ` + "lorem ipsum ".repeat(30) + `VERDICT-${i} merged` }));
+	const one = JSON.stringify({ count: 45, items: jobs });
+
+	test("a one-line JSON document: key fields (status/phase/error-like, the newest record's identity, the end of the last long string), not its first 160 chars", () => {
+		const ph = makePlaceholder(one, "bash", "jobs status", handleFor("j"), 8)!;
+		expect(ph).toContain("key fields kept (JSON; path: value, long strings show their end; up to 8):");
+		expect(ph).toContain('.items[44].status: "running"');
+		expect(ph).toContain('.items[44].phase: "review"');
+		expect(ph).toContain('.items[44].wid: "w44"');
+		expect(ph).toMatch(/\.items\[44\]\.result: "….*VERDICT-44 merged"/);
+		expect(ph).not.toContain("key lines kept");
+		expect(ph).not.toContain('{"count":45,"items":[{"wid"');
+	});
+
+	test("error fields come first; null/empty ones are skipped", () => {
+		const doc = JSON.stringify({ id: "run-7", steps: Array.from({ length: 30 }, (_, i) => ({ n: i, error: i === 17 ? "ENOSPC: no space left on device" : null, log: "x".repeat(200) })) });
+		const f = jsonKeyFields(doc)!;
+		expect(f.some((l) => l === '.steps[17].error: "ENOSPC: no space left on device"')).toBe(true);
+		expect(f.filter((l) => l.includes(".error")).length).toBe(1);
+	});
+
+	test("JSON already laid out one value per line, and text that only looks like JSON, keep their key lines", () => {
+		const pretty = JSON.stringify({ count: 45, items: jobs.slice(0, 5) }, null, 2) + "\n".repeat(0);
+		expect(jsonKeyFields(pretty)).toBeNull();
+		expect(makePlaceholder(pretty + " ".repeat(1000), "read", "x.json", handleFor("p"), 8)).toContain("key lines kept");
+		expect(jsonKeyFields("{not json " + "x".repeat(2000))).toBeNull();
+		expect(jsonKeyFields('"just a string"')).toBeNull();
+	});
+
+	test("the folded-outputs table shows a JSON output by its most telling field; look-alike JSON rows are told apart", async () => {
+		const st = (n: number) => JSON.stringify({ count: 45, items: jobs.map((j, i) => (i === 44 ? { ...j, status: n === 1 ? "running" : "failed" } : j)) });
+		const t = await cutOf([U("u1", "go"), tcall("j1", "bash", { command: "jobs status" }), tres("j1", "bash", st(1)), tcall("j2", "bash", { command: "jobs status" }), tres("j2", "bash", st(2)), A("e")]);
+		const rows = sec(t, "## Folded outputs").split("\n").filter((l) => l.startsWith("- "));
+		expect(rows).toHaveLength(2);
+		expect(rows[0]).toContain('.items[44].status: "running"');
+		expect(rows[1]).toContain('.items[44].status: "failed"');
+	});
+
+	test("deterministic", () => {
+		expect(jsonKeyFields(one)).toEqual(jsonKeyFields(one));
 	});
 });
 

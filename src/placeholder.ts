@@ -53,6 +53,72 @@ export function pickKeyLines(text: string, keep = 8): KeyLine[] {
 	return [...picked.values()].sort((a, b) => a.no - b.no);
 }
 
+// ---- JSON outputs (2026-10-10 item 1): a JSON document on one line (or a few very long ones) has one "first line" that is most of
+// the output, so key lines say nothing. Its key fields are chosen instead: error-like, then status-like fields (the last ones first: a
+// log or a list of jobs ends with the newest), then the last long string (its end: the result text), then the first fields (identity).
+const JSON_ERR_KEY = /error|err$|fail|exception|warning|traceback/i;
+const JSON_STATUS_KEY = /status|state|phase|stage|outcome|result|exit|code$|reason|message|summary|progress|^ok$|success|done|verdict|halt|blocked/i;
+const JSON_MAX_CHARS = 2_000_000;
+const JSON_MAX_LEAVES = 20_000;
+const JSON_VAL = 120;
+
+interface Leaf {
+	path: string;
+	key: string;
+	value: unknown;
+}
+
+/** Key fields of a JSON output, as `path: value` lines in document order (long strings keep their end), or null when the output is not a
+ *  JSON object or array, or is already laid out one value per line (its key lines work). Pure. */
+export function jsonKeyFields(text: string, keep = 8, byPriority = false): string[] | null {
+	const t = text.trim();
+	if (keep <= 0 || t.length > JSON_MAX_CHARS || !/^[[{]/.test(t)) return null;
+	const lines = t.split("\n");
+	if (lines.length > 3 && !lines.some((l) => l.length > 500)) return null;
+	let doc: unknown;
+	try {
+		doc = JSON.parse(t);
+	} catch {
+		return null;
+	}
+	if (!doc || typeof doc !== "object") return null;
+	const leaves: Leaf[] = [];
+	const walk = (v: unknown, path: string, key: string) => {
+		if (leaves.length >= JSON_MAX_LEAVES) return;
+		if (v && typeof v === "object") {
+			const ents = Array.isArray(v) ? v.map((x, i) => [String(i), x] as const) : Object.entries(v as object);
+			if (!ents.length) leaves.push({ path, key, value: v });
+			for (const [k, x] of ents) walk(x, Array.isArray(v) ? `${path}[${k}]` : `${path}.${/^[A-Za-z_$][\w$]*$/.test(k) ? k : JSON.stringify(k)}`, Array.isArray(v) ? key : k);
+		} else leaves.push({ path, key, value: v });
+	};
+	walk(doc, "", "");
+	const empty = (v: unknown) => v === null || v === false || v === "" || v === 0 || (typeof v === "object" && !!v && !Object.keys(v).length);
+	const picked = new Set<number>();
+	const add = (i: number) => picked.size < keep && picked.add(i);
+	for (let i = leaves.length - 1; i >= 0; i--) if (JSON_ERR_KEY.test(leaves[i].key) && !empty(leaves[i].value)) add(i);
+	const statusKeys = new Set<string>(); // per status key, its last occurrence first, then earlier ones
+	for (let i = leaves.length - 1; i >= 0 && picked.size < keep - 2; i--) {
+		if (!JSON_STATUS_KEY.test(leaves[i].key) || typeof leaves[i].value === "object" || statusKeys.has(leaves[i].key)) continue;
+		statusKeys.add(leaves[i].key);
+		add(i);
+	}
+	for (let i = leaves.length - 1; i >= 0; i--) if (typeof leaves[i].value === "string" && (leaves[i].value as string).length > JSON_VAL) { add(i); break; }
+	// the identity of the newest record a status was picked from (its short scalar siblings: id, name), then the document's first fields
+	const newest = Math.max(-1, ...[...picked]);
+	const parent = (p: string) => p.replace(/(\.[^.[]+|\[\d+\])$/, "");
+	if (newest >= 0) {
+		const par = parent(leaves[newest].path);
+		for (let i = 0; i < leaves.length; i++) if (parent(leaves[i].path) === par && typeof leaves[i].value !== "object" && String(leaves[i].value).length <= 60 && !empty(leaves[i].value)) add(i);
+	}
+	for (let i = 0; i < leaves.length && picked.size < keep; i++) if (!empty(leaves[i].value)) add(i);
+	const show = (v: unknown) => {
+		if (typeof v !== "string") return clip(JSON.stringify(v) ?? String(v), JSON_VAL);
+		const s = v.replace(/\s+/g, " ").trim();
+		return s.length > JSON_VAL ? JSON.stringify("…" + s.slice(-(JSON_VAL - 1))) : JSON.stringify(s);
+	};
+	return (byPriority ? [...picked] : [...picked].sort((a, b) => a - b)).map((i) => `${clipMid(leaves[i].path || "(root)", 60)}: ${show(leaves[i].value)}`);
+}
+
 /** Collapse whitespace and cut to `n` chars keeping head AND tail (the distinguishing part of a path or command is often its end). */
 export function clipMid(s: string, n: number): string {
 	s = s.replace(/\s+/g, " ").trim();
@@ -183,11 +249,13 @@ export interface PlaceholderMeta {
 export function makePlaceholder(text: string, tool: string, args: string, handle: string, keep = 8, meta: PlaceholderMeta = {}): string | null {
 	if (text.length <= MIN_FOLD_CHARS) return null;
 	const lines = text.split("\n").length;
-	const keys = pickKeyLines(text, keep);
+	const fields = jsonKeyFields(text, keep);
+	const keys = fields ? [] : pickKeyLines(text, keep);
 	const body = keys.map((k) => `${k.no}: ${clip(k.text, 160)}`).join("\n");
 	const outcome = outcomeHint(text, tool, meta.isError);
 	return (
 		`${PH_MARK} · ${tool}${args ? " " + args : ""}${whenLabel(meta.at, meta.turn) ? ` · ${whenLabel(meta.at, meta.turn)}` : ""}${outcome ? ` · ${outcome}` : ""} · ${text.length} chars, ${lines} lines · handle ${handle}]\n` +
+		(fields?.length ? `key fields kept (JSON; path: value, long strings show their end; up to ${keep}):\n${fields.join("\n")}\n` : "") +
 		(keys.length ? `key lines kept (original line numbers; up to ${keep}):\n${body}\n` : "") +
 		(meta.file
 			? `Original kept byte for byte, even after summaries or compaction, in ${meta.file.dir}/${handle}.txt: ${fileRecallHow(meta.file)}; prefer that to re-running or re-reading the source (output may differ). Do not guess its content.`
@@ -195,6 +263,16 @@ export function makePlaceholder(text: string, tool: string, args: string, handle
 			? `Original kept byte for byte, recallable even after summaries or compaction: ${RECALL_TOOL}("${handle}") (optional grep/range) is instant, free, no side effects; prefer it to re-running or re-reading (output may differ). Do not guess its content.`
 			: `Original not shown (${RECALL_TOOL} is not enabled in this session): re-read the file or re-run the read-only command if you need it. Do not guess its content.`)
 	);
+}
+
+/** The lines that describe an output in a summary row, the most telling first: JSON key fields (error, status ones first), else the key
+ *  lines (an error or id line first, then the first line). */
+export function keyTexts(text: string, keep = 8): string[] {
+	const f = jsonKeyFields(text, keep, true);
+	if (f) return f;
+	const keys = pickKeyLines(text, keep);
+	const best = keys.find((k) => k.why === "error" || k.why === "id") ?? keys[0];
+	return best ? [best.text, ...keys.filter((k) => k !== best).map((k) => k.text)] : [];
 }
 
 /** Placeholder for a toolResult block (null for image results, entries without an id, or short outputs). */

@@ -1,7 +1,7 @@
 // Summary (F11, F12): deterministic skeleton (user words verbatim + files/commands) + model-written narrative + handle table.
 // Thinking is never quoted or paraphrased: it is stripped before the model sees the prefix.
 import { randomUUID } from "node:crypto";
-import { blockTime, cdDirOf, clipMid, distinctLines, handleFor, outcomeHint, pickKeyLines, RECALL_TOOL, sharedCdDirs, shortArgs, whenLabel } from "./placeholder.ts";
+import { blockTime, cdDirOf, clipMid, distinctLines, handleFor, keyTexts, outcomeHint, RECALL_TOOL, sharedCdDirs, shortArgs, whenLabel } from "./placeholder.ts";
 import { type Block, type Cut, type PlanResult, settings, toolCallIndex } from "./plan.ts";
 import { type FileRecall, fileRecallHow } from "./recallfile.ts";
 import { type Any, clamp, clip, envInt, fmtWhen, textOf, tok4 } from "./util.ts";
@@ -527,7 +527,7 @@ export function skeleton(prefix: Block[], previous: string | null, tableText = "
 	now.forEach((r, i) => groups.set(`${r.tool} ${r.args}`, [...(groups.get(`${r.tool} ${r.args}`) ?? []), i]));
 	for (const ix of groups.values()) {
 		if (ix.length < 2) continue;
-		const hints = distinctLines(ix.map((i) => nowText[i]), ix.map((i) => pickKeyLines(nowText[i]).map((k) => k.text)), [], INDEX_HINT);
+		const hints = distinctLines(ix.map((i) => nowText[i]), ix.map((i) => keyTexts(nowText[i])), [], INDEX_HINT);
 		ix.forEach((i, k) => hints[k] && (now[i].hint = hints[k]!));
 	}
 	const index = handleIndex(now, previous, out.join("\n") + "\n" + tableText, INDEX_TOKENS, file);
@@ -632,17 +632,17 @@ export async function buildCut(p: PlanResult, ctx: Any, signal?: AbortSignal): P
 	const prev = prefix[0]?.kind === "summary" ? String(prefix[0].msg.summary ?? "") || null : null;
 	const shared = sharedCdDirs(bashCommands(prefix.filter((b) => b.kind !== "summary")));
 	const texts: string[] = [];
-	const keyTexts: string[][] = [];
+	const keyLists: string[][] = [];
 	const rows: HandleRow[] = prefix
 		.filter((b) => b.kind === "toolResult" && b.entryId && (b.ours || b.tokens > foldMin))
 		.map((b) => {
 			const call = p.calls.get(b.msg.toolCallId);
 			const out = textOf((b.raw ?? b.msg).content);
-			const keys = pickKeyLines(out, keepLines);
+			const keys = keyTexts(out, keepLines);
 			const tool = call?.name ?? b.msg.toolName ?? "tool";
-			const hint = (keys.find((k) => k.why === "error" || k.why === "id") ?? keys[0])?.text ?? "";
+			const hint = keys[0] ?? "";
 			texts.push(out);
-			keyTexts.push([hint, ...keys.map((k) => k.text)]);
+			keyLists.push(keys);
 			return { handle: handleFor(b.entryId!), tool, args: call ? shortArgs(call.args, undefined, shared) : "", turn: b.userTurn, at: blockTime(b), outcome: outcomeHint(out, tool, !!b.msg.isError), hint };
 		});
 	// rows of one tool that would show the same key line (the first line of every status report, say): each shows the first of its
@@ -658,7 +658,7 @@ export async function buildCut(p: PlanResult, ctx: Any, signal?: AbortSignal): P
 		const { tool, hint } = rows[ix[0]];
 		const taken = prevHints.get(tool) ?? [];
 		if (ix.length < 2 && !taken.includes(clip(hint, 90))) continue;
-		const hs = distinctLines(ix.map((i) => texts[i]), ix.map((i) => keyTexts[i]), taken, 90);
+		const hs = distinctLines(ix.map((i) => texts[i]), ix.map((i) => keyLists[i]), taken, 90);
 		ix.forEach((i, k) => hs[k] && (rows[i].hint = hs[k]!));
 	}
 	const file = p.fileRecall; // zip_recall hidden by an allowlist: the summary names the recall files instead
