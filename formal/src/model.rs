@@ -520,6 +520,9 @@ pub struct ZipState {
 #[serde(rename_all = "camelCase", default)]
 pub struct Fresh {
     pub same: bool,
+    /// rule B: the fresh process planned the live request's cut, but with no summary written in the background it applied nothing and
+    /// started one (warm_defer): the same decision, carried out one turn_end later
+    pub deferred_same: bool,
     pub live: usize,
     pub fresh: usize,
     pub live_mods: usize,
@@ -572,6 +575,9 @@ pub struct Tick {
     /// narrative (summary) model calls the user waited for: in the run hook, at the turn_end after this request
     pub wait_run: u32,
     pub wait_te: u32,
+    /// summaries rules A/B started in the background that were dropped unused since the previous request (their pi-zip/unused-summary
+    /// entries, marked ab): once one is in a warm stretch, pi-zip may make the user wait for a warm summary again (the anti-thrash bound)
+    pub unused_ab: u32,
     pub grids: Vec<Grid>,
     pub zip: ZipState,
     pub fresh: Option<Fresh>,

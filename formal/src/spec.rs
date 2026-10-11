@@ -91,7 +91,7 @@ fn persisted_as_sent() -> F<R> {
 }
 /// A fresh pi process, given the same session and clock, sends the same first request of this run.
 fn fresh_plans_alike() -> F<R> {
-    atom("fresh_plans_alike", |r: &R, i, _| r.tick(i).fresh.as_ref().is_none_or(|f| f.same))
+    atom("fresh_plans_alike", |r: &R, i, _| r.tick(i).fresh.as_ref().is_none_or(|f| f.same || f.deferred_same))
 }
 /// Nothing is lost at this request: every message other than a folded output or a summary is sent byte for byte, every output
 /// the model does not see verbatim comes back byte for byte from zip_recall, a request pi-zip summarised away is quoted verbatim,
@@ -124,6 +124,22 @@ fn user_waits() -> F<R> {
 /// A warm return's run plan is not the valve (README A3 below): there the user just sent a prompt and waits for nothing else.
 fn valve_summary() -> F<R> {
     atom("valve_summary", |r: &R, i, _| r.decision_for(i).is_some_and(|g| g.at == "turn_end" && g.p >= 0.5))
+}
+/// Round 5 (rules A/B): a summary pi-zip started in the background for a warm return or a warm turn_end was dropped unused in this
+/// warm stretch (since the last return planned cold), up to this request. Then the stretch's bound of one unused background summary is
+/// spent, and a warm summary whose cut moved is written while the user waits, as in 0.3.0.
+fn bg_budget_spent() -> F<R> {
+    atom("bg_budget_spent", |r: &R, i, _| {
+        for j in (0..=i).rev() {
+            if r.tick(j).unused_ab > 0 {
+                return true;
+            }
+            if r.tick(j).n == 0 && r.st[j].believed_cold {
+                return false;
+            }
+        }
+        false
+    })
 }
 /// The model was switched since the previous request: the cache dies at the prompt, nothing could be prepared while away.
 fn switched() -> F<R> {
@@ -219,7 +235,7 @@ fn warm_summary_not_withheld() -> F<R> {
 }
 /// Residuals: the property's failures at this request that no known root cause (TRIAGE.md (a)) explains.
 fn rd_residual() -> F<R> {
-    atom("fresh_plans_alike_or_known_cause", |r: &R, i, _| r.tick(i).fresh.as_ref().is_none_or(|f| f.same || f.fixed_by_known))
+    atom("fresh_plans_alike_or_known_cause", |r: &R, i, _| r.tick(i).fresh.as_ref().is_none_or(|f| f.same || f.deferred_same || f.fixed_by_known))
 }
 fn mp_residual() -> F<R> {
     atom("monotone_or_known_cause", |r: &R, i, _| mp_breaches(r, i).iter().all(|(m, _)| MP_KNOWN.iter().any(|k| m.contains(k))))
@@ -255,12 +271,12 @@ pub fn axioms() -> Vec<Prop> {
             id: "A3",
             name: "never in the way",
             from: &[],
-            why: "README rule 3: a summary model call is prepared while the user is away; the user waits for one only at Pi's compaction room, \
-                  in the warm valve at a turn_end (mid-run: the user is already waiting for the agent; A2 checks it pays), or at a \
-                  return a model switch made cold (no away time to prepare it in). A warm return's run plan is not excused: its summary \
-                  is a wait the user would not have had (B2).",
+            why: "README rule 3: a summary model call is prepared while the user is away, or (round 5, rules A/B) written in the background \
+                  while the cache is warm; the user waits for one only at Pi's compaction room, at a return a model switch made cold (no \
+                  away time to prepare it in), or in the warm valve at a turn_end once the warm stretch's one unused background summary is \
+                  spent (the anti-thrash bound: 0.3.0's wait). A warm return's run plan, and a warm turn_end otherwise, are not excused.",
             evidence: Evidence::Conformance,
-            f: always(user_waits() >> (at_room() | valve_summary() | switched())),
+            f: always(user_waits() >> (at_room() | switched() | (valve_summary() & bg_budget_spent()))),
         },
     ]
 }
@@ -1201,6 +1217,8 @@ pub fn classify(id: &str, r: &R, v: &Violation) -> String {
             let ttl = r.trace.world.ttl_decl();
             if r.decision_for(v.at).is_some_and(|g| g.at == "run" && g.p >= 0.5) {
                 "warm return: the run plan summarises while the user waits (B2)".into()
+            } else if r.decision_for(v.at).is_some_and(|g| g.at == "turn_end" && g.p >= 0.5) {
+                "warm turn_end: the valve summarises while the user waits, the stretch's unused background summary not spent (rule B)".into()
             } else if env.iter().any(|e| e == "switch") {
                 "cold return by a model switch (nothing to foresee while away)".into()
             } else if env.iter().any(|e| e == "foreign") {

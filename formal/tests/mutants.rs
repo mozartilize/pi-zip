@@ -91,10 +91,12 @@ fn fold_and_recall() -> String {
     lines(&[W, "prompt", "call npm 30K", "say 60K", "prompt +60s", "say 100", "prompt +1h", "call recall", "say 100"])
 }
 
-/// a 150K turn, a cold return of small calls (the window has not slid), a second cold return that summarises: prepared while away
+/// a 150K turn, a cold return of small calls (the window has not slid), a second cold return that summarises: prepared while away.
+/// Three calls, not more (round 5): with a long run of small calls the growth estimate g falls so far that a WARM return would
+/// summarise too, and rule A then starts the summary at the run's end, which the away timer's mutants cannot remove.
 fn summary_prepared_away(gap: &str) -> String {
     let mut v = vec![W, "prompt", "say 150K", "prompt +1h"];
-    v.extend(std::iter::repeat_n("call npm 100", 12));
+    v.extend(std::iter::repeat_n("call npm 100", 3));
     v.extend(["say 100", gap, "say 100"]);
     lines(&v)
 }
@@ -144,6 +146,20 @@ fn lw_summary_call_is_priced() {
 fn lw_plan_step_call_is_pinned_both_ways() {
     caught_all("lw1", "plan.ts", &[("if (!planGate(ctxAfterFolds - (pre[pick] - S(pre[pick])), 0, call, true, true)) continue;", "if (!planGate(ctxAfterFolds - (pre[pick] - S(pre[pick])), 0, 0, true, true)) continue;", 1)], &["LW"], &summary_prepared_away("prompt +1h"));
     caught_all("lw2", "plan.ts", &[("!planGate(after, untouched, 0, planned, false)", "!planGate(after, untouched, 1000, planned, false)", 1)], &["LW"], &fold_and_recall());
+}
+
+/// Round 5, rule B: the warm valve at a turn_end writes its summary in the background (adopted at a later turn_end) instead of making
+/// the user wait; the mutant is 0.3.0's turn_end (always wait).
+#[test]
+fn a3_warm_turn_end_does_not_wait() {
+    caught("r5b", "run.ts", "if (!ctx?.hasUI || p.atRoom) return \"wait\";", "return \"wait\";", "A3", &trace_file("a3-warm-turn-end.trace"));
+}
+
+/// Round 5, rule B at a warm prompt: a warm return after a restart, nothing prepared (b2-restart.trace); with rule B it waits for
+/// nothing (the summary is written in the background), while the mutant (warm returns never defer) is 0.3.0's B2 wait.
+#[test]
+fn a3_warm_return_does_not_wait() {
+    caught("r5b2", "run.ts", "if (!this.cold && !native && p && p.cutIdx !== null && this.warmSummary(p, ctx, \"run\") === \"defer\") return;", "", "A3", &trace_file("b2-restart.trace"));
 }
 
 #[test]
