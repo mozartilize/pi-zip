@@ -54,6 +54,7 @@ interface Bg {
 	controller: AbortController;
 	origin: "away" | "key" | "early" | "defer";
 	stretch: number; // the warm stretch it was started in (Zip.abStretch)
+	estUsd: number; // what the call is billed for its input if it is aborted after the provider took it: the prefix it reads, uncached
 }
 /** Rules A and B start summaries a warm return may not use (its plan cuts elsewhere, the user never returns, the return is cold):
  *  at most this many of them go unused per warm stretch (cold return to cold return). Once spent, no early start, and a warm summary
@@ -1112,27 +1113,29 @@ export class Zip implements ZipControl {
 		this.awayPlan = null;
 	}
 
-	/** A summary nobody adopted still cost money: abort it if it is still running, book it if it finished. One rules A/B started in
-	 *  this warm stretch counts against AB_UNUSED_MAX (`count`: false when pi-zip's own away timer replaces it, which is not thrash);
-	 *  its entry says so (`ab`), so a restarted process counts it too. */
+	/** A summary nobody adopted still cost money: abort it if it is still running, book it either way. One rules A/B started in this
+	 *  warm stretch counts against AB_UNUSED_MAX (`count`: false when pi-zip's own away timer replaces it, which is not thrash); its
+	 *  entry says so (`ab`), so a restarted process counts it too. */
 	private discardBg(count = true) {
 		const b = this.bg;
 		this.bg = null;
-		if (!b) return;
-		if (!b.done) b.controller.abort();
-		const counted = count && isAB(b) && b.stretch === this.abStretch;
+		if (b) this.bookUnused(b, count && isAB(b) && b.stretch === this.abStretch);
+	}
+
+	/** Abort `b` if it still runs and book it as unused, now: the entry lands in the stretch (and the session) it belongs to, whatever the
+	 *  aborted call does later. A finished one is booked at its cost; one still running at the input it is billed for (estimated). */
+	private bookUnused(b: Bg, counted: boolean, extra: Any = {}) {
+		const running = !b.done && !b.failed;
+		if (running) b.controller.abort();
 		if (counted) {
 			this.unusedAB++;
 			this.ledger({ type: "unused_summary", origin: b.origin, key: b.key, unused: this.unusedAB });
 		}
-		b.promise.then((c) => {
-			if (!c && !counted) return;
-			const usd = c?.costUsd ?? 0;
-			this.stats.summaryUsd += usd;
-			try {
-				this.pi.appendEntry(UNUSED_SUMMARY_CUSTOM, { usd, ...(counted ? { ab: true } : {}) });
-			} catch {}
-		});
+		const usd = b.done ? b.done.costUsd : running ? b.estUsd : 0;
+		this.stats.summaryUsd += usd;
+		try {
+			this.pi.appendEntry(UNUSED_SUMMARY_CUSTOM, { usd, ...(running ? { estimated: true } : {}), ...(counted ? { ab: true } : {}), ...extra });
+		} catch {}
 	}
 
 	/** May rules A/B start a summary now, replacing whatever runs in the background? Not once AB_UNUSED_MAX of theirs went unused in
@@ -1529,7 +1532,9 @@ export class Zip implements ZipControl {
 		if (this.bg && this.bg.key === p.firstKeptEntryId && !this.bg.failed) return false;
 		this.discardBg(origin !== "away"); // the away timer replacing an early summary is 0.3.0's own cold preparation, not thrash: not counted
 		const controller = new AbortController();
-		const bg: Bg = { key: p.firstKeptEntryId, done: null, failed: false, promise: Promise.resolve(null), controller, origin, stretch: this.abStretch };
+		const prevSum = p.blocks[0]?.kind === "summary" ? p.blocks[0].tokens : 0;
+		const estUsd = (p.scale.c * Math.max(0, p.prefixTokens - prevSum) * (Number(ctx?.model?.cost?.input) || 0)) / 1e6;
+		const bg: Bg = { key: p.firstKeptEntryId, done: null, failed: false, promise: Promise.resolve(null), controller, origin, stretch: this.abStretch, estUsd };
 		bg.promise = buildCut(p, ctx, controller.signal)
 			.then((c) => ((bg.done = c), this.ledger({ type: "away_summary", origin, ms: c.ms, llmOk: c.llmOk, costUsd: c.costUsd, ...this.usageOf(c) }), c))
 			.catch((err) => {
