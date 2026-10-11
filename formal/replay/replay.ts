@@ -22,6 +22,10 @@
 //   lost          tool outputs a summary replaced that the transcript later asks for again (an identical call issued later): needed
 //                 again after being summarised away. recalls: the same for an output that was folded (recoverable by zip_recall or a
 //                 re-run); refetchK: tokens of both, real, in thousands
+//   digest        sha256 (first 16 hex) of the per-request decisions: request index, cold or warm plan, whether a plan ran, the cut
+//                 (index, first kept entry id, planned summary tokens), the folded entry ids, and the request's estimated size and cost.
+//                 Two sources with the same digest made the same decision at every request (the reference for a refactor).
+import { createHash } from "node:crypto";
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
@@ -103,6 +107,7 @@ function run(path: string) {
 	// summarizedWarm as run.ts keeps it: set by every summary (cold ones too: commit), cleared at a cold return; regrow: the real context
 	// (after folds) the last summary started from (run.ts summaryRegrow, plan.ts regrowAt; a source without the rule ignores the option)
 	let summarizedWarm = false, regrow = 0, justEdited = false, prevSize = 0;
+	const decisions: string[] = [];
 
 	const apply = (entries: any[]): any[] => {
 		let es = entries;
@@ -188,10 +193,12 @@ function run(path: string) {
 			out.rewriteK += Math.max(0, prevSize - untouchedReal) / 1000;
 		} else cost = rP * Math.min(prevSize, size) + wP * Math.max(0, size - prevSize);
 		out.cost += cost;
+		decisions.push([i, coldPlan ? "c" : "w", mayPlan && view.length ? 1 : 0, plan ? 1 : 0, edited && plan.cutIdx !== null ? `${plan.cutIdx}:${plan.firstKeptEntryId}:${plan.summaryTokensPlanned}` : "-", edited ? plan.folds.map((t: any) => t.entryId).sort().join(",") : "-", size, cost].join(" "));
 		justEdited = edited && !coldPlan;
 		prevSize = size;
 	});
 	out.cost += out.callCost;
+	out.digest = createHash("sha256").update(decisions.join("\n")).digest("hex").slice(0, 16);
 
 	// what the transcript asks for again after an output was folded or summarised away
 	const later: { req: number; sig: string; handle?: string }[] = [];
@@ -213,6 +220,6 @@ files.forEach((f, n) => {
 const sum = (k: string) => rows.reduce((a, x) => a + (x[k] ?? 0), 0);
 const KEYS = ["requests", "turns", "coldReturns", "summaries", "coldSummaries", "warmSummaries", "foldsCold", "foldsWarm", "warmEdits", "rewriteK", "waitS", "cost", "lost", "recalls", "refetchK", "planErrors"];
 const fmt = (k: string, v: number) => (k === "cost" ? (v / 1e6).toFixed(3) : k === "waitS" || k === "rewriteK" || k === "refetchK" ? v.toFixed(0) : String(v));
-const table = [...rows.map((r) => ({ session: String(r.session), ...Object.fromEntries(KEYS.map((k) => [k, fmt(k, r[k])])) })), { session: "total", ...Object.fromEntries(KEYS.map((k) => [k, fmt(k, sum(k))])) }];
+const table = [...rows.map((r) => ({ session: String(r.session), ...Object.fromEntries(KEYS.map((k) => [k, fmt(k, r[k])])), digest: r.digest })), { session: "total", ...Object.fromEntries(KEYS.map((k) => [k, fmt(k, sum(k))])) }];
 console.log(JSON.stringify({ tag, src: SRC, rows: table }));
 if (outPath) writeFileSync(outPath, JSON.stringify({ tag, rows }, null, 1));
