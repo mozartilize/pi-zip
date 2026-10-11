@@ -60,6 +60,7 @@ const JSON_ERR_KEY = /error|err$|fail|exception|warning|traceback/i;
 const JSON_STATUS_KEY = /status|state|phase|stage|outcome|result|exit|code$|reason|message|summary|progress|^ok$|success|done|verdict|halt|blocked/i;
 const JSON_MAX_CHARS = 2_000_000;
 const JSON_MAX_LEAVES = 20_000;
+const JSON_MAX_DEPTH = 64;
 const JSON_VAL = 120;
 
 interface Leaf {
@@ -83,15 +84,16 @@ export function jsonKeyFields(text: string, keep = 8, byPriority = false): strin
 	}
 	if (!doc || typeof doc !== "object") return null;
 	const leaves: Leaf[] = [];
-	const walk = (v: unknown, path: string, key: string) => {
+	// recursive, so depth is capped (a deeply nested document would overflow the stack): deeper values are leaves
+	const walk = (v: unknown, path: string, key: string, depth: number) => {
 		if (leaves.length >= JSON_MAX_LEAVES) return;
-		if (v && typeof v === "object") {
+		if (v && typeof v === "object" && depth < JSON_MAX_DEPTH) {
 			const ents = Array.isArray(v) ? v.map((x, i) => [String(i), x] as const) : Object.entries(v as object);
 			if (!ents.length) leaves.push({ path, key, value: v });
-			for (const [k, x] of ents) walk(x, Array.isArray(v) ? `${path}[${k}]` : `${path}.${/^[A-Za-z_$][\w$]*$/.test(k) ? k : JSON.stringify(k)}`, Array.isArray(v) ? key : k);
+			for (const [k, x] of ents) walk(x, Array.isArray(v) ? `${path}[${k}]` : `${path}.${/^[A-Za-z_$][\w$]*$/.test(k) ? k : JSON.stringify(k)}`, Array.isArray(v) ? key : k, depth + 1);
 		} else leaves.push({ path, key, value: v });
 	};
-	walk(doc, "", "");
+	walk(doc, "", "", 0);
 	const empty = (v: unknown) => v === null || v === false || v === "" || v === 0 || (typeof v === "object" && !!v && !Object.keys(v).length);
 	const picked = new Set<number>();
 	const add = (i: number) => picked.size < keep && picked.add(i);
@@ -112,7 +114,13 @@ export function jsonKeyFields(text: string, keep = 8, byPriority = false): strin
 	}
 	for (let i = 0; i < leaves.length && picked.size < keep; i++) if (!empty(leaves[i].value)) add(i);
 	const show = (v: unknown) => {
-		if (typeof v !== "string") return clip(JSON.stringify(v) ?? String(v), JSON_VAL);
+		if (typeof v !== "string") {
+			try {
+				return clip(JSON.stringify(v) ?? String(v), JSON_VAL);
+			} catch {
+				return Array.isArray(v) ? "[…]" : "{…}"; // a value below the depth cap too deep for JSON.stringify
+			}
+		}
 		const s = v.replace(/\s+/g, " ").trim();
 		return s.length > JSON_VAL ? JSON.stringify("…" + s.slice(-(JSON_VAL - 1))) : JSON.stringify(s);
 	};

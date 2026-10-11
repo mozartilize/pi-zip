@@ -2,7 +2,7 @@
 // mechanical lists, short fold text, JSON key fields. Synthetic sessions only.
 import { describe, expect, test } from "bun:test";
 import { buildBlocks, toolCallIndex } from "../src/plan.ts";
-import { cmdLabel, distinctLines, handleFor, jsonKeyFields, makePlaceholder, makePlaceholderFor, sharedCdDirs, shortArgs, strippableCdDirs } from "../src/placeholder.ts";
+import { cmdLabel, distinctLines, handleFor, jsonKeyFields, keyTexts, makePlaceholder, makePlaceholderFor, sharedCdDirs, shortArgs, strippableCdDirs } from "../src/placeholder.ts";
 import { BUDGET, buildCut, handleRowsOf, INDEX_TOKENS, skeleton, TABLE_ROWS } from "../src/summary.ts";
 import { A, type Any, U } from "./helpers.ts";
 
@@ -263,6 +263,17 @@ describe("single-line JSON outputs (2026-10-10 item 1)", () => {
 		expect(rows).toHaveLength(2);
 		expect(rows[0]).toContain('.items[44].status: "running"');
 		expect(rows[1]).toContain('.items[44].status: "failed"');
+	});
+
+	test("10,000 (and 100,000) levels of nesting: no throw (the walk stops at depth 64), and a placeholder is made", () => {
+		const deep = "[".repeat(10_000) + '"x"' + "]".repeat(10_000);
+		expect(() => jsonKeyFields(deep)).not.toThrow();
+		const o = '{"a":' .repeat(10_000) + '{"status":"done"}' + "}".repeat(10_000);
+		expect(() => jsonKeyFields(o)).not.toThrow();
+		expect(makePlaceholder(o, "bash", "deep", handleFor("d"), 8)).toContain("handle");
+		expect(() => keyTexts(deep)).not.toThrow();
+		const deeper = "[".repeat(100_000) + '"x"' + "]".repeat(100_000); // overflows bun's stack too without the cap (node's from ~5,000)
+		expect(() => jsonKeyFields(deeper)).not.toThrow();
 	});
 
 	test("deterministic", () => {
