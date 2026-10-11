@@ -100,5 +100,19 @@ describe("learned cache survival", () => {
 		expect(record("a/b", { explicit: false, total: 60_000, gapS: 365, alive: true }, path).n).toBe(1);
 		expect(loadStats(path).models["a/b"].cls).toBe("automatic");
 	});
+
+	test("entries with no survival sample (n = 0) of other models are dropped when the file is saved, unless their class is explicit (sticky); the model in use keeps its class (2026-10-11 item 5)", () => {
+		record("tried/once", { explicit: false, total: 50_000 }, path); // an automatic class, no gap sample
+		expect(loadStats(path).models["tried/once"]).toEqual({ cls: "automatic", n: 0, bins: {} }); // in use: kept (its class survives a restart)
+		record("explicit/once", { explicit: true, total: 50_000 }, path); // an explicit class, no gap sample
+		record("x/used", { explicit: true, total: 50_000, gapS: 365, alive: true }, path);
+		const f = loadStats(path);
+		expect(Object.keys(f.models).sort()).toEqual(["explicit/once", "x/used"]); // the automatic n = 0 entry goes; the explicit one stays (sticky)
+		expect(f.models["explicit/once"]).toEqual({ cls: "explicit", n: 0, bins: {} });
+		expect(f.models["x/used"].n).toBe(1);
+		// an entry with samples is never dropped
+		record("y/other", { explicit: false, total: 60_000, gapS: 365, alive: false }, path);
+		expect(Object.keys(loadStats(path).models).sort()).toEqual(["explicit/once", "x/used", "y/other"]);
+	});
 });
 
