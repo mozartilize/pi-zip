@@ -16,7 +16,7 @@
 // the clock and timers (virtual), and pi-zip's index.ts is called as is (only the Zip instance is captured to read its state).
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 
 const argv = process.argv.slice(2);
@@ -82,10 +82,13 @@ function uninstall() {
 	(globalThis as Any).clearTimeout = realClearTimeout;
 }
 const tick = () => new Promise<void>((r) => realSetImmediate(r));
+/** World `slow`: the background summary calls still running (each answers when the clock reaches its due time; restart drops them). */
+const slowCalls = new Set<() => void>();
+const SLOW_MS = 120_000;
 async function drain(z?: Any) {
 	for (let i = 0; i < 4; i++) await tick();
 	const bg = z?.bg;
-	if (bg?.promise) await bg.promise;
+	if (bg?.promise && !slowCalls.size) await bg.promise;
 	for (let i = 0; i < 4; i++) await tick();
 }
 
@@ -164,8 +167,8 @@ function withFile(manager: Any): Any {
  *  context window, Pi's ctx.compact available (native summary path), interactive (away timer), the cache tier (short, or long:
  *  PI_CACHE_RETENTION=long, a 1-hour cache_control in every payload), the tool selection (full: zip_recall declared; file: a `--tools
  *  read,bash` allowlist, recall through files; reread: an allowlist without read, grep, bash or zip_recall) and Pi's idle cache warming. */
-interface World { cls: "explicit" | "automatic"; known: boolean; ttl: number; ttlTrue: number; survival: "none" | "outlives"; c: number; sys: number; window: number; native: boolean; interactive: boolean; tier: "short" | "long"; tools: "full" | "file" | "reread"; warming: boolean }
-const DEFAULT_WORLD: World = { cls: "explicit", known: true, ttl: 300, ttlTrue: 300, survival: "none", c: 1, sys: 3000, window: 200_000, native: true, interactive: true, tier: "short", tools: "full", warming: false };
+interface World { cls: "explicit" | "automatic"; known: boolean; ttl: number; ttlTrue: number; survival: "none" | "outlives"; c: number; sys: number; window: number; native: boolean; interactive: boolean; tier: "short" | "long"; tools: "full" | "file" | "reread"; warming: boolean; slow: boolean }
+const DEFAULT_WORLD: World = { cls: "explicit", known: true, ttl: 300, ttlTrue: 300, survival: "none", c: 1, sys: 3000, window: 200_000, native: true, interactive: true, tier: "short", tools: "full", warming: false, slow: false };
 const LONG_TTL = 3600; // the 1-hour tier
 // the two models a switch moves between: one vendor's family (the world has one tokenizer scale c), so pi-zip may carry the session's
 // scale across a switch (plan.ts sameTokenizer)
@@ -192,6 +195,7 @@ async function runTrace(tr: Any): Promise<Any> {
 	const probes = { pgrid: [0, 0.25, 0.49, 0.51, 0.75, 1], fresh: true, lossless: true, ...(tr.probes ?? {}) };
 	clock = T0;
 	timers = [];
+	slowCalls.clear();
 	narrativeCalls = [];
 	sink = [];
 	captured = null;
@@ -256,13 +260,23 @@ async function runTrace(tr: Any): Promise<Any> {
 		};
 		piZip(pi);
 		const ctx: Any = {
-			mode: w.interactive ? "tui" : "print", hasUI: w.interactive, cwd: CWD, ui: { notify: () => {}, setWorkingMessage: () => {}, setStatus: () => {} },
+			mode: w.interactive ? "tui" : "print", hasUI: w.interactive, cwd: CWD,
+			// pi-zip waits for a call still running (it says so in the working line): in a slow world that call answers now
+			ui: { notify: () => {}, setWorkingMessage: (text?: string) => { if (text) for (const f of [...slowCalls]) f(); }, setStatus: () => {} },
 			getSystemPrompt: () => sysText, sessionManager: manager, isIdle: () => true,
 			modelRegistry: {
 				complete: async (_m: Any, req: Any) => {
 					const r = narrativeOf(req);
 					// the call's real tokens (the world's c per chars/4 token): an uncached read of the prompt, the narrative written
 					narrativeCalls.push({ phase: probe ? "probe" : bgCall.getStore() && phase === "present" ? "background" : phase, at: clock, input: Math.ceil(w.c * r.usage.input), output: Math.ceil(w.c * r.usage.output) });
+					if (w.slow && !probe && bgCall.getStore()) {
+						// a slow world: the background call answers SLOW_MS later on the clock (or at once when pi-zip waits for it)
+						await new Promise<void>((resolve) => {
+							const done = () => { if (slowCalls.delete(done)) resolve(); };
+							slowCalls.add(done);
+							fakeSetTimeout(done, SLOW_MS);
+						});
+					}
 					return r;
 				},
 			},
@@ -1024,6 +1038,7 @@ async function runTrace(tr: Any): Promise<Any> {
 					await fire(live, "session_shutdown", {});
 					warmer?.cancel();
 					timers = [];
+					slowCalls.clear(); // a call still running is lost with the process
 					live = makeInst(sm);
 					await fire(live, "session_start", { type: "session_start", reason: "resume" });
 					warmer = newWarmer();
@@ -1054,6 +1069,12 @@ async function runTrace(tr: Any): Promise<Any> {
 			}
 		}
 		await closeRun(events.length);
+		if (process.env.PZF_CALLS_LOG) {
+			// summary calls made (probes excluded) and pi-zip compactions in the session: calls - used = unused calls (one line a trace)
+			const made = narrativeCalls.filter((c) => c.phase !== "probe").length;
+			const used = sm.getEntries().filter((x: Any) => x.type === "compaction" && x.details?.by === "pi-zip").length;
+			appendFileSync(process.env.PZF_CALLS_LOG, JSON.stringify({ id: tr.id, made, used }) + "\n");
+		}
 	} catch (err) {
 		errors.push(err instanceof Error ? `${err.message}\n${err.stack}` : String(err));
 	} finally {

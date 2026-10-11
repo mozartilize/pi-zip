@@ -1,0 +1,24 @@
+# 0.4.0 step 2: a restart while a summary call runs. A run ends at ~155K and settle starts the summary the warm return would make
+# (rule A); in a slow world it takes 2 minutes, so pi restarts while it runs: the call is lost (recorded as one unused call, its cost
+# kept). The prompt 60 s later finds the cache warm and nothing ready: the restarted process decides as a fresh one (RD, RDr) and,
+# with a UI, writes the summary in the background instead of making the user wait (A3; 0.3.0 waited at req 14).
+world explicit known ttl=300 true=300 survival=none c=1 sys=3000 window=200000 native interactive slow
+prompt
+say 150K
+prompt +1h
+call npm 100
+call npm 100
+call npm 100
+call npm 100
+call npm 100
+call npm 100
+call npm 100
+call npm 100
+call npm 100
+call npm 100
+call npm 100
+call npm 100
+say 100
+restart
+prompt +60s
+say 100
