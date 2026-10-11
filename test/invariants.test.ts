@@ -783,9 +783,12 @@ describe("round 5: rules A (start early) and B (never wait while warm)", () => {
 		expect(s2.calls).toBe(2);
 		expect(s2.signals[0].aborted).toBe(true); // 0.3.0 never started the first one; its final startBg replaced a live summary without aborting it
 		expect(s2.signals[1].aborted).toBe(false);
-		await sleep(450);
-		// booked, not counted against the A/B bound: the context changed under it, nothing thrashed
-		expect(q.appended.filter((x: Any) => x.customType === "pi-zip/unused-summary").map((x: Any) => x.data)).toEqual([{ usd: 0.02 }]);
+		// booked at once (the aborted call's input, estimated), not counted against the A/B bound: the context changed, nothing thrashed
+		const unused = q.appended.filter((x: Any) => x.customType === "pi-zip/unused-summary").map((x: Any) => x.data);
+		expect(unused).toHaveLength(1);
+		expect(unused[0]).toMatchObject({ estimated: true });
+		expect(unused[0].usd).toBeGreaterThan(0);
+		expect(unused[0].ab).toBeUndefined();
 	});
 
 	test("the away timer replacing an early summary (cold cut elsewhere) does not spend the A/B budget: a warm prompt whose pin fails defers, no wait", async () => {
@@ -854,6 +857,22 @@ describe("round 5: rules A (start early) and B (never wait while warm)", () => {
 		expect(req.messages[0].role).toBe("compactionSummary");
 		expect(st.calls).toBe(1);
 		expect(rows("unused_summary")).toEqual([]);
+	});
+
+	test("a discarded A/B summary is booked at discard time, in its stretch: the entry (ab, the estimated input) is there before the aborted call settles", async () => {
+		const st = { calls: 0, delay: 5_000 }; // the call ignores the abort and settles 5 s later
+		const r = await rig(done, WARM_TS(), { modelRegistry: { complete: mkComplete(st) } });
+		const zip = await zipOf(r);
+		await settle(r);
+		await sleep(10);
+		expect(zip.bg?.origin).toBe("early");
+		zip.discardBg();
+		// before: appended only once the aborted promise settled (5 s here), possibly after a cold return or in the next session
+		const unused = r.appended.filter((x: Any) => x.customType === "pi-zip/unused-summary").map((x: Any) => x.data);
+		expect(unused).toHaveLength(1);
+		expect(unused[0]).toMatchObject({ ab: true, estimated: true });
+		expect(unused[0].usd).toBeCloseTo(zip.stats.summaryUsd, 9);
+		expect(unused[0].usd).toBeGreaterThan(0);
 	});
 
 	test("a finished early summary lost when the process ends is booked (its cost), but not counted against the bound: the restarted process starts its own", async () => {
