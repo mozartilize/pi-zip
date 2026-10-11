@@ -851,7 +851,7 @@ model as replay.ts: every request at the cache-class prices plus every summary c
 
 `--suite standard --random 3000 --seed 1 --workers 26 --shrink 40` (36,924 traces, 307,635 requests) and
 `--suite none --random 15000 --seed 7`, both sources under the final checker (strict A3), v031 at the review fixes (`out/r5b` for
-d7d6ff5, `out/r5c` for v031; the first v031's columns, `out/r5`, were identical but for one suite NR trace):
+d7d6ff5, `out/r5c` for v031; the first v031's columns, `out/r5`, are identical trace for trace):
 
 | property | suite d7d6ff5 | suite v031 | seed 7 d7d6ff5 | seed 7 v031 |
 |---|---|---|---|---|
