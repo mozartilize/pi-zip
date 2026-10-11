@@ -1,6 +1,6 @@
 // The pure decision core (src/core.ts): view, clock, law, plan and decide as functions of (branch, Λ, now).
 import { describe, expect, test } from "bun:test";
-import { checkEdits, clock, coldReturnAfter, decideRun, decideSettle, decideTurnEnd, grow, lastRegrow, lawOf, pin, planOpts, ruleB, runPlanOf, scaleOf, summarizedSince, valvePlanOf, type Env, type Learned } from "../src/core.ts";
+import { checkEdits, clock, coldReturnAfter, decideRun, decideSettle, decideTurnEnd, adopt, artifactsOf, grow, headOf, lastRegrow, lawOf, planOpts, readyOf, ruleB, unusedOf, runPlanOf, scaleOf, summarizedSince, valvePlanOf, type Env, type Learned } from "../src/core.ts";
 import { planContext, UNIT, type PlanResult } from "../src/plan.ts";
 import { replayGrowth } from "../src/state.ts";
 import { A, AX, R, U, type Any } from "./helpers.ts";
@@ -93,32 +93,51 @@ describe("core: plan", () => {
 		expect(planOpts(big, [], env(), lam(), false, "warm", 1, "u2").o.cutAt).toBe("u2");
 		expect(planOpts(big, [], env({ rereadOnly: true }), lam(), false, "cold").o.rereadOnly).toBe(true);
 	});
-	test("pin: no key, no cut or the same cut keep the first plan; another cut is taken only if the plan for it cuts there", () => {
-		const p = (k: string | null) => ({ p: k === null ? null : ({ cutIdx: 3, firstKeptEntryId: k } as PlanResult) });
-		expect(pin(p("a"), () => p("b"), null, "x")).toEqual({ r: p("a") });
-		expect(pin(p("a"), () => p("b"), "a", "x")).toEqual({ r: p("a") });
-		expect(pin(p("a"), () => p("b"), "b", "x")).toEqual({ r: p("b"), note: { type: "pin", where: "x", from: "a", to: "b", ok: true } });
-		expect(pin(p("a"), () => p(null), "b", "x")).toEqual({ r: p("a"), note: { type: "pin", where: "x", from: "a", to: "b", ok: false } });
+	test("adopt: nothing available, no cut or the same cut keep the first plan; the deepest summary not deeper than the cut is taken if the plan for it cuts there", () => {
+		const blocks = ["s", "a", "b", "c", "d"].map((entryId) => ({ entryId }));
+		const p = (k: string | null) => ({ p: k === null ? null : ({ cutIdx: 3, firstKeptEntryId: k, blocks } as unknown as PlanResult) });
+		const r = (key: string) => ({ key, running: false });
+		expect(adopt(p("c"), () => p("b"), [], "x")).toEqual({ r: p("c") });
+		expect(adopt(p("c"), () => p("b"), [r("c"), r("a")], "x")).toEqual({ r: p("c") });
+		expect(adopt(p("c"), (k) => p(k), [r("a"), r("b")], "x")).toEqual({ r: p("b"), note: { type: "pin", where: "x", from: "c", to: "b", ok: true } });
+		expect(adopt(p("c"), (k) => p(k), [{ key: "b", running: true }], "x")).toEqual({ r: p("b"), note: { type: "pin", where: "x", from: "c", to: "b", ok: true, running: true } });
+		expect(adopt(p("c"), () => p(null), [r("b")], "x")).toEqual({ r: p("c"), note: { type: "pin", where: "x", from: "c", to: "b", ok: false } });
+		// never deeper than the plan's own cut, and never a cut the projection does not have
+		expect(adopt(p("c"), (k) => p(k), [r("d"), r("gone")], "x")).toEqual({ r: p("c") });
+	});
+	test("artifacts: ready while their head is the branch's; unused unless a pi-zip compaction used their text; lost calls count, at their cost", () => {
+		const cut = (k: string, text: string) => ({ firstKeptEntryId: k, text }) as Any;
+		const rec = (data: Any) => ({ type: "custom", customType: "pi-zip/summary", data });
+		const branch: Any[] = [{ type: "message", id: "m1" }, rec({ head: "", key: "m1", cut: cut("m1", "S1"), usd: 0.1 }), rec({ head: "", key: "m2", usd: 0.05, estimated: true, lost: "shutdown" })];
+		expect(headOf(branch)).toBe("");
+		expect(artifactsOf(branch)).toHaveLength(2);
+		expect(readyOf(branch).map((a) => a.key)).toEqual(["m1"]); // the lost call has no summary
+		expect(readyOf(branch, [{ head: "", key: "m3", cut: cut("m3", "S3"), usd: 0 }]).map((a) => a.key)).toEqual(["m1", "m3"]);
+		expect(unusedOf(branch)).toEqual({ n: 2, usd: 0.15000000000000002 });
+		const used = [...branch, { type: "compaction", id: "c1", firstKeptEntryId: "m1", summary: "S1", details: { by: "pi-zip" } }];
+		expect(headOf(used)).toBe("c1");
+		expect(readyOf(used)).toEqual([]); // any compaction moves the head: what was written for the old one is not ready any more
+		expect(unusedOf(used)).toEqual({ n: 1, usd: 0.05 });
+		expect(unusedOf([...branch, { type: "compaction", id: "c2", firstKeptEntryId: "m1", summary: "other", details: { by: "pi-zip" } }]).n).toBe(2);
 	});
 });
 
 describe("core: decide", () => {
 	const plan = (o: Any) => ({ atRoom: false, atRoomUnedited: false, firstKeptEntryId: "k", ...o }) as PlanResult;
-	test("ruleB: no UI or the room waits; a summary for this cut is taken when done, else left running; otherwise started unless the budget is spent", () => {
-		expect(ruleB(plan({}), false, null, true)).toBe("wait");
-		expect(ruleB(plan({ atRoom: true }), true, null, true)).toBe("wait");
-		expect(ruleB(plan({ atRoomUnedited: true }), true, null, true)).toBe("wait");
-		expect(ruleB(plan({}), true, { key: "k", done: {}, failed: false }, false)).toBe("take");
-		expect(ruleB(plan({}), true, { key: "k", done: null, failed: false }, false)).toBe("running");
-		expect(ruleB(plan({}), true, { key: "k", done: null, failed: true }, true)).toBe("start");
-		expect(ruleB(plan({}), true, { key: "other", done: {}, failed: false }, true)).toBe("start");
-		expect(ruleB(plan({}), true, null, false)).toBe("spent");
+	test("ruleB: no UI or the room waits; a summary for this cut is taken when ready, else left running; otherwise started", () => {
+		expect(ruleB(plan({}), false, [])).toBe("wait");
+		expect(ruleB(plan({ atRoom: true }), true, [])).toBe("wait");
+		expect(ruleB(plan({ atRoomUnedited: true }), true, [])).toBe("wait");
+		expect(ruleB(plan({}), true, [{ key: "k", running: false }])).toBe("take");
+		expect(ruleB(plan({}), true, [{ key: "k", running: true }])).toBe("running");
+		expect(ruleB(plan({}), true, [{ key: "other", running: false }])).toBe("start");
+		expect(ruleB(plan({}), true, [])).toBe("start");
 	});
 	const opts = (l: Learned, mode: "cold" | "warm", p: number) => (entries: Any[], cutAt?: string) => planOpts(entries, [], env(), l, false, mode, p, cutAt);
 	test("decideRun: b2b only for a warm return right after an edit without a native summary; a cold return plans on the session", () => {
 		const l = lam({ justEdited: true });
-		expect(decideRun({ cold: false, pastTtl: false, justEdited: true, nat: null, foreign: false, now: big, bgKey: null, opts: opts(l, "warm", 1) }).kind).toBe("b2b");
-		const d = decideRun({ cold: true, pastTtl: true, justEdited: true, nat: null, foreign: false, now: big, bgKey: null, opts: opts(l, "cold", 0) });
+		expect(decideRun({ cold: false, pastTtl: false, justEdited: true, nat: null, foreign: false, now: big, avail: [], opts: opts(l, "warm", 1) }).kind).toBe("b2b");
+		const d = decideRun({ cold: true, pastTtl: true, justEdited: true, nat: null, foreign: false, now: big, avail: [], opts: opts(l, "cold", 0) });
 		expect(d.kind).toBe("plan");
 		if (d.kind !== "plan") return;
 		expect(d.o.pastTtl).toBe(true);
@@ -127,23 +146,23 @@ describe("core: decide", () => {
 		expect(d.onPre).toBe(false);
 		expect(d.notes).toEqual([]);
 		// pure: the same inputs give the same decision
-		const again = decideRun({ cold: true, pastTtl: true, justEdited: true, nat: null, foreign: false, now: big, bgKey: null, opts: opts(l, "cold", 0) });
+		const again = decideRun({ cold: true, pastTtl: true, justEdited: true, nat: null, foreign: false, now: big, avail: [], opts: opts(l, "cold", 0) });
 		expect(again.kind === "plan" && again.p?.firstKeptEntryId).toBe(d.p!.firstKeptEntryId);
 	});
 	test("decideRun: another extension's compaction just went in: folds only (no summary)", () => {
-		const d = decideRun({ cold: true, pastTtl: true, justEdited: false, nat: null, foreign: true, now: big, bgKey: null, opts: opts(lam(), "cold", 0) });
+		const d = decideRun({ cold: true, pastTtl: true, justEdited: false, nat: null, foreign: true, now: big, avail: [], opts: opts(lam(), "cold", 0) });
 		expect(d.kind === "plan" && d.o.noSummary).toBe(true);
 		expect(d.kind === "plan" && d.p?.cutIdx).toBeNull();
 	});
 	test("decideRun: a native summary whose cut the plan does not reach: the session as it is, with a note", () => {
-		const d = decideRun({ cold: false, pastTtl: false, justEdited: true, nat: { key: "nowhere", pre: big, entryId: "c9" }, foreign: false, now: small, bgKey: null, opts: opts(lam(), "warm", 1) });
+		const d = decideRun({ cold: false, pastTtl: false, justEdited: true, nat: { key: "nowhere", pre: big, entryId: "c9" }, foreign: false, now: small, avail: [], opts: opts(lam(), "warm", 1) });
 		expect(d.kind).toBe("plan");
 		if (d.kind !== "plan") return;
 		expect(d.onPre).toBe(false);
 		expect(d.notes).toEqual([{ type: "native_mismatch", planned: d.p?.firstKeptEntryId ?? null, compacted: "nowhere" }]);
 	});
 	test("runPlanOf: source settle / runstart / valve; the guard drops a cut that left the projection; sizes count the summary", () => {
-		const d = decideRun({ cold: true, pastTtl: true, justEdited: false, nat: null, foreign: false, now: big, bgKey: null, opts: opts(lam(), "cold", 0) });
+		const d = decideRun({ cold: true, pastTtl: true, justEdited: false, nat: null, foreign: false, now: big, avail: [], opts: opts(lam(), "cold", 0) });
 		if (d.kind !== "plan" || !d.p) throw new Error("no plan");
 		const base = { p: d.p, cal: d.cal, cold: true, onPre: false, native: null, nat: null, folds: d.p.folds, cut: null, adopted: false, settleIds: [] as string[], ms: 1, bgWaitMs: 0 };
 		expect(runPlanOf(base).plan.source).toBe("runstart");
@@ -161,9 +180,9 @@ describe("core: decide", () => {
 	});
 	test("decideTurnEnd: none after a failed turn, b2b after an edited request, a warm plan only when it changes something", () => {
 		const o = (cutAt?: string) => planOpts(small, [], env(), lam(), false, "warm", 1, cutAt);
-		expect(decideTurnEnd({ failed: true, justEdited: false, bgKey: null, entries: small, opts: o }).kind).toBe("none");
-		expect(decideTurnEnd({ failed: false, justEdited: true, bgKey: null, entries: small, opts: o }).kind).toBe("b2b");
-		const d = decideTurnEnd({ failed: false, justEdited: false, bgKey: null, entries: small, opts: o });
+		expect(decideTurnEnd({ failed: true, justEdited: false, avail: [], entries: small, opts: o }).kind).toBe("none");
+		expect(decideTurnEnd({ failed: false, justEdited: true, avail: [], entries: small, opts: o }).kind).toBe("b2b");
+		const d = decideTurnEnd({ failed: false, justEdited: false, avail: [], entries: small, opts: o });
 		expect(d.kind === "plan" && d.p).toBeNull();
 	});
 	test("valvePlanOf: a valve plan's sizes and the wait of its summary (adopted: the background wait)", () => {
@@ -174,7 +193,7 @@ describe("core: decide", () => {
 		expect(valvePlanOf(p, cut, false, 42, 1).waitMs).toBe(7);
 	});
 	test("decideSettle: the cold plan always; the warm plan unless the newest request carried an edit", () => {
-		const x = (justEdited: boolean) => decideSettle({ justEdited, bgKey: null, entries: big, cold: () => planOpts(big, [], env(), lam(), true, "cold"), warm: (cutAt) => planOpts(big, [], env(), lam(), true, "warm", undefined, cutAt) });
+		const x = (justEdited: boolean) => decideSettle({ justEdited, avail: [], entries: big, cold: () => planOpts(big, [], env(), lam(), true, "cold"), warm: (cutAt) => planOpts(big, [], env(), lam(), true, "warm", undefined, cutAt) });
 		expect(x(true).p).not.toBeNull();
 		expect(x(true).w).toBeNull();
 		expect(x(false).w).not.toBeNull();

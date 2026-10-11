@@ -373,7 +373,7 @@ describe("real Pi: a summary prepared while the user was away goes in through Pi
 		const req1 = await r.request();
 		expect(req1.some((m) => m.role === "compactionSummary")).toBe(true);
 		expect(r.narrativeCalls.length).toBe(1); // old code: 2 (the key's call cut at the note, the run plan one turn earlier)
-		expect(r.sm.getEntries().filter((e: Any) => e.type === "custom" && e.customType === "pi-zip/unused-summary")).toEqual([]);
+		expect(r.sm.getEntries().filter((e: Any) => e.type === "custom" && e.customType === "pi-zip/summary" && !e.data?.cut)).toEqual([]); // no call ended unused
 	});
 
 	// review P1-1: the usual "open, look, leave" (Ctrl+D, Ctrl+C twice, Esc, arrows, /quit, /resume to another session) is not typing a
