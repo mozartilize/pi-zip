@@ -1,7 +1,7 @@
 // Summary (F11, F12): deterministic skeleton (user words verbatim + files/commands) + model-written narrative + handle table.
 // Thinking is never quoted or paraphrased: it is stripped before the model sees the prefix.
 import { randomUUID } from "node:crypto";
-import { handleFor, outcomeHint, pickKeyLines, RECALL_TOOL, shortArgs } from "./placeholder.ts";
+import { cdDirOf, clipMid, distinctLines, handleFor, outcomeHint, pickKeyLines, RECALL_TOOL, sharedCdDirs, shortArgs } from "./placeholder.ts";
 import { type Block, type Cut, type PlanResult, settings, toolCallIndex } from "./plan.ts";
 import { type FileRecall, fileRecallHow } from "./recallfile.ts";
 import { type Any, clamp, clip, fmtWhen, textOf, tok4 } from "./util.ts";
@@ -47,7 +47,7 @@ const CMD_ROW = new RegExp(`^\`(.*)\` -> [^(]*\\(turn (\\d+), (${H})\\)$`);
 const OTHER_ROW = new RegExp(`^(\\S+) (.*) \\(turn (\\d+), (${H})\\)$`);
 const FILE_ROW = /^- (.*) \(([^()]*)\)$/;
 const FILE_OP = new RegExp(`^(\\S+): (${H})$`);
-const TABLE_ROW = new RegExp(`^- (${H}) · (\\S+)((?: [^·]*?)?)(?: · turn (\\d+))?(?: · .*)?$`);
+const TABLE_ROW = new RegExp(`^- (${H}) · (\\S+)((?: [^·]*?)?)(?: · turn (\\d+))?(?: · (.*))?$`);
 const INDEX_HEAD = "## Handle index";
 /** Budget of the "Handle index" section, in tokens. */
 export const INDEX_TOKENS = 1500;
@@ -57,9 +57,11 @@ interface IndexRow {
 	tool: string;
 	args: string;
 	turn?: number;
+	hint?: string; // only for rows that would otherwise read the same: the first line of the output that tells it apart
 }
+const INDEX_HINT = 50;
 
-const indexLine = (r: IndexRow) => `- ${r.handle} · ${r.tool}${r.args ? " " + r.args : ""}${r.turn ? ` · turn ${r.turn}` : ""}`;
+const indexLine = (r: IndexRow) => `- ${r.handle} · ${r.tool}${r.args ? " " + r.args : ""}${r.turn ? ` · turn ${r.turn}` : ""}${r.hint ? ` · ${clip(r.hint, INDEX_HINT)}` : ""}`;
 
 /**
  * Handle rows (oldest first) recorded in an earlier summary, read from every section that carries them: the commands, files and
@@ -86,7 +88,8 @@ export function handleRowsOf(text: string | null): IndexRow[] {
 					if (h) rows.push({ handle: h[2], tool: h[1], args: m[1] });
 				}
 		} else if (sec.startsWith("## Folded outputs") || sec.startsWith(INDEX_HEAD)) {
-			if ((m = TABLE_ROW.exec(line))) rows.push({ handle: m[1], tool: m[2], args: m[3].trim(), turn: m[4] ? Number(m[4]) : undefined });
+			// an index row keeps the line that tells it apart; a table row's tail (outcome, key line) stays in the table
+			if ((m = TABLE_ROW.exec(line))) rows.push({ handle: m[1], tool: m[2], args: m[3].trim(), turn: m[4] ? Number(m[4]) : undefined, ...(m[5] && sec.startsWith(INDEX_HEAD) ? { hint: m[5] } : {}) });
 		}
 	}
 	return rows;
@@ -102,7 +105,7 @@ function handleIndex(now: IndexRow[], previous: string | null, listed: string, b
 	for (const r of [...now].reverse().concat(handleRowsOf(previous).reverse())) {
 		if (seen.has(r.handle)) continue;
 		seen.add(r.handle);
-		rows.push({ ...r, args: clip(r.args, 60) });
+		rows.push({ ...r, args: clipMid(r.args, 60) });
 	}
 	if (!rows.length) return null;
 	const head = `${INDEX_HEAD} (older outputs, newest first; ${file ? `${file.dir}/<handle>.txt holds the original` : "zip_recall with a handle returns the original"})`;
@@ -142,6 +145,7 @@ export interface ParsedSummary {
 	table: Items;
 	narrative: string[]; // model-written text and free text, oldest first
 	narrativeAt?: string; // a narrative carried forward unchanged (its call failed) says when it was written
+	cmdDirs: string[]; // the shared `cd <dir>` prefixes the command rows leave out (oldest first)
 }
 
 const SECTIONS: Array<[RegExp, string]> = [
@@ -164,11 +168,14 @@ const COVERS_ROW = /^Covers \d+ earlier messages\./;
 const NONE_ROW = "(none)";
 /** Heading of a previous narrative carried forward unchanged because the call for a new one failed (buildCut). */
 const narrCarriedHead = (at: string | undefined, why: string) => `## Narrative (carried forward from the summary of ${at ?? "an earlier time"}; possibly stale: a new one could not be written: ${why})`;
+/** The commands heading names the shared `cd <dir>` prefixes its rows leave out. */
+const cmdsHead = (dirs: string[]) => `## Commands run (with exit status${dirs.length ? `; a leading "cd <dir> &&" is left out for: ${dirs.join(", ")}` : ""})`;
+const CMD_DIRS_RE = /^## Commands run \(.*; a leading "cd <dir> &&" is left out for: (.*)\)$/;
 const NARR_CARRIED_RE = /^## Narrative \(carried forward from the summary of ([^;]+);/;
 
 /** Parse any summary text: pi-zip's current and older formats (carried-forward blocks nested inside carried-forward blocks included), or free text. */
 export function parseSummary(text: string | null): ParsedSummary {
-	const out: ParsedSummary = { structured: false, users: { items: [], omitted: 0 }, files: { rows: [], omitted: 0 }, cmds: { items: [], omitted: 0 }, others: { items: [], omitted: 0 }, errors: { items: [], omitted: 0 }, table: { items: [], omitted: 0 }, narrative: [] };
+	const out: ParsedSummary = { cmdDirs: [], structured: false, users: { items: [], omitted: 0 }, files: { rows: [], omitted: 0 }, cmds: { items: [], omitted: 0 }, others: { items: [], omitted: 0 }, errors: { items: [], omitted: 0 }, table: { items: [], omitted: 0 }, narrative: [] };
 	if (!text) return out;
 	// occurrences in text order; in the older nested format the nested (older) copy of a section comes first, so order = oldest first
 	const occ: Array<{ key: string; lines: string[]; indented?: boolean }> = [{ key: "free", lines: [] }];
@@ -178,6 +185,8 @@ export function parseSummary(text: string | null): ParsedSummary {
 		if (hit) {
 			const at = NARR_CARRIED_RE.exec(line);
 			if (at) out.narrativeAt = at[1];
+			const dirs = CMD_DIRS_RE.exec(line);
+			if (dirs) out.cmdDirs.push(...dirs[1].split(", ").filter((d) => d && !out.cmdDirs.includes(d)));
 			occ.push({ key: hit[1], lines: [], indented: hit[1] === "users" && line.trim() === USERS_HEAD });
 			if (hit[1] !== "free" && hit[1] !== "narr") out.structured = true;
 			continue;
@@ -303,6 +312,10 @@ function mergeItems(older: string[], newer: string[], omitted: number, maxItems:
 	return { kept: all.slice(from), omitted: omitted + from };
 }
 
+/** Every bash command of these blocks, in order. */
+const bashCommands = (blocks: Block[]): string[] =>
+	blocks.flatMap((b) => (b.kind === "assistant" ? (b.msg.content ?? []).filter((c: Any) => c?.type === "toolCall" && c.name === "bash").map((c: Any) => String(c.arguments?.command ?? "")) : []));
+
 /** Per-section budgets (characters unless noted); the total stays near the old design's 12,000-char carry plus the new prefix's own lists. */
 const BUDGET = { users: 16000, files: 6000, cmds: 10000, others: 5000, errors: 4000, lines: 60, errorLines: 15 };
 /** The previous summary's narrative the narrative call merges (summary.ts narrative): at most this many characters, the clip a narrative
@@ -360,6 +373,9 @@ export function skeleton(prefix: Block[], previous: string | null, tableText = "
 	const others: string[] = []; // tools with neither a command nor a path (web fetch, pathless grep, custom tools)
 	const errors: string[] = [];
 	const now: IndexRow[] = []; // every recallable result of this prefix, oldest first
+	const nowText: string[] = []; // ... and its output (to tell look-alike rows apart)
+	const usedDirs = new Set<string>(); // shared `cd <dir>` prefixes left out of this prefix's command rows
+	const shared = sharedCdDirs(bashCommands(prefix));
 	for (const b of prefix) {
 		if (b.kind === "user") {
 			const t = textOf(b.msg.content).trim();
@@ -375,7 +391,9 @@ export function skeleton(prefix: Block[], previous: string | null, tableText = "
 				const m = /Command exited with code (\d+)/.exec(resText);
 				const status = m ? `exit ${m[1]}` : res?.msg.isError ? "error" : res ? "exit 0" : "no result";
 				const tag = res ? ` (turn ${res.userTurn}${res.entryId ? ", " + handleFor(res.entryId) : ""})` : ""; // every result is recallable, so every one gets its handle
-				cmds.push(`\`${clip(String(a.command ?? ""), 160)}\` -> ${status}${tag}`);
+				const d = cdDirOf(String(a.command ?? ""));
+				if (d && shared.has(d)) usedDirs.add(d);
+				cmds.push(`\`${shortArgs({ command: String(a.command ?? "") }, 160, shared)}\` -> ${status}${tag}`);
 			} else if (typeof a.path === "string" || typeof a.file_path === "string") {
 				const p = String(a.path ?? a.file_path);
 				if (!files.has(p)) files.set(p, new Map());
@@ -383,9 +401,12 @@ export function skeleton(prefix: Block[], previous: string | null, tableText = "
 				ops.set(c.name, res?.entryId ? handleFor(res.entryId) : (ops.get(c.name) ?? null));
 			} else if (c.name !== RECALL_TOOL) {
 				const tag = res ? ` (turn ${res.userTurn}${res.entryId ? ", " + handleFor(res.entryId) : ""})` : " (no result)";
-				others.push(`${c.name} ${clip(shortArgs(a), 160)}${tag}`);
+				others.push(`${c.name} ${shortArgs(a, 160)}${tag}`);
 			}
-			if (res?.entryId && c.name !== RECALL_TOOL) now.push({ handle: handleFor(res.entryId), tool: c.name, args: clip(shortArgs(a), 60), turn: res.userTurn });
+			if (res?.entryId && c.name !== RECALL_TOOL) {
+				now.push({ handle: handleFor(res.entryId), tool: c.name, args: shortArgs(a, 60, shared), turn: res.userTurn });
+				nowText.push(resText);
+			}
 			if (res?.msg.isError) errors.push(`- ${c.name} ${shortArgs(a)}: ${clip(resText, 200)}`);
 		}
 	}
@@ -417,9 +438,18 @@ export function skeleton(prefix: Block[], previous: string | null, tableText = "
 	if (mu.omitted) out.push(`[… ${mu.omitted} older requests omitted …]`);
 	out.push(...(userLines.length ? userLines : [NONE_ROW]));
 	out.push(...list("## Files touched", mf, "older omitted"));
-	out.push(...list("## Commands run (with exit status)", mc, "older omitted"));
+	const dirs = [...prev.cmdDirs.filter((d) => !usedDirs.has(d)), ...usedDirs].slice(-3);
+	out.push(...list(cmdsHead(dirs), mc, "older omitted"));
 	if (mo.kept.length) out.push(...list("## Other tool calls (turn, handle)", mo, "older omitted"));
 	out.push(...list("## Errors", me, "older omitted"));
+	// index rows of this prefix that would read the same (same tool and arguments): each gets the first line of its output that tells it apart
+	const groups = new Map<string, number[]>();
+	now.forEach((r, i) => groups.set(`${r.tool} ${r.args}`, [...(groups.get(`${r.tool} ${r.args}`) ?? []), i]));
+	for (const ix of groups.values()) {
+		if (ix.length < 2) continue;
+		const hints = distinctLines(ix.map((i) => nowText[i]), ix.map((i) => pickKeyLines(nowText[i]).map((k) => k.text)), [], INDEX_HINT);
+		ix.forEach((i, k) => hints[k] && (now[i].hint = hints[k]!));
+	}
 	const index = handleIndex(now, previous, out.join("\n") + "\n" + tableText, INDEX_TOKENS, file);
 	if (index) out.push(index);
 	// the previous narrative is not carried here: the narrative call merges it into one (buildCut), or the fallback carries it whole
@@ -518,14 +548,37 @@ export async function buildCut(p: PlanResult, ctx: Any, signal?: AbortSignal): P
 	const t0 = performance.now();
 	const prefix = p.blocks.slice(0, p.cutIdx!);
 	const prev = prefix[0]?.kind === "summary" ? String(prefix[0].msg.summary ?? "") || null : null;
+	const shared = sharedCdDirs(bashCommands(prefix.filter((b) => b.kind !== "summary")));
+	const texts: string[] = [];
+	const keyTexts: string[][] = [];
 	const rows: HandleRow[] = prefix
 		.filter((b) => b.kind === "toolResult" && b.entryId && (b.ours || b.tokens > foldMin))
 		.map((b) => {
 			const call = p.calls.get(b.msg.toolCallId);
-			const keys = pickKeyLines(textOf((b.raw ?? b.msg).content), keepLines);
+			const out = textOf((b.raw ?? b.msg).content);
+			const keys = pickKeyLines(out, keepLines);
 			const tool = call?.name ?? b.msg.toolName ?? "tool";
-			return { handle: handleFor(b.entryId!), tool, args: call ? shortArgs(call.args) : "", turn: b.userTurn, outcome: outcomeHint(textOf((b.raw ?? b.msg).content), tool, !!b.msg.isError), hint: (keys.find((k) => k.why === "error" || k.why === "id") ?? keys[0])?.text ?? "" };
+			const hint = (keys.find((k) => k.why === "error" || k.why === "id") ?? keys[0])?.text ?? "";
+			texts.push(out);
+			keyTexts.push([hint, ...keys.map((k) => k.text)]);
+			return { handle: handleFor(b.entryId!), tool, args: call ? shortArgs(call.args, undefined, shared) : "", turn: b.userTurn, outcome: outcomeHint(out, tool, !!b.msg.isError), hint };
 		});
+	// rows of one tool that would show the same key line (the first line of every status report, say): each shows the first of its
+	// lines that none of the others has, nor a row of that tool the previous summary's table already shows
+	const prevHints = new Map<string, string[]>();
+	for (const l of parseSummary(prev).table.items) {
+		const m = TABLE_ROW.exec(l);
+		if (m) prevHints.set(m[2], [...(prevHints.get(m[2]) ?? []), (m[5] ?? "").split(" · ").pop() ?? ""]);
+	}
+	const same = new Map<string, number[]>();
+	rows.forEach((r, i) => same.set(`${r.tool}\u0000${clip(r.hint, 90)}`, [...(same.get(`${r.tool}\u0000${clip(r.hint, 90)}`) ?? []), i]));
+	for (const ix of same.values()) {
+		const { tool, hint } = rows[ix[0]];
+		const taken = prevHints.get(tool) ?? [];
+		if (ix.length < 2 && !taken.includes(clip(hint, 90))) continue;
+		const hs = distinctLines(ix.map((i) => texts[i]), ix.map((i) => keyTexts[i]), taken, 90);
+		ix.forEach((i, k) => hs[k] && (rows[i].hint = hs[k]!));
+	}
 	const file = p.fileRecall; // zip_recall hidden by an allowlist: the summary names the recall files instead
 	const table = handleTable(rows, prev, file);
 	const sk = skeleton(prefix.filter((b) => b.kind !== "summary"), prev, table ?? "", file);

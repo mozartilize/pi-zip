@@ -63,9 +63,47 @@ export function clipMid(s: string, n: number): string {
 
 const ARG_CHARS = 90;
 
-export function shortArgs(args: Any): string {
+/** A leading `cd <dir> &&` or `cd <dir>;` (the dir quoted or not), the prefix a whole session of commands often shares. */
+const CD_RE = /^\s*cd\s+("[^"]*"|'[^']*'|[^\s;&|]+)\s*(?:&&|;)\s*/;
+export const cdDirOf = (cmd: string): string | null => CD_RE.exec(cmd)?.[1] ?? null;
+/** The `cd <dir>` prefixes at least two of these commands share (they say nothing that tells the rows apart), sorted. */
+export function sharedCdDirs(cmds: string[]): Set<string> {
+	const n = new Map<string, number>();
+	for (const c of cmds) {
+		const d = cdDirOf(c);
+		if (d) n.set(d, (n.get(d) ?? 0) + 1);
+	}
+	return new Set([...n].filter(([, k]) => k >= 2).map(([d]) => d).sort());
+}
+
+const HEREDOC_RE = /<<-?\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\1/;
+const ECHO_RE = /^\s*(?:echo|printf|print\(|console\.log\()/;
+/** A heredoc command shown by its command line and the part of its body that tells it apart: a comment, else an echo/print line, else
+ *  the tail of the body (the head is boilerplate: imports, file opens), then whatever follows the terminator. null: no heredoc. */
+function heredocLabel(cmd: string): string | null {
+	const lines = cmd.split("\n");
+	const m = HEREDOC_RE.exec(lines[0]);
+	if (!m || lines.length < 2) return null;
+	let end = lines.findIndex((l, i) => i > 0 && l.trim() === m[2]);
+	if (end < 0) end = lines.length;
+	const body = lines.slice(1, end).filter((l) => l.trim());
+	const after = lines.slice(end + 1).join(" ").trim();
+	const comment = body.find((l) => /^\s*(#(?!!)|\/\/)\s*\S/.test(l));
+	const echo = body.find((l) => ECHO_RE.test(l));
+	const gist = comment ?? echo ?? body.slice(-2).join(" ");
+	return `${lines[0].trim()} … ${gist.trim()}${after ? ` ${m[2]} ${after}` : ""}`;
+}
+
+/** A command as a label: a `cd` prefix shared with other rows (`shared`) dropped, a heredoc shown by its gist, clipped in the middle. */
+export function cmdLabel(cmd: string, n = ARG_CHARS, shared?: Set<string>): string {
+	const d = cdDirOf(cmd);
+	const c = d && shared?.has(d) ? cmd.replace(CD_RE, "") : cmd;
+	return clipMid(heredocLabel(c) ?? c, n);
+}
+
+export function shortArgs(args: Any, n = ARG_CHARS, shared?: Set<string>): string {
 	if (!args || typeof args !== "object") return "";
-	if (typeof args.command === "string") return clipMid(args.command, ARG_CHARS);
+	if (typeof args.command === "string") return cmdLabel(args.command, n, shared);
 	const path = typeof args.path === "string" ? args.path : typeof args.file_path === "string" ? args.file_path : null;
 	if (path !== null && typeof args.pattern !== "string") {
 		// which slice of the file, written the way Pi's own read row writes it: "src/a.ts:1-2000", "src/a.ts:50-"
@@ -73,14 +111,28 @@ export function shortArgs(args: Any): string {
 		const off = num("offset"), lim = num("limit");
 		const start = off ?? 1;
 		const win = off !== undefined || lim !== undefined ? `:${start}${lim !== undefined ? `-${start + lim - 1}` : ""}` : "";
-		return clipMid(path, ARG_CHARS) + win;
+		return clipMid(path, n) + win;
 	}
-	if (typeof args.pattern === "string") return clipMid(args.pattern + (args.path ? " " + args.path : ""), ARG_CHARS);
+	if (typeof args.pattern === "string") return clipMid(args.pattern + (args.path ? " " + args.path : ""), n);
 	try {
-		return clipMid(JSON.stringify(args), ARG_CHARS);
+		return clipMid(JSON.stringify(args), n);
 	} catch {
 		return "";
 	}
+}
+
+/**
+ * Rows that would show the same label: for each output, the first line (its `preferred` key lines first, then every line in order) that
+ * no other of these outputs contains and that is not one of the `taken` labels already shown; null when there is none. Lines compare
+ * as shown (whitespace collapsed, clipped to `n`). Pure: the same outputs always give the same lines.
+ */
+export function distinctLines(texts: string[], preferred: string[][] = [], taken: string[] = [], n = 90, maxLines = 2000): Array<string | null> {
+	const norm = (l: string) => clip(l, n);
+	const linesOf = texts.map((t, i) => [...(preferred[i] ?? []), ...t.split("\n", maxLines)].map(norm).filter((l) => l));
+	const count = new Map<string, number>();
+	for (const ls of linesOf) for (const l of new Set(ls)) count.set(l, (count.get(l) ?? 0) + 1);
+	const used = new Set(taken.map(norm));
+	return linesOf.map((ls) => ls.find((l) => count.get(l) === 1 && !used.has(l)) ?? null);
 }
 
 const COUNT_RE = /\b(\d+)\s+(passed|passing|pass|failed|failing|fail|skipped|errors?)\b/gi;
