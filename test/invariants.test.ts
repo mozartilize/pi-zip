@@ -784,7 +784,35 @@ describe("round 5: rules A (start early) and B (never wait while warm)", () => {
 		expect(s2.signals[0].aborted).toBe(true); // 0.3.0 never started the first one; its final startBg replaced a live summary without aborting it
 		expect(s2.signals[1].aborted).toBe(false);
 		await sleep(450);
-		expect(q.appended.filter((x: Any) => x.customType === "pi-zip/unused-summary").map((x: Any) => x.data)).toEqual([{ usd: 0.02, ab: true }]);
+		// booked, not counted against the A/B bound: the context changed under it, nothing thrashed
+		expect(q.appended.filter((x: Any) => x.customType === "pi-zip/unused-summary").map((x: Any) => x.data)).toEqual([{ usd: 0.02 }]);
+	});
+
+	test("the away timer replacing an early summary (cold cut elsewhere) does not spend the A/B budget: a warm prompt whose pin fails defers, no wait", async () => {
+		const st = { calls: 0 };
+		const r = await rig(done, WARM_TS(), { modelRegistry: { complete: mkComplete(st) } }, R5);
+		const zip = await zipOf(r);
+		const settled = await settle(r);
+		await sleep(20);
+		expect(rows("settle_plan")[0]).toMatchObject({ warmCut: "u3", early: true });
+		// the away timer fires with a cold plan that cuts elsewhere (u1): it replaces the early summary (0.3.0's own preparation)
+		const cold = planContext(done, zip.opts(r.ctx, true, "cold", done).o)!;
+		await zip.runAway({ ...cold, firstKeptEntryId: "u1" }, r.ctx);
+		await sleep(20);
+		expect(rows("away_summary_start").map((x) => x.origin)).toEqual(["early", "away"]);
+		expect(zip.unusedAB).toBe(0); // 0.3.0-era bookkeeping of this branch: 1 (counted as A/B thrash)
+		const booked = r.appended.filter((x: Any) => x.customType === "pi-zip/unused-summary").map((x: Any) => x.data);
+		expect(booked).toHaveLength(1);
+		expect(booked[0].ab).toBeUndefined();
+		// a warm prompt (the cache outlives 0.8 x TTL): its plan cuts at u3, the away summary's u1 is not a cut it accepts
+		const t0 = Date.now();
+		const req = await prompt(r, settled);
+		expect(req).toBeUndefined();
+		expect(Date.now() - t0).toBeLessThan(150);
+		expect(rows("pin").at(-1)).toMatchObject({ where: "run", to: "u1", ok: false });
+		expect(rows("warm_wait")).toEqual([]);
+		expect(rows("warm_defer").at(-1)).toMatchObject({ where: "run", key: "u3", running: false });
+		expect(zip.unusedAB).toBe(0);
 	});
 
 	test("anti-thrash: once a background summary went unused in a warm stretch, a moved cut is written while the user waits; no new call per turn", async () => {

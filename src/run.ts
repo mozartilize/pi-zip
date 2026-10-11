@@ -1113,13 +1113,14 @@ export class Zip implements ZipControl {
 	}
 
 	/** A summary nobody adopted still cost money: abort it if it is still running, book it if it finished. One rules A/B started in
-	 *  this warm stretch counts against AB_UNUSED_MAX; its entry says so (`ab`), so a restarted process counts it too. */
-	private discardBg() {
+	 *  this warm stretch counts against AB_UNUSED_MAX (`count`: false when pi-zip's own away timer replaces it, which is not thrash);
+	 *  its entry says so (`ab`), so a restarted process counts it too. */
+	private discardBg(count = true) {
 		const b = this.bg;
 		this.bg = null;
 		if (!b) return;
 		if (!b.done) b.controller.abort();
-		const counted = isAB(b) && b.stretch === this.abStretch;
+		const counted = count && isAB(b) && b.stretch === this.abStretch;
 		if (counted) {
 			this.unusedAB++;
 			this.ledger({ type: "unused_summary", origin: b.origin, key: b.key, unused: this.unusedAB });
@@ -1377,7 +1378,7 @@ export class Zip implements ZipControl {
 			// compaction or another extension's edit rewrites the context while the user is away, runAway plans again on the context as it
 			// is and drops a summary (an early one too) written for the old one
 			const scheduledMs = this.scheduleSummary((p ?? w)!, ctx);
-			this.ledger({ type: "settle_plan", folds: p?.folds.length ?? 0, summary: cKey !== null, ...(p?.ahead ? { ahead: true } : {}), timerMs: scheduledMs, ...(wKey ? { warmCut: wKey, early } : {}), ...this.calOf(cal), ctxBefore: Math.round(p?.ctxTokens ?? w?.ctxTokens ?? 0), ms: Math.round(performance.now() - t0) });
+			this.ledger({ type: "settle_plan", folds: p?.folds.length ?? 0, summary: cKey !== null, ...(p?.ahead ? { ahead: true } : {}), timerMs: scheduledMs, ...(cKey ? { coldCut: cKey } : {}), ...(wKey ? { warmCut: wKey, early } : {}), ...this.calOf(cal), ctxBefore: Math.round(p?.ctxTokens ?? w?.ctxTokens ?? 0), ms: Math.round(performance.now() - t0) });
 			if (!p || (!p.folds.length && p.cutIdx === null)) return undefined;
 			// ids only: placeholders and summary text are recomputed (they are pure functions of the session), never stored a second time
 			const data = { policy: PRODUCT, ts: Date.now(), targets: p.folds.map((t) => t.entryId), cutKey: p.firstKeptEntryId };
@@ -1509,8 +1510,9 @@ export class Zip implements ZipControl {
 				const { o } = this.opts(ctx, true, "cold", entries);
 				const q = entries.length ? planContext(entries, o) : null;
 				this.ledger({ type: "away_replan", from: p0.firstKeptEntryId, to: q?.firstKeptEntryId ?? null });
-				// a summary written before (an early one, rule A) read a context that no longer exists: never adopted, whatever its cut
-				this.discardBg();
+				// a summary written before (an early one, rule A) read a context that no longer exists: never adopted, whatever its cut. Not
+				// counted against AB_UNUSED_MAX: the context changed under it, nothing thrashed
+				this.discardBg(false);
 				if (!q || q.cutIdx === null) return;
 				p = q;
 			} catch (err) {
@@ -1525,7 +1527,7 @@ export class Zip implements ZipControl {
 	 *  same cut is kept (false: nothing started); any other is discarded first, never overwritten. */
 	private startBg(p: PlanResult, ctx: Any, origin: Bg["origin"] = "away"): boolean {
 		if (this.bg && this.bg.key === p.firstKeptEntryId && !this.bg.failed) return false;
-		this.discardBg();
+		this.discardBg(origin !== "away"); // the away timer replacing an early summary is 0.3.0's own cold preparation, not thrash: not counted
 		const controller = new AbortController();
 		const bg: Bg = { key: p.firstKeptEntryId, done: null, failed: false, promise: Promise.resolve(null), controller, origin, stretch: this.abStretch };
 		bg.promise = buildCut(p, ctx, controller.signal)
