@@ -1,7 +1,7 @@
 // Summary (F11, F12): deterministic skeleton (user words verbatim + files/commands) + model-written narrative + handle table.
 // Thinking is never quoted or paraphrased: it is stripped before the model sees the prefix.
 import { randomUUID } from "node:crypto";
-import { blockTime, cdDirOf, clipMid, distinctLines, handleFor, keyTexts, outcomeHint, RECALL_TOOL, sharedCdDirs, shortArgs, whenLabel } from "./placeholder.ts";
+import { blockTime, cdDirOf, clipMid, distinctLines, handleFor, keyTexts, outcomeHint, RECALL_TOOL, shortArgs, strippableCdDirs, whenLabel } from "./placeholder.ts";
 import { type Block, type Cut, type PlanResult, settings, toolCallIndex } from "./plan.ts";
 import { type FileRecall, fileRecallHow } from "./recallfile.ts";
 import { type Any, clamp, clip, envInt, fmtWhen, textOf, tok4 } from "./util.ts";
@@ -457,7 +457,7 @@ export function skeleton(prefix: Block[], previous: string | null, tableText = "
 	const now: IndexRow[] = []; // every recallable result of this prefix, oldest first
 	const nowText: string[] = []; // ... and its output (to tell look-alike rows apart)
 	const usedDirs = new Set<string>(); // shared `cd <dir>` prefixes left out of this prefix's command rows
-	const shared = sharedCdDirs(bashCommands(prefix));
+	const shared = strippableCdDirs(bashCommands(prefix), parseSummary(previous).cmdDirs);
 	for (const b of prefix) {
 		if (b.kind === "user") {
 			const t = textOf(b.msg.content).trim();
@@ -518,7 +518,7 @@ export function skeleton(prefix: Block[], previous: string | null, tableText = "
 	out.push(mu.lines.some((l) => /^\d+\. ≈ /.test(l)) ? USERS_HEAD_SHORT : USERS_HEAD);
 	out.push(...(mu.lines.length ? mu.lines : [NONE_ROW]));
 	out.push(...list("## Files touched", mf, "older omitted"));
-	const dirs = [...prev.cmdDirs.filter((d) => !usedDirs.has(d)), ...usedDirs].slice(-3);
+	const dirs = [...new Set([...prev.cmdDirs, ...usedDirs])]; // every dir any row leaves out (at most one: strippableCdDirs)
 	out.push(...list(cmdsHead(dirs), mc, "older omitted"));
 	if (mo.kept.length) out.push(...list("## Other tool calls (time, handle)", mo, "older omitted"));
 	out.push(...list("## Errors", me, "older omitted"));
@@ -630,7 +630,7 @@ export async function buildCut(p: PlanResult, ctx: Any, signal?: AbortSignal): P
 	const t0 = performance.now();
 	const prefix = p.blocks.slice(0, p.cutIdx!);
 	const prev = prefix[0]?.kind === "summary" ? String(prefix[0].msg.summary ?? "") || null : null;
-	const shared = sharedCdDirs(bashCommands(prefix.filter((b) => b.kind !== "summary")));
+	const shared = strippableCdDirs(bashCommands(prefix.filter((b) => b.kind !== "summary")), parseSummary(prev).cmdDirs);
 	const texts: string[] = [];
 	const keyLists: string[][] = [];
 	const rows: HandleRow[] = prefix

@@ -141,6 +141,14 @@ export function sharedCdDirs(cmds: string[]): Set<string> {
 	}
 	return new Set([...n].filter(([, k]) => k >= 2).map(([d]) => d).sort());
 }
+/** The `cd <dir>` prefix rows may leave out: only when exactly one dir is shared by these commands and no other dir was left out
+ *  earlier (`earlier` = the dirs an earlier summary's heading names). With two dirs in play, `cd` is what tells rows apart: kept. */
+export function strippableCdDirs(cmds: string[], earlier: string[] = []): Set<string> {
+	const s = sharedCdDirs(cmds);
+	if (s.size !== 1) return new Set();
+	const [d] = s;
+	return earlier.every((e) => e === d) ? s : new Set();
+}
 
 const HEREDOC_RE = /<<-?\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\1/;
 const ECHO_RE = /^\s*(?:echo|printf|print\(|console\.log\()/;

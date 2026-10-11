@@ -2,7 +2,7 @@
 // mechanical lists, short fold text, JSON key fields. Synthetic sessions only.
 import { describe, expect, test } from "bun:test";
 import { buildBlocks, toolCallIndex } from "../src/plan.ts";
-import { cmdLabel, distinctLines, handleFor, jsonKeyFields, makePlaceholder, makePlaceholderFor, sharedCdDirs, shortArgs } from "../src/placeholder.ts";
+import { cmdLabel, distinctLines, handleFor, jsonKeyFields, makePlaceholder, makePlaceholderFor, sharedCdDirs, shortArgs, strippableCdDirs } from "../src/placeholder.ts";
 import { BUDGET, buildCut, handleRowsOf, INDEX_TOKENS, skeleton, TABLE_ROWS } from "../src/summary.ts";
 import { A, type Any, U } from "./helpers.ts";
 
@@ -70,6 +70,31 @@ describe("row labels tell look-alike rows apart (2026-10-11 item 3)", () => {
 		expect(sec(again, "## Commands run").split("\n")[0]).toContain(`left out for: ${dir}`);
 		// a cd used once says where the command ran: kept
 		expect(skeleton(buildBlocks([U("u1", "go"), tcall("x", "bash", { command: "cd /a/b && ls" }), tres("x", "bash", "a"), A("e")]), null).text).toContain("`cd /a/b && ls`");
+	});
+
+	test("two dirs with two commands each: no row drops its cd (it is what tells them apart), and the heading names none", () => {
+		const entries: Any[] = [U("u1", "go")];
+		["/srv/a", "/srv/b", "/srv/a", "/srv/b"].forEach((d, i) => entries.push(tcall(`d${i}`, "bash", { command: `cd ${d} && make t${i}` }), tres(`d${i}`, "bash", "ok")));
+		entries.push(A("e"));
+		const cmds = sec(skeleton(buildBlocks(entries), null).text, "## Commands run");
+		expect(cmds.split("\n")[0]).toBe("## Commands run (with exit status)");
+		const rows = cmds.split("\n").filter((l) => l.startsWith("`"));
+		expect(rows).toHaveLength(4);
+		expect(rows[0]).toStartWith("`cd /srv/a && make t0`");
+		expect(rows[2]).toStartWith("`cd /srv/a && make t2`");
+		expect(rows[1]).toStartWith("`cd /srv/b && make t1`");
+		expect(strippableCdDirs(["cd /srv/a && x", "cd /srv/a && y"], ["/srv/b"]).size).toBe(0); // another dir was stripped earlier: keep
+	});
+
+	test("one shared dir is still stripped, also when an earlier summary stripped the same dir; the heading lists it", () => {
+		const one = (id: string, n: number) => [tcall(`${id}${n}`, "bash", { command: `cd /srv/a && step ${n}` }), tres(`${id}${n}`, "bash", "ok")];
+		const t1 = skeleton(buildBlocks([U("u1", "go"), ...one("x", 1), ...one("x", 2), A("e")]), null).text;
+		const c1 = sec(t1, "## Commands run");
+		expect(c1.split("\n")[0]).toBe('## Commands run (with exit status; a leading "cd <dir> &&" is left out for: /srv/a)');
+		expect(c1).toContain("`step 1` -> exit 0");
+		const t2 = skeleton(buildBlocks([U("u2", "more"), ...one("y", 3), ...one("y", 4), A("e2")]), t1).text;
+		expect(sec(t2, "## Commands run")).toContain("`step 4` -> exit 0");
+		expect(sec(t2, "## Commands run").split("\n")[0]).toContain("left out for: /srv/a)");
 	});
 
 	test("cmdLabel: heredoc gist (comment, else echo/print, else tail), cd only when shared, middle clip", () => {
