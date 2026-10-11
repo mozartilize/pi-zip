@@ -1,0 +1,34 @@
+== 1. frozen files
+(nothing frozen yet)
+== 2. forbidden constructs
+== 3. every module is imported by PiZip.lean
+== 4. lake build
+Build completed successfully (9048 jobs).
+== 5. audit: proofs against the frozen statements
+STATEMENT                    STATUS    WITNESS     AXIOMS
+T2_i                         MISSING   yes         -
+T2_ii                        MISSING   yes         -
+T2_iii                       MISSING   yes         -
+T2_iv_a                      MISSING   yes         -
+T2_iv_b                      MISSING   yes         -
+T2_iv_c                      MISSING   yes         -
+T2_v                         MISSING   yes         -
+T2_vi                        MISSING   yes         -
+T2_vii                       MISSING   yes         -
+T2_vii_hazard_exact          MISSING   yes         -
+T2_vii_warm_exact            MISSING   yes         -
+T3_i                         MISSING   yes         -
+T3_ii                        MISSING   yes         -
+T3_iii                       MISSING   yes         -
+T3_iv                        MISSING   yes         -
+T4_i                         MISSING   yes         -
+T4_ii                        MISSING   yes         -
+T4_iv                        MISSING   yes         -
+T5_i                         MISSING   yes         -
+T5_ii                        MISSING   yes         -
+T5_iv                        MISSING   yes         -
+T5_v                         REFUTED   yes         depends on axioms: [propext, Classical.choice, Quot.sound]
+T5_v_persistent              PROVED    yes         depends on axioms: [propext, Classical.choice, Quot.sound]
+== 6. kernel re-check (leanchecker) of every PiZip module
+leanchecker: all modules re-checked
+CHECK: statements 23, proved 1, refuted 1, missing 21, gate PASS

@@ -1,0 +1,36 @@
+2026-10-11 independent kernel check
+
+Lean: 4.35.0-rc4, commit c29b6dda4f7c20e3eeaa717c4e565663c5cfa364
+Exporter: lean4export 3.1.0; export format 3.1.0
+Checker: nanoda_bin 0.4.19
+
+Command: lake env leanexport PiZip -- $(cat verification/export-roots.txt)
+Standard output was saved as audit/pizip-export.ndjson.
+Export exit code: 0; standard error was empty.
+Export size: 178497631 bytes; the large export is an ignored local artifact.
+All 119 named source declaration roots in verification/export-roots.txt were
+present in the parsed export, together with their recursive dependencies.
+This includes all 23 statement definitions, all 23 nonvacuity witnesses,
+T5_v_false, T5_v_persistent_proof, and law_early_quantitative.
+The only exported axioms were propext, Classical.choice, and Quot.sound.
+
+Command: lake env nanoda_bin verification/nanoda-config.json
+Exit code: 0
+Checked 34395 declarations with no typechecker errors, 1 pretty printer errors: [
+    "Unable to print axioms",
+]
+
+The diagnostic concerns pretty printing. The checker reported no typechecker
+errors. The configuration rejects every axiom outside the three listed above
+and enables the Nat and String kernel extensions.
+
+Command: lake env lean4lean PiZip
+Exit code: 1
+The bundled checker rejected every PiZip module with "incompatible header"
+while reading its .olean file. This is a format compatibility failure and
+provides no independent validation. No toolchain or dependency was changed.
+
+The full gate, recorded in verification/full-gate.txt, is the primary result.
+Nanoda is supplementary evidence about the existing declarations, not evidence
+that the 21 unproved statement definitions have proofs or that English fidelity
+has been approved. The frozen manifest is empty.
