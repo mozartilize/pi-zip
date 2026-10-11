@@ -102,9 +102,10 @@ export function record(key: string, u: { explicit: boolean; total: number; gapS?
 		dirty = true;
 	}
 	if (dirty) {
-		// entries of other models with no survival sample (n = 0: only a class, from a model tried once) are dropped; the model being
-		// recorded keeps its own, so its class survives a restart while it is in use
-		for (const [k, x] of Object.entries(f.models)) if (k !== key && !(x.n > 0)) delete f.models[k];
+		// entries of other models with no survival sample (n = 0: only a class, from a model tried once) are dropped, except an explicit
+		// class: it is sticky (a write premium once reported stays) and another live process may rely on it; the model being recorded
+		// keeps its own, so its class survives a restart while it is in use
+		for (const [k, x] of Object.entries(f.models)) if (k !== key && !(x.n > 0) && x.cls !== "explicit") delete f.models[k];
 		try {
 			mkdirSync(dirname(path), { recursive: true });
 			const tmp = `${path}.${process.pid}.tmp`;
