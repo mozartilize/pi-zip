@@ -120,31 +120,10 @@ fn pays() -> F<R> {
 fn user_waits() -> F<R> {
     atom("user_waits", |r: &R, i, _| r.trace.world.interactive && (r.tick(i).wait_run > 0 || (i > 0 && r.tick(i - 1).wait_te > 0)))
 }
-/// The summary the user waited for was planned warm (P(warm) >= 0.5): a warm return's run plan or the warm valve at a turn_end.
-/// Round 5 excuses it only together with bg_budget_spent (rule B's fallback to 0.3.0).
-fn warm_summary() -> F<R> {
-    atom("warm_summary", |r: &R, i, _| r.decision_for(i).is_some_and(|g| g.p >= 0.5))
-}
 /// Round 5: the live process's warm plan at this return cut where a summary it held in memory (written in the background) cuts, the
 /// law accepting that cut (run.ts pinned, the anti-thrash rule). A restarted process has lost that summary and makes its unpinned plan.
 pub fn pinned_live(r: &R, i: usize) -> bool {
     r.ledger(i, "pin").iter().any(|p| p.get("ok").and_then(serde_json::Value::as_bool) == Some(true) && matches!(p.get("where").and_then(serde_json::Value::as_str), Some("run") | Some("native")))
-}
-/// Round 5 (rules A/B): a summary pi-zip started in the background for a warm return or a warm turn_end was dropped unused in this
-/// warm stretch (since the last return planned cold), up to this request. Then the stretch's bound of one unused background summary is
-/// spent, and a warm summary whose cut moved is written while the user waits, as in 0.3.0.
-fn bg_budget_spent() -> F<R> {
-    atom("bg_budget_spent", |r: &R, i, _| {
-        for j in (0..=i).rev() {
-            if r.tick(j).unused_ab > 0 {
-                return true;
-            }
-            if r.tick(j).n == 0 && r.st[j].believed_cold {
-                return false;
-            }
-        }
-        false
-    })
 }
 /// The model was switched since the previous request: the cache dies at the prompt, nothing could be prepared while away.
 fn switched() -> F<R> {
@@ -277,12 +256,11 @@ pub fn axioms() -> Vec<Prop> {
             name: "never in the way",
             from: &[],
             why: "README rule 3: a summary model call is prepared while the user is away, or (round 5, rules A/B) written in the background \
-                  while the cache is warm; the user waits for one only at Pi's compaction room, at a return a model switch made cold (no \
-                  away time to prepare it in), or for a warm plan (a warm return's run plan, the valve at a turn_end) once the warm \
-                  stretch's one unused background summary is spent (the anti-thrash bound: 0.3.0's wait). Otherwise a warm wait is not \
-                  excused: the summary is written in the background (rule B).",
+                  while the cache is warm; the user waits for one only at Pi's compaction room, or at a return a model switch made cold \
+                  (no away time to prepare it in). A warm wait below the room is never excused (review P1 #2, option (b): once the warm \
+                  stretch's unused background summary is spent, a warm plan applies nothing and starts nothing until the room).",
             evidence: Evidence::Conformance,
-            f: always(user_waits() >> (at_room() | switched() | (warm_summary() & bg_budget_spent()))),
+            f: always(user_waits() >> (at_room() | switched())),
         },
     ]
 }
@@ -1224,7 +1202,7 @@ pub fn classify(id: &str, r: &R, v: &Violation) -> String {
             if r.decision_for(v.at).is_some_and(|g| g.at == "run" && g.p >= 0.5) {
                 "warm return: the run plan summarises while the user waits (B2)".into()
             } else if r.decision_for(v.at).is_some_and(|g| g.at == "turn_end" && g.p >= 0.5) {
-                "warm turn_end: the valve summarises while the user waits, the stretch's unused background summary not spent (rule B)".into()
+                "warm turn_end: the valve summarises while the user waits below the room (rule B)".into()
             } else if env.iter().any(|e| e == "switch") {
                 "cold return by a model switch (nothing to foresee while away)".into()
             } else if env.iter().any(|e| e == "foreign") {

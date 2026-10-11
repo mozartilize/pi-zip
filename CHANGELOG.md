@@ -8,7 +8,8 @@
 - **No wait for a summary while the cache is warm** (rule B), unless the context is at Pi's compaction room. A finished summary goes
   in through Pi's compaction before the prompt (`Compacted from N` is pi-zip's size before); otherwise the request goes out
   unchanged, the summary is written in the background and a later turn end puts it in.
-- At most one background summary started this way goes unused per warm stretch; the away timer replacing one does not count.
+- At most one background summary started this way goes unused per warm stretch; the away timer replacing one does not count. Once
+  it is spent, a warm plan whose cut moved changes nothing until the context reaches Pi's compaction room (no call, no wait).
   Every discarded or lost summary is booked when it is discarded (`pi-zip/unused-summary`), a running one at its estimated input.
 - RPC mode (which binds a UI on Pi 1.1) gets these rules too; `-p` and `--mode json` behave as in 0.3.0, session and requests byte
   for byte.

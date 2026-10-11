@@ -57,8 +57,9 @@ interface Bg {
 	estUsd: number; // what the call is billed for its input if it is aborted after the provider took it: the prefix it reads, uncached
 }
 /** Rules A and B start summaries a warm return may not use (its plan cuts elsewhere, the user never returns, the return is cold):
- *  at most this many of them go unused per warm stretch (cold return to cold return). Once spent, no early start, and a warm summary
- *  the user would wait for is written while they wait, as in 0.3.0. */
+ *  at most this many of them go unused per warm stretch (cold return to cold return). Once spent, no early start, and a warm plan that
+ *  would summarise applies nothing and starts nothing: the context grows until Pi's compaction room, where the summary is waited for
+ *  (review P1 #2, option (b): no wait while warm below the room, ever). */
 const AB_UNUSED_MAX = 1;
 const isAB = (b: Bg | null): boolean => !!b && (b.origin === "early" || b.origin === "defer");
 
@@ -1155,9 +1156,10 @@ export class Zip implements ZipControl {
 	/**
 	 * Rule B: a warm plan that summarises, while the user is here. "take": a finished summary for this cut is there (takeBg adopts it,
 	 * no wait). "defer": nothing is applied now, the plan is made again at the next turn_end (folds and summary were priced together, so
-	 * the folds alone do not go either); the summary for this cut is written in the background (one running is left to run). "wait":
-	 * written now while the user waits, as in 0.3.0: without a UI (print, json: nothing runs in the background; rpc binds a UI), at Pi's compaction
-	 * room (Pi would compact, lossily, otherwise), or once AB_UNUSED_MAX background summaries went unused in this warm stretch.
+	 * the folds alone do not go either); the summary for this cut is written in the background (one running is left to run), unless
+	 * AB_UNUSED_MAX background summaries went unused in this warm stretch: then none is started either (a running one is left alone).
+	 * "wait": written now while the user waits, as in 0.3.0: without a UI (print, json: nothing runs in the background; rpc binds a
+	 * UI), or at Pi's compaction room (Pi would compact, lossily, otherwise).
 	 */
 	private warmSummary(p: PlanResult, ctx: Any, where: "run" | "turn_end"): "take" | "defer" | "wait" {
 		if (!ctx?.hasUI || p.atRoom) return "wait";
@@ -1168,8 +1170,8 @@ export class Zip implements ZipControl {
 			return "defer";
 		}
 		if (!this.abRoom()) {
-			this.ledger({ type: "warm_wait", where, key, unused: this.unusedAB });
-			return "wait";
+			this.ledger({ type: "warm_skip", where, key, unused: this.unusedAB, running: b?.key ?? null });
+			return "defer";
 		}
 		this.startBg(p, ctx, "defer");
 		this.ledger({ type: "warm_defer", where, key, running: false });
