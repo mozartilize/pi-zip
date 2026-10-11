@@ -706,7 +706,7 @@ pub fn pays_fully(r: &R, i: usize) -> Result<(), String> {
     Ok(())
 }
 
-/// The narrative part of a planned summary the planner's estimate is checked with (summary.ts asks for at most 1,500 words).
+/// The narrative part of a planned summary the planner's estimate is checked with (summary.ts asks for at most 1,000 words when it merges a previous narrative, 1,500 for a first summary).
 const NARRATIVE_EST: f64 = 2_500.0;
 
 /// The mechanism behind an A2 failure at request i (one class per failing request).
