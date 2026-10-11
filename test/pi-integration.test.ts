@@ -719,7 +719,7 @@ describe("round 5 on real Pi: rule A starts the warm summary early, rule B never
 		expect(Math.abs(n.before - comp.tokensBefore) / comp.tokensBefore).toBeLessThan(0.05); // the notice's before is pi-zip's estimate of the same request
 	});
 
-	test("no UI on real Pi (pi -p, json, rpc): the warm prompt waits for the summary in the request, as in 0.3.0", async () => {
+	test("no UI on real Pi (pi -p, json): the warm prompt waits for the summary in the request, as in 0.3.0", async () => {
 		const r = await rig(undefined, { file: template(60_000), tui: false, native: true, idle: true, start: false, latencyMs: 300 });
 		const { req, waited } = await prompt(r);
 		expect(waited).toBeGreaterThanOrEqual(280);
@@ -730,11 +730,12 @@ describe("round 5 on real Pi: rule A starts the warm summary early, rule B never
 	});
 });
 
-// Round 5: without a UI (pi -p, --mode json, rpc) nothing runs in the background, so rules A and B change nothing there. Every request
+// Round 5: without a UI (pi -p, --mode json; rpc binds one on Pi 1.1) nothing runs in the background, so rules A and B change nothing there. Every request
 // and every session entry of three no-UI scenarios (a warm return that summarises, a warm turn_end valve that summarises, a cold return
 // that summarises), normalised only for what differs from run to run (entry ids and the handles made from them, timestamps, measured
-// durations), hash to the digest 0.3.0 (d7d6ff5) gives: run this test there with R5_PRINT_DIGEST=1 to print it.
-describe("round 5: no UI (pi -p, json, rpc) behaves byte for byte as 0.3.0", () => {
+// durations), hash to the digest 0.3.0 (d7d6ff5) gives: run this test there with R5_PRINT_DIGEST=1 to print it. The claim covers the
+// session and the requests only: the ledger's waitedMs changed as a fix (README, CHANGELOG; test "ledger fix" in invariants.test.ts).
+describe("round 5: no UI (pi -p, json) sends the same requests and writes the same session as 0.3.0, byte for byte", () => {
 	const NOUI_DIGEST_030 = "bb2e4238ae92a40c61f71564ae7a465d"; // printed by this test on d7d6ff5 (R5_PRINT_DIGEST=1)
 	const sleep = (ms: number) => new Promise((res) => setTimeout(res, ms));
 	const shifted = (agoMs: number, prose: number) => {

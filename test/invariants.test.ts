@@ -746,7 +746,27 @@ describe("round 5: rules A (start early) and B (never wait while warm)", () => {
 		expect(roomy.calls).toBe(1);
 	});
 
-	test("no UI (print, json, rpc): the warm return waits for the summary as in 0.3.0; with a UI the same return does not", async () => {
+	test("ledger fix: a summary computed during a no-UI cold return of a session with a prepared plan records the time waited (0.3.0: 0)", async () => {
+		process.env.PI_ZIP_TTL_SECS = "1";
+		const done2 = [...done.slice(0, -1), A("a5", ["c5"]), R("r5", "c5", 30_000), A("a5e")]; // the last turn has an output to fold
+		const back2 = [...done2, U("u4", "back")];
+		const ui = await rig(done2, COLD_TS(), { modelRegistry: { complete: mkComplete({ calls: 0 }) } });
+		const settled = await ui.fire("agent_before_settle", { context: { contextEntries: done2 }, entries: [] }); // an interactive process left its plan
+		expect(settled.entries.at(-1)).toMatchObject({ customType: "pi-zip/plan" });
+		const st = { calls: 0, delay: 200 };
+		const r = await rig(done2, COLD_TS(), { hasUI: false, mode: "json", modelRegistry: { complete: mkComplete(st) } });
+		r.ctx.sessionManager.getBranch = () => [...branchOf(done2, COLD_TS()), settled.entries.at(-1)];
+		r.ctx.sessionManager.buildSessionProjection = () => ({ entries: back2 });
+		await r.fire("before_agent_start", {});
+		const req = await r.fire("context_with_system", { messages: flat(back2) });
+		expect(req.messages[0].role).toBe("compactionSummary");
+		await r.fire("turn_end", turnEnd([...back2, ...tail], "r6"));
+		const sum = rows("summary").at(-1);
+		expect(sum.source).toBe("settle");
+		expect(sum.waitedMs).toBeGreaterThanOrEqual(190); // the session and the request are 0.3.0's; only this ledger figure (and /zip's) changed
+	});
+
+	test("no UI (print, json): the warm return waits for the summary as in 0.3.0; with a UI the same return does not", async () => {
 		const st = { calls: 0, delay: 200 };
 		const quiet = await rig(done, WARM_TS(), { hasUI: false, mode: "json", modelRegistry: { complete: mkComplete(st) } });
 		expect(await settle(quiet)).toBeUndefined();
