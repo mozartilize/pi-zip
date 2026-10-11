@@ -1,7 +1,7 @@
 // Summary (F11, F12): deterministic skeleton (user words verbatim + files/commands) + model-written narrative + handle table.
 // Thinking is never quoted or paraphrased: it is stripped before the model sees the prefix.
 import { randomUUID } from "node:crypto";
-import { cdDirOf, clipMid, distinctLines, handleFor, outcomeHint, pickKeyLines, RECALL_TOOL, sharedCdDirs, shortArgs } from "./placeholder.ts";
+import { blockTime, cdDirOf, clipMid, distinctLines, handleFor, outcomeHint, pickKeyLines, RECALL_TOOL, sharedCdDirs, shortArgs, whenLabel } from "./placeholder.ts";
 import { type Block, type Cut, type PlanResult, settings, toolCallIndex } from "./plan.ts";
 import { type FileRecall, fileRecallHow } from "./recallfile.ts";
 import { type Any, clamp, clip, fmtWhen, textOf, tok4 } from "./util.ts";
@@ -17,7 +17,8 @@ export interface HandleRow {
 	tool: string;
 	args: string;
 	hint: string;
-	turn?: number; // user turn of the output, so look-alike runs stay apart
+	turn?: number; // user turn of the output, so look-alike runs stay apart (shown only without `at`)
+	at?: number; // when the output arrived (ms), shown as local MM-DD HH:MM
 	outcome?: string; // exit status / test counts (outcomeHint)
 }
 
@@ -25,7 +26,8 @@ const TABLE_HEAD = "## Folded outputs (originals recallable with zip_recall; han
 /** The same heading when zip_recall is hidden and the originals are read from recall files (parseSummary keys on "## Folded outputs"). */
 const tableHead = (file?: FileRecall) => (file ? `## Folded outputs (originals in ${file.dir}/<handle>.txt; handles stay valid after later summaries or compaction)` : TABLE_HEAD);
 const TABLE_ROWS = 40;
-const tableLine = (r: HandleRow) => `- ${r.handle} · ${r.tool}${r.args ? " " + r.args : ""}${r.turn ? ` · turn ${r.turn}` : ""}${r.outcome ? ` · ${r.outcome}` : ""} · ${clip(r.hint, 90)}`;
+const when = (r: { at?: number; turn?: number; when?: string }) => { const w = r.when ?? whenLabel(r.at, r.turn); return w ? ` · ${w}` : ""; };
+const tableLine = (r: HandleRow) => `- ${r.handle} · ${r.tool}${r.args ? " " + r.args : ""}${when(r)}${r.outcome ? ` · ${r.outcome}` : ""} · ${clip(r.hint, 90)}`;
 
 /**
  * Compact table appended to every summary so handles survive it: this prefix's rows merged with the rows of the previous summary's
@@ -43,11 +45,13 @@ export function handleTable(rows: HandleRow[], previous: string | null = null, f
 const newest = (xs: string[], n: number): string[] => (xs.length > n ? [`[… ${xs.length - n} older omitted …]`, ...xs.slice(-n)] : xs);
 
 const H = "[0-9a-z]{10}"; // a handle, see handleFor
-const CMD_ROW = new RegExp(`^\`(.*)\` -> [^(]*\\(turn (\\d+), (${H})\\)$`);
-const OTHER_ROW = new RegExp(`^(\\S+) (.*) \\(turn (\\d+), (${H})\\)$`);
+/** The time label of a row: "turn 12" (older summaries, and outputs without a timestamp) or a local time "10-11 02:31". */
+const W = "turn \\d+|\\d\\d-\\d\\d \\d\\d:\\d\\d";
+const CMD_ROW = new RegExp(`^\`(.*)\` -> [^(]*\\((${W}), (${H})\\)$`);
+const OTHER_ROW = new RegExp(`^(\\S+) (.*) \\((${W}), (${H})\\)$`);
 const FILE_ROW = /^- (.*) \(([^()]*)\)$/;
 const FILE_OP = new RegExp(`^(\\S+): (${H})$`);
-const TABLE_ROW = new RegExp(`^- (${H}) · (\\S+)((?: [^·]*?)?)(?: · turn (\\d+))?(?: · (.*))?$`);
+const TABLE_ROW = new RegExp(`^- (${H}) · (\\S+)((?: [^·]*?)?)(?: · (${W}))?(?: · (.*))?$`);
 const INDEX_HEAD = "## Handle index";
 /** Budget of the "Handle index" section, in tokens. */
 export const INDEX_TOKENS = 1500;
@@ -57,11 +61,13 @@ interface IndexRow {
 	tool: string;
 	args: string;
 	turn?: number;
+	at?: number;
+	when?: string; // the time label as an earlier summary wrote it ("turn 12" or "10-11 02:31")
 	hint?: string; // only for rows that would otherwise read the same: the first line of the output that tells it apart
 }
 const INDEX_HINT = 50;
 
-const indexLine = (r: IndexRow) => `- ${r.handle} · ${r.tool}${r.args ? " " + r.args : ""}${r.turn ? ` · turn ${r.turn}` : ""}${r.hint ? ` · ${clip(r.hint, INDEX_HINT)}` : ""}`;
+const indexLine = (r: IndexRow) => `- ${r.handle} · ${r.tool}${r.args ? " " + r.args : ""}${when(r)}${r.hint ? ` · ${clip(r.hint, INDEX_HINT)}` : ""}`;
 
 /**
  * Handle rows (oldest first) recorded in an earlier summary, read from every section that carries them: the commands, files and
@@ -78,9 +84,9 @@ export function handleRowsOf(text: string | null): IndexRow[] {
 		}
 		let m: RegExpExecArray | null;
 		if (sec.startsWith("## Commands run")) {
-			if ((m = CMD_ROW.exec(line))) rows.push({ handle: m[3], tool: "bash", args: m[1], turn: Number(m[2]) });
+			if ((m = CMD_ROW.exec(line))) rows.push({ handle: m[3], tool: "bash", args: m[1], when: m[2] });
 		} else if (sec.startsWith("## Other tool calls")) {
-			if ((m = OTHER_ROW.exec(line))) rows.push({ handle: m[4], tool: m[1], args: m[2], turn: Number(m[3]) });
+			if ((m = OTHER_ROW.exec(line))) rows.push({ handle: m[4], tool: m[1], args: m[2], when: m[3] });
 		} else if (sec.startsWith("## Files touched")) {
 			if ((m = FILE_ROW.exec(line)))
 				for (const op of m[2].split(", ")) {
@@ -89,7 +95,7 @@ export function handleRowsOf(text: string | null): IndexRow[] {
 				}
 		} else if (sec.startsWith("## Folded outputs") || sec.startsWith(INDEX_HEAD)) {
 			// an index row keeps the line that tells it apart; a table row's tail (outcome, key line) stays in the table
-			if ((m = TABLE_ROW.exec(line))) rows.push({ handle: m[1], tool: m[2], args: m[3].trim(), turn: m[4] ? Number(m[4]) : undefined, ...(m[5] && sec.startsWith(INDEX_HEAD) ? { hint: m[5] } : {}) });
+			if ((m = TABLE_ROW.exec(line))) rows.push({ handle: m[1], tool: m[2], args: m[3].trim(), ...(m[4] ? { when: m[4] } : {}), ...(m[5] && sec.startsWith(INDEX_HEAD) ? { hint: m[5] } : {}) });
 		}
 	}
 	return rows;
@@ -390,7 +396,7 @@ export function skeleton(prefix: Block[], previous: string | null, tableText = "
 			if (c.name === "bash") {
 				const m = /Command exited with code (\d+)/.exec(resText);
 				const status = m ? `exit ${m[1]}` : res?.msg.isError ? "error" : res ? "exit 0" : "no result";
-				const tag = res ? ` (turn ${res.userTurn}${res.entryId ? ", " + handleFor(res.entryId) : ""})` : ""; // every result is recallable, so every one gets its handle
+				const tag = res ? ` (${whenLabel(blockTime(res), res.userTurn)}${res.entryId ? ", " + handleFor(res.entryId) : ""})` : ""; // every result is recallable, so every one gets its handle
 				const d = cdDirOf(String(a.command ?? ""));
 				if (d && shared.has(d)) usedDirs.add(d);
 				cmds.push(`\`${shortArgs({ command: String(a.command ?? "") }, 160, shared)}\` -> ${status}${tag}`);
@@ -400,11 +406,11 @@ export function skeleton(prefix: Block[], previous: string | null, tableText = "
 				const ops = files.get(p)!;
 				ops.set(c.name, res?.entryId ? handleFor(res.entryId) : (ops.get(c.name) ?? null));
 			} else if (c.name !== RECALL_TOOL) {
-				const tag = res ? ` (turn ${res.userTurn}${res.entryId ? ", " + handleFor(res.entryId) : ""})` : " (no result)";
+				const tag = res ? ` (${whenLabel(blockTime(res), res.userTurn)}${res.entryId ? ", " + handleFor(res.entryId) : ""})` : " (no result)";
 				others.push(`${c.name} ${shortArgs(a, 160)}${tag}`);
 			}
 			if (res?.entryId && c.name !== RECALL_TOOL) {
-				now.push({ handle: handleFor(res.entryId), tool: c.name, args: shortArgs(a, 60, shared), turn: res.userTurn });
+				now.push({ handle: handleFor(res.entryId), tool: c.name, args: shortArgs(a, 60, shared), turn: res.userTurn, at: blockTime(res) });
 				nowText.push(resText);
 			}
 			if (res?.msg.isError) errors.push(`- ${c.name} ${shortArgs(a)}: ${clip(resText, 200)}`);
@@ -440,7 +446,7 @@ export function skeleton(prefix: Block[], previous: string | null, tableText = "
 	out.push(...list("## Files touched", mf, "older omitted"));
 	const dirs = [...prev.cmdDirs.filter((d) => !usedDirs.has(d)), ...usedDirs].slice(-3);
 	out.push(...list(cmdsHead(dirs), mc, "older omitted"));
-	if (mo.kept.length) out.push(...list("## Other tool calls (turn, handle)", mo, "older omitted"));
+	if (mo.kept.length) out.push(...list("## Other tool calls (time, handle)", mo, "older omitted"));
 	out.push(...list("## Errors", me, "older omitted"));
 	// index rows of this prefix that would read the same (same tool and arguments): each gets the first line of its output that tells it apart
 	const groups = new Map<string, number[]>();
@@ -509,7 +515,7 @@ export async function narrative(prefix: Block[], ctx: Any, budgetTokens: number,
 			`<conversation>\n${conv}\n</conversation>\n\n` +
 			`Write the NARRATIVE part of a context summary for this conversation. A separate deterministic section already lists the user's ` +
 			`requests, files touched, commands with exit codes and errors, so do NOT repeat those. When you refer to a specific tool output, name it by its ` +
-			`tool and exact command or path (and turn) so that look-alike runs stay distinguishable; never merge similar runs into one. Output only these markdown sections:\n` +
+			`tool and exact command or path so that look-alike runs stay distinguishable; never merge similar runs into one. Output only these markdown sections:\n` +
 			`## Decisions and rationale\n## Current state of the work\n## Open todos / next steps\n## Key facts to remember (exact values, paths, identifiers, results the work still depends on)\n` +
 			merge +
 			`Be concrete and keep exact paths, names and numbers. Stay under about ${words} words. Do not call tools.`;
@@ -561,7 +567,7 @@ export async function buildCut(p: PlanResult, ctx: Any, signal?: AbortSignal): P
 			const hint = (keys.find((k) => k.why === "error" || k.why === "id") ?? keys[0])?.text ?? "";
 			texts.push(out);
 			keyTexts.push([hint, ...keys.map((k) => k.text)]);
-			return { handle: handleFor(b.entryId!), tool, args: call ? shortArgs(call.args, undefined, shared) : "", turn: b.userTurn, outcome: outcomeHint(out, tool, !!b.msg.isError), hint };
+			return { handle: handleFor(b.entryId!), tool, args: call ? shortArgs(call.args, undefined, shared) : "", turn: b.userTurn, at: blockTime(b), outcome: outcomeHint(out, tool, !!b.msg.isError), hint };
 		});
 	// rows of one tool that would show the same key line (the first line of every status report, say): each shows the first of its
 	// lines that none of the others has, nor a row of that tool the previous summary's table already shows

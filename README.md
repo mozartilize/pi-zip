@@ -132,10 +132,10 @@ The cold cap is kept below Pi's own compaction trigger (window minus `compaction
 
 ## Recall
 
-A folded block says what produced it (tool, command or path with offset/limit, user turn, exit status and test counts for commands), its size, a handle and its key lines, so look-alike runs stay apart. It also tells the model to prefer `zip_recall` (original bytes, instant, free, no side effects) over re-running or re-reading, because a re-run may give a different result:
+A folded block says what produced it (tool, command or path with offset/limit, the local time of the output, exit status and test counts for commands), its size, a handle and its key lines, so look-alike runs stay apart. It also tells the model to prefer `zip_recall` (original bytes, instant, free, no side effects) over re-running or re-reading, because a re-run may give a different result:
 
 ```
-[folded by pi-zip · bash bun test test/api.test.ts · turn 12 · exit 1, 79 passed, 2 failed · 5637 chars, 109 lines · handle k3f9a0x1qz]
+[folded by pi-zip · bash bun test test/api.test.ts · 10-11 02:31 · exit 1, 79 passed, 2 failed · 5637 chars, 109 lines · handle k3f9a0x1qz]
 key lines kept (original line numbers; up to 8):
 1: (pass) suite 0 > case parse config ...
 106: 2 fail
@@ -143,7 +143,7 @@ key lines kept (original line numbers; up to 8):
 Original kept byte for byte, recallable even after summaries or compaction: zip_recall("k3f9a0x1qz") (optional grep/range) is instant, free, no side effects; prefer it to re-running or re-reading (output may differ). Do not guess its content.
 ```
 
-Placeholders are written once, when the fold is saved: sessions folded by an earlier version keep their old placeholder text unchanged. Summaries list each folded output with its handle, turn and outcome in the same way, and say at the top that the 10-character code next to a command, file or call is its handle and that what an output said is to be recalled rather than re-run or re-read. A summary of an earlier summary merges it section by section (requests, files, commands, other calls, errors, handle table, handle index) instead of clipping its text: items are deduplicated, the oldest are dropped first under a per-section budget with a count of what was left out, and there is one narrative: the summary call reads the previous summary's narrative (not its lists) next to the new conversation and writes one updated narrative, newer values replacing older ones, finished todos dropped, durable facts kept (bounded: a longer previous narrative is sent as its head and tail). If that call fails, the previous narrative is carried as it was, marked as possibly stale with the time it was written. Pi's own free-text compaction summaries are merged the same way.
+Placeholders are written once, when the fold is saved: sessions folded by an earlier version keep their old placeholder text unchanged. Summaries list each folded output with its handle, time (`MM-DD HH:MM`, local; a turn count would restart at every compaction) and outcome in the same way; rows that would read alike show the first line of their output that differs, and a `cd <dir> &&` prefix shared by many commands is named once in the heading instead of on every row, and say at the top that the 10-character code next to a command, file or call is its handle and that what an output said is to be recalled rather than re-run or re-read. A summary of an earlier summary merges it section by section (requests, files, commands, other calls, errors, handle table, handle index) instead of clipping its text: items are deduplicated, the oldest are dropped first under a per-section budget with a count of what was left out, and there is one narrative: the summary call reads the previous summary's narrative (not its lists) next to the new conversation and writes one updated narrative, newer values replacing older ones, finished todos dropped, durable facts kept (bounded: a longer previous narrative is sent as its head and tail). If that call fails, the previous narrative is carried as it was, marked as possibly stale with the time it was written. Pi's own free-text compaction summaries are merged the same way.
 
 The model recalls by itself when it needs the content:
 
