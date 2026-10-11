@@ -152,14 +152,15 @@ theorem T4_ii_nonvacuous : ∃ (_ALG : ModelT.Online ℝ) (B eps : ℝ), 0 < B �
   exact ⟨ModelT.bal, 1, 1 / 10, by norm_num⟩
 
 theorem T4_iv_nonvacuous :
-    (∃ (estimate : ModelT.Estimate ℝ) (Ghat : ℝ), 0 < Ghat ∧
+    (∃ (estimate : ModelT.Estimate ℝ) (Ghat B : ℝ), 0 < Ghat ∧
       (∀ B : ℝ, 0 < B → ∀ a : List ℝ, ModelT.arrivalsValid a → 0 ≤ estimate B a) ∧
-      (∀ B D : ℝ, 0 < B → 0 ≤ D → estimate B [D] ≤ Ghat)) ∧
+      (∀ B D : ℝ, 0 < B → 0 ≤ D → estimate B [D] ≤ Ghat) ∧
+      0 < B ∧ Real.sqrt (2 * Ghat * B) + 1 < B) ∧
     (∃ (estimate : ModelT.Estimate ℝ) (B G' : ℝ), 0 < B ∧ 0 < G' ∧
       ∀ a : List ℝ, a ≠ [] → ModelT.arrivalsValid a → G' ≤ estimate B a) := by
   constructor
-  · exact ⟨ModelT.fixed 1, 1, by norm_num, by intros; norm_num [ModelT.fixed],
-      by intros; simp [ModelT.fixed]⟩
+  · exact ⟨ModelT.fixed 1, 1, 8, by norm_num, by intros; norm_num [ModelT.fixed],
+      by intros; simp [ModelT.fixed], by norm_num, by norm_num⟩
   · exact ⟨ModelT.fixed 1, 1, 1, by norm_num, by norm_num, by intros; simp [ModelT.fixed]⟩
 
 theorem T5_i_nonvacuous : ∃ (B alpha : ℝ) (pred : ModelT.Predicate ℝ) (a : List ℝ),
@@ -237,5 +238,41 @@ theorem T5_v_persistent_nonvacuous :
   · norm_num [ModelT.fixed]
   · intro j _ _
     norm_num [ModelT.fixed]
+
+/-- The quantitative price condition and both exact costs hold simultaneously. -/
+theorem law_early_quantitative_witness :
+    Real.sqrt (2 * (1 : ℝ) * 8) + 1 = 5 ∧
+    (0 : ℝ) < 5 ∧ (5 : ℝ) < 8 ∧
+    ModelT.Optimal (8 : ℝ) [5] (fun _ => false) ∧
+    ModelT.cost (8 : ℝ) [5] (fun _ => false) = 5 ∧
+    ModelT.algCost (8 : ℝ) [5] (ModelT.law (ModelT.fixed 1)) = 8 ∧
+    ModelT.algCost (8 : ℝ) [5] (ModelT.law (ModelT.fixed 1)) /
+      ModelT.cost (8 : ℝ) [5] (fun _ => false) = 8 / 5 := by
+  have hopt : ModelT.Optimal (8 : ℝ) [5] (fun _ => false) := by
+    intro sigma
+    simp only [ModelT.cost, ModelT.run, List.zipIdx, List.foldl_cons,
+      List.foldl_nil, ModelT.initial, ModelT.step]
+    cases sigma 0 <;> norm_num
+  norm_num [hopt, ModelT.algCost, ModelT.cost, ModelT.run, List.zipIdx,
+    ModelT.onlineSchedule, ModelT.law, ModelT.fixed, ModelT.controller,
+    ModelT.decisions, ModelT.initial, ModelT.step]
+
+/-- A uniform upper estimate bound does not give the source's ratio upper bound. -/
+theorem law_bounded_estimate_no_ratio_upper :
+    (∀ B : ℝ, ∀ a : List ℝ, ModelT.fixed 0 B a ≤ (1 : ℝ)) ∧
+    ModelT.Optimal (100 : ℝ) [1] (fun _ => false) ∧
+    ModelT.algCost (100 : ℝ) [1] (ModelT.law (ModelT.fixed 0)) /
+      ModelT.cost (100 : ℝ) [1] (fun _ => false) = 100 ∧
+    Real.sqrt ((100 : ℝ) / (2 * 1)) < 100 := by
+  have hopt : ModelT.Optimal (100 : ℝ) [1] (fun _ => false) := by
+    intro sigma
+    simp only [ModelT.cost, ModelT.run, List.zipIdx, List.foldl_cons,
+      List.foldl_nil, ModelT.initial, ModelT.step]
+    cases sigma 0 <;> norm_num
+  have hsquare : (Real.sqrt (50 : ℝ)) ^ 2 = 50 := Real.sq_sqrt (by norm_num)
+  have hsqrt : Real.sqrt (50 : ℝ) < 100 := by nlinarith
+  norm_num [ModelT.fixed, hopt, ModelT.algCost, ModelT.cost, ModelT.run,
+    List.zipIdx, ModelT.onlineSchedule, ModelT.law, ModelT.controller,
+    ModelT.decisions, ModelT.initial, ModelT.step, hsqrt]
 
 end PiZip

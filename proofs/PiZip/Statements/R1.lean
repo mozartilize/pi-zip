@@ -255,6 +255,11 @@ Added hypotheses: Ghat > 0, estimates nonnegative on positive-price nonnegative
 prefixes, and a uniform first-request bound for every B and arrival. The growth
 estimate is online. c > 0 suffices for unbounded ratios. The instance is one
 positive burst with D < B, so the hold schedule is a positive hindsight optimum.
+The quantitative clause uses B > 0 and sqrt(2*Ghat*B)+1 < B, precisely the
+source proof's condition for that optimum (line 727). It exhibits a burst of
+size at most sqrt(2*Ghat*B)+1, exact costs LAW=B and OPT=D, and the stated
+ratio lower bound. For arbitrary bounded estimates this is a lower growth
+bound; the source's "grows like" needs "grows at least on the order of".
 
 "If its estimate stays ≥ G′ > 0 whatever the removable arrivals are, as the product's context-growth estimate does, LAW can
 also never fire while the rent grows without bound."
@@ -265,9 +270,17 @@ def T4_iv : Prop :=
   (∀ (estimate : ModelT.Estimate ℝ) (Ghat : ℝ), 0 < Ghat →
     (∀ B : ℝ, 0 < B → ∀ a : List ℝ, ModelT.arrivalsValid a → 0 ≤ estimate B a) →
     (∀ B D : ℝ, 0 < B → 0 ≤ D → estimate B [D] ≤ Ghat) →
-    ∀ c : ℝ, 0 < c → ∃ B D : ℝ, 0 < B ∧ 0 < D ∧ D < B ∧
+    (∀ B : ℝ, 0 < B → Real.sqrt (2 * Ghat * B) + 1 < B →
+      ∃ D : ℝ, 0 < D ∧ D ≤ Real.sqrt (2 * Ghat * B) + 1 ∧ D < B ∧
+        ModelT.Optimal B [D] (fun _ => false) ∧
+        ModelT.cost B [D] (fun _ => false) = D ∧
+        ModelT.algCost B [D] (ModelT.law estimate) = B ∧
+        B / (Real.sqrt (2 * Ghat * B) + 1) ≤
+          ModelT.algCost B [D] (ModelT.law estimate) /
+            ModelT.cost B [D] (fun _ => false)) ∧
+    (∀ c : ℝ, 0 < c → ∃ B D : ℝ, 0 < B ∧ 0 < D ∧ D < B ∧
       ModelT.Optimal B [D] (fun _ => false) ∧
-      c * ModelT.cost B [D] (fun _ => false) < ModelT.algCost B [D] (ModelT.law estimate)) ∧
+      c * ModelT.cost B [D] (fun _ => false) < ModelT.algCost B [D] (ModelT.law estimate))) ∧
   (∀ (estimate : ModelT.Estimate ℝ) (B G' : ℝ), 0 < B → 0 < G' →
     (∀ a : List ℝ, a ≠ [] → ModelT.arrivalsValid a → G' ≤ estimate B a) →
     ∃ D : ℝ, 0 < D ∧ D ^ 2 < 2 * G' * B ∧
