@@ -809,6 +809,25 @@ describe("round 5: rules A (start early) and B (never wait while warm)", () => {
 		expect(st.calls).toBe(2);
 	});
 
+	test("idle cache warming does not drop the early summary: Pi's warm and stop decisions leave it alone, the warm return takes it", async () => {
+		const st = { calls: 0, signals: [] as Any[] };
+		const idle = { getSettings: () => ({ cacheWarming: "idle" }), registerEntryRenderer: () => {} };
+		const r = await rig(done, WARM_TS(), { modelRegistry: { complete: mkComplete(st) } }, idle);
+		const settled = await settle(r);
+		await sleep(20);
+		expect(st.calls).toBe(1); // rule A does not wait for Pi's decision (only the cold plan's timer does)
+		const decide = (action: string) => r.handlers.get("cache_warming_decision")({ type: "cache_warming_decision", action, warmCost: 0.01, missCost: 1, continuationProbability: 0.15 }, r.ctx);
+		await decide("warm");
+		await decide("stop"); // the cold plan's summary is released: it cuts where the early one does, which is kept
+		await sleep(20);
+		expect(st.calls).toBe(1);
+		expect(st.signals[0].aborted).toBe(false);
+		const req = await prompt(r, settled);
+		expect(req.messages[0].role).toBe("compactionSummary");
+		expect(st.calls).toBe(1);
+		expect(rows("unused_summary")).toEqual([]);
+	});
+
 	test("a finished early summary lost when the process ends is booked (its cost), but not counted against the bound: the restarted process starts its own", async () => {
 		const st = { calls: 0 };
 		const r = await rig(done, WARM_TS(), { modelRegistry: { complete: mkComplete(st) } });
