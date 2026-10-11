@@ -875,6 +875,19 @@ describe("round 5: rules A (start early) and B (never wait while warm)", () => {
 		expect(unused[0].usd).toBeGreaterThan(0);
 	});
 
+	test("a summary still running when the process ends is booked as unused at the input it was billed for (not counted against the bound)", async () => {
+		const st = { calls: 0, delay: 5_000 };
+		const r = await rig(done, WARM_TS(), { modelRegistry: { complete: mkComplete(st) } });
+		await settle(r);
+		await sleep(10);
+		await r.fire("session_shutdown", {});
+		const unused = r.appended.filter((x: Any) => x.customType === "pi-zip/unused-summary").map((x: Any) => x.data);
+		expect(unused).toHaveLength(1); // before: nothing (only a finished one was booked)
+		expect(unused[0]).toMatchObject({ lost: "shutdown", estimated: true });
+		expect(unused[0].usd).toBeGreaterThan(0);
+		expect(unused[0].ab).toBeUndefined();
+	});
+
 	test("a finished early summary lost when the process ends is booked (its cost), but not counted against the bound: the restarted process starts its own", async () => {
 		const st = { calls: 0 };
 		const r = await rig(done, WARM_TS(), { modelRegistry: { complete: mkComplete(st) } });
