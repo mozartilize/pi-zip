@@ -221,17 +221,17 @@ theorem T2_vii_warm_exact_nonvacuous : ∃ B g : ℝ, 0 < B ∧ 0 < g := by
 theorem T2_vii_hazard_exact_nonvacuous : ∃ B g h : ℝ, 0 < B ∧ 0 < g ∧ 0 < h := by
   exact ⟨1, 1, 1, by norm_num⟩
 
-/-- A fixed zero estimate satisfies LAW throughout the first burst cycle. -/
+/-- A fixed positive estimate persists on a horizon ending at its first guarded edit. -/
 theorem T5_v_persistent_nonvacuous :
     ∃ (B D alpha : ℝ) (estimate : ModelT.Estimate ℝ) (m : ℕ),
       0 < B ∧ 0 < D ∧ 0 < alpha ∧ alpha ≤ 1 ∧
       (∀ a : List ℝ, ModelT.arrivalsValid a → 0 ≤ estimate B a) ∧
-      D ^ 2 ≥ 2 * estimate B [D] * B ∧ B ≤ (m : ℝ) * D ∧
+      D ^ 2 ≥ 2 * estimate B [D] * B ∧ alpha * B ≤ ((m + 1 : ℕ) : ℝ) * D ∧
       (∀ j : ℕ, j < (ModelT.burst D m).length →
         (∀ i : ℕ, i < j → ModelT.onlineSchedule B
           (ModelT.guarded alpha (ModelT.lawPredicate estimate)) (ModelT.burst D m) i = false) →
         D ^ 2 ≥ 2 * estimate B ((ModelT.burst D m).take (j + 1)) * B) := by
-  refine ⟨1, 1, 1 / 2, ModelT.fixed 0, 1, by norm_num, by norm_num,
+  refine ⟨10, 1, 1 / 2, ModelT.fixed (1 / 100), 4, by norm_num, by norm_num,
     by norm_num, by norm_num, ?_, ?_, by norm_num, ?_⟩
   · intro a _
     norm_num [ModelT.fixed]
@@ -274,5 +274,73 @@ theorem law_bounded_estimate_no_ratio_upper :
   norm_num [ModelT.fixed, hopt, ModelT.algCost, ModelT.cost, ModelT.run,
     List.zipIdx, ModelT.onlineSchedule, ModelT.law, ModelT.controller,
     ModelT.decisions, ModelT.initial, ModelT.step, hsqrt]
+
+/-- The zero rewrite-price fluid objective has zero infimum, never attained at d > 0. -/
+theorem fluid_zero_price_boundary (x : ModelC.Instance ℝ) (g : ℝ) (hn : x.n = x.A) :
+    (∀ d : ℝ, 0 < d → 0 < x.k * (x.A - x.n) * g / d + d / 2) ∧
+    (∀ ε : ℝ, 0 < ε → ∃ d : ℝ, 0 < d ∧
+      x.k * (x.A - x.n) * g / d + d / 2 < ε) := by
+  simp only [hn, sub_self, mul_zero, zero_mul, zero_div, zero_add]
+  constructor
+  · intro d hd
+    positivity
+  · intro ε hε
+    exact ⟨ε, hε, by linarith⟩
+
+/-- The zero-price boundary occurs in a valid Model C state, without a zero removal. -/
+theorem fluid_zero_price_boundary_nonvacuous :
+    ∃ (x : ModelC.Instance ℝ) (g : ℝ),
+      ModelC.Valid x ∧ 0 < g ∧ x.n = x.A ∧ x.call = 0 ∧ x.eta = 0 := by
+  refine ⟨⟨1, 1, 1, 1, 0, 0⟩, 1, ?_⟩
+  norm_num [ModelC.Valid, ModelC.view]
+
+/-- This stretch contains the first guarded edit while ending before rent reaches B. -/
+theorem persistent_short_horizon_witness :
+    (1 / 2 : ℝ) * 10 ≤ ((4 + 1 : ℕ) : ℝ) * 1 ∧
+    ¬ (10 : ℝ) ≤ (4 : ℝ) * 1 ∧
+    (∀ i : ℕ, i < 4 → ModelT.onlineSchedule (10 : ℝ)
+      (ModelT.guarded (1 / 2) (ModelT.lawPredicate (ModelT.fixed (1 / 100))))
+      (ModelT.burst 1 4) i = false) ∧
+    ModelT.onlineSchedule (10 : ℝ)
+      (ModelT.guarded (1 / 2) (ModelT.lawPredicate (ModelT.fixed (1 / 100))))
+      (ModelT.burst 1 4) 4 = true ∧
+    ModelT.algCost (10 : ℝ) (ModelT.burst 1 4)
+      (ModelT.guarded (1 / 2) (ModelT.lawPredicate (ModelT.fixed (1 / 100)))) = 14 ∧
+    (14 : ℝ) < (1 + 1 / 2) * 10 := by
+  refine ⟨by norm_num, by norm_num, ?_, ?_, ?_, by norm_num⟩
+  · intro i hi
+    interval_cases i <;>
+      norm_num [ModelT.onlineSchedule, ModelT.guarded, ModelT.lawPredicate, ModelT.fixed,
+        ModelT.controller, ModelT.decisions, ModelT.step, ModelT.initial, ModelT.burst]
+  · norm_num [ModelT.onlineSchedule, ModelT.guarded, ModelT.lawPredicate, ModelT.fixed,
+      ModelT.controller, ModelT.decisions, ModelT.step, ModelT.initial, ModelT.burst]
+  · norm_num [ModelT.algCost, ModelT.cost, ModelT.run, List.zipIdx,
+      ModelT.onlineSchedule, ModelT.guarded, ModelT.lawPredicate, ModelT.fixed,
+      ModelT.controller, ModelT.decisions, ModelT.step, ModelT.initial, ModelT.burst]
+
+/-- A positive optimum needs strictness even when BAL never edits. -/
+theorem false_predicate_no_edit_positive_witness :
+    ModelT.arrivalsValid ([1] : List ℝ) ∧
+    ¬ ModelT.edits (5 : ℝ) [1] ModelT.bal ∧
+    ModelT.Optimal (5 : ℝ) [1] (fun _ => false) ∧
+    ModelT.cost (5 : ℝ) [1] (fun _ => false) = 1 ∧
+    ModelT.algCost (5 : ℝ) [1] (ModelT.guarded (1 / 2) (fun _ _ _ _ => false)) = 1 ∧
+    (0 : ℝ) < 1 ∧ (1 : ℝ) < 2 * 1 := by
+  refine ⟨by simp [ModelT.arrivalsValid], ?_, ?_, ?_, ?_, by norm_num, by norm_num⟩
+  · rintro ⟨i, hi, hedit⟩
+    have hi0 : i = 0 := by simpa using hi
+    subst i
+    norm_num [ModelT.onlineSchedule, ModelT.bal, ModelT.controller, ModelT.decisions,
+      ModelT.initial] at hedit
+  · intro sigma
+    cases h : sigma 0 <;>
+      norm_num [ModelT.cost, ModelT.run, List.zipIdx, ModelT.initial, ModelT.step, h]
+  · norm_num [ModelT.cost, ModelT.run, List.zipIdx, ModelT.initial, ModelT.step]
+  · norm_num [ModelT.algCost, ModelT.cost, ModelT.run, List.zipIdx, ModelT.onlineSchedule,
+      ModelT.guarded, ModelT.controller, ModelT.decisions, ModelT.initial, ModelT.step]
+
+/- At zero optimum only the non-strict bound is required; the ratio is undefined. -/
+#guard ModelT.algCost (5 : ℚ) [] (ModelT.guarded (1 / 2) (fun _ _ _ _ => false)) = 0
+#guard ModelT.algCost (5 : ℚ) [0, 0] (ModelT.guarded (1 / 2) (fun _ _ _ _ => false)) = 0
 
 end PiZip
