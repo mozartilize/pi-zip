@@ -358,6 +358,24 @@ describe("real Pi: a summary prepared while the user was away goes in through Pi
 		expect(waited).toBeLessThan(1_800);
 	});
 
+	// 0.3.1 live, first restart: durable-subagents posted a display-only note at session start ("1 workflow was paused"). After the final
+	// answer it opened a turn (it could have started a run), so the first-key plan, counting the prompt as one more turn on top, protected
+	// only the note and cut there; the real prompt joins the note's turn (a prompt right after its starter is one turn) and the run plan
+	// cut one turn earlier: the key's summary was thrown away (booked unused) and the user waited for a second one, in full.
+	test("a display-only custom message after the final answer: the first-key summary cuts where the prompt's run plan cuts (no second call)", async () => {
+		const r = await rig(undefined, { file: template(240 * 60_000), tui: true, native: false, idle: false, start: false, latencyMs: 300 });
+		r.sm.appendCustomMessageEntry("dsa-note", "1 subagent workflow was paused when pi quit", true);
+		r.typeKey("h");
+		await sleep(50);
+		expect(r.narrativeCalls.length).toBe(1);
+		await r.beforeAgentStart("hello");
+		sendPrompt(r.sm, "hello");
+		const req1 = await r.request();
+		expect(req1.some((m) => m.role === "compactionSummary")).toBe(true);
+		expect(r.narrativeCalls.length).toBe(1); // old code: 2 (the key's call cut at the note, the run plan one turn earlier)
+		expect(r.sm.getEntries().filter((e: Any) => e.type === "custom" && e.customType === "pi-zip/unused-summary")).toEqual([]);
+	});
+
 	// review P1-1: the usual "open, look, leave" (Ctrl+D, Ctrl+C twice, Esc, arrows, /quit, /resume to another session) is not typing a
 	// prompt; the old code started the paid call at the first of those keys (isKeystroke accepts control keys and "/")
 	test("keys that do not type a prompt start nothing: Ctrl+C, Ctrl+D, Esc, arrows, /quit, /resume; the listener stays until a prompt is typed", async () => {

@@ -477,6 +477,17 @@ export type Calls = Map<string, { name: string; args: Any }>;
 /** User turns so far: the real prompts. Steering and follow-up messages typed during a run belong to that run's turn. */
 export const countUserTurns = (blocks: Block[]): number => blocks.reduce((a, b) => Math.max(a, b.userTurn), 0);
 
+/** The newest turn was opened by an extension's custom message that nothing has answered or joined yet (no user, assistant or tool
+ *  result since): a prompt typed now joins that turn (buildBlocks: a prompt right after its starter is the same turn), so a plan made
+ *  before that prompt (promptPending) must not count it as one more. A display-only note posted at session start (durable-subagents'
+ *  "1 workflow was paused") opens such a turn; a message that does start a run is answered before any prompt is planned for. */
+export const openStarter = (blocks: Block[]): boolean => {
+	const n = countUserTurns(blocks);
+	if (n === 0) return false;
+	const turn = blocks.filter((b) => b.userTurn === n);
+	return turn[0]?.kind === "other" && turn[0].msg?.role === "custom" && !turn.some((b) => b.kind === "user" || b.kind === "assistant" || b.kind === "toolResult");
+};
+
 export function buildBlocks(contextEntries: Any[], steerIds?: Set<string>): Block[] {
 	const blocks: Block[] = [];
 	let userTurn = 0;
@@ -709,7 +720,7 @@ export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
 	const inturnAge = o.inturnAge ?? s.inturnAge;
 	const blocks = buildBlocks(entries, o.steerIds);
 	if (!blocks.length) return null;
-	const userTurns = countUserTurns(blocks) + (o.promptPending ? 1 : 0) + (o.slide ?? 0); // the upcoming prompt is a new user turn
+	const userTurns = countUserTurns(blocks) + (o.promptPending && !openStarter(blocks) ? 1 : 0) + (o.slide ?? 0); // the upcoming prompt is a new user turn (unless it joins an open starter)
 	const f1 = o.warmSummaryGate ?? WARM_SUMMARY_GATE, f2 = mode === "cold" && !o.warmStyle && (o.lookahead ?? LOOKAHEAD), f3 = o.narrativePrice ?? NARRATIVE_PRICE;
 	const calls = toolCallIndex(blocks);
 	const recalled = o.recalled ?? new Set<string>();
