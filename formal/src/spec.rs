@@ -706,7 +706,7 @@ pub fn pays_fully(r: &R, i: usize) -> Result<(), String> {
     Ok(())
 }
 
-/// The narrative part of a planned summary the planner's estimate is checked with (summary.ts asks for at most 1,500 words).
+/// The narrative part of a planned summary the planner's estimate is checked with (summary.ts asks for at most 1,000 words when it merges a previous narrative, 1,500 for a first summary).
 const NARRATIVE_EST: f64 = 2_500.0;
 
 /// The mechanism behind an A2 failure at request i (one class per failing request).
@@ -1014,7 +1014,7 @@ pub fn law_mismatch(r: &R, i: usize) -> Option<String> {
                     return Some(format!("{} {} at P={}: a negative call term {call:.1}", g.at, s.at, pt.p));
                 }
                 // the call is a real uncached model call that reads the conversation the summary replaces (B = X, the prefix, minus the
-                // previous summary it carries forward and never reads): whatever each version's pricing, it costs at least half of that
+                // previous summary it carries forward; the call reads only that summary's narrative, which this floor leaves out): whatever each version's pricing, it costs at least half of that
                 // at the input price (half: the planner's calibrated estimate against the request's real size of the previous summary)
                 if s.at == "summary" && s.a < s.b && s.k.is_some() {
                     let carried = r.st[i].prev_sum.max(if i > 0 { r.st[i - 1].prev_sum } else { 0.0 });
