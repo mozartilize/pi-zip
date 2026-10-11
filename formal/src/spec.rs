@@ -120,10 +120,15 @@ fn pays() -> F<R> {
 fn user_waits() -> F<R> {
     atom("user_waits", |r: &R, i, _| r.trace.world.interactive && (r.tick(i).wait_run > 0 || (i > 0 && r.tick(i - 1).wait_te > 0)))
 }
-/// The summary the user waited for is the warm valve's at a turn_end, mid-run: the user is already waiting for the agent there.
-/// A warm return's run plan is not the valve (README A3 below): there the user just sent a prompt and waits for nothing else.
-fn valve_summary() -> F<R> {
-    atom("valve_summary", |r: &R, i, _| r.decision_for(i).is_some_and(|g| g.at == "turn_end" && g.p >= 0.5))
+/// The summary the user waited for was planned warm (P(warm) >= 0.5): a warm return's run plan or the warm valve at a turn_end.
+/// Round 5 excuses it only together with bg_budget_spent (rule B's fallback to 0.3.0).
+fn warm_summary() -> F<R> {
+    atom("warm_summary", |r: &R, i, _| r.decision_for(i).is_some_and(|g| g.p >= 0.5))
+}
+/// Round 5: the live process's warm plan at this return cut where a summary it held in memory (written in the background) cuts, the
+/// law accepting that cut (run.ts pinned, the anti-thrash rule). A restarted process has lost that summary and makes its unpinned plan.
+pub fn pinned_live(r: &R, i: usize) -> bool {
+    r.ledger(i, "pin").iter().any(|p| p.get("ok").and_then(serde_json::Value::as_bool) == Some(true) && matches!(p.get("where").and_then(serde_json::Value::as_str), Some("run") | Some("native")))
 }
 /// Round 5 (rules A/B): a summary pi-zip started in the background for a warm return or a warm turn_end was dropped unused in this
 /// warm stretch (since the last return planned cold), up to this request. Then the stretch's bound of one unused background summary is
@@ -235,7 +240,7 @@ fn warm_summary_not_withheld() -> F<R> {
 }
 /// Residuals: the property's failures at this request that no known root cause (TRIAGE.md (a)) explains.
 fn rd_residual() -> F<R> {
-    atom("fresh_plans_alike_or_known_cause", |r: &R, i, _| r.tick(i).fresh.as_ref().is_none_or(|f| f.same || f.deferred_same || f.fixed_by_known))
+    atom("fresh_plans_alike_or_known_cause", |r: &R, i, _| r.tick(i).fresh.as_ref().is_none_or(|f| f.same || f.deferred_same || f.fixed_by_known || pinned_live(r, i)))
 }
 fn mp_residual() -> F<R> {
     atom("monotone_or_known_cause", |r: &R, i, _| mp_breaches(r, i).iter().all(|(m, _)| MP_KNOWN.iter().any(|k| m.contains(k))))
@@ -273,10 +278,11 @@ pub fn axioms() -> Vec<Prop> {
             from: &[],
             why: "README rule 3: a summary model call is prepared while the user is away, or (round 5, rules A/B) written in the background \
                   while the cache is warm; the user waits for one only at Pi's compaction room, at a return a model switch made cold (no \
-                  away time to prepare it in), or in the warm valve at a turn_end once the warm stretch's one unused background summary is \
-                  spent (the anti-thrash bound: 0.3.0's wait). A warm return's run plan, and a warm turn_end otherwise, are not excused.",
+                  away time to prepare it in), or for a warm plan (a warm return's run plan, the valve at a turn_end) once the warm \
+                  stretch's one unused background summary is spent (the anti-thrash bound: 0.3.0's wait). Otherwise a warm wait is not \
+                  excused: the summary is written in the background (rule B).",
             evidence: Evidence::Conformance,
-            f: always(user_waits() >> (at_room() | switched() | (valve_summary() & bg_budget_spent()))),
+            f: always(user_waits() >> (at_room() | switched() | (warm_summary() & bg_budget_spent()))),
         },
     ]
 }
@@ -1240,6 +1246,7 @@ pub fn classify(id: &str, r: &R, v: &Violation) -> String {
         "RD" | "RDr" if r.tick(v.at).fresh.as_ref().is_some_and(|f| !f.fixed_by_all) && r.tick(v.at).env.iter().any(|e| e == "away-summary") && r.tick(v.at).env.iter().any(|e| e == "edit" || e == "compact") => {
             "the summary prepared while away was planned before another context change (an extension's edit, Pi's compaction)".into()
         }
+        "RD" | "RDr" if pinned_live(r, v.at) => "the live process pinned its warm plan to a summary only it held in memory (round 5 anti-thrash)".into(),
         "RD" | "RDr" => match r.tick(v.at).fresh.as_ref() {
             Some(f) if !f.fixed_by.is_empty() => format!("in-memory state a restart loses: {}", f.fixed_by.join("+")),
             Some(f) if f.fixed_by_all => "in-memory state a restart loses: several fields together".into(),
