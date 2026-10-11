@@ -130,7 +130,7 @@ fn a1_view_by_position() {
 
 #[test]
 fn a1_users_quoted_by_the_summary() {
-    caught("m03", "summary.ts", "out.push(...(userLines.length ? userLines : [NONE_ROW]));", "out.push(NONE_ROW);", "A1", &summary_prepared_away("prompt +1h"));
+    caught("m03", "summary.ts", "out.push(...(mu.lines.length ? mu.lines : [NONE_ROW]));", "out.push(NONE_ROW);", "A1", &summary_prepared_away("prompt +1h"));
 }
 
 #[test]

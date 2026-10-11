@@ -1,45 +1,30 @@
-# Round 5, rule B at a warm turn_end: the valve's summary is written in the background and adopted at the next turn_end (no wait).
-# Shrunk by the checker on a mutant whose warmSummary always waits (0.3.0's turn_end): A3 fails at req 31 there.
-world automatic known ttl=300 true=300 survival=none c=1 sys=3000 window=200000 native interactive warming
+# Round 5, rule B at a warm turn_end: the valve's summary is written in the background and adopted at a later turn_end (no wait).
+# Shrunk by the checker (seed 1, 3,000 random traces, --only A3) on a mutant whose warmSummary always waits (0.3.0's turn_end): A3 fails
+# at req 18 there. Re-shrunk at 0.3.1: the round-5 trace no longer reaches a warm turn_end summary there, so the mutant passed it.
+world automatic known ttl=300 true=300 survival=none c=1 sys=3000 window=200000 native interactive
 prompt +0s
-call npm 9.3K
-call recall
+say 20K
+prompt +60s
 say 100
-prompt +4min
-call npm 6.5K
+prompt +60s
+call npm 100
 say 100
-prompt +241s
+prompt +60s
+call npm 100
 call recall
+call npm 100
+call npm 2.5K
 say 100
-prompt +438s
-call npm 4.9K
-call recall
-call recall
-call cat 2.9K
-call recall
-call cat 1.3K
-call npm 13.9K
-call npm 7.1K
-call cat 429
-call npm 561
-call npm 5.2K
-call npm 7.9K
-call npm 1.8K
-call cat 267
-steer
-call cat 9.4K
-call npm 611
-call npm 3.3K
-call npm 8.9K
-say 67
-switch
-prompt +3507s
-call npm 208
-say 5.0K
-prompt +411s
-nextturn
-say 170
-prompt +19s
-call cat 132
-call cat 8.7K
-say 182
+prompt +60s
+call npm 100
+call npm 100
+call npm 100
+call npm 100
+say 100
+prompt +60s
+call npm 100
+call npm 100
+call npm 100
+say 12.2K
+prompt +60s
+say 100
