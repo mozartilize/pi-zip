@@ -152,7 +152,7 @@ fn lw_plan_step_call_is_pinned_both_ways() {
 /// the user wait; the mutant is 0.3.0's turn_end (always wait).
 #[test]
 fn a3_warm_turn_end_does_not_wait() {
-    caught("r5b", "run.ts", "if (!ctx?.hasUI || p.atRoom || p.atRoomUnedited) return \"wait\";", "return \"wait\";", "A3", &trace_file("a3-warm-turn-end.trace"));
+    caught("r5b", "core.ts", "if (!hasUI || p.atRoom || p.atRoomUnedited) return \"wait\";", "return \"wait\";", "A3", &trace_file("a3-warm-turn-end.trace"));
 }
 
 /// Round 5, rule B at a warm prompt: a warm return after a restart, nothing prepared (b2-restart.trace); with rule B it waits for
@@ -217,7 +217,7 @@ fn i1_persisted_equals_sent() {
 #[test]
 fn b2b_no_back_to_back() {
     let t = trace_of(&["world explicit known ttl=300 true=300 survival=none c=1 sys=3000 window=128000 native interactive", "prompt", "call npm 5K", "call npm 10K", "call npm 11.2K", "call npm 9.6K", "say 100", "prompt +60s", "call npm 28.4K", "call npm 23.3K", "call npm 5K", "call npm 5.7K", "say 100", "prompt +60s", "say 100", "prompt +60s", "say 100"]);
-    caught_all("m10", "run.ts", &[("if (!this.cold && this.justEdited && !nat) {", "if (false) {", 1), ("if (this.justEdited) {", "if (false) {", 1)], &["B2B"], &t);
+    caught_all("m10", "core.ts", &[("if (!cold && x.justEdited && !nat) return { kind: \"b2b\" };", "", 1), ("if (x.justEdited) return { kind: \"b2b\" };", "", 1)], &["B2B"], &t);
 }
 
 #[test]
@@ -340,10 +340,11 @@ fn wl_a_restart_knows_a_driven_cold_wake() {
     let t = trace_file("wl-drive-restart.trace");
     caught_all(
         "wl2",
-        "run.ts",
+        "core.ts",
         &[
             ("if (!afterAnswer) continue; // mid-run, or riding with the prompt just before it", "continue;", 1),
-            ("this.summaryRegrow = this.summarizedWarm ? lastRegrow(branch) : undefined;", "this.summaryRegrow = undefined;", 1),
+            // lastRegrow is read only by run.ts restoreState: the same as restoring `summaryRegrow = undefined`
+            ("return typeof e.details.regrow === \"number\" && e.details.regrow > 0 ? e.details.regrow : undefined;", "return undefined;", 1),
         ],
         &["WL"],
         &t,
