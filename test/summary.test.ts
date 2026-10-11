@@ -3,7 +3,7 @@
 import { describe, expect, test } from "bun:test";
 import { buildBlocks, toolCallIndex } from "../src/plan.ts";
 import { handleFor } from "../src/placeholder.ts";
-import { buildCut, FOREIGN_SUMMARY_CHARS, handleRowsOf, handleTable, parseSummary, PREV_NARRATIVE_CHARS, skeleton } from "../src/summary.ts";
+import { buildCut, handleRowsOf, handleTable, parseSummary, PREV_NARRATIVE_CHARS, previousNarrative, skeleton } from "../src/summary.ts";
 import { A, R, U, type Any } from "./helpers.ts";
 
 const tcall = (id: string, name: string, args: Any) => {
@@ -35,25 +35,24 @@ function level(L: number): Any[] {
 }
 const narrativeFor = (L: number) => `## Decisions and rationale\nDECISION-${L}: chose plan ${L}.\n## Current state of the work\n` + `state line for level ${L}\n`.repeat(40) + `## Open todos / next steps\nTODO-${L}: finish ${L}\n## Key facts to remember\nKEYFACT-${L}: value-${L}`;
 
-/** The real buildCut over [previous summary?] + one level, with a stub model that writes narrativeFor(L). */
-async function cutOver(L: number, previous: string | null): Promise<string> {
+/** The real buildCut over [previous summary?] + one level, with a stub model that writes narrativeFor(L); `prompts` collects what it was sent. */
+async function cutOver(L: number, previous: string | null, prompts: string[] = []): Promise<string> {
 	const entries = [...(previous ? [summaryEntry(previous)] : []), ...level(L), U(`keep${L}`, "kept"), A(`keepA${L}`)];
 	const blocks = buildBlocks(entries);
 	const cutIdx = blocks.findIndex((b) => b.entryId === `keep${L}`);
-	const complete = async () => ({ stopReason: "stop", content: [{ type: "text", text: narrativeFor(L) }], usage: { cost: { total: 0 } } });
+	const complete = async (_m: Any, c: Any) => (prompts.push(c.messages[0].content[0].text), { stopReason: "stop", content: [{ type: "text", text: narrativeFor(L) }], usage: { cost: { total: 0 } } });
 	const p: Any = { blocks, calls: toolCallIndex(blocks), cutIdx, prefixTokens: 50_000, summaryTokensPlanned: 7000, sumTrigger: "cold" };
 	return (await buildCut(p, { model: { id: "m" }, modelRegistry: { complete } } as Any)).text;
 }
-async function chain(levels: number) {
+async function chain(levels: number, prompts: string[] = []) {
 	const texts: string[] = [];
 	let prev: string | null = null;
-	for (let L = 1; L <= levels; L++) texts.push((prev = await cutOver(L, prev)));
+	for (let L = 1; L <= levels; L++) texts.push((prev = await cutOver(L, prev, prompts)));
 	return texts;
 }
 const requestsOf = (t: string) => t.split("\n").filter((l) => /^\d+\. REQ-\d+-\d+ /.test(l)).map((l) => /REQ-(\d+)-(\d+)/.exec(l)!.slice(1).map(Number) as [number, number]);
 const sec = (t: string, head: string) => { const i = t.indexOf(head); const j = t.indexOf("\n## ", i + 1); return t.slice(i, j < 0 ? undefined : j); };
-/** The earlier-narrative excerpt: it holds "## ..." headings of its own, so it runs to the next top-level header of ours. */
-const excerptOf = (t: string) => t.slice(t.indexOf("## Earlier narrative"), t.indexOf("\n## Narrative (model-written)"));
+const prevBlockOf = (prompt: string) => /<previous-narrative[^>]*>\n([\s\S]*?)\n<\/previous-narrative>/.exec(prompt)?.[1] ?? null;
 const cmdHandle = (L: number, k: number) => handleFor(`r-b${L}-${k}`);
 
 describe("sectioned carry-forward: nested summaries, 4 levels deep", () => {
@@ -101,17 +100,66 @@ describe("sectioned carry-forward: nested summaries, 4 levels deep", () => {
 		expect(files.some((l) => l.startsWith("- src/mod1_2.ts"))).toBe(true);
 	});
 
-	test("narrative: the newest narrative is whole, the previous ones survive only as a bounded tail excerpt", async () => {
-		const texts = await chain(4);
+	test("narrative: ONE merged narrative; the previous one goes to the call as its own block (narrative only, not the lists), never into the summary", async () => {
+		const prompts: string[] = [];
+		const texts = await chain(4, prompts);
 		const last = texts[3];
 		expect(last).toContain("KEYFACT-4: value-4");
-		const excerpt = excerptOf(last);
-		expect(excerpt).toContain("KEYFACT-3: value-3"); // the tail of the previous narrative: todos and key facts
-		expect(excerpt).toContain("TODO-3");
-		expect(excerpt).not.toContain("DECISION-1"); // the head of old narratives is what goes first
-		expect(excerpt.length).toBeLessThanOrEqual(PREV_NARRATIVE_CHARS + 200);
+		expect(last).not.toContain("Earlier narrative");
+		expect(last).not.toContain("KEYFACT-3"); // what the model did not keep is gone: no stale copy next to the new narrative
+		expect(last.match(/^## Key facts to remember/gm)).toHaveLength(1);
 		expect(last.match(/## Narrative \(model-written\)/g)).toHaveLength(1);
+		expect(prevBlockOf(prompts[0])).toBeNull(); // the first summary has nothing to merge
+		for (let L = 2; L <= 4; L++) {
+			const block = prevBlockOf(prompts[L - 1])!;
+			expect(block).toBe(narrativeFor(L - 1)); // exactly the previous narrative ...
+			expect(block).not.toContain("REQ-"); // ... not its request list, commands or tables
+			expect(block).not.toContain("## Commands run");
+			expect(block).not.toContain("## Folded outputs");
+			expect(prompts[L - 1]).toContain("Write ONE updated narrative");
+			expect(prompts[L - 1]).toMatch(/keep only the newer one/);
+			expect(prompts[L - 1]).toMatch(/drop todos that are done or obsolete/);
+		}
 		expect(last).not.toContain("## Earlier summary (carried forward)");
+	});
+
+	test("an older summary with an 'Earlier narrative' excerpt: excerpt and narrative are merged by the call, and the excerpt is not carried", async () => {
+		const old = (await chain(1))[0] + "";
+		const withExcerpt = old.replace("\n## Narrative (model-written)\n", "\n## Earlier narrative (excerpt of the previous summary, newest part)\nKey facts: npm latest 0.2.8\n## Narrative (model-written)\n");
+		const prompts: string[] = [];
+		const t = await cutOver(2, withExcerpt, prompts);
+		expect(prevBlockOf(prompts[0])).toContain("npm latest 0.2.8");
+		expect(prevBlockOf(prompts[0])).toContain("KEYFACT-1");
+		expect(t).not.toContain("0.2.8");
+		expect(t).not.toContain("Earlier narrative");
+	});
+
+	test("the previous narrative sent is bounded (head and tail of a longer one), so the chain cannot grow without limit", () => {
+		const huge = "[summary of earlier conversation by pi-zip]\n## User requests (verbatim, oldest first)\n1. x\n## Narrative (model-written)\nHEAD-FACT\n" + "middle line of an endless narrative\n".repeat(3000) + "TAIL-FACT";
+		const p = previousNarrative(huge)!;
+		expect(p.text.length).toBeLessThanOrEqual(PREV_NARRATIVE_CHARS + 100);
+		expect(p.text).toContain("HEAD-FACT");
+		expect(p.text).toContain("TAIL-FACT");
+		expect(p.text).toContain("[… middle of the earlier narrative omitted …]");
+		expect(p.foreign).toBe(false);
+	});
+
+	test("narrative call failed after an earlier summary: the previous narrative is carried whole, marked possibly stale, with its time; the next call merges it", async () => {
+		const t1 = await cutOver(1, null);
+		const at = new Date(2026, 9, 11, 2, 31).getTime();
+		const entries = [{ sourceEntry: { id: "comp", type: "compaction" }, messages: [{ role: "compactionSummary", summary: t1, tokensBefore: 0, timestamp: at }] }, ...level(2), U("keep2", "kept"), A("keepA2")];
+		const blocks = buildBlocks(entries);
+		const p: Any = { blocks, calls: toolCallIndex(blocks), cutIdx: blocks.findIndex((b) => b.entryId === "keep2"), prefixTokens: 50_000, summaryTokensPlanned: 7000, sumTrigger: "cold" };
+		const down = async () => ({ stopReason: "error", errorMessage: "down", content: [], usage: { cost: { total: 0 } } });
+		const cut = await buildCut(p, { model: { id: "m" }, modelRegistry: { complete: down } } as Any);
+		expect(cut.llmOk).toBe(false);
+		expect(cut.text).toContain("## Narrative (carried forward from the summary of 10-11 02:31; possibly stale: a new one could not be written: down)");
+		expect(cut.text).toContain("KEYFACT-1: value-1");
+		expect(cut.text).not.toContain("(unavailable");
+		const prompts: string[] = [];
+		await cutOver(3, cut.text, prompts);
+		expect(prevBlockOf(prompts[0])).toContain("KEYFACT-1: value-1");
+		expect(prompts[0]).toContain('<previous-narrative written="10-11 02:31">');
 	});
 
 	test("no narrative (model call failed): the fallback line points at recall by handle, like the header, not at re-reading", async () => {
@@ -213,7 +261,8 @@ describe("old formats and foreign summaries", () => {
 		expect(t).toContain("`bun test` -> exit 1 (turn 1, " + H("o1") + ")");
 		expect(t).toContain("`ls` -> exit 0 (turn 1)");
 		expect(t).toContain("- src/a.ts (read, edit)");
-		expect(t).toContain("OLD-DECISION use bun");
+		expect(t).not.toContain("OLD-DECISION use bun"); // the narrative is the narrative call's to merge ...
+		expect(previousNarrative(aeText)!.text).toContain("OLD-DECISION use bun"); // ... which reads it
 		expect(handleTable([], aeText)).toContain("FAIL x");
 	});
 
@@ -243,20 +292,34 @@ describe("old formats and foreign summaries", () => {
 		expect(t.indexOf("OLD-ONE")).toBeLessThan(t.indexOf("MID-ONE"));
 		expect(t.indexOf("MID-ONE")).toBeLessThan(t.indexOf("NEW"));
 		expect(t).toContain(H("m2"));
-		expect(t).toContain("KEYFACT-MID");
+		expect(previousNarrative(outer)!.text).toContain("KEYFACT-MID");
 	});
 
-	test("a native Pi compaction summary (free text) is kept as a head and a long tail excerpt, never dropped, never crashes", () => {
+	test("a native Pi compaction summary (free text) goes to the narrative call as the previous narrative (head and tail if long); the fallback carries it", async () => {
 		const native = "## Goal\nGOAL-LINE ship the synthetic feature\n## Progress\n" + "progress line\n".repeat(900) + "## Next Steps\nNEXT-STEP do the final thing\n<read-files>\nsrc/x.ts\n</read-files>";
 		const p = parseSummary(native);
 		expect(p.structured).toBe(false);
 		const t = skeleton(buildBlocks([U("u1", "NEW"), A("e")]), native).text;
-		expect(t).toContain("GOAL-LINE");
-		expect(t).toContain("NEXT-STEP do the final thing");
-		expect(t).toContain("</read-files>");
-		expect(t).toContain("[… middle of the earlier narrative omitted …]");
-		expect(t.slice(t.indexOf("## Earlier narrative")).length).toBeLessThanOrEqual(FOREIGN_SUMMARY_CHARS + 200);
 		expect(t).toContain("1. NEW");
+		expect(t).not.toContain("GOAL-LINE"); // not an excerpt in the skeleton any more
+		const prompts: string[] = [];
+		const merged = await cutOver(1, native, prompts);
+		const block = prevBlockOf(prompts[0])!;
+		expect(block).toContain("GOAL-LINE");
+		expect(block).toContain("NEXT-STEP do the final thing");
+		expect(prompts[0]).toContain("earlier summary (written by another summariser)");
+		expect(merged).toContain("KEYFACT-1");
+		const huge = native.replace("progress line\n".repeat(900), "progress line\n".repeat(4000));
+		expect(previousNarrative(huge)!.text.length).toBeLessThanOrEqual(PREV_NARRATIVE_CHARS + 100);
+		expect(previousNarrative(huge)!.text).toContain("NEXT-STEP");
+		// the call fails: Pi's summary is carried, not lost
+		const blocks = buildBlocks([summaryEntry(native), ...level(1), U("keep1", "kept"), A("keepA1")]);
+		const pl: Any = { blocks, calls: toolCallIndex(blocks), cutIdx: blocks.findIndex((b) => b.entryId === "keep1"), prefixTokens: 50_000, summaryTokensPlanned: 7000, sumTrigger: "cold" };
+		const down = async () => ({ stopReason: "error", errorMessage: "down", content: [], usage: { cost: { total: 0 } } });
+		const cut = await buildCut(pl, { model: { id: "m" }, modelRegistry: { complete: down } } as Any);
+		expect(cut.text).toContain("GOAL-LINE");
+		expect(cut.text).toContain("NEXT-STEP do the final thing");
+		expect(cut.text).toContain("possibly stale");
 	});
 
 	test("empty, '(none)'-only, null and a bare mark all merge into an empty-but-valid summary", () => {

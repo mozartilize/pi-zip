@@ -89,4 +89,19 @@ describe("F3: the summary call is priced as the narrative call it is", () => {
 		expect(p.cutIdx).not.toBeNull();
 		expect(p.blocks.slice(p.cutIdx!).map((b) => b.entryId)).toContain("u2"); // the protected window stays
 	});
+	test("the previous summary's narrative, which the call merges, is priced as input; its lists are not", () => {
+		// two previous summaries of the same size: one mostly lists, one mostly narrative. Same prefix, same carried size, so the
+		// summary step's call differs only by the narrative the call reads (chars/4 tokens, at the input price)
+		const mk = (narr: number) => {
+			const s = "[summary of earlier conversation by pi-zip]\n## User requests (verbatim, oldest first, continuation lines indented)\n1. x\n## Commands run (with exit status)\n" + "`ls` -> exit 0 (turn 1)\n".repeat((40_000 - narr) / 24) + "## Narrative (model-written)\n" + "n".repeat(narr);
+			return { sourceEntry: { id: "cmp", type: "compaction", summary: s, firstKeptEntryId: "k1" }, messages: [{ role: "compactionSummary", summary: s, content: s }] };
+		};
+		const step = (narr: number) => {
+			const o = { ...base, narrativePrice: true, mode: "cold" as const, coldCap: 20_000, law: law(0, 500), trace: [] as Any[] };
+			planContext([mk(narr), ...older.slice(1)], o);
+			return o.trace.find((t: Any) => t.where === "summary")!;
+		};
+		const small = step(240), big = step(20_040);
+		expect(big.K - small.K).toBeCloseTo(ANTH.input * (Math.ceil(20_040 / 4) - Math.ceil(240 / 4)), 0);
+	});
 });
