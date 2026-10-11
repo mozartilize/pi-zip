@@ -324,10 +324,19 @@ const bashCommands = (blocks: Block[]): string[] =>
 
 /** Per-section budgets (characters unless noted); the total stays near the old design's 12,000-char carry plus the new prefix's own lists. */
 const BUDGET = { users: 16000, files: 6000, cmds: 10000, others: 5000, errors: 4000, lines: 60, errorLines: 15 };
-/** The previous summary's narrative the narrative call merges (summary.ts narrative): at most this many characters, the clip a narrative
- *  of the largest budget gets (NARRATIVE_MAX tokens x 6 chars, buildCut). A longer one (Pi's own free-text summary, an old summary's
- *  narrative plus its earlier excerpt) keeps its head and its tail, so the chain cannot grow without limit. */
-export const PREV_NARRATIVE_CHARS = 24_000; // plan.ts NARRATIVE_MAX x 6 (a literal: plan.ts imports this module)
+/**
+ * The narrative call's word budget for a narrative budget of this many tokens. A merge (a previous narrative given) asks for at most
+ * MERGE_WORDS: given an old narrative to carry, the model writes about 1.55x its budget (S6 chain probe: 2,349 words for 1,500, 1,547 for
+ * 1,000), and the merged narrative stays near the size of the narrative plus earlier-narrative excerpt it replaces.
+ */
+const narrativeWords = (budgetTokens: number, merge: boolean) => Math.round(clamp(budgetTokens * 0.6, 120, merge ? MERGE_WORDS : 1500));
+const MERGE_WORDS = 1000;
+/** The previous summary's narrative the narrative call merges is at most PREV_CHARS_PER_WORD characters per word of the call's budget,
+ *  PREV_NARRATIVE_CHARS in all: what a merge writes (1.55 x 1,000 words x ~7.7 chars), so a merged narrative passes whole to the next merge.
+ *  A longer one (Pi's own free-text summary, an older summary's narrative and its earlier excerpt) is sent as its head and its tail, so
+ *  the chain cannot grow. */
+const PREV_CHARS_PER_WORD = 12;
+export const PREV_NARRATIVE_CHARS = MERGE_WORDS * PREV_CHARS_PER_WORD;
 
 function excerpt(text: string, max: number, head = 0): string {
 	if (text.length <= max) return text;
@@ -339,7 +348,7 @@ function excerpt(text: string, max: number, head = 0): string {
 	};
 	const h = head ? text.slice(0, head).replace(/\s+\S*$/, "") : "";
 	const t = cutAtLine(text.slice(-(max - h.length)));
-	return (h ? h + "\n" : "") + "[… middle of the earlier narrative omitted …]\n" + t;
+	return (h ? h + "\n" : "") + "[… middle of the narrative omitted …]\n" + t;
 }
 
 /** The narrative part of a previous summary, as the next narrative call reads it. */
@@ -354,12 +363,13 @@ export interface PrevNarrative {
  * excerpt included, so the first merge also settles what that excerpt said), or the whole text of a free-text summary. null: none.
  * `at` = the previous summary's timestamp (ms), used when the text does not say when its narrative was written.
  */
-export function previousNarrative(text: string | null, at?: number): PrevNarrative | null {
+export function previousNarrative(text: string | null, at?: number, maxChars = PREV_NARRATIVE_CHARS): PrevNarrative | null {
 	const p = parseSummary(text);
 	const t = p.narrative.join("\n\n").trim();
 	if (!t) return null;
 	const when = p.narrativeAt ?? (at && at > 0 ? fmtWhen(at) : undefined);
-	return { text: excerpt(t, PREV_NARRATIVE_CHARS, Math.floor(PREV_NARRATIVE_CHARS / 4)), foreign: !p.structured, ...(when ? { at: when } : {}) };
+	const max = Math.min(maxChars, PREV_NARRATIVE_CHARS);
+	return { text: excerpt(t, max, Math.floor(max / 4)), foreign: !p.structured, ...(when ? { at: when } : {}) };
 }
 
 const list = (title: string, m: { kept: string[]; omitted: number }, marker: string): string[] => [title, m.kept.length ? [...(m.omitted ? [`[… ${m.omitted} ${marker} …]`] : []), ...m.kept].join("\n") : NONE_ROW];
@@ -499,7 +509,7 @@ export async function narrative(prefix: Block[], ctx: Any, budgetTokens: number,
 	let lastErr = "";
 	try {
 		const conv = await serialize(msgs);
-		const words = Math.round(clamp(budgetTokens * 0.6, 120, 1500));
+		const words = narrativeWords(budgetTokens, !!previous);
 		const prev = previous
 			? `<previous-narrative${previous.at ? ` written="${previous.at}"` : ""}>\n${previous.text}\n</previous-narrative>\n\n`
 			: "";
@@ -518,7 +528,9 @@ export async function narrative(prefix: Block[], ctx: Any, budgetTokens: number,
 			`tool and exact command or path so that look-alike runs stay distinguishable; never merge similar runs into one. Output only these markdown sections:\n` +
 			`## Decisions and rationale\n## Current state of the work\n## Open todos / next steps\n## Key facts to remember (exact values, paths, identifiers, results the work still depends on)\n` +
 			merge +
-			`Be concrete and keep exact paths, names and numbers. Stay under about ${words} words. Do not call tools.`;
+			`Be concrete and keep exact paths, names and numbers. Stay under about ${words} words` +
+			(previous ? ` (a hard limit: the previous narrative and the conversation together say more, so compress: keep what the work still depends on, drop how it got there and whatever is finished)` : "") +
+			`. Do not call tools.`;
 		const signals: AbortSignal[] = [AbortSignal.timeout(240_000)];
 		// a background summary has its own signal (nothing is running, so the run's signal would be stale); a summary the user waits for follows the run's (Esc)
 		const outer = ownSignal ?? ctx.signal;
@@ -590,11 +602,12 @@ export async function buildCut(p: PlanResult, ctx: Any, signal?: AbortSignal): P
 	const sk = skeleton(prefix.filter((b) => b.kind !== "summary"), prev, table ?? "", file);
 	const nb = clamp(p.summaryTokensPlanned - tok4(sk.text), 300, 4000);
 	const prevAt = prefix[0]?.kind === "summary" ? Number(prefix[0].msg.timestamp) || 0 : 0;
-	const prevNarr = previousNarrative(prev, prevAt);
+	const prevNarr = previousNarrative(prev, prevAt, narrativeWords(nb, true) * PREV_CHARS_PER_WORD);
 	const nar = await narrative(prefix, ctx, nb, signal, prevNarr);
 	let text = sk.text;
 	const how = file ? `read an output's file by its handle (${file.dir}/<handle>.txt)` : `${RECALL_TOOL} an output by its handle`;
-	if (nar.ok && nar.text) text += `\n## Narrative (model-written)\n${nar.text.slice(0, nb * 6)}`;
+	// a narrative over its budget keeps its head and its tail (the key facts come last), not just its head
+	if (nar.ok && nar.text) text += `\n## Narrative (model-written)\n${excerpt(nar.text, nb * 6, Math.floor((nb * 6) / 3))}`;
 	// no new narrative: the previous one is carried whole (up to the narrative's own budget), marked as possibly stale, with its time
 	else if (prevNarr) text += `\n${narrCarriedHead(prevNarr.at, clip(nar.error ?? "n/a", 120))}\n${excerpt(prevNarr.text, nb * 6, Math.floor((nb * 6) / 4))}`;
 	else text += `\n## Narrative\n(unavailable: ${nar.error ?? "n/a"}; rely on the sections above and ${how} rather than re-running or re-reading)`;

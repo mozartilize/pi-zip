@@ -134,13 +134,33 @@ describe("sectioned carry-forward: nested summaries, 4 levels deep", () => {
 		expect(t).not.toContain("Earlier narrative");
 	});
 
+	test("a merge asks for at most 1,000 words and says the limit is hard; a narrative over its budget keeps its head and its tail (the key facts)", async () => {
+		const prompts: string[] = [];
+		const first = await cutOver(1, null, prompts);
+		const entries = [summaryEntry(first), ...level(2), U("keep2", "kept"), A("keepA2")];
+		const blocks = buildBlocks(entries);
+		const long = "## Decisions and rationale\nHEAD-DECISION\n" + "a sentence of the current state of the work.\n".repeat(2000) + "## Key facts to remember\nTAIL-KEYFACT: 42";
+		const complete = async (_m: Any, c: Any) => (prompts.push(c.messages[0].content[0].text), { stopReason: "stop", content: [{ type: "text", text: long }], usage: { cost: { total: 0 } } });
+		const p: Any = { blocks, calls: toolCallIndex(blocks), cutIdx: blocks.findIndex((b) => b.entryId === "keep2"), prefixTokens: 50_000, summaryTokensPlanned: 40_000, sumTrigger: "cold" };
+		const t = (await buildCut(p, { model: { id: "m" }, modelRegistry: { complete } } as Any)).text;
+		expect(Number(/under about (\d+) words/.exec(prompts[0])![1])).toBe(1500); // no previous narrative: the old budget
+		expect(Number(/under about (\d+) words/.exec(prompts[1])![1])).toBe(1000);
+		expect(prompts[1]).toContain("a hard limit");
+		expect(t).toContain("HEAD-DECISION");
+		expect(t).toContain("TAIL-KEYFACT: 42");
+		expect(t).toContain("[… middle of the narrative omitted …]");
+		const narr = t.slice(t.indexOf("## Narrative (model-written)"), t.indexOf("\n## Folded outputs"));
+		expect(narr.length).toBeLessThanOrEqual(4000 * 6 + 100); // the narrative budget's clip (4,000 tokens x 6)
+		expect(narr.length).toBeGreaterThan(20_000);
+	});
+
 	test("the previous narrative sent is bounded (head and tail of a longer one), so the chain cannot grow without limit", () => {
 		const huge = "[summary of earlier conversation by pi-zip]\n## User requests (verbatim, oldest first)\n1. x\n## Narrative (model-written)\nHEAD-FACT\n" + "middle line of an endless narrative\n".repeat(3000) + "TAIL-FACT";
 		const p = previousNarrative(huge)!;
 		expect(p.text.length).toBeLessThanOrEqual(PREV_NARRATIVE_CHARS + 100);
 		expect(p.text).toContain("HEAD-FACT");
 		expect(p.text).toContain("TAIL-FACT");
-		expect(p.text).toContain("[… middle of the earlier narrative omitted …]");
+		expect(p.text).toContain("[… middle of the narrative omitted …]");
 		expect(p.foreign).toBe(false);
 	});
 
