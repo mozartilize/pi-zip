@@ -2,6 +2,7 @@
 // projection of persisted edits. test/helpers.ts' own projector is NOT used here, so Pi's behaviour decides what is right.
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { createEventBus, discoverAndLoadExtensions, ExtensionRunner, SessionManager, convertToLlm } from "@earendil-works/pi-coding-agent";
+import { createHash } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -707,5 +708,107 @@ describe("round 5 on real Pi: rule A starts the warm summary early, rule B never
 		expect(r.compactCalls.n).toBe(0);
 		const ui = await rig(undefined, { file: template(60_000), tui: true, native: true, idle: true, start: false, latencyMs: 300 });
 		expect((await prompt(ui)).waited).toBeLessThan(250); // 0.3.0: the same 300 ms
+	});
+});
+
+// Round 5: without a UI (pi -p, --mode json, rpc) nothing runs in the background, so rules A and B change nothing there. Every request
+// and every session entry of three no-UI scenarios (a warm return that summarises, a warm turn_end valve that summarises, a cold return
+// that summarises), normalised only for what differs from run to run (entry ids and the handles made from them, timestamps, measured
+// durations), hash to the digest 0.3.0 (d7d6ff5) gives: run this test there with R5_PRINT_DIGEST=1 to print it.
+describe("round 5: no UI (pi -p, json, rpc) behaves byte for byte as 0.3.0", () => {
+	const NOUI_DIGEST_030 = "bb2e4238ae92a40c61f71564ae7a465d"; // printed by this test on d7d6ff5 (R5_PRINT_DIGEST=1)
+	const sleep = (ms: number) => new Promise((res) => setTimeout(res, ms));
+	const shifted = (agoMs: number, prose: number) => {
+		const sm = SessionManager.inMemory(CWD);
+		populate(sm, prose);
+		const file = [sm.getHeader() as Any, ...sm.getEntries()];
+		const newest = Math.max(...file.map((e) => e.message?.timestamp ?? 0));
+		const shift = Date.now() - agoMs - newest;
+		for (const e of file) if (typeof e.message?.timestamp === "number") e.message.timestamp += shift;
+		return file;
+	};
+	const big = (input: number): Any => ({ ...usage, input, totalTokens: input });
+	const transcript = async (scenario: (r: Any, log: (x: Any) => void) => Promise<void>, file: Any[]) => {
+		const r = await rig(undefined, { file, tui: false, native: true, idle: true, start: false });
+		const out: Any[] = [];
+		await scenario(r, (x) => out.push(x));
+		out.push({ entries: r.sm.getEntries(), narrativeCalls: r.narrativeCalls.length });
+		// normalise: entry ids (and the fold handles made from them) to ordinals, timestamps and measured durations out
+		let s = JSON.stringify(out, (k, v) => (k === "timestamp" || k === "reqTs" || /(^|[a-z])(ms|Ms)$/.test(k) ? undefined : v));
+		const { handleFor } = await import("../src/placeholder.ts");
+		r.sm.getEntries().forEach((e: Any, i: number) => {
+			s = s.split(e.id).join(`#${i}`).split(handleFor(e.id)).join(`@${i}`);
+		});
+		return s.replace(/\d+(\.\d+)? ?(ms|s)\b/g, "T").replace(/[0-9a-f]{8}-[0-9a-f-]{27}/g, "U");
+	};
+	const prompt = async (r: Any, log: (x: Any) => void, text: string) => {
+		await r.beforeAgentStart(text);
+		r.sm.appendMessage(user(text, Date.now() - T0));
+		log(await r.request());
+	};
+	const step = async (r: Any, log: (x: Any) => void, n: number, input: number, out: string, prose = "") => {
+		const a = r.sm.appendMessage({ ...asst([...(prose ? [{ type: "text", text: prose }] : []), call(`s${n}`)], "toolUse", 30_000_000 + 2 * n), usage: big(input) });
+		r.sm.appendMessage(result(`s${n}`, out, 30_000_001 + 2 * n));
+		log(await r.turnEnd(a, { ...asst([call(`s${n}`)], "toolUse"), usage: big(input) }));
+		log(await r.request());
+	};
+	const scenarios = async () => {
+		const parts: string[] = [];
+		// warm return 60 s after a big run: the warm run plan summarises (the user waits, as in 0.3.0), drafts at the first turn_end
+		parts.push(await transcript(async (r, log) => {
+			await prompt(r, log, "warm return");
+			await step(r, log, 1, 110_000, "small");
+			await step(r, log, 2, 111_000, "y".repeat(2_000));
+			log(await r.settle());
+		}, shifted(60_000, 6000)));
+		// a warm prompt right after a request that carried an edit (b2b: no warm edit at the prompt; the state a restarted process
+		// restores, set here directly): its first turn_end valve summarises, and the user waits for it, as in 0.3.0
+		parts.push(await transcript(async (r, log) => {
+			const { Zip } = await import("../src/run.ts");
+			const orig = (Zip.prototype as Any).beginRun;
+			let zip: Any = null;
+			(Zip.prototype as Any).beginRun = async function (this: Any, ...a: Any[]) {
+				(Zip.prototype as Any).beginRun = orig;
+				zip = this;
+				this.justEdited = true;
+				return orig.apply(this, a);
+			};
+			try {
+				await prompt(r, log, "right after an edit");
+			} finally {
+				(Zip.prototype as Any).beginRun = orig;
+			}
+			zip.justEdited = false; // the prompt's response answered a request without a fresh edit (message_end, which this rig does not fire)
+			await step(r, log, 1, 110_000, "small");
+			await step(r, log, 2, 111_000, "small");
+			log(await r.settle());
+		}, shifted(60_000, 6000)));
+		// a cold return (past the TTL) that summarises
+		parts.push(await transcript(async (r, log) => {
+			await prompt(r, log, "cold return");
+			await step(r, log, 1, 110_000, "small");
+			log(await r.settle());
+		}, shifted(400_000, 6000)));
+		return parts;
+	};
+
+	test("three no-UI scenarios hash to 0.3.0's digest; with a UI the warm return of the first one does not wait", async () => {
+		const parts = await scenarios();
+		const digest = createHash("sha256").update(parts.join("\n")).digest("hex").slice(0, 32);
+		if (process.env.R5_PRINT_DIGEST) console.log("R5 NO-UI DIGEST", digest, parts.map((p) => createHash("sha256").update(p).digest("hex").slice(0, 12)).join(" "));
+		// every scenario summarises (a compaction draft: the warm run plan's, the warm turn_end valve's, the cold run plan's), each with one
+		// narrative call made inside the hook (waited for)
+		for (const p of parts) expect([p.includes('"type":"compaction"'), /"narrativeCalls":1\b/.test(p)]).toEqual([true, true]);
+		expect(parts[1]).toContain('"trigger":"valve"');
+		expect(digest).toBe(NOUI_DIGEST_030);
+		// the same warm return with a UI: no summary in its first request (0.3.0: the summary, after the wait)
+		const ui = await rig(undefined, { file: shifted(60_000, 6000), tui: true, native: true, idle: true, start: false, latencyMs: 300 });
+		await ui.beforeAgentStart("warm return");
+		ui.sm.appendMessage(user("warm return", Date.now() - T0));
+		const t0 = performance.now();
+		const req = await ui.request();
+		expect(performance.now() - t0).toBeLessThan(250);
+		expect(req === undefined || !req.some((m: Any) => m.role === "compactionSummary")).toBe(true);
+		await sleep(400);
 	});
 });
