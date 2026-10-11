@@ -1,0 +1,1 @@
+-- Root module: imports every PiZip module (check.sh fails if one is missing).
