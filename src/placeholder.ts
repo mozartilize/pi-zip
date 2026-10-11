@@ -266,7 +266,7 @@ export function makePlaceholder(text: string, tool: string, args: string, handle
 	if (text.length <= MIN_FOLD_CHARS) return null;
 	const lines = text.split("\n").length;
 	const fields = jsonKeyFields(text, keep);
-	const keys = fields ? [] : pickKeyLines(text, keep);
+	const keys = fields?.length ? [] : pickKeyLines(text, keep); // no field worth showing (all empty): key lines
 	const body = keys.map((k) => `${k.no}: ${clip(k.text, 160)}`).join("\n");
 	const outcome = outcomeHint(text, tool, meta.isError);
 	return (
@@ -285,7 +285,7 @@ export function makePlaceholder(text: string, tool: string, args: string, handle
  *  lines (an error or id line first, then the first line). */
 export function keyTexts(text: string, keep = 8): string[] {
 	const f = jsonKeyFields(text, keep, true);
-	if (f) return f;
+	if (f?.length) return f;
 	const keys = pickKeyLines(text, keep);
 	const best = keys.find((k) => k.why === "error" || k.why === "id") ?? keys[0];
 	return best ? [best.text, ...keys.filter((k) => k !== best).map((k) => k.text)] : [];
