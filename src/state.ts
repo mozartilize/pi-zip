@@ -1,6 +1,7 @@
 // Planner state that is a function of the session: rebuilt from the branch at session start (a restart, a resume, a fork), so a fresh
 // process plans exactly like one that never left (formal/TRIAGE.md (a) 1: growth g, "the newest response carried an edit", and
 // "a summary was made in this warm stretch" lived only in memory).
+import { grow } from "./core.ts";
 import { COMMIT_CUSTOM, PRODUCT, type Any } from "./util.ts";
 
 /** A pi-zip summary that went in through Pi's compaction before a run (the run's first request is the first to carry it). */
@@ -40,12 +41,7 @@ export function replayGrowth(branch: Any[], g0: number): { g: number; deltas: nu
 		const total = (u.input ?? 0) + (u.cacheRead ?? 0) + (u.cacheWrite ?? 0);
 		if (!(total > 0)) return;
 		const key = `${m.provider ?? ""}/${m.model ?? ""}`;
-		if (!edited.has(i) && prevKey === key && prevTotal > 0 && total >= prevTotal) {
-			const d = total - prevTotal;
-			deltas = [...deltas.slice(-19), d];
-			const sorted = [...deltas].sort((a, b) => a - b);
-			g = 0.9 * g + 0.1 * Math.min(d, sorted[Math.ceil(0.9 * sorted.length) - 1]);
-		}
+		if (!edited.has(i) && prevKey === key && prevTotal > 0 && total >= prevTotal) ({ g, deltas } = grow(g, deltas, total - prevTotal));
 		prevTotal = total;
 		prevKey = key;
 	});

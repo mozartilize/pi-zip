@@ -2,7 +2,7 @@
 //
 //   PZ_SRC=/path/to/src bun formal/replay/replay.ts --tag T [--out rows.json] session.jsonl ...
 //
-// The planner of PZ_SRC (plan.ts, learn.ts, placeholder.ts) is run at every request of every session, on the session as the transcript
+// The planner of PZ_SRC (plan.ts, learn.ts, placeholder.ts; the view and growth from core.ts when present) is run at every request of every session, on the session as the transcript
 // recorded it with pi-zip's own edits and summaries removed (the same pristine conversation for every source): at the prompt of a turn
 // (a cold plan when the gap since the previous request exceeds the TTL, else a warm one) and at every later request of the turn (the
 // warm valve at turn_end), with the folds and summaries the source itself chose before applied. Nothing is called: a summary is a
@@ -26,7 +26,7 @@
 //                 (index, first kept entry id, planned summary tokens), the folded entry ids, and the request's estimated size and cost.
 //                 Two sources with the same digest made the same decision at every request (the reference for a refactor).
 import { createHash } from "node:crypto";
-import { readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 const SRC = process.env.PZ_SRC;
@@ -35,6 +35,15 @@ const P: any = await import(join(SRC, "plan.ts"));
 const L: any = await import(join(SRC, "learn.ts"));
 const PH: any = await import(join(SRC, "placeholder.ts"));
 const PI: any = await import(join(SRC, "../node_modules/@earendil-works/pi-coding-agent/dist/index.js"));
+// 0.4.0 step 1 on: the view (token scale) and the growth step come from the pure core (core.ts); an older source has them in plan.ts
+// and run.ts (the same functions before the move)
+const C: any = existsSync(join(SRC, "core.ts")) ? await import(join(SRC, "core.ts")) : null;
+const scaleOf = (entries: any[], branch: any[], key: string) => (C ? C.scaleOf(entries, branch, undefined, key) : P.calibrate(entries, undefined, branch, key));
+const grow = (g: number, deltas: number[], d: number): { g: number; deltas: number[] } => {
+	if (C) return C.grow(g, deltas, d);
+	const next = [...deltas.slice(-19), d], s = [...next].sort((a, b) => a - b);
+	return { g: 0.9 * g + 0.1 * Math.min(d, s[Math.ceil(0.9 * s.length) - 1]), deltas: next };
+};
 
 const TTL_S = 300;
 const NO_REGROW = process.env.PZ_NO_REGROW === "1"; // the same source with the warm-stretch flag never lapsing (the rule before 0.3.0's review round 4)
@@ -89,11 +98,7 @@ function run(path: string) {
 		let g = P.G0, prev = 0, deltas: number[] = [];
 		reqs.forEach((q, i) => {
 			gAt[i] = g;
-			if (prev > 0 && q.total >= prev) {
-				deltas = [...deltas.slice(-19), q.total - prev];
-				const s = [...deltas].sort((a, b) => a - b);
-				g = 0.9 * g + 0.1 * Math.min(q.total - prev, s[Math.ceil(0.9 * s.length) - 1]);
-			}
+			if (prev > 0 && q.total >= prev) ({ g, deltas } = grow(g, deltas, q.total - prev));
 			prev = q.total;
 		});
 	}
@@ -135,7 +140,7 @@ function run(path: string) {
 		const br = branch.slice(0, q.bi);
 		const [provider, ...idp] = q.key.split("/");
 		const model = { provider, id: idp.join("/"), contextWindow: 200_000 };
-		const scale = P.calibrate(proj.entries, undefined, br, q.key);
+		const scale = scaleOf(proj.entries, br, q.key);
 		const view = apply(proj.entries);
 		let plan: any = null;
 		const mayPlan = coldPlan || !justEdited; // no warm edit on the request right after an edited one
