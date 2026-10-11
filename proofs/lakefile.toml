@@ -1,0 +1,10 @@
+name = "pizip_proofs"
+defaultTargets = ["PiZip"]
+
+[[require]]
+name = "mathlib"
+git = "https://github.com/leanprover-community/mathlib4.git"
+rev = "051bc081081f2bb77b81d47ee69146c4cef28bbe"
+
+[[lean_lib]]
+name = "PiZip"
