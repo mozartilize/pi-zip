@@ -67,15 +67,20 @@ prices are now explicit in the source statement and its proof (theory.md, lines 
 The attainment clause requires n < A, as the corrected sentence states, for a
 positive rewrite price and positive fluid optimum. The objective is fluid
 average cost rewrite*g/d + d/2; discrete EOQ rounding is separately stated in T3.
-At n = A the definition supplies the zero threshold and lower bound; the source's
-non-attainment follows from the objective d/2 on positive cycle lengths. -/
+At n = A the objective is d/2: the boundary clause explicitly requires strict
+positivity for every positive cycle and arbitrarily small positive-cycle costs,
+formalizing the zero infimum and non-attainment without extra hypotheses. -/
 def T2_iv_b : Prop :=
   ∀ (x : ModelC.Instance ℝ) (g : ℝ), ModelC.Valid x → 0 < g →
     x.call = 0 → x.eta = 0 →
     let dstar := Real.sqrt (2 * g * x.k * (x.A - x.n))
     (ModelC.law x 1 g (x.A - x.n) ↔ dstar ≤ x.D) ∧
     (∀ d : ℝ, 0 < d → dstar ≤ x.k * (x.A - x.n) * g / d + d / 2) ∧
-    (x.n < x.A → x.k * (x.A - x.n) * g / dstar + dstar / 2 = dstar)
+    (x.n < x.A → x.k * (x.A - x.n) * g / dstar + dstar / 2 = dstar) ∧
+    (x.n = x.A →
+      (∀ d : ℝ, 0 < d → 0 < x.k * (x.A - x.n) * g / d + d / 2) ∧
+      (∀ ε : ℝ, 0 < ε → ∃ d : ℝ, 0 < d ∧
+        x.k * (x.A - x.n) * g / d + d / 2 < ε))
 
 /-- Source: theory.md, lines 540-541.
 "under steady growth it equals the rent already paid since the last rewrite (fluid; discretely D²/2g + D/2). This is the
@@ -335,7 +340,7 @@ def T5_i : Prop :=
 0.1 used in the proof, and every ε > 0, some instance has G_α ≥ (1 + 1/α − ε)·OPT. So for these estimates the competitive ratio
 of the guarded law is exactly 1 + 1/α."
 "It is not exact for every predicate. Π ≡ false gives G_α = BAL, with cost at most 2·OPT on every instance and strictly below
-when BAL edits (Theorem 4(i))."
+whenever OPT > 0, hence ratio < 2 on that domain (Theorem 4(i) and its no-edit case)."
 "The bound is approached only where the early clause binds. LAW holds at s only if P_s ≥ √(2ĝB), and R_s ≥ P_s, so the clause
 "R_s < α·B while LAW holds" needs √(2ĝB) < α·B, i.e. B > 2ĝ/α²."
 "The same local necessary condition B > 2ĝ/α² holds with positive Beff in place of B at p < 1 (section 1.4's guard): the law
@@ -355,8 +360,10 @@ Added hypotheses: B > 0, G >= 0, P >= 0, 0 < alpha <= 1, R >= P, and LAW holds.
 B denotes either the fixed rewrite price or a positive effective price; this is
 only the local necessary condition, not a competitive theorem with varying Beff.
 The false-predicate clause uses B > 0, 0 < alpha <= 1 and nonnegative arrivals.
-The corrected cost bound is strict when BAL edits, as its cited T4(i) requires;
-empty or all-zero instances are covered by the non-strict cost bound. -/
+Strict comparison is required whenever the comparator cost is positive, making
+the ratio domain explicit; the edited-instance conclusion is also retained.
+T4(i) supplies strictness when BAL edits; its proof gives BAL <= OPT otherwise.
+Empty or all-zero instances are covered by the non-strict cost bound. -/
 def T5_ii : Prop :=
   (∀ alpha G eps M : ℝ, 0 < alpha → alpha ≤ 1 → 0 < G → 0 < eps → 0 < M →
     ∃ (B D : ℝ) (m : ℕ) (sigma : ModelT.Schedule), 0 < B ∧ M * G < B ∧ 0 < D ∧
@@ -380,6 +387,8 @@ def T5_ii : Prop :=
     (∀ sigma : ModelT.Schedule,
       ModelT.algCost B a (ModelT.guarded alpha (fun _ _ _ _ => false)) ≤ 2 * ModelT.cost B a sigma ∧
       (ModelT.edits B a ModelT.bal →
+        ModelT.algCost B a (ModelT.guarded alpha (fun _ _ _ _ => false)) < 2 * ModelT.cost B a sigma) ∧
+      (0 < ModelT.cost B a sigma →
         ModelT.algCost B a (ModelT.guarded alpha (fun _ _ _ _ => false)) < 2 * ModelT.cost B a sigma)))
 
 /-- Source: theory.md, lines 784-786.
@@ -428,9 +437,10 @@ def T5_v : Prop :=
 enough to contain the first guarded edit. Assume LAW remains true through that first guarded edit; fixed or non-increasing
 burst estimates suffice. Then G_α's first cycle costs < (1 + α)·B."
 Added hypotheses: positive B, D, alpha in (0,1], a nonnegative online estimate,
-immediate LAW firing, and m*D >= B, a sufficient horizon for the first guarded
-edit to occur. Persistence now appears explicitly in the corrected source and
-its proof (theory.md, lines 834-835). It is imposed only before the first edit,
+immediate LAW firing, and alpha*B <= (m+1)*D. The burst contains m+1
+requests, so this is exactly the horizon needed to contain the first guarded
+edit under persistence. Persistence appears explicitly in the corrected source
+and its proof (theory.md, lines 836-837). It is imposed only before the first edit,
 including its decision request; it makes no restriction on later cycles.
 Fixed estimates and non-increasing burst estimates satisfy this qualification.
 The unqualified original statement is retained as T5_v and refuted by T5_v_false. -/
@@ -438,7 +448,7 @@ def T5_v_persistent : Prop :=
   ∀ (B D alpha : ℝ) (estimate : ModelT.Estimate ℝ) (m : ℕ),
     0 < B → 0 < D → 0 < alpha → alpha ≤ 1 →
     (∀ a : List ℝ, ModelT.arrivalsValid a → 0 ≤ estimate B a) →
-    D ^ 2 ≥ 2 * estimate B [D] * B → B ≤ (m : ℝ) * D →
+    D ^ 2 ≥ 2 * estimate B [D] * B → alpha * B ≤ ((m + 1 : ℕ) : ℝ) * D →
     let a := ModelT.burst D m
     let rule := ModelT.guarded alpha (ModelT.lawPredicate estimate)
     (∀ j : ℕ, j < a.length →

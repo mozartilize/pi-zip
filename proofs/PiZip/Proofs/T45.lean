@@ -265,10 +265,7 @@ theorem T5_v_persistent_proof : PiZip.T5_v_persistent := by
       | true => exact (h ⟨k, hk, hval⟩).elim
     have hlast := hfalse m (by simp [a, ModelT.burst])
     rw [hdecision m le_rfl (by intro i hi; exact hfalse i (by simp [a, ModelT.burst]; omega))] at hlast
-    have hthreshold : alpha * B ≤ (m + 1 : ℕ) * D := by
-      have hsmall := mul_le_of_le_one_left hB.le hle
-      push_cast
-      nlinarith
+    have hthreshold : alpha * B ≤ (m + 1 : ℕ) * D := hlong
     have hlt : (m + 1 : ℕ) * D < alpha * B := by simpa only [decide_eq_false_iff_not, not_le] using hlast
     linarith
   let k := Nat.find hex
