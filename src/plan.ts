@@ -588,6 +588,7 @@ export interface RunPlan {
 	waitMs?: number; // how long the user waited for this plan's summary (0: none, or it was ready)
 	noticed?: boolean; // its notice is already in the transcript (shown when the first request carrying it went out)
 	native?: Cut; // this run's summary went in through Pi's own compaction before the run: no request-local cut, no compaction draft
+	ready?: "away" | "background"; // its summary was written in the background: before this warm return ("away"), or while the run went on (rule B)
 }
 
 export interface PlanOpts {
@@ -618,6 +619,7 @@ export interface PlanOpts {
 	narrativePrice?: boolean; // F3, default NARRATIVE_PRICE
 	slide?: number; // internal (F2): plan as if this many more user turns had started (the protected window slid)
 	valveB?: number; // internal (F2): the real context the slid warm plan's law sees (the cold plan's folds already applied)
+	cutAt?: string; // warm plans only: cut at this entry or not at all (a summary for that cut is already being written: rules A/B, run.ts)
 	warmStyle?: boolean; // internal: a cold plan at 0 < P(warm) < 0.5 that the law refused is planned once more the way a warm plan is (no relax folds unless pastTtl, the summary gated)
 }
 
@@ -638,6 +640,7 @@ export interface PlanResult {
 	cutKeptFirstMsg: Any;
 	fileRecall?: FileRecall; // the summary of this plan names recall files instead of zip_recall (PlanOpts.fileRecall)
 	ahead?: boolean; // F2: the cut was decided by the lookahead (it may lie inside the previous user turn, before its final answer)
+	atRoom?: boolean; // the context after the plan's folds is at Pi's compaction room: Pi would compact (lossy) if nothing is done now
 }
 
 /** Index of the final assistant message of user turn `turn` (the answer the user saw), -1 if none. */
@@ -805,9 +808,10 @@ export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
 	 *  (no prices: the legacy gain rule) must pass. When the minimal cut's summary or the whole plan with it is refused, the deeper cuts
 	 *  are tried in turn (the gain grows as D^2, the call only with the prefix read). The whole plan's law prices the summary call too.
 	 *  Applies the first cut both laws accept (folds in the prefix are void) and returns true, or changes nothing. */
+	const pinned = mode === "warm" ? o.cutAt : undefined;
 	const summarise = (maxCut: number, gated: boolean): boolean => {
 		const cuts: number[] = [];
-		for (let i = minCut; i < blocks.length && i <= maxCut; i++) if (isCutBlock(blocks[i])) cuts.push(i);
+		for (let i = minCut; i < blocks.length && i <= maxCut; i++) if (isCutBlock(blocks[i]) && (pinned === undefined || blocks[i].entryId === pinned)) cuts.push(i);
 		if (!cuts.length) return false;
 		let acc = 0;
 		for (let i = 0; i < blocks.length; i++) {
@@ -880,7 +884,7 @@ export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
 		if (mode === "cold" && !o.warmStyle && law.pr && law.pWarm > 0 && law.pWarm < 0.5) return planContext(entries, { ...o, warmStyle: true });
 		return null;
 	}
-	return { blocks, calls, folds, cutIdx, firstKeptEntryId: cutIdx !== null ? blocks[cutIdx].entryId : null, prefixTokens, summaryTokensPlanned, sumTrigger: cutIdx !== null ? (sumTrigger ?? trig) : sumTrigger, scale: o.scale ?? UNIT, ctxTokens: real(ctxEst), ctxAfterFolds: real(ctxAfterFolds), userTurns, cutVisibleIdx, cutKeptFirstMsg, ...(o.fileRecall ? { fileRecall: o.fileRecall } : {}), ...(ahead ? { ahead } : {}) };
+	return { blocks, calls, folds, cutIdx, firstKeptEntryId: cutIdx !== null ? blocks[cutIdx].entryId : null, prefixTokens, summaryTokensPlanned, sumTrigger: cutIdx !== null ? (sumTrigger ?? trig) : sumTrigger, scale: o.scale ?? UNIT, ctxTokens: real(ctxEst), ctxAfterFolds: real(ctxAfterFolds), userTurns, cutVisibleIdx, cutKeptFirstMsg, ...(o.fileRecall ? { fileRecall: o.fileRecall } : {}), ...(ahead ? { ahead } : {}), ...(atRoom ? { atRoom } : {}) };
 }
 
 const sameMsg = (a: Any, b: Any): boolean =>

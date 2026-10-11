@@ -11,6 +11,7 @@ export interface NoticeAction {
 	ms: number;
 	waitMs?: number; // summary: how long the user waited for it (ms = how long it took to write)
 	prepared?: boolean; // summary computed while the user was away
+	background?: boolean; // summary computed in the background while the run went on (the warm valve, never waited for)
 	pressure?: boolean; // done by the warm valve (the law fired while the cache is still warm), not because the cache was cold
 }
 
@@ -58,6 +59,7 @@ export function noticeDesc(actions: NoticeAction[]): string {
 			const wait = a.prepared ? 0 : (a.waitMs ?? a.ms);
 			const took = `summarized ${plural(a.count, "request")}`;
 			if (a.prepared) return `${took} in ${dur(a.ms)} · ready while you were away`;
+			if (a.background) return `${took} in ${dur(a.ms)} · written while you worked`;
 			if (wait >= a.ms - 500) return `${took} · waited ${secs(wait)}`; // the user waited for all of it
 			return `${took} in ${dur(a.ms)} · waited ${secs(wait)}`; // started while away, finished after the return
 		})
