@@ -199,4 +199,43 @@ theorem T5_v_nonvacuous : ∃ (B D alpha : ℝ) (estimate : ModelT.Estimate ℝ)
     split <;> norm_num
   · norm_num [changingEstimate]
 
+/- The zero-price qualification in T2(iv)(b) is necessary in both directions.
+Automatic cache premium kappa=4, A=1, n=0, g=2 gives Dstar=4. -/
+theorem law_positive_call_counterexample :
+    let x : ModelC.Instance ℝ := ⟨1, 4, 0, 4, 1, 0⟩
+    ModelC.Valid x ∧ Real.sqrt (2 * 2 * x.k * (x.A - x.n)) = x.D ∧
+      ¬ ModelC.law x 1 2 (x.A - x.n) := by
+  norm_num [ModelC.Valid, ModelC.view, ModelC.law, ModelC.cycleValue]
+theorem law_positive_room_counterexample :
+    let x : ModelC.Instance ℝ := ⟨1, 2, 0, 4, 0, 2⟩
+    ModelC.Valid x ∧ x.D < Real.sqrt (2 * 2 * x.k * (x.A - x.n)) ∧
+      ModelC.law x 1 2 (x.A - x.n) := by
+  norm_num [ModelC.Valid, ModelC.view, ModelC.law, ModelC.cycleValue]
+#guard (2 : ℚ) ^ 2 < 2 * 2 * 4 * 1
+
+/-- The added exact-value statements have positive model parameters. -/
+theorem T2_vii_warm_exact_nonvacuous : ∃ B g : ℝ, 0 < B ∧ 0 < g := by
+  exact ⟨1, 1, by norm_num⟩
+
+theorem T2_vii_hazard_exact_nonvacuous : ∃ B g h : ℝ, 0 < B ∧ 0 < g ∧ 0 < h := by
+  exact ⟨1, 1, 1, by norm_num⟩
+
+/-- A fixed zero estimate satisfies LAW throughout the first burst cycle. -/
+theorem T5_v_persistent_nonvacuous :
+    ∃ (B D alpha : ℝ) (estimate : ModelT.Estimate ℝ) (m : ℕ),
+      0 < B ∧ 0 < D ∧ 0 < alpha ∧ alpha ≤ 1 ∧
+      (∀ a : List ℝ, ModelT.arrivalsValid a → 0 ≤ estimate B a) ∧
+      D ^ 2 ≥ 2 * estimate B [D] * B ∧ B ≤ (m : ℝ) * D ∧
+      (∀ j : ℕ, j < (ModelT.burst D m).length →
+        (∀ i : ℕ, i < j → ModelT.onlineSchedule B
+          (ModelT.guarded alpha (ModelT.lawPredicate estimate)) (ModelT.burst D m) i = false) →
+        D ^ 2 ≥ 2 * estimate B ((ModelT.burst D m).take (j + 1)) * B) := by
+  refine ⟨1, 1, 1 / 2, ModelT.fixed 0, 1, by norm_num, by norm_num,
+    by norm_num, by norm_num, ?_, ?_, by norm_num, ?_⟩
+  · intro a _
+    norm_num [ModelT.fixed]
+  · norm_num [ModelT.fixed]
+  · intro j _ _
+    norm_num [ModelT.fixed]
+
 end PiZip

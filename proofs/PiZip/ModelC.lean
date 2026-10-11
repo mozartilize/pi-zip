@@ -41,12 +41,45 @@ def law [Field K] [LinearOrder K] [IsStrictOrderedRing K] (x : Instance K) (p g 
 def chosenCost [Field K] [LinearOrder K] [IsStrictOrderedRing K] (x : Instance K) (p phat F : K) : K :=
   if delta x phat (x.D + F) ≤ 0 then fireCost x else holdCost x p F
 
-/-- Warm-forever relative continuation value on the continuation region. -/
+/-- Candidate closed formula; its model identification is stated separately. -/
 def warmValue [Field K] (D dstar g : K) : K := (dstar * D - D ^ 2 / 2) / g
 
-/-- Discounted continuation value for an optimal fluid hazard cycle of length dH/g. -/
+/-- Candidate hazard relative-value formula; model identification is separate. -/
 noncomputable def hazardValue (D dH g h : ℝ) : ℝ :=
   D / h - g / h ^ 2 * Real.exp (-h * dH / g) * (Real.exp (h * D / g) - 1)
+
+/-- Average cost of a fluid renewal cycle: integrated rent plus its terminal edit. -/
+noncomputable def fluidAverageCost (B g T : ℝ) : ℝ :=
+  (B + ∫ t in (0 : ℝ)..T, g * t) / T
+
+/-- An attained minimum of the fluid renewal average costs. -/
+def OptimalFluidAverage (B g d rate : ℝ) : Prop :=
+  fluidAverageCost B g (d / g) = rate ∧
+  ∀ T : ℝ, 0 < T → rate ≤ fluidAverageCost B g T
+
+/-- Normalized average-cost Bellman characterization on the continuation region.
+The derivative is the infinitesimal wait equation, and the terminal condition
+is value matching for an edit that resets pending mass to zero. -/
+def WarmBellman (B g d rate : ℝ) (V : ℝ → ℝ) : Prop :=
+  OptimalFluidAverage B g d rate ∧ V 0 = 0 ∧ V d = B ∧
+  ContinuousOn V (Set.Icc 0 d) ∧
+  (∀ x ∈ Set.Ioo 0 d, HasDerivAt V ((rate - x) / g) x) ∧
+  (∀ x ∈ Set.Icc 0 d, V x ≤ B)
+
+/-- Expected cost of waiting T while the stretch survives, then editing and
+restarting with continuation cost J0. The survival probability is exp(-h*t). -/
+noncomputable def hazardWaitCost (B g h J0 D T : ℝ) : ℝ :=
+  (∫ t in (0 : ℝ)..T, Real.exp (-h * t) * (D + g * t)) +
+    Real.exp (-h * T) * (B + J0)
+
+/-- Solution of the discounted renewal equation J0 = C(T) + exp(-h*T)*J0,
+with C(T) derived from the survival-weighted rent integral and terminal edit. -/
+noncomputable def hazardRenewalCost (B g h T : ℝ) : ℝ :=
+  hazardWaitCost B g h 0 0 T / (1 - Real.exp (-h * T))
+
+/-- Starting at pending mass D, continue to threshold d, then restart at zero. -/
+noncomputable def hazardStateCost (B g h d D : ℝ) : ℝ :=
+  hazardWaitCost B g h (hazardRenewalCost B g h (d / g)) D ((d - D) / g)
 
 end ModelC
 end PiZip

@@ -55,7 +55,9 @@ def T2_iv_a : Prop :=
 
 /-- "with it and n = 0, the threshold at p = 1 is exactly the EOQ optimum D* = √(2gκA) of Theorem 3. With n it is the EOQ optimum
 for the rewrite price κ(A − n);"
-Added hypotheses: ModelC.Valid, g > 0, call = eta = 0; the attainment clause is conditional
+Added hypotheses: ModelC.Valid, g > 0, call = eta = 0; the zero prices are required
+by the source proof (line 586) but omitted from its statement (line 536).
+The needed English correction is recorded in the round-eight notes. The attainment clause is conditional
 on n < A for a positive rewrite price and positive fluid optimum. The objective is fluid average cost
 rewrite*g/d + d/2; discrete EOQ rounding is separately stated in T3. -/
 def T2_iv_b : Prop :=
@@ -104,15 +106,16 @@ V_ex(D) = (D*·D − D²/2)/g for D ≤ D*. This is ≥ D²/(2g), with equality 
 model's Bayes rule."
 Added hypotheses: ModelC.Valid (in particular D > 0), g > 0,
 0 < p < 1, and D <= the fluid threshold for rewrite price kappa(A-n).
-The explicit relative-value formula is the model's value; inclusion of firing
-regions formalizes "later". D=0 is excluded by Model C, and would also give equality
+This part compares candidate closed formulas; their identification with model
+values is separately required by T2_vii_warm_exact and T2_vii_hazard_exact.
+Inclusion of firing regions formalizes "later". D=0 is excluded by Model C, and would also give equality
 if the comparison were extended to nonnegative removal.
 
 "With an end-of-stretch hazard the exact value is smaller."
 Added hypotheses: positive rewrite price B, g, hazard h, and 0 < D <= sqrt(2gB).
 The optimal hazard threshold dH > 0 satisfies T6(ii)'s root equation in tokens;
 the discounted value solves g*J' = h*J - pending on that continuation region.
-These explicit model-H quantities specify which exact value "smaller" compares:
+These candidate model-H formulas specify which value "smaller" compares:
 the warm-forever value, not the surrogate (which need not bound hazard values). -/
 def T2_vii : Prop :=
   (∀ (x : ModelC.Instance ℝ) (p g : ℝ), ModelC.Valid x → 0 < g → 0 < p → p < 1 →
@@ -125,6 +128,51 @@ def T2_vii : Prop :=
     D ≤ Real.sqrt (2 * g * B) → 0 < dH →
     g / h ^ 2 * (h * dH / g - 1 + Real.exp (-h * dH / g)) = B →
     ModelC.hazardValue D dH g h < ModelC.warmValue D (Real.sqrt (2 * g * B)) g)
+
+/-- "In the warm-forever fluid model (after this request the EOQ policy runs forever), the exact value is
+V_ex(D) = (D*·D − D²/2)/g for D ≤ D*."
+Added hypotheses: positive rewrite price B and growth g, implicit in a positive
+EOQ cycle. B here is kappa(A-n) from Model C. The relative value is normalized
+at zero; this removes the arbitrary additive constant in the source Bellman
+proof (lines 593-598). Continuity at the endpoints and differentiability in the
+interior express that proof's fluid Bellman equation. They are properties of the
+characterization, not antecedents assuming the desired formula or optimal rate.
+The statement establishes the optimal average cost, a Bellman solution, and
+uniqueness of its relative value on the entire continuation region. -/
+def T2_vii_warm_exact : Prop :=
+  ∀ B g : ℝ, 0 < B → 0 < g →
+    let dstar := Real.sqrt (2 * g * B)
+    ModelC.OptimalFluidAverage B g dstar dstar ∧
+    ModelC.WarmBellman B g dstar dstar (fun D => ModelC.warmValue D dstar g) ∧
+    (∀ (rate : ℝ) (V : ℝ → ℝ), ModelC.WarmBellman B g dstar rate V →
+      rate = dstar ∧ ∀ D ∈ Set.Icc 0 dstar, V D - V 0 = ModelC.warmValue D dstar g)
+
+/-- "With an end-of-stretch hazard the exact value is smaller."
+Added hypotheses: positive rewrite price B, growth g and hazard h, implicit in
+model H. This part supplies the missing model identification for T2_vii's
+comparison: a unique positive optimal root, its minimum discounted renewal cost,
+and the relative cost from pending D, derived from survival-weighted rent and a
+resetting edit. The root equation is proved as a conclusion, not assumed.
+D in [0,dH] is the continuation region; beyond dH an immediate edit costs B
+relative to the reset state. The wait inequality includes every first waiting
+time, not just stationary competitors; waiting forever has cost D/h+g/h^2.
+These are the discounted Bellman alternatives used to certify optimality. -/
+def T2_vii_hazard_exact : Prop :=
+  ∀ B g h : ℝ, 0 < B → 0 < g → 0 < h →
+    ∃ dH : ℝ, 0 < dH ∧
+      g / h ^ 2 * (h * dH / g - 1 + Real.exp (-h * dH / g)) = B ∧
+      (∀ d : ℝ, 0 < d →
+        g / h ^ 2 * (h * d / g - 1 + Real.exp (-h * d / g)) = B → d = dH) ∧
+      (∀ T : ℝ, 0 < T →
+        ModelC.hazardRenewalCost B g h (dH / g) ≤ ModelC.hazardRenewalCost B g h T) ∧
+      (∀ D ∈ Set.Icc 0 dH,
+        ModelC.hazardStateCost B g h dH D - ModelC.hazardRenewalCost B g h (dH / g) =
+          ModelC.hazardValue D dH g h) ∧
+      (let J0 := ModelC.hazardRenewalCost B g h (dH / g)
+       let J := fun D => if D ≤ dH then ModelC.hazardStateCost B g h dH D else B + J0
+       J 0 = J0 ∧ ∀ D : ℝ, 0 ≤ D →
+         J D ≤ B + J0 ∧ J D ≤ D / h + g / h ^ 2 ∧
+         ∀ T : ℝ, 0 ≤ T → J D ≤ ModelC.hazardWaitCost B g h J0 D T)
 
 /-- "Every schedule of N requests costs ≥ N·(√(2gB) − g/2) − B. So its long-run cost per request is ≥ √(2gB) − g/2. This holds for
 every schedule, online or offline."
@@ -321,6 +369,30 @@ def T5_v : Prop :=
     D ^ 2 ≥ 2 * estimate B [D] * B → B ≤ (m : ℝ) * D →
     let a := ModelT.burst D m
     let rule := ModelT.guarded alpha (ModelT.lawPredicate estimate)
+    ∃ k : ℕ, k < a.length ∧ ModelT.onlineSchedule B rule a k = true ∧
+      (∀ j : ℕ, j < k → ModelT.onlineSchedule B rule a j = false) ∧
+      ModelT.algCost B (a.take (k + 1)) rule < (1 + alpha) * B
+
+/-- "After a rewrite, take a burst D on which LAW fires at once (cost B for that cycle), followed by a long stretch.
+G_α's cycle costs < (1 + α)·B."
+Corrected version of T5_v: LAW must remain true until the first guarded edit.
+Added hypotheses: the same positive B, D, alpha in (0,1], nonnegative online
+estimate, immediate LAW firing and long horizon as T5_v. The extra persistence
+hypothesis repairs the unsupported step "P_s = D after the burst, and LAW holds"
+in the source proof (line 819). It is imposed only before the first edit,
+including its decision request; it makes no restriction on later cycles.
+Fixed estimates and non-increasing burst estimates satisfy this qualification.
+The unqualified source statement is retained as T5_v for refutation. -/
+def T5_v_persistent : Prop :=
+  ∀ (B D alpha : ℝ) (estimate : ModelT.Estimate ℝ) (m : ℕ),
+    0 < B → 0 < D → 0 < alpha → alpha ≤ 1 →
+    (∀ a : List ℝ, ModelT.arrivalsValid a → 0 ≤ estimate B a) →
+    D ^ 2 ≥ 2 * estimate B [D] * B → B ≤ (m : ℝ) * D →
+    let a := ModelT.burst D m
+    let rule := ModelT.guarded alpha (ModelT.lawPredicate estimate)
+    (∀ j : ℕ, j < a.length →
+      (∀ i : ℕ, i < j → ModelT.onlineSchedule B rule a i = false) →
+      D ^ 2 ≥ 2 * estimate B (a.take (j + 1)) * B) →
     ∃ k : ℕ, k < a.length ∧ ModelT.onlineSchedule B rule a k = true ∧
       (∀ j : ℕ, j < k → ModelT.onlineSchedule B rule a j = false) ∧
       ModelT.algCost B (a.take (k + 1)) rule < (1 + alpha) * B
