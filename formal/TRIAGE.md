@@ -712,7 +712,7 @@ Tests at this commit: `bun test` 469 pass, 0 fail; `bunx tsc --noEmit` clean; `b
 
 ### (d) Coverage against recorded sessions
 
-`bun formal/coverage/coverage.ts /work/sessions-archive` reads every Pi session file under the directory
+`bun formal/coverage/coverage.ts <dir of Pi session files>` reads every Pi session file under the directory
 (read-only; counts only, no names) and maps each entry of the newest branch onto the model: 305 sessions, 49,408 entries.
 
 | kind | model event | entries | sessions |

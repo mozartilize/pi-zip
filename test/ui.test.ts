@@ -253,7 +253,7 @@ describe("the mark on a folded output", () => {
 		expect(r.renderCall({ path: "a.ts", n: 1 }, th, { toolCallId: "w1", lastComponent: last })).toBe(last); // one wrapper per component
 		// a row pi-zip drew itself (a read of a recall file) is never handed to the built-in renderer to update
 		const rr = resolver("read", () => base);
-		const row = rr.renderCall({ path: "/home/user/.cache/pi-zip/recall/01a11183-cd3b-7713-9d92-44fa8cad9600/k3x9q2m7ab.txt" }, th, { toolCallId: "r1" });
+		const row = rr.renderCall({ path: "/home/u/.cache/pi-zip/recall/s1/k3x9q2m7ab.txt" }, th, { toolCallId: "r1" });
 		seen.length = 0;
 		rr.renderCall({ path: "src/a.ts" }, th, { toolCallId: "r1", lastComponent: row });
 		expect(seen).toEqual([undefined]);

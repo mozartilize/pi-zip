@@ -14,17 +14,18 @@ pi install git:github.com/purboo/pi-zip
 
 Try it for one run without installing: `pi -e npm:pi-zip`.
 
-## Measured results (v0.2.0)
+## Measured results
 
 Live A/B runs on the same coding tasks (4 task templates × 4 seeds, the user away between prompts as stated), paired by task, 95% bootstrap intervals. BC = [billion-context](https://github.com/ranxianglei/billion-context) with its defaults.
 
-| Model | Cost vs BC | Speed | Quality (task done / planted facts recalled) |
+| Model (pi-zip version) | Cost vs BC | Speed | Quality (task done / planted facts recalled) |
 |---|---|---|---|
-| Claude Sonnet 5.5, away 6 min | **0.79×** [0.72, 0.86] | p90 wait per prompt 53 s vs 85 s; same as plain Pi | 16/16 and 1.00, same as BC |
-| GPT-6.1-sol, away 6 min | 1.00× [0.92, 1.08] | median task 209 s vs 305 s | 16/16 and 1.00 vs 15/16 |
-| GPT-6.1-sol, away 2 or 6 min | 1.07× [0.91, 1.22] | median task 271 s vs 389 s | 16/16 and 1.00 vs 14/16 |
+| Claude Sonnet 5.5, away 6 min (v0.3.0) | **0.77×** [0.67, 0.89] | median task 142 s vs 203 s | 16/16 and 1.00, same as BC |
+| Claude Sonnet 5.5, away 2 or 6 min (v0.3.0) | **0.91×** [0.85, 0.97] | median task 143 s vs 209 s | 16/16 and 1.00, same as BC |
+| GPT-6.1-sol, away 6 min (v0.2.0) | 1.00× [0.92, 1.08] | median task 209 s vs 305 s | 16/16 and 1.00 vs 15/16 |
+| GPT-6.1-sol, away 2 or 6 min (v0.2.0) | 1.07× [0.91, 1.22] | median task 271 s vs 389 s | 16/16 and 1.00 vs 14/16 |
 
-Against plain Pi on the same Claude runs: same speed, 0.45× the cost. Hidden-question probes on real long sessions (questions whose answer had been folded): 45–52% answered from the original via `zip_recall` vs 5% for BC's reconstruction, same number of wrong answers.
+Runs started by another extension's message after you were away (sub-agent results, scheduled follow-ups) get the same cold-cache handling as a prompt you type, new in v0.3.0: on 4 such tasks, 0.38× the cost of v0.2.8, which left them untouched (context 31K vs 253K at the end). Against plain Pi on the same Claude runs (v0.2.0): same speed, 0.45× the cost. Hidden-question probes on real long sessions (questions whose answer had been folded): 45–52% answered from the original via `zip_recall` vs 5% for BC's reconstruction, same number of wrong answers.
 
 Known limits:
 
