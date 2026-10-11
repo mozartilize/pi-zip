@@ -217,7 +217,7 @@ fn i1_persisted_equals_sent() {
 #[test]
 fn b2b_no_back_to_back() {
     let t = trace_of(&["world explicit known ttl=300 true=300 survival=none c=1 sys=3000 window=128000 native interactive", "prompt", "call npm 5K", "call npm 10K", "call npm 11.2K", "call npm 9.6K", "say 100", "prompt +60s", "call npm 28.4K", "call npm 23.3K", "call npm 5K", "call npm 5.7K", "say 100", "prompt +60s", "say 100", "prompt +60s", "say 100"]);
-    caught_all("m10", "run.ts", &[("if (!this.cold && this.justEdited) {", "if (false) {", 1), ("if (this.justEdited) {", "if (false) {", 1)], &["B2B"], &t);
+    caught_all("m10", "run.ts", &[("if (!this.cold && this.justEdited && !nat) {", "if (false) {", 1), ("if (this.justEdited) {", "if (false) {", 1)], &["B2B"], &t);
 }
 
 #[test]

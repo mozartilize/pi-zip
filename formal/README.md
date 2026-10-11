@@ -94,9 +94,10 @@ say 100
 |---|---|---|
 | A1 | nothing is lost | □ nothing_lost: the request carries the session's conversation **by position**, one to one and in order from its first kept message to the newest (a summary may stand for a prefix, nothing in between may go missing); every message except a folded output or a summary goes out byte for byte (user text, tool args, system prompt, thinking); pi-zip's request guard does not have to rewrite the payload (an edit that broke a tool_use / tool_result pair); **every folded block names its handle and shows its key lines** (first, last, the error line, as README rule 1 says); every output the model does not see verbatim comes back byte for byte **the way the model gets it back**: `zip_recall(handle)` as the tool executes it, all pages, or a `read` of the recall file the placeholder names (through pi-zip's `tool_call` hook), and in reread-only mode only re-readable outputs fold; a user request pi-zip summarised away is quoted verbatim |
 | A2 | edit only when the cache is gone or the edit pays | □ (zip_edit → pays): the law's own model, **at the class ratios of the true cache class and tier** (not the planner's prices) and **at the request's real sizes** (B: what the request would have sent without the edit; A: what it sent), with the summary call priced as what it is (uncached read of the conversation the cut replaces, without the carried previous summary, plus the summary written), says the edit costs no more than not editing (10% tolerance: the planner's calibrated estimate). At P < 0.5 folds are free (lemma C), and a summary must also pay its call at its own margin (what the cut removes beyond the folds): no decision is excused for being cold |
-| A3 | never in the way | □ (user_waits → at_room ∨ valve_summary ∨ switched): the user waits for a summary call only at Pi's compaction room, in the warm valve **at a turn_end** (A2 checks it pays), or at a return a model switch made cold |
+| A3 | never in the way | □ (user_waits → at_room ∨ switched ∨ (warm_summary ∧ bg_budget_spent)): the user waits for a summary call only at Pi's compaction room, at a return a model switch made cold, or (round 5) for a warm plan once the warm stretch's one unused background summary is spent (rule B's anti-thrash fallback to 0.3.0) |
 
-**A3 is a product decision, stated here because pi-zip's README does not say it.** README rule 3's "the same inequality prices the
+**A3 is a product decision.** Round 5 (rules A and B, TRIAGE.md) narrowed it: a warm turn_end valve is no longer excused either; the
+summary is written in the background and adopted at a later turn_end. The paragraph below is the round-2 reasoning it narrows. README rule 3's "the same inequality prices the
 extra model call in" (at a cold return and in the warm valve alike) is about how a summary call is *priced*, not about when the user
 may wait for one. The spec allows a wait only where nothing better exists: at Pi's compaction room (Pi would make the user wait
 anyway), at a turn_end valve (mid-run: the user is already waiting for the agent, and the context crossed the target during the
@@ -301,8 +302,8 @@ as turns, PW 0 → 1,932; m06 explicit w 1.25 → 0.3, LW 0 → 25,449; m25 summ
 m26 warm below the cap, WB 4 → 692 (new class). m15 (`summarizedWarm` ignored) moves NT 4 → 28 in its existing class: caught
 by the per-trace verdicts only. m03 and m04 are now caught by A1 itself (0 → 5,523 and 0 → 5,218; m04 before only by I1).
 
-`tests/mutants.rs` keeps one mutant per property as a regression test (A1 ×5, A2/LW, A3 ×2, I1, RC ×3, PW ×4, B2B, NT, TR ×3, GC ×4,
-WB, MH, LW ×2, MPr, RDr, WL ×2; round 4 added WL, PW over `nextturn`, GC over `drive` and two TR over `drive`, see TRIAGE.md) and shows that W, G and LW's arithmetic fail on a tampered observation.
+`tests/mutants.rs` keeps one mutant per property as a regression test (A1 ×5, A2/LW, A3 ×4, I1, RC ×3, PW ×4, B2B, NT, TR ×3, GC ×4,
+WB, MH, LW ×2, MPr, RDr, WL ×2; round 4 added WL, PW over `nextturn`, GC over `drive` and two TR over `drive`; round 5 two A3 over rule B, see TRIAGE.md) and shows that W, G and LW's arithmetic fail on a tampered observation.
 
 ## How to run
 
