@@ -276,6 +276,15 @@ describe("single-line JSON outputs (2026-10-10 item 1)", () => {
 		expect(() => jsonKeyFields(deeper)).not.toThrow();
 	});
 
+	test("JSON whose values are all empty (0, null) falls back to key lines in the placeholder and the summary hint", () => {
+		const empty = JSON.stringify({ items: Array.from({ length: 300 }, () => ({ a: 0, b: null })) });
+		expect(jsonKeyFields(empty)).toEqual([]);
+		const ph = makePlaceholder(empty, "bash", "dump", handleFor("e"), 8)!;
+		expect(ph).toContain("key lines kept");
+		expect(ph).not.toContain("key fields kept");
+		expect(keyTexts(empty).length).toBeGreaterThan(0);
+	});
+
 	test("deterministic", () => {
 		expect(jsonKeyFields(one)).toEqual(jsonKeyFields(one));
 	});
