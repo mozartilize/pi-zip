@@ -641,29 +641,48 @@ describe("round 5 on real Pi: rule A starts the warm summary early, rule B never
 		expect(shut.inputListeners.size).toBe(0);
 	});
 
-	test("warm native adoption: an early summary goes in through Pi's compaction before the prompt, Pi's 'Compacted from N' is the notice's before, no wait", async () => {
-		const r = await rig(undefined, { file: template(60_000), tui: true, native: true, idle: true, start: false, latencyMs: 300 });
-		await r.settle(); // the run ends: rule A starts the warm return's summary now
-		await sleep(400);
-		expect(r.narrativeCalls.length).toBe(1); // 0.3.0: 0 here, then a 300 ms wait at the prompt
-		const { req, waited } = await prompt(r);
-		expect(waited).toBeLessThan(250);
-		expect(r.narrativeCalls.length).toBe(1);
-		expect(r.compactCalls.n).toBe(1); // 0.3.0: 0 (a warm return never took the native path)
-		expect(r.compactions).toHaveLength(1);
-		const branch = r.sm.getBranch() as Any[];
-		const at = branch.findIndex((e) => e.type === "compaction");
-		const promptAt = branch.findIndex((e) => e.type === "message" && e.message.role === "user" && e.message.content === "next request");
-		expect(at).toBeGreaterThan(-1);
-		expect(at).toBeLessThan(promptAt); // one place, before the prompt
-		expect(branch[at].details).toMatchObject({ by: "pi-zip", via: "native", trigger: "valve" });
-		expect(req.some((m: Any) => m.role === "compactionSummary")).toBe(true);
-		await sleep(5);
-		const n = noticeOf(r);
-		expect(n.before).toBe(branch[at].tokensBefore);
-		expect(n.native).toBe("ok");
-		expect(n.desc).toMatch(/ready while you were away$/);
-	});
+	// the second case: the prompt Pi appends comes out smaller than what before_agent_start announced (pendingPrompt's estimate). The
+	// warm plan must still cut where Pi's compaction just cut (review P2 #5: it hung on real(ctxAfterFolds) >= regrowAt holding with
+	// equality, fell into native_mismatch and dropped the folds priced with the summary)
+	for (const [label, announced] of [["same prompt", "next request"], ["real prompt smaller than announced", `next request ${"with an expanded template ".repeat(400)}`]] as const) {
+		test(`warm native adoption (${label}): an early summary goes in through Pi's compaction before the prompt, Pi's 'Compacted from N' is the notice's before, no wait, the plan on the pre-compaction projection`, async () => {
+			const ledger = join(mkdtempSync(join(tmpdir(), "pz-r5-native-")), "ledger.jsonl");
+			const before = process.env.PI_ZIP_LEDGER;
+			process.env.PI_ZIP_LEDGER = ledger;
+			try {
+				const r = await rig(undefined, { file: template(60_000), tui: true, native: true, idle: true, start: false, latencyMs: 300 });
+				await r.settle(); // the run ends: rule A starts the warm return's summary now
+				await sleep(400);
+				expect(r.narrativeCalls.length).toBe(1); // 0.3.0: 0 here, then a 300 ms wait at the prompt
+				const t0 = performance.now();
+				await r.beforeAgentStart(announced);
+				r.sm.appendMessage(user("next request", Date.now() - T0));
+				const req = await r.request();
+				expect(performance.now() - t0).toBeLessThan(250);
+				expect(r.narrativeCalls.length).toBe(1);
+				expect(r.compactCalls.n).toBe(1); // 0.3.0: 0 (a warm return never took the native path)
+				expect(r.compactions).toHaveLength(1);
+				const branch = r.sm.getBranch() as Any[];
+				const at = branch.findIndex((e) => e.type === "compaction");
+				const promptAt = branch.findIndex((e) => e.type === "message" && e.message.role === "user" && e.message.content === "next request");
+				expect(at).toBeGreaterThan(-1);
+				expect(at).toBeLessThan(promptAt); // one place, before the prompt
+				expect(branch[at].details).toMatchObject({ by: "pi-zip", via: "native", trigger: "valve" });
+				expect(req.some((m: Any) => m.role === "compactionSummary")).toBe(true);
+				const rows = readFileSync(ledger, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+				expect(rows.filter((x) => x.type === "native_mismatch")).toEqual([]);
+				expect(rows.find((x) => x.type === "cold_plan")).toMatchObject({ via: "native", onPre: true });
+				await sleep(5);
+				const n = noticeOf(r);
+				expect(n.before).toBe(branch[at].tokensBefore);
+				expect(n.native).toBe("ok");
+				expect(n.desc).toMatch(/ready while you were away$/);
+			} finally {
+				if (before === undefined) delete process.env.PI_ZIP_LEDGER;
+				else process.env.PI_ZIP_LEDGER = before;
+			}
+		});
+	}
 
 	test("B on real Pi: no wait at the warm prompt, nothing applied; a later turn_end commits the summary as a draft the next request first carries, so Pi's tokensBefore is the size before", async () => {
 		const r = await rig(undefined, { file: template(60_000), tui: true, native: true, idle: true, start: false, latencyMs: 600 });

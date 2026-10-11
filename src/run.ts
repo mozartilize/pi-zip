@@ -1261,17 +1261,24 @@ export class Zip implements ZipControl {
 			this.discardBg();
 			return;
 		}
-		const plan = (entries: Any[], cutAt?: string) => {
+		const plan = (entries: Any[], cutAt?: string, asNative = false) => {
 			const { o, cal } = this.opts(ctx, false, this.cold ? "cold" : "warm", entries, this.pWarm, cutAt);
 			o.pastTtl = this.pastTtl;
+			// the plan that carries the summary Pi's compaction just put in is made in the state nativeSummary planned it in: before that
+			// summary, so it is not "a second summary in this warm stretch" (noSummary, regrowAt). Otherwise a real prompt a token smaller
+			// than before_agent_start's estimate falls below regrowAt, the plan does not cut and the folds priced with it are dropped
+			if (asNative) {
+				o.noSummary = false;
+				delete o.regrowAt;
+			}
 			if (foreign) o.noSummary = true; // another extension's compaction just went in: folds only (a summary only at Pi's compaction room)
 			return { o, cal, p: planContext(entries, o) };
 		};
 		// a warm plan cuts where the summary Pi's compaction just put in cuts (nativeSummary planned it so), or where the one written in
 		// the background cuts, when the law accepts that cut (pinned)
 		const warmPlan = (entries: Any[]) => {
-			const first = plan(entries);
-			return this.cold ? first : this.pinned(first, (k) => plan(entries, k), "run", nat ? nat.key : undefined);
+			const first = plan(entries, undefined, !!nat);
+			return this.cold ? first : this.pinned(first, (k) => plan(entries, k, !!nat), "run", nat ? nat.key : undefined);
 		};
 		let { o, cal, p } = warmPlan(spliced ?? now);
 		const onPre = !!nat && !!spliced && !!p && p.cutIdx !== null && p.firstKeptEntryId === nat.key;
