@@ -1156,7 +1156,7 @@ export class Zip implements ZipControl {
 	 * Rule B: a warm plan that summarises, while the user is here. "take": a finished summary for this cut is there (takeBg adopts it,
 	 * no wait). "defer": nothing is applied now, the plan is made again at the next turn_end (folds and summary were priced together, so
 	 * the folds alone do not go either); the summary for this cut is written in the background (one running is left to run). "wait":
-	 * written now while the user waits, as in 0.3.0: without a UI (print, json, rpc: nothing runs in the background), at Pi's compaction
+	 * written now while the user waits, as in 0.3.0: without a UI (print, json: nothing runs in the background; rpc binds a UI), at Pi's compaction
 	 * room (Pi would compact, lossily, otherwise), or once AB_UNUSED_MAX background summaries went unused in this warm stretch.
 	 */
 	private warmSummary(p: PlanResult, ctx: Any, where: "run" | "turn_end"): "take" | "defer" | "wait" {
