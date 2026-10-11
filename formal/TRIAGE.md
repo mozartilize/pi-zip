@@ -840,8 +840,8 @@ rest at one unused call per stretch; it halves the waits below the room in set A
 
 Compared trace by trace (`--verdicts`):
 * **A3**: suite 10 fixed (7 B2 warm returns, 3 warm turn_end waits), 0 new; seed 7 58 fixed, 0 new. The 17 / 76 left are all cold
-  returns (after a restart, before the away timer, an away summary not used), untouched by these rules; the B2 class left on the
-  suite before the spec change (a warm prompt once the stretch's budget is spent) is excused by the new A3.
+  returns (after a restart, before the away timer, an away summary not used), untouched by these rules. A warm wait once the
+  stretch's budget is spent (one suite trace before the spec's A3 was finished) is excused by the new A3.
 * **RD +1 / +5**: suite 1 and seed 7 4 are the pinning class above (RDr 0). Seed 7's fifth (trace 3414, RDr +1) shrinks to the
   existing 35-event "not explained" counterexample, which fails identically on d7d6ff5 (a cold return after a switch adopting a summary
   prepared before it): an existing class reached by a path shift.
