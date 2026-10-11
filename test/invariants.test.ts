@@ -809,6 +809,16 @@ describe("round 5: rules A (start early) and B (never wait while warm)", () => {
 		expect(st.calls).toBe(2);
 	});
 
+	test("a finished early summary lost when the process ends is booked (its cost), but not counted against the bound: the restarted process starts its own", async () => {
+		const st = { calls: 0 };
+		const r = await rig(done, WARM_TS(), { modelRegistry: { complete: mkComplete(st) } });
+		await settle(r);
+		await sleep(20);
+		expect(st.calls).toBe(1);
+		await r.fire("session_shutdown", {});
+		expect(r.appended.filter((x: Any) => x.customType === "pi-zip/unused-summary").map((x: Any) => x.data)).toEqual([{ usd: 0.02, lost: "shutdown" }]); // 0.3.0: never booked
+	});
+
 	test("anti-thrash across a restart: the unused one is in the session (pi-zip/unused-summary, ab), so a restarted process keeps the bound", async () => {
 		const run = async (extra: Any[]) => {
 			const st = { calls: 0, delay: 200 };
