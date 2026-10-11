@@ -24,6 +24,10 @@
   command is named once in the heading; look-alike rows show their first differing output line; a JSON document on one line shows
   its key fields (errors and status first).
 - Learned cache-survival classes with no samples are dropped unless they were set explicitly.
+- Fix: a display-only message an extension posts after the final answer (durable-subagents' "1 workflow was paused" at startup)
+  made the plans made before your prompt (first key after a restart, the away timer) cut one turn later than the prompt's own plan,
+  so the summary started early was thrown away and you waited for a second one in full. Your prompt joins that message's turn, and
+  the early plans now count it so.
 - Fix: the ledger's and `/zip` stats' `waitedMs` for a summary computed during the prompt of a session with a prepared plan was 0;
   it is now the time waited. Ledgers of the same session can differ from 0.3.0 there; sessions and requests do not.
 - Fix: the warm plan that carries a summary Pi's compaction just put in no longer falls back to a plan on the compacted session
