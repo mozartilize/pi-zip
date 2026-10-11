@@ -760,3 +760,118 @@ recording.
   reasons given there.
 * **The two item-5 tests the review calls non-discriminating** are kept: they still state behaviour (one start per prompt; a warm
   driven run plans like a warm prompt). The discriminating tests are the new ones.
+
+## Round 5: rules A and B (the 39 s warm wait of 0.3.0)
+
+Branch v031, on top of v0.3.0 (d7d6ff5). "Old" is d7d6ff5's `src`, "new" is this branch's, both under this round's checker (same
+bridge, spec and suites for both columns; the old column is re-run, not copied from round 4).
+
+### What changed in pi-zip
+
+* **Rule A, start early.** `settle` also plans what a warm return would make (`opts(ctx, true, "warm")`; nothing right after an
+  edited request: that return is b2b) and starts that summary at once when it cuts (`startBg(..., "early")`). The away timer still
+  runs for the cold plan; `runAway` keeps a summary for its own cut and drops one written for a context that changed while away.
+  A reopened session whose cache is alive and whose warm plan cuts starts it on the first key of a prompt (`resumeAway`,
+  `startOnKey`), as a dead cache's cold plan already did.
+* **Rule B, never wait while warm** (with a UI, below Pi's compaction room). A warm return with a finished summary for its cut puts
+  it in through Pi's compaction, as a cold return does (`beginRun`, `nativeSummary` planning in the run's mode). Without one, the
+  request goes out with nothing applied and the summary is written in the background (`warmSummary` → `"defer"`); the turn_end
+  valve adopts it once done (a draft the next request first carries, so Pi's `tokensBefore` is the size before) or the next prompt
+  does through Pi's compaction. `onTurnEnd`'s warm path waits only at the room. Without a UI nothing changes (a test pins the bytes).
+* **Anti-thrash.** A warm plan whose cut moved is planned again cutting where the background summary cuts (`plan.ts cutAt`, run.ts
+  `pinned`), if the law accepts it. At most one summary rules A/B started goes unused per warm stretch (`AB_UNUSED_MAX`), counted
+  across restarts (`pi-zip/unused-summary` with `ab`); once spent, a warm summary whose cut moved is waited for, as in 0.3.0.
+* `startBg` never overwrites a live summary (it keeps one for the same cut, discards and books any other); `shutdown` books a
+  finished summary the process loses.
+
+### The measurement behind the anti-thrash rule
+
+`formal/replay/keymove.ts` replays the planner (this branch's `plan.ts`) over recorded sessions with the summary call taking its
+latency (the bench's fit) and rules A/B applied, under five policies. Set A: the 3 zipnotice sessions and the 6 recorded pairs
+(9 sessions, 9,863 requests, 157 warm stretches); set B: the 295 batch2 sessions (9,719 requests, 321 stretches). Totals:
+
+| measure (set A / set B) | v030 | naive | stretch1 | pin-naive | **pin** (shipped) |
+|---|---|---|---|---|---|
+| deferred summaries started (first firing of a warm cut) | 0 / 0 | 76 / 18 | 23 / 9 | 37 / 9 | **23 / 9** |
+| later turn_ends while one was pending / its cut had moved | - | 88 / 15 → **46 / 7** | 26 / 9 → 9 / 2 | 55 / 9 → 10 / 0 | 26 / 9 → 5 / 0 |
+| unused summaries started by rules A/B | 0 / 0 | 60 / 14 | 17 / 6 | 19 / 4 | **13 / 4** |
+| max unused A/B summaries in one warm stretch | 0 / 0 | 14 / 6 | 1 / 1 | 4 / 1 | **1 / 1** |
+| unused away-timer summaries (0.3.0's own) | 17 / 5 | 14 / 6 | 14 / 5 | 14 / 5 | 13 / 5 |
+| waits below the room (count / seconds) | 23 / 1,195 s ; 6 / 162 s | 0 ; 0 | 15 / 748 s ; 2 / 46 s | 0 ; 0 | **11 / 567 s ; 0 / 0** |
+| waits at the room (count; same in all) | 57 | 60 | 58 | 60 | 58 |
+
+The warm valve's cut moves often: in the naive policy, at 46 of the 88 later turn_ends that saw a pending summary (52%, set A) the
+plan wanted another cut, mostly one request later (`summarise()` takes the first cut that reaches the cap). Starting a new call at
+each move (naive) wastes up to 14 calls in one stretch. "pin" keeps the pending cut whenever the law still accepts it, and caps the
+rest at one unused call per stretch; it halves the waits below the room in set A (1,195 s → 567 s) and removes them in set B.
+
+### Spec and bridge changes (where the policy changed)
+
+* **A3** now reads □(user_waits → at_room ∨ switched ∨ (warm_summary ∧ bg_budget_spent)). The round-2 excuse for any wait in the
+  warm valve at a turn_end is withdrawn (rule B writes that summary in the background); a warm wait, at a prompt or a turn_end, is
+  excused only once the stretch's unused background summary is spent (the policy's documented fallback to 0.3.0). The old column
+  is measured under the same statement, so it gains the turn_end waits round 4 excused (suite 24 → 27).
+* **RDr** knows a new root cause: the live process pinned its warm plan to a summary only it held in memory; a restarted process
+  lost that summary and makes its unpinned plan. Both plans pass the law; the live one reuses a call already paid. RD still counts it.
+* **RD** accepts a fresh process that, with no background summary, defers the very cut the live request carries (`deferredSame`).
+* Bridge: a summary started through `startBg` is tagged through its async context and never counted as a wait (the bridge's model
+  answers at once, so timing cannot tell); a warm plan re-made with `cutAt` is the decision when it cuts there.
+* Mutants (`tests/mutants.rs`, 31 tests, all pass): `a3_warm_turn_end_does_not_wait` (turn_end always waits, as 0.3.0;
+  `traces/a3-warm-turn-end.trace`), `a3_warm_return_does_not_wait` (a warm prompt never defers; `traces/b2-restart.trace`, the
+  incident after a restart). The away timer's mutants (m07, m08) now use a run of 3 small calls instead of 12: with 12 the growth
+  estimate falls so far that a warm return would summarise too, and rule A prepares it regardless of the timer. m10's site moved.
+
+### Checker table
+
+`--suite standard --random 3000 --seed 1 --workers 26 --shrink 40` (36,924 traces, 307,635 requests) and
+`--suite none --random 15000 --seed 7`, both sources under this round's checker:
+
+| property | suite d7d6ff5 | suite v031 | seed 7 d7d6ff5 | seed 7 v031 |
+|---|---|---|---|---|
+| A1, I1, PW, B2B, MP, NT, WL, WB, MPr, LW, G, W | 0 | 0 | 0 | 0 |
+| A2 / A2r | 4 / 4 | 4 / 4 | 24 / 24 | 24 / 24 |
+| **A3** | 27 | **17** | 134 | **76** |
+| RD / RDr | 0 / 0 | **1** / 0 | 2 / 2 | **7 / 3** |
+| RC | 0 | 0 | 1 | 1 |
+| NR | 141 | 141 | 338 | 335 |
+| TR | 0 | 0 | 6 | 6 |
+| GC | 0 | 0 | 1 | 1 |
+| MH | 2 | 2 | 7 | 7 |
+
+Compared trace by trace (`--verdicts`):
+* **A3**: suite 10 fixed (7 B2 warm returns, 3 warm turn_end waits), 0 new; seed 7 58 fixed, 0 new. The 17 / 76 left are all cold
+  returns (after a restart, before the away timer, an away summary not used), untouched by these rules; the B2 class left on the
+  suite before the spec change (a warm prompt once the stretch's budget is spent) is excused by the new A3.
+* **RD +1 / +5**: suite 1 and seed 7 4 are the pinning class above (RDr 0). Seed 7's fifth (trace 3414, RDr +1) shrinks to the
+  existing 35-event "not explained" counterexample, which fails identically on d7d6ff5 (a cold return after a switch adopting a summary
+  prepared before it): an existing class reached by a path shift.
+* **NR −3** on seed 7 ("smallest cut only"); everything else is identical trace for trace.
+
+Tests at this commit: `bun test` 485 pass, 0 fail (470 before; 15 new tests, each failing on d7d6ff5, checked by running them in a
+d7d6ff5 worktree; the no-UI digest test passes its digest half there by design and fails its UI half); `tsc` clean;
+`bun run build-check` clean; `cargo test --release`: 10 unit + 1 bridge + 31 mutants pass; `cargo clippy --release --all-targets` clean.
+
+### The TUI check (Pi 1.1.0 in tmux, fake provider, summary call 40 s)
+
+`formal/tui/r5-incident.sh`: a session at ~98.7K (a big prompt and small tool steps), a run that ends there, the next prompt 108 s
+later (warm, TTL 300 s). "live": the same process; "restart": `/quit` and `pi -c` at 75 s, first key at 100 s, Enter at 108 s, the
+prompt runs a 50 s tool.
+
+| | user's wait at the prompt | where `[compaction]` sits | Pi's `Compacted from N` | notice's before |
+|---|---|---|---|---|
+| live, d7d6ff5 | **40.0 s** ("writing a summary (folding alone cannot make the context small enough)") | after the prompt, written at its turn_end | **5,288** (the size after) | 98.7K |
+| live, v031 | **0** (rule A: written at the run's end) | before the prompt (Pi's compaction) | **98,719** | 98,719 |
+| restart, d7d6ff5 | **40.0 s** | after the tool, written at the next turn_end | **5,309** (the size after) | 98.7K |
+| restart, v031 | **0** (started on the first key, deferred at the prompt) | at the turn_end after the tool, before the next request | **98,790** (the size before) | 98,862 (+0.07%) |
+
+The restart row's figures differ by 72 tokens: Pi takes the newest usage plus chars/4 of what follows it, pi-zip's estimate of the same
+context counts the tool call's own tokens at the calibrated scale. The live row is exact (pi-zip hands Pi its own number).
+
+### Still open
+
+* A cold return whose background summary is still being written waits for the rest and goes in as a draft (Pi's number is then the
+  size after); so does a warm return whose finished summary Pi's compaction cannot take (busy, an older Pi, another extension).
+* Pinning makes a live and a restarted process cut differently (RD above); a restart also loses any background summary.
+* An early summary is sized by the warm plan; a cold return adopting it (same cut) keeps that size.
+* Worst case of unused summary calls per session: one per warm stretch from rules A/B (counted across restarts), plus 0.3.0's away
+  timer (at most one per away period), plus one finished summary per pi exit.
