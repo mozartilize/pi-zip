@@ -801,14 +801,19 @@ describe("never wait: rule A starts early; a summary is used once ready; the one
 		expect(rows("unused_summary")).toEqual([]);
 	});
 
-	test("a call ended before it finishes is recorded at once (no summary, the estimated input), before the aborted call settles", async () => {
+	test("a call ended before it finishes books its input at once and persists on asynchronous cancellation, before the provider settles", async () => {
 		const st = { calls: 0, delay: 5_000 }; // the call ignores the abort and settles 5 s later
 		const r = await rig(done, WARM_TS(), { modelRegistry: { complete: mkComplete(st) } });
 		const zip = await zipOf(r);
 		await settle(r);
 		await sleep(10);
 		expect(zip.bg?.key).toBe("u3");
+		const cancelled = zip.bg.promise;
 		zip.discardBg("replaced");
+		expect(zip.bg).toBeNull();
+		expect(zip.mine.at(-1)).toMatchObject({ key: "u3", lost: "replaced", usd: zip.stats.summaryUsd });
+		expect(r.appended.filter((x: Any) => x.customType === "pi-zip/summary")).toHaveLength(0);
+		expect(await cancelled).toBeNull();
 		const recs = r.appended.filter((x: Any) => x.customType === "pi-zip/summary").map((x: Any) => x.data);
 		expect(recs).toHaveLength(1);
 		expect(recs[0]).toMatchObject({ key: "u3", head: "", estimated: true, lost: "replaced" });
@@ -819,14 +824,18 @@ describe("never wait: rule A starts early; a summary is used once ready; the one
 	test("a call still running when the process ends is one unused call: recorded at the input it was billed for, kept in the session totals", async () => {
 		const st = { calls: 0, delay: 5_000 };
 		const r = await rig(done, WARM_TS(), { modelRegistry: { complete: mkComplete(st) } });
+		const zip = await zipOf(r);
 		await settle(r);
 		await sleep(10);
-		await r.fire("session_shutdown", {});
+		const cancelled = zip.bg.promise;
+		zip.shutdown(); // exit must flush synchronously, before any cancellation microtask can run
 		const recs = r.appended.filter((x: Any) => x.customType === "pi-zip/summary").map((x: Any) => x.data);
 		expect(recs).toHaveLength(1);
 		expect(recs[0]).toMatchObject({ key: "u3", lost: "shutdown", estimated: true });
 		expect(recs[0].cut).toBeUndefined();
 		expect(recs[0].usd).toBeGreaterThan(0);
+		expect(await cancelled).toBeNull();
+		expect(r.appended.filter((x: Any) => x.customType === "pi-zip/summary")).toHaveLength(1);
 		// the restarted process: the lost call is in the totals, and it decides as with no summary at all (its own call in the background, no wait)
 		const st2 = { calls: 0, delay: 200 };
 		const q = await rig(done, WARM_TS(), { modelRegistry: { complete: mkComplete(st2) } });

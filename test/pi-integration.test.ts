@@ -10,6 +10,7 @@ import { fileURLToPath } from "node:url";
 import { collapseSystemMessages, getCurrentSystemMessage, normalizeContext, resolveTranscript } from "@earendil-works/pi-ai";
 import { calibrate, collapseSystem, planContext, wireTokensOf } from "../src/plan.ts";
 import { planOpts } from "../src/core.ts";
+import { record } from "../src/learn.ts";
 import type { Any } from "./helpers.ts";
 // Pi's own draft application (AgentSession._applyBoundaryDrafts uses no instance state): the order of the drafts and the
 // tokensBefore Pi writes for a compaction draft are Pi's, not a re-implementation
@@ -554,6 +555,59 @@ describe("real Pi: a summary prepared while the user was away goes in through Pi
 		const cut = await rig(undefined, { file, tui: true, start: false });
 		await sleep(1_300);
 		expect(cut.narrativeCalls.length).toBe(0);
+	});
+
+	test("a measured-latency timer invalidating a running cut persists its loss after the callback", async () => {
+		process.env.PI_ZIP_TTL_SECS = "300";
+		process.env.PI_ZIP_COLD_CAP = "65000";
+		const model = { ...MODEL, provider: "timer", id: "replacement" };
+		record("timer/replacement", { explicit: true, total: 0, call: { ms: 200, tokens: 60_000 } });
+		const r = await rig(undefined, { file: template(), tui: true, start: false, model, latencyMs: 500 });
+		const realSet = globalThis.setTimeout, realNow = Date.now;
+		const callbacks = new Map<Any, { fire: () => void; due: number }>();
+		let inTimer = false, timerWrites = 0;
+		const append = r.zip.pi.appendEntry;
+		r.zip.pi.appendEntry = (type: string, data: Any) => {
+			if (inTimer) timerWrites++;
+			return append(type, data);
+		};
+		(globalThis as Any).setTimeout = (fn: () => void, ms: number) => {
+			const handle = realSet(fn, ms);
+			callbacks.set(handle, { fire: fn, due: realNow() + ms });
+			return handle;
+		};
+		try {
+			await r.settle();
+			const running = r.zip.bg;
+			expect(running).toBeTruthy();
+			const timer = callbacks.get(r.zip.timer)!;
+			expect(timer).toBeTruthy(); // warm and pause cuts differ, so a running call still leaves a pause deadline
+			const lastTouch = Math.max(...(r.sm.getBranch() as Any[]).map((e) => e.message?.timestamp ?? 0));
+			expect(timer.due).toBeLessThan(lastTouch + 300_000); // a measured lead starts before the first paying gap
+			await sleep(10);
+			expect(r.narrativeCalls).toHaveLength(1);
+			const keep = (r.sm.getBranch() as Any[]).filter((e) => e.type === "message" && e.message.role === "user")[3];
+			r.sm.appendCompaction("short history", keep.id, 12_000, { by: "other" }, true);
+			clearTimeout(r.zip.timer);
+			Date.now = () => timer.due + 1;
+			inTimer = true;
+			try { timer.fire(); } finally { inTimer = false; Date.now = realNow; }
+			expect(timerWrites).toBe(0);
+			expect(running.controller.signal.aborted).toBe(true);
+			expect(r.zip.stats.summaryUsd).toBeGreaterThanOrEqual(running.estUsd);
+			expect(r.sm.getEntries().filter((e: Any) => e.customType === "pi-zip/summary")).toHaveLength(0);
+			expect(await running.promise).toBeNull(); // cancellation persists without waiting for a provider that ignores abort
+			const lost = () => r.sm.getEntries().filter((e: Any) => e.customType === "pi-zip/summary" && e.data.lost === "replaced") as Any[];
+			expect(lost()).toHaveLength(1);
+			expect(lost()[0].data).toMatchObject({ key: running.key, head: running.head, usd: running.estUsd, estimated: true });
+			await sleep(550);
+			expect(lost()).toHaveLength(1); // the late provider completion cannot record or charge the aborted call again
+			expect(r.zip.stats.summaryUsd).toBeCloseTo(running.estUsd, 9);
+		} finally {
+			globalThis.setTimeout = realSet;
+			Date.now = realNow;
+			await r.shutdown();
+		}
 	});
 
 	test("the timer re-plans after a compaction instead of using a cached settle plan", async () => {
