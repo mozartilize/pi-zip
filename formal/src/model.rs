@@ -580,6 +580,9 @@ pub struct Tick {
     pub persist_ok: Option<bool>,
     /// the turn_end after this request persisted a new (valve) plan, not the run plan already sent
     pub te_valve: bool,
+    /// that turn_end persisted the run plan already sent together with a summary its room wait wrote (run.ts runRoom): the valve
+    /// decision is the room plan's cut; the folds are the run plan's
+    pub run_room: bool,
     /// narrative (summary) model calls the user waited for: in the run hook, at the turn_end after this request
     pub wait_run: u32,
     pub wait_te: u32,

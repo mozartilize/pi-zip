@@ -170,7 +170,7 @@ fn lw_plan_step_call_is_pinned_both_ways() {
 /// turn_end with a cut waits for it: 0.3.0's valve summary at turn_end).
 #[test]
 fn a3_turn_end_does_not_wait() {
-    caught("r5b", "core.ts", "after >= room", "after >= 0", "A3", &trace_file("a3-warm-turn-end.trace"));
+    caught("r5b", "core.ts", "if (room === null || after < room) return null;", "if (room === null) return null;", "A3", &trace_file("a3-warm-turn-end.trace"));
 }
 
 /// Never wait at a return: a plan whose summary is not ready (here a restart lost the call still running for it) goes with its folds
@@ -194,6 +194,20 @@ fn a3_return_does_not_wait() {
 #[test]
 fn tr_produced_summary_goes_in_once_ready() {
     caught("r4tr", "plan.ts", "const ready = new Set(o.ready ?? []);", "const ready = new Set<string>();", "TR", &trace_file("tr-produced.trace"));
+}
+
+/// 0.4.0 step 4, review fix: the turn_end that persists a run plan of folds alone still waits at Pi's compaction room for the room
+/// plan's cut (theory 1.4 R9). The mutant persists the run plan alone, and the next request reaches Pi's own threshold (PC).
+#[test]
+fn pc_run_plan_turn_end_waits_at_the_room() {
+    caught("r4pc", "run.ts", "const room = failed ? null : await this.runRoom(e, ctx, this.runPlan, o, pIn);", "const room = null;", "PC", &trace_file("pc-run-plan-room.trace"));
+}
+
+/// 0.4.0 step 4, WL restated: a summary a decision wants is produced at once and taken at the first decision after it is ready. The
+/// mutant hides ready summaries from the decisions (run.ts ready), so the next return produces the same cut again (WL (c)).
+#[test]
+fn wl_ready_summary_is_taken_not_produced_again() {
+    caught("r4wl", "run.ts", "return readyOf(branch, this.mine).map((a) => ({ key: a.key, running: false }));", "return [];", "WL", &trace_file("wl-ready-taken.trace"));
 }
 
 /// The away timer prepares the summary a return after a pause wants, so the return's free rewrite carries it. 0.4.0: nobody waits,
@@ -351,7 +365,7 @@ fn harness_checks_can_fail() {
 #[test]
 fn rc_file_recall_inside_a_run() {
     let t = trace_file("rc-file-recall-in-run.trace");
-    caught("rcf", "run.ts", "\t\tfor (const h of recalledHandlesFromBranch(branch)) this.recalled.add(h);\n\t\tconst touch", "\t\tconst touch", "RC", &t);
+    caught("rcf", "run.ts", "\t\tfor (const h of recalledHandlesFromBranch(branch)) this.recalled.add(h);\n\t\tconst pIn", "\t\tconst pIn", "RC", &t);
 }
 
 fn trace_file(name: &str) -> String {

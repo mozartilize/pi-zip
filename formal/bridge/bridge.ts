@@ -877,7 +877,13 @@ async function runTrace(tr: Any): Promise<Any> {
 		// I1: what turn_end persisted equals what was sent (the projection now starts with the view of this request)
 		let persistOk: boolean | null = null;
 		const committedSent = !!rp && rpSent && !rpWasPersisted && !!rp.persisted;
-		if (committedSent && drafts.some((d: Any) => d.type === "context_edit" || d.type === "compaction")) {
+		const roomCut = sink.some((x: Any) => x.type === "room_wait") ? drafts.find((d: Any) => d.type === "compaction")?.firstKeptEntryId : undefined;
+		if (committedSent && roomCut) {
+			// the room wait's summary went in with the run plan (run.ts runRoom): what it keeps must be exactly what the request sent
+			const now = describeView(sm.buildSessionContext().messages, sm);
+			const k = desc.findIndex((d: Any) => d.id === roomCut), off = now.findIndex((d: Any) => d.id === roomCut);
+			persistOk = k >= 0 && off >= 0 && desc.slice(k).every((d: Any, i: number) => now[off + i]?.h === d.h);
+		} else if (committedSent && drafts.some((d: Any) => d.type === "context_edit" || d.type === "compaction")) {
 			const now = describeView(sm.buildSessionContext().messages, sm).map((d: Any) => d.h);
 			persistOk = desc.every((d: Any, i: number) => now[i] === d.h);
 		}
@@ -888,7 +894,7 @@ async function runTrace(tr: Any): Promise<Any> {
 			runPlan: runStart && runPlan ? { source: runPlan.source, folds: runPlan.folds.map((f: Any) => f.entryId), cut: runPlan.cut?.firstKeptEntryId ?? runPlan.native?.firstKeptEntryId ?? null, native: !!runPlan.native } : null,
 			runLedger, teLedger,
 			drafts: drafts.map((d: Any) => (d.type === "context_edit" ? { type: d.type, target: d.targetId } : d.type === "compaction" ? { type: d.type, firstKept: d.firstKeptEntryId } : { type: d.type, customType: d.customType })),
-			persistOk, teValve: !committedSent && drafts.some((d: Any) => d.type === "context_edit" || d.type === "compaction"),
+			persistOk, teValve: (!committedSent || !!roomCut) && drafts.some((d: Any) => d.type === "context_edit" || d.type === "compaction"), runRoom: committedSent && !!roomCut,
 			// the narrative model calls since the previous request's turn_end (away, at the previous turn_end, in this run plan)
 			narr: narrativeCalls.slice(ncSeen, nc1).filter((c) => c.phase !== "probe").map((c) => ({ input: c.input, output: c.output, away: c.phase === "away" })),
 			waitRun: narrativeCalls.slice(nc0, nc1).filter((c) => c.phase === "present").length,
