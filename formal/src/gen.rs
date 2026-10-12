@@ -409,7 +409,7 @@ pub fn normalize(mut t: Trace) -> Trace {
                     out.push(e);
                 }
             }
-            Event::Compact | Event::Edit => out.push(e),
+            Event::Compact | Event::Edit | Event::BoundaryEdit => out.push(e),
         }
     }
     if open {

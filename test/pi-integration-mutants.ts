@@ -18,6 +18,18 @@ const mutants = [
 			.replace("!this.runPlan.noticed && (this.runPlan.cut || this.runPlan.native)", "!this.runPlan.noticed")
 			.replace("if (!plan.noticed) this.noticeFor", "if (plan.noticed && cut) this.noticeFor(ctx, plan, [], cut, ctxTokens, 0);\n\t\tif (!plan.noticed) this.noticeFor"),
 	},
+	{
+		name: "boundary-discards-new-folds",
+		pattern: "an output becoming 60 requests old",
+		check: "expect(received).toEqual(expected)",
+		edit: (source: string) => source.replace("const live = plan.folds.filter((t) => byId.has(t.entryId) && wasApplied(t));", "const live = plan.folds.filter((t) => byId.has(t.entryId) && wasApplied(t) && (!plan.carriedIds || plan.carriedIds.has(t.entryId)));")
+	},
+	{
+		name: "boundary-ignores-incoming-edit",
+		pattern: "a preceding extension boundary edit",
+		check: "expect(received).toBe(expected)",
+		edit: (source: string) => source.replace("piContextTokens(e.context.contextEntries, this.branch(ctx), e.entries)", "piContextTokens(e.context.contextEntries, this.branch(ctx))")
+	},
 ];
 for (const mutant of mutants) {
 	const dir = mkdtempSync(join(output, "source-"));
@@ -28,7 +40,7 @@ for (const mutant of mutants) {
 		const changed = mutant.edit(original);
 		if (changed === original) throw new Error(`${mutant.name}: mutation site missing`);
 		writeFileSync(file, changed);
-		const result = Bun.spawnSync(["bun", "test", "test/pi-integration.test.ts", "--test-name-pattern", "mixed room boundary"], {
+		const result = Bun.spawnSync(["bun", "test", "test/pi-integration.test.ts", "--test-name-pattern", mutant.pattern ?? "mixed room boundary"], {
 			cwd: root, env: { ...process.env, PI_ZIP_TEST_SRC: source }, stdout: "pipe", stderr: "pipe",
 		});
 		const text = result.stdout.toString() + result.stderr.toString();

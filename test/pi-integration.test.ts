@@ -8,8 +8,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { collapseSystemMessages, getCurrentSystemMessage, normalizeContext, resolveTranscript } from "@earendil-works/pi-ai";
-import { calibrate, collapseSystem, planContext, wireTokensOf } from "../src/plan.ts";
-import { planOpts } from "../src/core.ts";
+import { buildBlocks, calibrate, collapseSystem, editAllowed, planContext, UNIT, wireTokensOf } from "../src/plan.ts";
+import { decideTurnEnd, planOpts } from "../src/core.ts";
 import { loadStats, record } from "../src/learn.ts";
 import type { Any } from "./helpers.ts";
 // Pi's own draft application (AgentSession._applyBoundaryDrafts uses no instance state): the order of the drafts and the
@@ -65,6 +65,7 @@ interface RigOpts {
 	settings?: Any;
 	model?: Any;
 	// another extension's session_before_compact handler (Pi runs every extension's for pi-zip's compaction too), loaded before or after pi-zip
+	boundary?: (e: Any, ctx: Any) => Any; // a preceding extension drafts edits at turn_end
 	foreign?: { at: "before" | "after"; on: (e: Any, ctx: Any) => Any };
 	latencyMs?: number; // the summary's model call takes this long
 }
@@ -85,6 +86,10 @@ async function rig(setup: (sm: SessionManager) => void = populate, opts: RigOpts
 		const f = opts.foreign;
 		const other = await loadExtensionFromFactory((api: Any) => api.on("session_before_compact", async (e: Any, c: Any) => (foreignCalls.push(e.reason), f.on(e, c))), CWD, bus, runtime, "<other-compactor>");
 		extensions = f.at === "before" ? [other, ...extensions] : [...extensions, other];
+	}
+	if (opts.boundary) {
+		const other = await loadExtensionFromFactory((api: Any) => api.on("turn_end", opts.boundary), CWD, bus, runtime, "<other-editor>");
+		extensions = [other, ...extensions];
 	}
 	const narrativeCalls: Any[] = [];
 	const registry: Any = {
@@ -207,7 +212,7 @@ async function rig(setup: (sm: SessionManager) => void = populate, opts: RigOpts
 		const marker = drafts.find((d) => d.type === "custom" && d.customType === "pi-zip/commit");
 		for (const draft of drafts) {
 			if (draft.type === "compaction" && draft.details?.by === "pi-zip" && draft.details.carried !== containsCut(actualRequest, draft)) checks.carry.push("summary carried flag disagrees with request");
-			if (draft.type === "context_edit" && marker && marker.data.carried !== containsFold(actualRequest, draft.targetId, draft.replacement.content)) checks.carry.push("fold carried flag disagrees with request");
+			if (draft.type === "context_edit" && JSON.stringify(draft.replacement).includes("[folded by pi-zip") && marker && (marker.data.carried && (!marker.data.carriedIds || marker.data.carriedIds.includes(draft.targetId))) !== containsFold(actualRequest, draft.targetId, draft.replacement.content)) checks.carry.push("fold carried flag disagrees with request");
 		}
 		apply(sm, drafts);
 		await new Promise((resolve) => setTimeout(resolve, 5));
@@ -265,6 +270,81 @@ const produced = async (r: Any) => {
 	expect(r.narrativeCalls.length).toBe(1);
 	await r.beforeAgentStart();
 };
+
+describe("boundary decision regressions", () => {
+	test("an output becoming 60 requests old before the first boundary joins the exact priced summary edit", async () => {
+		delete process.env.PI_ZIP_COLD_CAP;
+		const sm = SessionManager.inMemory(CWD);
+		sm.appendMessage(user("first"));
+		sm.appendMessage({ ...asst([{ type: "text", text: "p".repeat(160_000) }, call("older")], "toolUse"), usage: undefined });
+		const older = sm.appendMessage(result("older", bulk("older", 1000)));
+		const key = sm.appendMessage(user("previous"));
+		sm.appendMessage({ ...asst([{ type: "text", text: "q".repeat(32_000) }]), usage: undefined });
+		sm.appendMessage(user("current"));
+		sm.appendMessage({ ...asst([call("aged")], "toolUse"), usage: undefined });
+		const aged = sm.appendMessage(result("aged", bulk("aged", 10_500)));
+		for (let i = 0; i < 59; i++) sm.appendMessage({ ...asst([{ type: "text", text: "working" }]), usage: undefined });
+		const text = "## Decisions\nsummary";
+		sm.appendCustomEntry("pi-zip/summary", { head: "", key, usd: 0, cut: { firstKeptEntryId: key, text, trigger: "valve", count: 1, prefixTokens: 20_000, summaryTokens: 1000, llmOk: true, llmError: null, costUsd: 0, ms: 0 } });
+		const r = await rig(undefined, { file: [sm.getHeader() as Any, ...sm.getEntries()], start: false });
+		await r.beforeAgentStart();
+		const pWarm = 0.4923076923;
+		let probability = 0;
+		const originalOpts = r.zip.opts.bind(r.zip);
+		r.zip.opts = (...args: Any[]) => {
+			const o = originalOpts(...args).o;
+			o.scale = UNIT; o.law.pWarm = probability;
+			return { o, cal: UNIT };
+		};
+		r.zip.cold = true;
+		expect(buildBlocks(r.sm.buildSessionProjection().entries).find((b) => b.entryId === aged)?.age).toBe(59);
+		const request = await r.request();
+		expect(request.filter(isFolded)).toHaveLength(1);
+		expect([...r.zip.runPlan.applied]).toEqual([older]);
+		probability = pWarm;
+		const response = { ...asst([{ type: "text", text: "working" }], "toolUse"), timestamp: Date.now(), usage: undefined };
+		const id = r.sm.appendMessage(response);
+		const entries = r.sm.buildSessionProjection().entries;
+		expect(buildBlocks(entries).find((b) => b.entryId === aged)?.age).toBe(60);
+		const d = decideTurnEnd({ failed: false, justEdited: false, pWarm, ready: [{ key, running: false }], entries, runPlan: r.zip.runPlan,
+			opts: (cutAt, foldsOnly, ready) => r.zip.opts({}, false, entries, pWarm, false, cutAt, foldsOnly, ready) });
+		if (d.kind !== "plan" || !d.p) throw new Error("expected ready edit");
+		expect(d.p.firstKeptEntryId).toBe(key);
+		expect(d.p.folds.map((t) => t.entryId)).toEqual([older, aged]);
+		const after = d.p.ctxAfterFolds - d.p.prefixTokens + d.p.summaryTokensPlanned;
+		expect(editAllowed(d.p.ctxTokens, after, pWarm, null, d.o.law!.pr, d.o.law!.g)).toBe(true);
+		expect(editAllowed(d.p.ctxTokens, after + d.p.folds[1].entryTokens - d.p.folds[1].phTokens, pWarm, null, d.o.law!.pr, d.o.law!.g)).toBe(false);
+		const drafts = await r.turnEnd(id, response);
+		expect(drafts.filter((d) => d.type === "context_edit").map((d) => d.targetId)).toEqual([older, aged]);
+		expect(drafts[0].type).toBe("compaction");
+		expect(drafts.find((d) => d.customType === "pi-zip/commit").data).toEqual({ carried: true, next: true, carriedIds: [older] });
+		await r.shutdown();
+	});
+
+	test("a preceding extension boundary edit invalidates usage for Pi's exact compaction number", async () => {
+		const r = await rig((sm) => populate(sm, 3500), { start: false, tui: true, boundary: (e) => {
+			const target = e.context.contextEntries.find((e: Any) => e.messages.some((m: Any) => m.role === "toolResult"));
+			return { entries: [...e.entries, { type: "context_edit", targetId: target.sourceEntry.id, replacement: { content: [{ type: "text", text: "short" }] } }] };
+		} });
+		await r.beforeAgentStart();
+		const originalOpts = r.zip.opts.bind(r.zip);
+		r.zip.opts = (...args: Any[]) => { const o = originalOpts(...args).o; o.scale = UNIT; o.law.pWarm = 0; return { o, cal: UNIT }; };
+		await r.request();
+		await new Promise((res) => setTimeout(res, 50));
+		const response = { ...asst([{ type: "text", text: "done" }]), timestamp: Date.now(), usage: { ...usage, input: 50_000, totalTokens: 50_050 } };
+		const id = r.sm.appendMessage(response);
+		const stale = estimateProjectedContextTokens(r.sm.buildSessionProjection(), r.sm.getBranch()).tokens;
+		const drafts = await r.turnEnd(id, response);
+		const compaction = r.sm.getBranch().findLast((e: Any) => e.type === "compaction") as Any;
+		expect(compaction).toBeDefined();
+		expect(drafts[0].type).toBe("context_edit"); // the preceding handler's draft is applied before pi-zip's first draft
+		expect(drafts[1].type).toBe("compaction");
+		expect(compaction.tokensBefore).not.toBe(stale);
+		const notice = r.sm.getBranch().findLast((e: Any) => e.customType === "pi-zip/notice" && !e.data?.kind) as Any;
+		expect(notice.data.before).toBe(compaction.tokensBefore);
+		await r.shutdown();
+	});
+});
 
 describe("mixed room boundary", () => {
 	test("carried views and one notice follow the real Pi requests across the room boundary", async () => {
@@ -1010,7 +1090,7 @@ describe("round 5 on real Pi: rule A starts the warm summary early, nobody waits
 // no-UI behaviour moves, and each move is justified in its commit: 0.3.1's (0907ceea..., 0.3.0's decisions with 0.3.1's format, where
 // these scenarios waited for their summaries in line) became this one when 0.4.0 stopped waiting.
 describe("no UI (pi -p, json): the requests and the session of three scenarios hash to a recorded digest", () => {
-	const NOUI_DIGEST = "1b62cac6f4279964e13bb38c03cc5885"; // R5_PRINT_DIGEST=1 prints it (0.3.1: 0907ceeacca2be4a8b8f684dd6a47a96)
+	const NOUI_DIGEST = "b473737be61fd0e62b0259d639815cd3"; // R5_PRINT_DIGEST=1 prints it (0.3.1: 0907ceeacca2be4a8b8f684dd6a47a96)
 	const sleep = (ms: number) => new Promise((res) => setTimeout(res, ms));
 	const shifted = (agoMs: number, prose: number) => {
 		const sm = SessionManager.inMemory(CWD);

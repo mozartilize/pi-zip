@@ -62,19 +62,20 @@ export function keepRecentTokensFor(settings: Any, model: Any): number {
 
 /** Pi's boundary compaction meter: newest valid usage plus trailing messages, else the projected chars/4 estimate.
  *  Like Pi's estimateProjectedContextTokens, a later fold or compaction invalidates that usage. */
-export function piContextTokens(entries: Any[], branch: Any[]): number {
+export function piContextTokens(entries: Any[], branch: Any[], drafts: Any[] = []): number {
 	const messages = entries.flatMap((e) => e.messages ?? []);
 	const usage = (m: Any) => {
 		const u = m?.role === "assistant" && !dropped(m) ? m.usage : null;
 		return u ? Number(u.totalTokens) || (Number(u.input) || 0) + (Number(u.output) || 0) + (Number(u.cacheRead) || 0) + (Number(u.cacheWrite) || 0) : 0;
 	};
-	const invalid = branch.reduce((at, e, i) => e.type === "context_edit" || e.type === "compaction" ? i : at, -1);
+	const staged = [...branch, ...drafts];
+	const invalid = staged.reduce((at, e, i) => e.type === "context_edit" || e.type === "compaction" ? i : at, -1);
 	let n = 0, usageAt = -1, usageId = "";
 	for (const e of entries) for (const m of e.messages ?? []) {
 		if (usage(m) > 0) { usageAt = n; usageId = e.sourceEntry?.id; }
 		n++;
 	}
-	if (usageAt >= 0 && branch.findIndex((e) => e.id === usageId) > invalid) {
+	if (usageAt >= 0 && staged.findIndex((e) => e.id === usageId) > invalid) {
 		return usage(messages[usageAt]) + messages.slice(usageAt + 1).reduce((t, m) => t + piTokensOf(m), 0);
 	}
 	const system = collapseSystem(messages);
@@ -237,7 +238,7 @@ function requestEst(branch: Any[], id: string): number | null {
 		const e = branch[i];
 		if ((e?.type === "message" && e.message?.role !== "toolResult")) break;
 		if (e?.type === "custom" && e.customType === COMMIT_CUSTOM) {
-			if (e.data?.carried) for (let j = at + 1; j < i; j++) if (branch[j]?.type === "context_edit") edit.set(branch[j].targetId, branch[j].replacement);
+			if (e.data?.carried) for (let j = at + 1; j < i; j++) if (branch[j]?.type === "context_edit" && (!e.data.carriedIds || e.data.carriedIds.includes(branch[j].targetId))) edit.set(branch[j].targetId, branch[j].replacement);
 			break;
 		}
 	}
@@ -268,7 +269,7 @@ export function calibrate(entries: Any[], sys?: SysInfo, branch: Any[] = [], mod
 	const resp: Resp[] = [];
 	const sysMsgs: Any[] = [];
 	const edits: { at: number; target: string; foreign: boolean }[] = [];
-	const marks: { at: number; carried: boolean }[] = []; // pi-zip's commit entries: who first carried the edits right before them (run.ts commit)
+	const marks: { at: number; carried: boolean; carriedIds?: string[] }[] = []; // pi-zip's commit entries: who first carried the edits right before them (run.ts commit)
 	const orig = new Map<string, { at: number; d: number }>(); // edited entries: tokens their originals add back
 	const withMsgs: number[] = [0]; // withMsgs[k]: entries before k that carry messages (a commit group has none inside it)
 	let est = 0, sysAt = 0; // sysAt: responses before the newest system message
@@ -278,7 +279,7 @@ export function calibrate(entries: Any[], sys?: SysInfo, branch: Any[] = [], mod
 		// an edit with a replacement that is not our placeholder is another extension's (never carried by a request of ours); one without
 		// (a bare entry) is judged by the size heuristics below
 		if (src?.type === "context_edit") edits.push({ at, target: src.targetId, foreign: "replacement" in src && !textOf(src.replacement?.content).startsWith(PH_MARK) });
-		if (src?.type === "custom" && src.customType === COMMIT_CUSTOM) marks.push({ at, carried: !!src.data?.carried });
+		if (src?.type === "custom" && src.customType === COMMIT_CUSTOM) marks.push({ at, carried: !!src.data?.carried, carriedIds: src.data?.carriedIds });
 		if (src?.type === "message" && msgs.length === 1 && msgs[0] !== src.message) orig.set(src.id, { at, d: wireTokensOf(src.message) - wireTokensOf(msgs[0]) });
 		for (const m of msgs) {
 			if (m?.role === "system") { sysMsgs.push(m); sysAt = resp.length; continue; }
@@ -315,7 +316,7 @@ export function calibrate(entries: Any[], sys?: SysInfo, branch: Any[] = [], mod
 			const t = orig.get(x.target);
 			if (x.at <= resp[i].at || !t || t.at >= resp[i].at) continue;
 			const m = x.foreign ? undefined : markOf(x.at);
-			if (m ? m.carried && respBefore(m.at) === i : !x.foreign && legacy) continue;
+			if (m ? m.carried && (!m.carriedIds || m.carriedIds.includes(x.target)) && respBefore(m.at) === i : !x.foreign && legacy) continue;
 			d += t.d;
 		}
 		return d;
@@ -574,6 +575,7 @@ export interface RunPlan {
 	ms: number;
 	scale: Scale; // the token scale the plan was made with (stats and notices of this run use the same one)
 	persisted: boolean;
+	carriedIds?: Set<string>; // a mixed boundary plan: folds already carried by the request
 	sent?: boolean; // a request view carrying this plan's folds has gone out
 	noticeTs?: number; // the first request carrying the folds (their notice may wait for the boundary)
 	applied?: Set<string>; // entry ids whose fold the latest request view actually carried (what turn_end must persist, no more)
@@ -585,6 +587,7 @@ export interface RunPlan {
 }
 
 export interface PlanOpts {
+	carriedFolds?: readonly FoldTarget[]; // already sent folds: retain their exact placeholders when pricing the boundary edit
 	law?: Law; // prices, g and P(warm): the only input that depends on P; default: the explicit class ratios at P = 0
 	pause?: boolean; // a return after a pause (the absence outlived the requested cache lifetime) or a model switch: the previous user turn's re-readable outputs may fold
 	trace?: (LawTerms & { where: "summary" | "plan"; cut?: boolean; ready?: boolean; key?: string })[]; // every law evaluation is pushed here (ledger)
@@ -678,7 +681,8 @@ export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
 	if (!(ctxEst > coldCap)) return null; // below the working view nothing is planned (I6)
 	const trig = law.pWarm < 0.5 ? "cold" : "valve"; // a label for the ledger and the summary's trigger only
 	const tokOverride = new Map<number, number>();
-	const folds: FoldTarget[] = [];
+	const folds: FoldTarget[] = [...(o.carriedFolds ?? [])].filter((t) => blocks.some((b) => b.entryId === t.entryId && !b.edited));
+	for (const t of folds) tokOverride.set(blocks.findIndex((b) => b.entryId === t.entryId), t.phTokens);
 	const visOfBlock: number[] = []; // block idx -> index among the non-system projected messages (the numbering a request view uses)
 	{
 		let vis = 0;
@@ -724,7 +728,7 @@ export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
 	const savings = () => folds.reduce((a, t) => a + t.entryTokens - t.phTokens, 0);
 	// the eligible outputs, class by class, each biggest first, until the view is at the working size: inside one rewrite a fold beyond
 	// it would hide work for no saving the law asked for
-	let est = ctxEst;
+	let est = ctxEst - savings();
 	const take = (list: Block[], tag: string) => {
 		for (const b of list.sort((x, y) => y.tokens - x.tokens)) {
 			if (est <= coldCap) return;
@@ -797,7 +801,7 @@ export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
 			cutIdx = pick;
 			prefixTokens = pre[pick];
 			summaryTokensPlanned = S(pre[pick]);
-			for (let i = folds.length - 1; i >= 0; i--) if (foldAt[i] < pick) { tokOverride.delete(foldAt[i]); folds.splice(i, 1); foldAt.splice(i, 1); } // the prefix is replaced: its folds are void
+			for (let i = folds.length - 1; i >= 0; i--) if (foldAt[i] < pick && !o.carriedFolds?.some((t) => t.entryId === folds[i].entryId)) { tokOverride.delete(foldAt[i]); folds.splice(i, 1); foldAt.splice(i, 1); } // prefix folds are void, except sent folds retained for request calibration
 			return true;
 		};
 		if (pinned !== undefined) return cuts.some((pick) => take(pick, true)); // adopt's cut a <= c: its call may be spent

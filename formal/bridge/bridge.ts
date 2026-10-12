@@ -389,6 +389,7 @@ async function runTrace(tr: Any): Promise<Any> {
 		clock = end;
 		phase = "present";
 	}
+	let incomingDrafts: Any[] = [];
 	const boundaryCtx = (manager: Any) => {
 		const p = manager.buildSessionProjection();
 		return { contextEntries: p.entries, contextMessages: p.messages, llmMessages: convertToLlm(p.messages), pendingMessages: [], canContinue: false };
@@ -487,7 +488,8 @@ async function runTrace(tr: Any): Promise<Any> {
 	 *  not, the first plan stands and the pinned attempt is dropped. */
 	function decisions(caps: Any[], room = false): Any[] {
 		const out: Any[] = [];
-		for (const c of caps) {
+		for (const captured of caps) {
+			const c = { ...captured, o: { ...captured.o, scale: captured.live.scale, carriedFolds: captured.live.carriedFolds } };
 			// a cut with no ready summary gives way to its folds alone (core.ts unready): that plan is the decision, except at the room
 			// wait (a turn_end still at Pi's compaction room), whose decision is the plan with its own cut
 			if (c.o.foldsOnly && room) continue;
@@ -902,12 +904,16 @@ async function runTrace(tr: Any): Promise<Any> {
 		optsSink = [];
 		const nc1 = narrativeCalls.length;
 		const rp = z?.runPlan, rpWasPersisted = !!rp?.persisted, rpSent = !!rp?.sent;
-		const te = await fire(live, "turn_end", { type: "turn_end", turnIndex: reqInRun, message: asst, toolResults, messageEntryId: aid, toolResultEntryIds: [], context: boundaryCtx(sm), entries: [] });
-		const drafts: Any[] = te?.entries ?? [];
+		const incoming = incomingDrafts.splice(0);
+		const staged = incoming.length ? SessionManager.inMemory(WORK, undefined, [sm.getHeader(), ...sm.getBranch()]) : sm;
+		applyDrafts(staged, incoming);
+		const te = await fire(live, "turn_end", { type: "turn_end", turnIndex: reqInRun, message: asst, toolResults, messageEntryId: aid, toolResultEntryIds: [], context: boundaryCtx(staged), entries: incoming });
+		const drafts: Any[] = te?.entries ?? incoming;
+		const ours = drafts.slice(incoming.length);
 		const exactIssues: string[] = nativeIssues.splice(0);
 		const compaction = drafts.find((d: Any) => d.type === "compaction" && d.details?.by === "pi-zip");
-		const piBefore = estimateProjectedContextTokens(sm.buildSessionProjection(), sm.getBranch()).tokens;
-		if (compaction && drafts[0] !== compaction) exactIssues.push("the compaction was not the first boundary draft");
+		const piBefore = estimateProjectedContextTokens(staged.buildSessionProjection(), staged.getBranch()).tokens;
+		if (compaction && drafts[incoming.length] !== compaction) exactIssues.push("the compaction was not the first boundary draft");
 		if (runStart && runPlan?.cut && !runPlan.native) exactIssues.push("a summary was applied request-locally");
 		const teGrids = decisions(optsSink.filter((c: Any) => !c.pending), sink.some((x: Any) => x.type === "room_wait")).map((c: Any) => gridFor({ ...c, at: c.produce ? "produce" : "turn_end" }));
 		const teLedger = sink.map(slim);
@@ -923,14 +929,20 @@ async function runTrace(tr: Any): Promise<Any> {
 		const committedSent = !!rp && rpSent && !rpWasPersisted && !!rp.persisted;
 		const roomCut = sink.some((x: Any) => x.type === "room_wait") ? compaction?.firstKeptEntryId : undefined;
 		const boundaryCut = compaction?.firstKeptEntryId;
+		// The boundary may add folds that became eligible since the request; compare their declared replacements too.
+		const expected = new Map<string, string>();
+		for (const d of drafts) if (d.type === "context_edit" && !rp?.applied?.has(d.targetId)) {
+			const original = sm.getBranch().find((e: Any) => e.id === d.targetId)?.message;
+			if (original) expected.set(d.targetId, sha(llmJson({ ...original, content: d.replacement.content })));
+		}
 		if (committedSent && boundaryCut) {
 			// the room wait's summary went in with the run plan (the unified turn_end decision): what it keeps must be exactly what the request sent
 			const now = describeView(sm.buildSessionContext().messages, sm);
 			const k = desc.findIndex((d: Any) => d.id === boundaryCut), off = now.findIndex((d: Any) => d.id === boundaryCut);
-			persistOk = k >= 0 && off >= 0 && desc.slice(k).every((d: Any, i: number) => now[off + i]?.h === d.h);
+			persistOk = k >= 0 && off >= 0 && desc.slice(k).every((d: Any, i: number) => now[off + i]?.h === (expected.get(d.id) ?? d.h));
 		} else if (committedSent && drafts.some((d: Any) => d.type === "context_edit" || d.type === "compaction")) {
 			const now = describeView(sm.buildSessionContext().messages, sm).map((d: Any) => d.h);
-			persistOk = desc.every((d: Any, i: number) => now[i] === d.h);
+			persistOk = desc.every((d: Any, i: number) => now[i] === (expected.get(d.id) ?? d.h));
 		}
 		const t: Any = {
 			exactIssues,
@@ -940,8 +952,8 @@ async function runTrace(tr: Any): Promise<Any> {
 			view: desc, zipNew, env: envSince, state0, lossless: lossIssues,
 			runPlan: runStart && runPlan ? { source: runPlan.source, folds: runPlan.folds.map((f: Any) => f.entryId), cut: runPlan.cut?.firstKeptEntryId ?? runPlan.native?.firstKeptEntryId ?? null, native: !!runPlan.native } : null,
 			runLedger, teLedger,
-			drafts: drafts.map((d: Any) => (d.type === "context_edit" ? { type: d.type, target: d.targetId } : d.type === "compaction" ? { type: d.type, firstKept: d.firstKeptEntryId } : { type: d.type, customType: d.customType })),
-			persistOk, teValve: (!committedSent || !!boundaryCut) && drafts.some((d: Any) => d.type === "context_edit" || d.type === "compaction"), runRoom: committedSent && !!roomCut,
+			drafts: ours.map((d: Any) => (d.type === "context_edit" ? { type: d.type, target: d.targetId } : d.type === "compaction" ? { type: d.type, firstKept: d.firstKeptEntryId } : { type: d.type, customType: d.customType })),
+			persistOk, teValve: (!committedSent || !!boundaryCut) && ours.some((d: Any) => d.type === "context_edit" || d.type === "compaction"), runRoom: committedSent && !!roomCut,
 			// the narrative model calls since the previous request's turn_end (away, at the previous turn_end, in this run plan)
 			narr: narrativeCalls.slice(ncSeen, nc1).filter((c) => c.phase !== "probe").map((c) => ({ input: c.input, output: c.output, away: c.phase === "away" })),
 			waitRun: narrativeCalls.slice(nc0, nc1).filter((c) => c.phase === "present").length,
@@ -987,13 +999,15 @@ async function runTrace(tr: Any): Promise<Any> {
 		envSince.push("compact");
 	}
 	/** Another context manager prunes the oldest output the model still sees verbatim (a context_edit that is not pi-zip's). */
-	function foreignEdit() {
+	function foreignEdit(boundary = false) {
 		const proj = sm.buildSessionProjection();
 		for (const pe of proj.entries) {
 			const src = pe.sourceEntry;
 			const m = pe.messages?.[0];
 			if (src?.type !== "message" || m?.role !== "toolResult" || textOfMsg(m).startsWith(PH_MARK) || foreignEdited.has(src.id) || toolOf.get(src.id) === "recall") continue;
-			sm.appendContextEdit(src.id, { content: [{ type: "text", text: `[pruned by another extension: ${textOfMsg(m).length} chars]` }] });
+			const replacement = { content: [{ type: "text", text: `[pruned by another extension: ${textOfMsg(m).length} chars]` }] };
+			if (boundary) incomingDrafts.push({ type: "context_edit", targetId: src.id, replacement });
+			else sm.appendContextEdit(src.id, replacement);
 			foreignEdited.add(src.id);
 			envSince.push("edit");
 			return;
@@ -1172,6 +1186,9 @@ async function runTrace(tr: Any): Promise<Any> {
 				}
 				case "compact":
 					await piOwnCompaction(ev);
+					break;
+				case "boundaryedit":
+					foreignEdit(true);
 					break;
 				case "edit":
 					foreignEdit();

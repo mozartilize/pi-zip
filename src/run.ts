@@ -6,9 +6,9 @@ import { dirname, join } from "node:path";
 import { lastMessageMs, lastPrompt, modelKey, payloadRetention, refused, ttlFor } from "./cache.ts";
 import { agentDir, curve, describe, lawPrices, loadStats, pWarm, record, sample, statsPath, GAP_EDGES, type Entry } from "./learn.ts";
 import { repairPayload } from "./guard.ts";
-import { adopt, checkEdits, clock, decideRun, inRunClock, want, decideTurnEnd, grow, headOf, lastRegrow, planOpts, readyOf, runPlanOf, scaleOf, summarizedSince, unusedOf, valvePlanOf, SUMMARY_CUSTOM, type Artifact, type Avail, type Env, type Learned } from "./core.ts";
+import { candidateOf, decideEdits, checkEdits, clock, decideRun, inRunClock, want, decideTurnEnd, grow, headOf, lastRegrow, planOpts, readyOf, runPlanOf, scaleOf, summarizedSince, unusedOf, valvePlanOf, SUMMARY_CUSTOM, type Artifact, type Avail, type Env, type Learned } from "./core.ts";
 import { fmtK, Stats, noticeDesc, noticeText, type NoticeAction, type NoticeData, type ZipControl } from "./notice.ts";
-import { applyPlanToMessages, buildBlocks, countUserTurns, G0, keepRecentTokensFor, piCanCompact, piContextTokens, planContext, reserveTokensFor, sizeOf, UNIT, type Block, type Cut, type FoldTarget, type PlanOpts, type PlanResult, type RunPlan, type Scale, type SysInfo } from "./plan.ts";
+import { applyPlanToMessages, buildBlocks, countUserTurns, G0, keepRecentTokensFor, piCanCompact, piContextTokens, reserveTokensFor, sizeOf, UNIT, type Block, type Cut, type FoldTarget, type PlanOpts, type PlanResult, type RunPlan, type Scale, type SysInfo } from "./plan.ts";
 import { handleFor, PH_MARK, RECALL_TOOL } from "./placeholder.ts";
 import { branchOutputs, recalledHandlesFromBranch, resolveHandlesInBranch } from "./recall.ts";
 import { cleanupRecall, commandNamesRecall, fileRecallFor, materialize, parseRecallPath, recallRoot, recallRootShown, rewriteCommand, sidDir, type FileRecall } from "./recallfile.ts";
@@ -757,19 +757,13 @@ export class Zip implements ZipControl {
 			this.nativeNote = { native: reason };
 			this.ledger({ type: "native_skip", reason });
 		};
-		// a warm return right after a request that carried an edit makes none (b2b): the run plan would not adopt it either
-		if (!this.cold && this.justEdited) return skip("a warm return right after an edited request makes no edit (b2b)");
-		// Choose the joint edit with the prompt Pi is about to append; a produced cut must be no deeper than this plan.
-		// Its summary enters natively and its folds become the run plan, without another law decision.
-		const pending = pendingPrompt(e);
-		const entries = pending ? [...pre, pending] : pre;
-		const ready = this.ready(branch);
-		const keys = ready.map((a) => a.key);
-		const mk = (cutAt?: string) => {
-			const { o, cal } = this.opts(ctx, !pending, entries, this.pWarm, this.pause, cutAt, false, keys);
-			return { o, cal, p: planContext(entries, o) };
-		};
-		const { o, cal, p } = this.adopted(mk(), mk, "native", ready);
+		// Select once with the prompt Pi is about to append; its jointly priced folds become the first request's plan.
+		const pending = pendingPrompt(e), entries = pending ? [...pre, pending] : pre;
+		const d = decideEdits({ at: "native", justEdited: this.justEdited, pWarm: this.pWarm, entries, ready: this.ready(branch),
+			opts: (cutAt, foldsOnly, ready) => this.opts(ctx, !pending, entries, this.pWarm, this.pause, cutAt, foldsOnly, ready) });
+		for (const n of d.notes) this.ledger(n);
+		if (d.kind === "b2b") return skip("a warm return right after an edited request makes no edit (b2b)");
+		const { o, cal, p } = d;
 		const art = p && p.cutIdx !== null ? readyOf(branch, this.mine).find((a) => a.key === p.firstKeptEntryId) : undefined;
 		if (!p || !art?.cut) return skip(!p || p.cutIdx === null ? "the summary does not fit this plan: the plan at the prompt has no cut" : this.bg?.key === p.firstKeptEntryId ? "summary not finished when the prompt came" : "the summary does not fit this plan: the plan at the prompt cuts elsewhere");
 		const cut = art.cut;
@@ -908,13 +902,6 @@ export class Zip implements ZipControl {
 		const b = this.bg;
 		if (b && b.head === headOf(branch) && !out.some((a) => a.key === b.key)) out.push({ key: b.key, running: true });
 		return out;
-	}
-
-	/** The plan `first`, or the plan cutting where a produced summary cuts that is not deeper (core.ts adopt), logged. */
-	private adopted<T extends { p: PlanResult | null }>(first: T, mk: (cutAt: string) => T, where: string, avail: Avail[]): T {
-		const { r, note } = adopt(first, mk, avail, where);
-		if (note) this.ledger(note);
-		return r;
 	}
 
 	/** The ready summaries of this branch, as plans take them (a call still running is not ready: nobody waits for it). */
@@ -1072,8 +1059,7 @@ export class Zip implements ZipControl {
 			const w = want({ at: decision ? "decision" : at, now, lastTouch: Math.max(this.lastReqMs, lastMessageMs(branch)), ttlMs, avail: this.avail(branch), candidate,
 				survival: (g) => process.env.PI_ZIP_TTL_SECS ? (g <= ttlMs / 1000 ? 1 : 0) : pWarm(this.ent, g, ttlMs / 1000).p,
 				plan: (p, pause, have) => {
-					const keys = have.map((a) => a.key), mk = (cutAt?: string) => ({ p: planContext(view, this.opts(ctx, true, view, p, pause, cutAt, false, keys).o) });
-					return adopt(mk(), mk, have, "want").r.p;
+					return candidateOf(view, (cutAt, foldsOnly, ready) => this.opts(ctx, true, view, p, pause, cutAt, foldsOnly, ready), have, "want").r.p;
 				}, latency: (p) => this.ent?.call ? this.ent.call.ms * p.prefixTokens / this.ent.call.tokens : 0,
 			});
 			if (!decision) this.cancelTimer();
@@ -1220,10 +1206,8 @@ export class Zip implements ZipControl {
 		}
 		if (!p && !runPlan) return undefined;
 		if (cut) this.discardBg("replaced");
-		const plan = runPlan
-			? { ...runPlan, cut, ...(cut ? { untouched: runPlan.scale.O, waitMs, ready: ready ? "background" as const : undefined } : {}) }
-			: valvePlanOf(p!, cut, ready, waitMs, performance.now() - t0);
-		if (runPlan && cut) plan.ctxAfter -= plan.scale.c * (cut.prefixTokens - cut.summaryTokens);
+		const plan = p ? { ...valvePlanOf(p, cut, ready, waitMs, performance.now() - t0),
+			...(runPlan ? { source: runPlan.source, sent: runPlan.sent, carriedIds: runPlan.applied, native: runPlan.native, noticed: runPlan.noticed, noticeTs: runPlan.noticeTs } : {}) } : runPlan!;
 		const out = this.commit(e, ctx, plan, o);
 		if (runPlan) runPlan.persisted = plan.persisted;
 		return out;
@@ -1263,7 +1247,7 @@ export class Zip implements ZipControl {
 	private commit(e: Any, ctx: Any, plan: RunPlan, o: { t0: number; blocks: Block[]; userTurns: number; usageTotal: number }) {
 		plan.persisted = true;
 		const sc = plan.scale, c = sc.c; // one scale for the whole run: stats, notices and the ledger agree with what the plan compared against the limits
-		const ctxTokens = plan.cut ? piContextTokens(e.context.contextEntries, this.branch(ctx)) : sizeOf(sc, o.blocks.reduce((a, b) => a + b.tokens, 0));
+		const ctxTokens = plan.cut ? piContextTokens(e.context.contextEntries, this.branch(ctx), e.entries) : sizeOf(sc, o.blocks.reduce((a, b) => a + b.tokens, 0));
 		const byId = new Map(o.blocks.map((b) => [b.entryId, b]));
 		const wasApplied = (t: FoldTarget) => !plan.applied || plan.applied.has(t.entryId); // persist what the requests actually carried
 		const live = plan.folds.filter((t) => byId.has(t.entryId) && wasApplied(t));
@@ -1287,13 +1271,14 @@ export class Zip implements ZipControl {
 			return undefined;
 		}
 		const sentBefore = !!plan.sent;
-		if (!sentBefore || cut) this.nextEdit = plan.untouched ?? 0; // a new room summary is first sent with the next request
+		const mixed = sentBefore && plan.carriedIds && live.some((t) => !plan.carriedIds!.has(t.entryId));
+		if (!sentBefore || cut || mixed) this.nextEdit = plan.untouched ?? 0; // a new room summary is first sent with the next request
 		const ours: Any[] = live.map((t) => ({ type: "context_edit", targetId: t.entryId, replacement: { content: [{ type: "text", text: t.ph }] } }));
 		for (const t of live) if (t.toolCallId) this.foldedCalls.set(t.toolCallId, handleFor(t.entryId));
 		// the compaction draft goes FIRST: Pi writes its tokensBefore from the newest usage only while no edit follows that usage, so a
 		// fold drafted before it would make Pi's "Compacted from N tokens" the chars/4 of a half-applied projection (research pi-tricks §1a)
 		if (cut) ours.unshift({ type: "compaction", summary: cut.text, firstKeptEntryId: cut.firstKeptEntryId, details: { by: PRODUCT, trigger: cut.trigger, carried: false, regrow }, usage: cut.usage });
-		ours.push({ type: "custom", customType: COMMIT_CUSTOM, data: { carried: sentBefore, ...(cut && sentBefore ? { next: true } : {}) } }); // says who first carried these edits (state.ts, plan.ts calibrate)
+		ours.push({ type: "custom", customType: COMMIT_CUSTOM, data: { carried: sentBefore, ...((cut || mixed) && sentBefore ? { next: true } : {}), ...(mixed ? { carriedIds: [...plan.carriedIds!] } : {}) } }); // says who first carried these edits (state.ts, plan.ts calibrate)
 		const before = Math.round(c * live.reduce((a, t) => a + t.entryTokens, 0));
 		const after = Math.round(c * live.reduce((a, t) => a + t.phTokens, 0));
 		const cutSaved = cut ? Math.round(c * (cut.prefixTokens - cut.summaryTokens)) : 0;
