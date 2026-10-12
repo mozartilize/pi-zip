@@ -170,7 +170,7 @@ pub fn describe_tick(r: &Run, i: usize) -> String {
         let _ = write!(out, " · plan: no edit");
     }
     let waited = t.wait_run > 0 || (i > 0 && r.tick(i - 1).wait_te > 0);
-    if waited && r.trace.world.interactive {
+    if waited {
         let _ = write!(out, " · the user waits for a summary call");
     }
     if !t.env.is_empty() {

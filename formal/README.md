@@ -94,17 +94,14 @@ say 100
 |---|---|---|
 | A1 | nothing is lost | □ nothing_lost: the request carries the session's conversation **by position**, one to one and in order from its first kept message to the newest (a summary may stand for a prefix, nothing in between may go missing); every message except a folded output or a summary goes out byte for byte (user text, tool args, system prompt, thinking); pi-zip's request guard does not have to rewrite the payload (an edit that broke a tool_use / tool_result pair); **every folded block names its handle and shows its key lines** (first, last, the error line, as README rule 1 says); every output the model does not see verbatim comes back byte for byte **the way the model gets it back**: `zip_recall(handle)` as the tool executes it, all pages, or a `read` of the recall file the placeholder names (through pi-zip's `tool_call` hook), and in reread-only mode only re-readable outputs fold; a user request pi-zip summarised away is quoted verbatim |
 | A2 | edit only when the cache is gone or the edit pays | □ (zip_edit → pays): the law's own model, **at the class ratios of the true cache class and tier** (not the planner's prices) and **at the request's real sizes** (B: what the request would have sent without the edit; A: what it sent), with the summary call priced as what it is (uncached read of the conversation the cut replaces, without the carried previous summary, plus the summary written), says the edit costs no more than not editing (10% tolerance: the planner's calibrated estimate). At P < 0.5 folds are free (lemma C), and a summary must also pay its call at its own margin (what the cut removes beyond the folds): no decision is excused for being cold |
-| A3 | never in the way | □ (user_waits → at_room ∨ switched): the user waits for a summary call only at Pi's compaction room or at a return a model switch made cold; never for a warm plan below the room (round 5, rule B: the summary is written in the background and taken once it is ready) |
+| A3 | never in the way | □ (user_waits → at_room): nobody waits for a summary call except at Pi's compaction room, with a UI or without (sub-agents too). A summary is written in the background (away, at the end of a run, or produced when a decision wants one that is not ready) and taken at the first decision after it is ready; that decision goes with its folds alone meanwhile (0.4.0 step 4: 0.3.1's excuses, a no-UI session and a return a model switch made cold, are gone) |
 
-**A3 is a product decision.** Round 5 (rules A and B, TRIAGE.md) narrowed it: no warm wait below the room is excused, at a prompt or at
-a turn_end; the summary is written in the background and adopted later. The paragraph below is the round-2 reasoning it narrows. README rule 3's "the same inequality prices the
-extra model call in" (at a cold return and in the warm valve alike) is about how a summary call is *priced*, not about when the user
-may wait for one. The spec allows a wait only where nothing better exists: at Pi's compaction room (Pi would make the user wait
-anyway), at a turn_end valve (mid-run: the user is already waiting for the agent, and the context crossed the target during the
-run, so nothing could be prepared), and at a return a switch made cold (the cache dies at the prompt). A warm return's run plan is
-**not** excused: the user just sent a prompt to a warm cache and waits for a summary that the cold plan before could have made, or
-that the next turn_end valve could make (B2). The first round excused any decision at P(warm) ≥ 0.5, so A3 passed on
-`traces/b2.trace`, where the user waits at request 2.
+**A3 is a product decision** (axiom IV: you never wait for pi-zip). Round 5 (rules A and B) narrowed it to warm plans; 0.4.0 removes
+every synchronous summary: the run-plan summary at a return, the valve summary at a turn_end, the wait for the remainder of a call
+already running, and rule B. A plan whose summary is not ready goes with its folds alone, judged by the law, and the summary is
+produced in the background. The one wait left is the room's: a turn_end whose view after its edit is still at Pi's compaction room
+waits for the plan's own cut (the call already running for it, or a new one), since Pi would stop for its own, lossy compaction
+otherwise. The round-2 excuses (a turn_end valve mid-run, a return a switch made cold, a print-mode session) are gone.
 
 ## Derived properties
 

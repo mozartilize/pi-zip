@@ -1,6 +1,6 @@
 // The pure decision core (src/core.ts): view, clock, law, plan and decide as functions of (branch, Λ, now).
 import { describe, expect, test } from "bun:test";
-import { checkEdits, clock, coldReturnAfter, inRunClock, decideRun, decideSettle, decideTurnEnd, adopt, artifactsOf, grow, headOf, lastRegrow, lawOf, planOpts, readyOf, ruleB, unusedOf, runPlanOf, scaleOf, summarizedSince, valvePlanOf, type Env, type Learned } from "../src/core.ts";
+import { checkEdits, clock, coldReturnAfter, inRunClock, decideRun, decideSettle, decideTurnEnd, adopt, artifactsOf, grow, headOf, lastRegrow, lawOf, planOpts, readyOf, unready, unusedOf, runPlanOf, scaleOf, summarizedSince, valvePlanOf, type Env, type Learned } from "../src/core.ts";
 import { planContext, UNIT, type PlanResult } from "../src/plan.ts";
 import { replayGrowth } from "../src/state.ts";
 import { A, AX, R, U, type Any } from "./helpers.ts";
@@ -131,74 +131,106 @@ describe("core: plan", () => {
 
 describe("core: decide", () => {
 	const plan = (o: Any) => ({ atRoom: false, atRoomUnedited: false, firstKeptEntryId: "k", ...o }) as PlanResult;
-	test("ruleB: no UI or the room waits; a summary for this cut is taken when ready, else left running; otherwise started", () => {
-		expect(ruleB(plan({}), false, [])).toBe("wait");
-		expect(ruleB(plan({ atRoom: true }), true, [])).toBe("wait");
-		expect(ruleB(plan({ atRoomUnedited: true }), true, [])).toBe("wait");
-		expect(ruleB(plan({}), true, [{ key: "k", running: false }])).toBe("take");
-		expect(ruleB(plan({}), true, [{ key: "k", running: true }])).toBe("running");
-		expect(ruleB(plan({}), true, [{ key: "other", running: false }])).toBe("start");
-		expect(ruleB(plan({}), true, [])).toBe("start");
+	test("unready: a cut with a ready summary stands; one without gives way to its folds alone, and is produced", () => {
+		const r = { p: plan({ cutIdx: 3 }) };
+		const folds = { p: plan({ cutIdx: null, firstKeptEntryId: null }) };
+		expect(unready(r, [{ key: "k", running: false }], () => folds)).toEqual({ r, produce: null });
+		expect(unready(r, [{ key: "k", running: true }], () => folds)).toEqual({ r: folds, produce: r.p }); // running is not ready
+		expect(unready(r, [{ key: "other", running: false }], () => folds)).toEqual({ r: folds, produce: r.p });
+		expect(unready(folds, [], () => r)).toEqual({ r: folds, produce: null }); // no cut: nothing to produce
+		expect(unready({ p: null }, [], () => r)).toEqual({ r: { p: null }, produce: null });
 	});
-	const opts = (l: Learned, p: number, pause: boolean) => (entries: Any[], cutAt?: string) => planOpts(entries, [], env(), l, false, p, pause, cutAt);
-	test("decideRun: b2b only for a warm return right after an edit without a native summary; a cold return plans on the session", () => {
+	const opts = (l: Learned, p: number, pause: boolean) => (entries: Any[], cutAt?: string, foldsOnly?: boolean, ready?: readonly string[]) => planOpts(entries, [], env(), l, false, p, pause, cutAt, foldsOnly, ready);
+	test("decideRun: b2b only for a warm return right after an edit without a native summary (its summary is still produced); a cold return plans on the session", () => {
 		const l = lam({ justEdited: true });
-		expect(decideRun({ cold: false, justEdited: true, nat: null, foreign: false, now: big, avail: [], opts: opts(l, 1, false) }).kind).toBe("b2b");
-		const d = decideRun({ cold: true, justEdited: true, nat: null, foreign: false, now: big, avail: [], opts: opts(l, 0, true) });
+		const b = decideRun({ cold: false, justEdited: true, nat: null, foreign: false, now: big, ready: [], opts: opts(l, 1, false) });
+		expect(b.kind).toBe("b2b");
+		const d = decideRun({ cold: true, justEdited: true, nat: null, foreign: false, now: big, ready: [], opts: opts(l, 0, true) });
 		expect(d.kind).toBe("plan");
 		if (d.kind !== "plan") return;
 		expect(d.o.pause).toBe(true);
-		expect(d.p?.cutIdx).not.toBeNull();
-		expect(d.p!.folds.length).toBeGreaterThan(0);
 		expect(d.onPre).toBe(false);
 		expect(d.notes).toEqual([]);
+		// no ready summary: the folds alone go now, the cut is produced in the background (nobody waits)
+		expect(d.o.foldsOnly).toBe(true);
+		expect(d.p?.cutIdx).toBeNull();
+		expect(d.p!.folds.length).toBeGreaterThan(0);
+		expect(d.produce?.cutIdx).not.toBeNull();
+		const key = d.produce!.firstKeptEntryId!;
 		// pure: the same inputs give the same decision
-		const again = decideRun({ cold: true, justEdited: true, nat: null, foreign: false, now: big, avail: [], opts: opts(l, 0, true) });
-		expect(again.kind === "plan" && again.p?.firstKeptEntryId).toBe(d.p!.firstKeptEntryId);
+		const again = decideRun({ cold: true, justEdited: true, nat: null, foreign: false, now: big, ready: [], opts: opts(l, 0, true) });
+		expect(again.kind === "plan" && again.produce?.firstKeptEntryId).toBe(key);
+		// once it is ready the same return takes it, and produces nothing
+		const taken = decideRun({ cold: true, justEdited: true, nat: null, foreign: false, now: big, ready: [{ key, running: false }], opts: opts(l, 0, true) });
+		expect(taken.kind === "plan" && taken.p?.firstKeptEntryId).toBe(key);
+		expect(taken.kind === "plan" && taken.produce).toBeNull();
+		// a call still running is not ready: the folds alone, as without it
+		const running = decideRun({ cold: true, justEdited: true, nat: null, foreign: false, now: big, ready: [{ key, running: true }], opts: opts(l, 0, true) });
+		expect(running.kind === "plan" && running.p?.cutIdx).toBeNull();
 	});
 	test("decideRun: another extension's compaction just went in: folds only (no summary)", () => {
-		const d = decideRun({ cold: true, justEdited: false, nat: null, foreign: true, now: big, avail: [], opts: opts(lam(), 0, true) });
+		const d = decideRun({ cold: true, justEdited: false, nat: null, foreign: true, now: big, ready: [], opts: opts(lam(), 0, true) });
 		expect(d.kind === "plan" && d.o.noSummary).toBe(true);
 		expect(d.kind === "plan" && d.p?.cutIdx).toBeNull();
 	});
 	test("decideRun: a native summary whose cut the plan does not reach: the session as it is, with a note", () => {
-		const d = decideRun({ cold: false, justEdited: true, nat: { key: "nowhere", pre: big, entryId: "c9" }, foreign: false, now: small, avail: [], opts: opts(lam(), 1, false) });
+		const d = decideRun({ cold: false, justEdited: true, nat: { key: "nowhere", pre: big, entryId: "c9" }, foreign: false, now: small, ready: [], opts: opts(lam(), 1, false) });
 		expect(d.kind).toBe("plan");
 		if (d.kind !== "plan") return;
 		expect(d.onPre).toBe(false);
 		expect(d.notes).toEqual([{ type: "native_mismatch", planned: d.p?.firstKeptEntryId ?? null, compacted: "nowhere" }]);
 	});
 	test("runPlanOf: source settle / runstart / valve; the guard drops a cut that left the projection; sizes count the summary", () => {
-		const d = decideRun({ cold: true, justEdited: false, nat: null, foreign: false, now: big, avail: [], opts: opts(lam(), 0, true) });
-		if (d.kind !== "plan" || !d.p) throw new Error("no plan");
-		const base = { p: d.p, cal: d.cal, cold: true, onPre: false, native: null, nat: null, folds: d.p.folds, cut: null, adopted: false, settleIds: [] as string[], ms: 1, bgWaitMs: 0 };
+		const d = decideRun({ cold: true, justEdited: false, nat: null, foreign: false, now: big, ready: [], opts: opts(lam(), 0, true) });
+		if (d.kind !== "plan" || !d.produce) throw new Error("no plan");
+		const p = d.produce;
+		const base = { p, cal: d.cal, cold: true, onPre: false, native: null, nat: null, folds: p.folds, cut: null, adopted: false, settleIds: [] as string[], ms: 1 };
 		expect(runPlanOf(base).plan.source).toBe("runstart");
-		expect(runPlanOf({ ...base, settleIds: d.p.folds.map((t) => t.entryId) }).plan.source).toBe("settle");
+		expect(runPlanOf({ ...base, settleIds: p.folds.map((t) => t.entryId) }).plan.source).toBe("settle");
 		expect(runPlanOf({ ...base, cold: false }).plan.source).toBe("valve");
-		const cut = { firstKeptEntryId: d.p.firstKeptEntryId, prefixTokens: 1000, summaryTokens: 100, ms: 7 } as Any;
-		const r = runPlanOf({ ...base, cut });
+		const cut = { firstKeptEntryId: p.firstKeptEntryId, prefixTokens: 1000, summaryTokens: 100, ms: 7 } as Any;
+		const r = runPlanOf({ ...base, cut, adopted: true });
 		expect(r.cut).toBe(cut);
-		expect(r.plan.ctxAfter).toBeCloseTo(d.p.ctxAfterFolds - d.cal.c * 900, 6);
-		expect(r.plan.waitMs).toBe(7);
+		expect(r.plan.ctxAfter).toBeCloseTo(p.ctxAfterFolds - d.cal.c * 900, 6);
+		expect(r.plan.waitMs).toBe(0); // a run plan never waits: its summary is a ready one
 		const gone = runPlanOf({ ...base, cut: { ...cut, firstKeptEntryId: "gone" } });
 		expect(gone.cut).toBeNull();
 		expect(gone.drop).toMatchObject({ type: "guard_drop", where: "run_plan", summary: true });
-		expect(gone.folds).toEqual(d.p.folds); // the folds alone pass
+		expect(gone.folds).toEqual(p.folds); // the folds alone pass
 	});
 	test("decideTurnEnd: none after a failed turn, b2b after an edited request while warm, a plan only when it changes something", () => {
-		const o = (cutAt?: string) => planOpts(small, [], env(), lam(), false, 1, false, cutAt);
-		expect(decideTurnEnd({ failed: true, justEdited: false, pWarm: 1, avail: [], entries: small, opts: o }).kind).toBe("none");
-		expect(decideTurnEnd({ failed: false, justEdited: true, pWarm: 1, avail: [], entries: small, opts: o }).kind).toBe("b2b");
-		expect(decideTurnEnd({ failed: false, justEdited: true, pWarm: 0.2, avail: [], entries: small, opts: o }).kind).toBe("plan"); // a long tool call: the cache is believed gone
-		const d = decideTurnEnd({ failed: false, justEdited: false, pWarm: 1, avail: [], entries: small, opts: o });
+		const o = (cutAt?: string, foldsOnly?: boolean, ready?: readonly string[]) => planOpts(small, [], env(), lam(), false, 1, false, cutAt, foldsOnly, ready);
+		expect(decideTurnEnd({ failed: true, justEdited: false, pWarm: 1, ready: [], entries: small, opts: o }).kind).toBe("none");
+		expect(decideTurnEnd({ failed: false, justEdited: true, pWarm: 1, ready: [], entries: small, opts: o }).kind).toBe("b2b");
+		expect(decideTurnEnd({ failed: false, justEdited: true, pWarm: 0.2, ready: [], entries: small, opts: o }).kind).toBe("plan"); // a long tool call: the cache is believed gone
+		const d = decideTurnEnd({ failed: false, justEdited: false, pWarm: 1, ready: [], entries: small, opts: o });
 		expect(d.kind === "plan" && d.p).toBeNull();
 	});
-	test("valvePlanOf: a valve plan's sizes and the wait of its summary (adopted: the background wait)", () => {
+	test("decideTurnEnd: an unready summary is produced and its folds go alone; at Pi's compaction room the plan's own cut is the one wait", () => {
+		const at = (model: Any, ready: { key: string; running: boolean }[] = []) => {
+			const e = env({ model }), l = lam({ model });
+			return decideTurnEnd({ failed: false, justEdited: false, pWarm: 0, ready, entries: big, opts: (cutAt, foldsOnly, ready) => planOpts(big, [], e, l, false, 0, false, cutAt, foldsOnly, ready) });
+		};
+		const below = at(MODEL); // a 200K window: the view is far below the room
+		if (below.kind !== "plan") throw new Error("no plan");
+		expect(below.room).toBeNull();
+		expect(below.p?.cutIdx ?? null).toBeNull();
+		expect(below.produce?.cutIdx).not.toBeNull();
+		const key = below.produce!.firstKeptEntryId!;
+		const ready = at(MODEL, [{ key, running: false }]);
+		expect(ready.kind === "plan" && ready.p?.firstKeptEntryId).toBe(key); // ready: taken, nothing produced
+		expect(ready.kind === "plan" && ready.produce).toBeNull();
+		const tight = at({ ...MODEL, contextWindow: 60_000 }); // room 35,424: still above it after the folds alone
+		if (tight.kind !== "plan") throw new Error("no plan");
+		expect(tight.room?.cutIdx).not.toBeNull(); // wait for the plan's own cut
+		expect(tight.produce).toBeNull(); // the wait makes it: no background call besides
+	});
+	test("valvePlanOf: a valve plan's sizes, a ready summary (no wait) and the room wait", () => {
 		const p = planContext(big, planOpts(big, [], env(), lam(), false, 0, true).o)!;
 		const cut = { prefixTokens: 1000, summaryTokens: 100, ms: 7 } as Any;
 		expect(valvePlanOf(p, null, false, 0, 1)).toMatchObject({ source: "valve", cut: null, ctxAfter: p.ctxAfterFolds, persisted: false });
-		expect(valvePlanOf(p, cut, true, 42, 1)).toMatchObject({ waitMs: 42, ready: "background" });
-		expect(valvePlanOf(p, cut, false, 42, 1).waitMs).toBe(7);
+		expect(valvePlanOf(p, cut, true, 0, 1)).toMatchObject({ waitMs: 0, ready: "background" });
+		expect(valvePlanOf(p, cut, false, 42, 1).waitMs).toBe(42);
 	});
 	test("decideSettle: the cold plan always; the warm plan unless the newest request carried an edit", () => {
 		const x = (justEdited: boolean) => decideSettle({ justEdited, avail: [], entries: big, cold: () => planOpts(big, [], env(), lam(), true, 0, true), warm: (cutAt) => planOpts(big, [], env(), lam(), true, 1, false, cutAt) });

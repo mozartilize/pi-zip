@@ -110,7 +110,7 @@ Zip.prototype.sessionStart = function (this: Any, ctx: Any) {
 Zip.prototype.ledger = function (rec: Any) {
 	(this.__sink ?? sink).push(rec);
 };
-// a summary written in the background (Zip.startBg: the away timer, the first key, rules A and B) is no wait, whenever it runs: its model
+// a summary written in the background (Zip.startBg: the away timer, the first key, rule A, produce) is no wait, whenever it runs: its model
 // call is tagged through the async context it was started in (the bridge's narrative model answers at once, so timing cannot tell)
 const bgCall = new AsyncLocalStorage<boolean>();
 const origStartBg = (Zip.prototype as Any).startBg;
@@ -451,9 +451,20 @@ async function runTrace(tr: Any): Promise<Any> {
 	/** The decisions of one hook, as run.ts made them. A warm plan whose cut moved away from a summary written in the background is
 	 *  planned once more with `cutAt` (run.ts pinned): when that plan cuts there, it is the decision and the first plan is not; when it does
 	 *  not, the first plan stands and the pinned attempt is dropped. */
-	function decisions(caps: Any[]): Any[] {
+	function decisions(caps: Any[], room = false): Any[] {
 		const out: Any[] = [];
 		for (const c of caps) {
+			// a cut with no ready summary gives way to its folds alone (core.ts unready): that plan is the decision, except at the room
+			// wait (a turn_end still at Pi's compaction room), whose decision is the plan with its own cut
+			if (c.o.foldsOnly && room) continue;
+			if (c.o.foldsOnly) {
+				// the plan it replaced is the production decision (its cut is written in the background): kept as its own decision point
+				// ("produce"), so the law that priced that call is checked too (LW, PW, RC, MP)
+				const k = out.findLastIndex((x: Any) => x.pending === c.pending && x.mode === c.mode && x.o.cutAt === undefined && !x.o.foldsOnly && !x.produce);
+				if (k >= 0) out[k] = { ...out[k], produce: true };
+				out.push(c);
+				continue;
+			}
 			if (c.o.cutAt === undefined) {
 				out.push(c);
 				continue;
@@ -496,7 +507,7 @@ async function runTrace(tr: Any): Promise<Any> {
 			}
 			const c = r ? (r.scale?.c ?? r.k ?? 1) : 1;
 			const after = r ? r.ctxAfterFolds - (r.cutIdx !== null ? c * (r.prefixTokens - r.summaryTokensPlanned) : 0) : null;
-			out.push({ p, actual: p === actual, mode, plan: !!r, folds: r ? r.folds.map((f: Any) => f.entryId) : [], cut: r?.firstKeptEntryId ?? null, prefix: r ? c * r.prefixTokens : 0, sum: r ? c * r.summaryTokensPlanned : 0, before: r?.ctxTokens ?? null, afterFolds: r ? r.ctxAfterFolds : null, after, law: o.trace.map((t: Any) => ({ at: t.where, ok: t.ok, B: t.B, A: t.A, T: t.T, K: t.K, phi: t.phi, eta: t.eta, ...(t.cut !== undefined ? { cut: t.cut } : {}) })) });
+			out.push({ p, actual: p === actual, mode, plan: !!r, folds: r ? r.folds.map((f: Any) => f.entryId) : [], cut: r?.firstKeptEntryId ?? null, prefix: r ? c * r.prefixTokens : 0, sum: r ? c * r.summaryTokensPlanned : 0, before: r?.ctxTokens ?? null, afterFolds: r ? r.ctxAfterFolds : null, after, law: o.trace.map((t: Any) => ({ at: t.where, ok: t.ok, B: t.B, A: t.A, T: t.T, K: t.K, phi: t.phi, eta: t.eta, ...(t.cut !== undefined ? { cut: t.cut } : {}), ...(t.ready ? { ready: true } : {}) })) });
 		}
 		// WL's oracle: a warm decision the one-summary-per-warm-stretch flag constrained, planned again at the actual P with the flag lifted
 		// (everything else as captured): the summary the flag kept out, if any, and the law's verdict on it
@@ -505,7 +516,7 @@ async function runTrace(tr: Any): Promise<Any> {
 			const o = { ...cap.o, law: { ...cap.o.law, pWarm: actual }, noSummary: false, regrowAt: undefined, trace: [] };
 			try {
 				const r = plan.planContext(cap.entries, o);
-				free = { plan: !!r, cut: r?.firstKeptEntryId ?? null, folds: r ? r.folds.map((f: Any) => f.entryId) : [], afterFolds: r ? r.ctxAfterFolds : null, law: o.trace.map((t: Any) => ({ at: t.where, ok: t.ok, B: t.B, A: t.A, T: t.T, K: t.K, phi: t.phi, eta: t.eta, ...(t.cut !== undefined ? { cut: t.cut } : {}) })) };
+				free = { plan: !!r, cut: r?.firstKeptEntryId ?? null, folds: r ? r.folds.map((f: Any) => f.entryId) : [], afterFolds: r ? r.ctxAfterFolds : null, law: o.trace.map((t: Any) => ({ at: t.where, ok: t.ok, B: t.B, A: t.A, T: t.T, K: t.K, phi: t.phi, eta: t.eta, ...(t.cut !== undefined ? { cut: t.cut } : {}), ...(t.ready ? { ready: true } : {}) })) };
 			} catch (err) {
 				free = { error: String(err) };
 			}
@@ -652,10 +663,9 @@ async function runTrace(tr: Any): Promise<Any> {
 		clock: ["lastReqMs", "lastModelKey", "prevTotal", "prevKey"],
 	};
 	const KNOWN = ["g", "justEdited", "summarizedWarm"]; // TRIAGE (a) 1: the three fields the session does not carry
-	let liveCut: string | null = null; // the cut the live request being probed carries (its run plan's, or the native summary's)
 	async function freshProbe(snapshot: Any[], userMsg: Any, liveDesc: Any[], liveState?: Any) {
 		const base = await freshOnce(snapshot, userMsg, liveDesc, null);
-		if (base.same || base.deferredSame || !liveState) return base;
+		if (base.same || !liveState) return base;
 		const fixedBy: string[] = [];
 		for (const [name, fields] of Object.entries(TRANSPLANT)) {
 			const r = await freshOnce(snapshot, userMsg, liveDesc, Object.fromEntries(fields.map((f) => [f, liveState[f]])));
@@ -715,11 +725,9 @@ async function runTrace(tr: Any): Promise<Any> {
 			const desc = describeView(view, sm2);
 			const a = liveDesc.map((d) => d.h).join(","), b = desc.map((d: Any) => d.h).join(",");
 			const ledger = inst.zip?.__sink ?? [];
-			// rule B: a fresh process has no summary written in the background, so at a warm return whose plan summarises it applies nothing and
-			// starts that summary (warm_defer). It made the live process's decision when it deferred the very cut the live request carries
-			const defer = ledger.find((r: Any) => r.type === "warm_defer" && r.where === "run");
-			const deferredSame = !!defer && !ledger.some((r: Any) => r.type === "cold_plan") && defer.key === liveCut;
-			return { same: a === b, deferredSame, live: liveDesc.length, fresh: desc.length, liveMods: [...mods(liveDesc)].length, freshMods: [...mods(desc)].length, freshPlan: ledger.filter((r: Any) => r.type === "cold_plan" || r.type === "b2b_skip" || r.type === "warm_defer").map(slim) };
+			// 0.4.0: a summary is used only when ready, and a ready one is a pi-zip/summary entry the fresh process reads too (round 5's
+			// excuse for a fresh process that deferred the live cut is gone)
+			return { same: a === b, live: liveDesc.length, fresh: desc.length, liveMods: [...mods(liveDesc)].length, freshMods: [...mods(desc)].length, freshPlan: ledger.filter((r: Any) => r.type === "cold_plan" || r.type === "b2b_skip" || r.type === "produce").map(slim) };
 		} finally {
 			await fire(inst, "session_shutdown", {});
 			({ sink, optsSink, phase } = saved);
@@ -775,7 +783,7 @@ async function runTrace(tr: Any): Promise<Any> {
 		// every run start, and after anything someone else changed
 		const lossIssues = probes.lossless ? await lossless(desc, view, guardRewrote, zipNew.length > 0 || runStart || envSince.some((e) => e === "compact" || e === "edit" || e === "foreign")) : [];
 		const runPlan = z?.runPlan;
-		const planGrids = decisions(optsSink.filter((c: Any) => !c.pending)).map((c: Any) => gridFor({ ...c, at: "run" }));
+		const planGrids = decisions(optsSink.filter((c: Any) => !c.pending)).map((c: Any) => gridFor({ ...c, at: c.produce ? "produce" : "run" }));
 		const runLedger = sink.map(slim);
 		// Pi's cache warmer restarts from every session request (sdk.ts streamFn): it keeps this request's prefix warm while the
 		// session still extends it and the model is the same
@@ -862,7 +870,7 @@ async function runTrace(tr: Any): Promise<Any> {
 		const rp = z?.runPlan, rpWasPersisted = !!rp?.persisted, rpSent = !!rp?.sent;
 		const te = await fire(live, "turn_end", { type: "turn_end", turnIndex: reqInRun, message: asst, toolResults, messageEntryId: aid, toolResultEntryIds: [], context: boundaryCtx(sm), entries: [] });
 		const drafts: Any[] = te?.entries ?? [];
-		const teGrids = decisions(optsSink.filter((c: Any) => !c.pending)).map((c: Any) => gridFor({ ...c, at: "turn_end" }));
+		const teGrids = decisions(optsSink.filter((c: Any) => !c.pending), sink.some((x: Any) => x.type === "room_wait")).map((c: Any) => gridFor({ ...c, at: c.produce ? "produce" : "turn_end" }));
 		const teLedger = sink.map(slim);
 		optsSink = null;
 		applyDrafts(sm, drafts);
@@ -890,7 +898,6 @@ async function runTrace(tr: Any): Promise<Any> {
 		};
 		ncSeen = nc1;
 		probeAt = T0 + t0 * 1000;
-		liveCut = t.runPlan?.cut ?? null;
 		if (firstProbe && probes.fresh) t.fresh = await freshProbe(firstProbe.snapshot, firstProbe.userMsg, desc, firstProbe.liveState);
 		envSince = [];
 		lastView = view;

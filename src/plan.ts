@@ -572,10 +572,10 @@ export interface RunPlan {
 	applied?: Set<string>; // entry ids whose fold the latest request view actually carried (what turn_end must persist, no more)
 	cutTs?: number; // timestamp of the request-local summary message: one value per run, so every request of the run is identical
 	untouched?: number; // real tokens before the earliest edited block: what the first request carrying the plan can still read from the cache
-	waitMs?: number; // how long the user waited for this plan's summary (0: none, or it was ready)
+	waitMs?: number; // how long the turn waited for this plan's summary (only at Pi's compaction room; 0: it was ready)
 	noticed?: boolean; // its notice is already in the transcript (shown when the first request carrying it went out)
 	native?: Cut; // this run's summary went in through Pi's own compaction before the run: no request-local cut, no compaction draft
-	ready?: "away" | "background"; // its summary was written in the background: before this warm return ("away"), or while the run went on (rule B)
+	ready?: "away" | "background"; // its summary was written in the background: before this warm return ("away"), or while the run went on
 }
 
 export interface PlanOpts {
@@ -599,6 +599,8 @@ export interface PlanOpts {
 	rereadOnly?: boolean; // zip_recall is not available to the model: fold only outputs that can be re-read (classify "rereadable")
 	fileRecall?: FileRecall; // zip_recall is hidden but read, grep or bash is active: fold as in full mode, placeholders name the recall file
 	cutAt?: string; // cut at this entry or not at all (a summary for that cut is produced or being produced: core.ts adopt)
+	foldsOnly?: boolean; // no cut: the plan of the folds alone (its summary is not ready: core.ts unready)
+	ready?: readonly string[]; // cuts whose summary is produced and ready: its call is spent, so the law prices it at 0 (theory 1.4)
 }
 
 export interface PlanResult {
@@ -653,10 +655,10 @@ export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
 	const coldCap = (coldTarget(o.coldCap ?? s.coldCap, O, room) - O) / c;
 	const law: Law = o.law ?? { pr: lawPrices(undefined, false), g: G0, pWarm: 0 };
 	// `cut`: a whole-plan step records whether the plan it judges has a cut (and so carries its summary call); the formal checker pins the
-	// call to 0 for a folds-only plan and to the summary step's call for a cut
-	const gate = (where: "summary" | "plan", B: number, A: number, r: number | null, call: number, T: number, Tsuf?: number, cut?: boolean): boolean => {
+	// call to 0 for a folds-only plan and to the summary step's call for a cut; `ready`: the cut's summary is ready (its call is 0)
+	const gate = (where: "summary" | "plan", B: number, A: number, r: number | null, call: number, T: number, Tsuf?: number, cut?: boolean, isReady?: boolean): boolean => {
 		const t = lawTerms(B, A, law.pWarm, r, law.pr, law.g, call, T);
-		o.trace?.push({ where, ...t, ...(Tsuf !== undefined ? { Tsuf } : {}), ...(cut !== undefined ? { cut } : {}) });
+		o.trace?.push({ where, ...t, ...(Tsuf !== undefined ? { Tsuf } : {}), ...(cut !== undefined ? { cut } : {}), ...(isReady ? { ready: true } : {}) });
 		return t.ok;
 	};
 	const foldMin = o.foldMin ?? s.foldMin;
@@ -742,7 +744,7 @@ export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
 	const atRoom = room !== null && real(ctxAfterFolds) >= room;
 	const atRoomUnedited = room !== null && real(ctxEst) >= room;
 	const noSummary = !!o.noSummary && !(o.regrowAt !== undefined && o.regrowAt > 0 && real(ctxAfterFolds) >= o.regrowAt);
-	const sumTrigger: "cold" | "valve" | null = ctxAfterFolds > target && (!noSummary || atRoom) ? trig : null;
+	const sumTrigger: "cold" | "valve" | null = !o.foldsOnly && ctxAfterFolds > target && (!noSummary || atRoom) ? trig : null;
 	let cutIdx: number | null = null;
 	let prefixTokens = 0;
 	let summaryTokensPlanned = 0;
@@ -754,13 +756,14 @@ export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
 	/** The whole plan's law (F10): B is the context as it is, A what the plan leaves, `call` the summary call a cut makes; `untouched` is
 	 *  the content before the earliest edit (ledger only). T = A (the whole post-edit context, O included, as tuned: the cheaper A - O
 	 *  fires warm edits earlier and loses items offline). */
-	const planGate = (after: number, untouched: number, call: number, cut: boolean): boolean =>
-		gate("plan", real(ctxEst), real(after), room, call, real(after), c * (after - untouched), cut);
+	const planGate = (after: number, untouched: number, call: number, cut: boolean, isReady = false): boolean =>
+		gate("plan", real(ctxEst), real(after), room, call, real(after), c * (after - untouched), cut, isReady);
 	/** The cut for cut points minCut..maxCut: the first that brings the context to the cap, else the deepest; its summary must pay with
 	 *  its call (the summary step's law). When the minimal cut's summary or the whole plan with it is refused, the deeper cuts are tried
 	 *  in turn (the gain grows as D^2, the call only with the prefix read). The whole plan's law prices the summary call too. Applies
 	 *  the first cut both laws accept (folds in the prefix are void) and returns true, or changes nothing. */
 	const pinned = o.cutAt;
+	const ready = new Set(o.ready ?? []);
 	const summarise = (maxCut: number): boolean => {
 		const cuts: number[] = [];
 		for (let i = minCut; i < blocks.length && i <= maxCut; i++) if (isCutBlock(blocks[i]) && (pinned === undefined || blocks[i].entryId === pinned)) cuts.push(i);
@@ -773,23 +776,26 @@ export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
 		const total = acc;
 		let first = cuts.length - 1;
 		for (let k = 0; k < cuts.length; k++) if (total - pre[cuts[k]] + S(pre[cuts[k]]) <= coldCap) { first = k; break; }
-		for (const pick of cuts.slice(first)) {
+		const take = (pick: number): boolean => {
 			const X = c * pre[pick], Sr = c * S(pre[pick]);
 			// the call is the narrative call summary.ts makes: uncached input of the prefix without the previous summary, plus that
-			// summary's narrative, which it merges (not its lists), + output of at most the narrative budget
-			const call = law.pr.input * c * (Math.max(pre[pick] - prevSum, 0) + prevNarr) + law.pr.out * c * Math.min(S(pre[pick]), NARRATIVE_MAX);
-			if (!gate("summary", X, Sr, null, call, Sr)) continue; // the summary call must pay for itself
-			if (!(pre[pick] >= 2 * S(pre[pick]))) continue;
+			// summary's narrative, which it merges (not its lists), + output of at most the narrative budget; 0 for a ready summary
+			const isReady = ready.has(blocks[pick].entryId!);
+			const call = isReady ? 0 : law.pr.input * c * (Math.max(pre[pick] - prevSum, 0) + prevNarr) + law.pr.out * c * Math.min(S(pre[pick]), NARRATIVE_MAX);
+			if (!gate("summary", X, Sr, null, call, Sr, undefined, undefined, isReady)) return false; // the summary call must pay for itself
+			if (!(pre[pick] >= 2 * S(pre[pick]))) return false;
 			// what the plan leaves: the context with its folds (those inside the prefix too: the prefix is measured as folded, `pre`) minus
 			// what the summary replaces plus the summary
-			if (!planGate(ctxAfterFolds - (pre[pick] - S(pre[pick])), 0, call, true)) continue;
+			if (!planGate(ctxAfterFolds - (pre[pick] - S(pre[pick])), 0, call, true, isReady)) return false;
 			cutIdx = pick;
 			prefixTokens = pre[pick];
 			summaryTokensPlanned = S(pre[pick]);
 			for (let i = folds.length - 1; i >= 0; i--) if (foldAt[i] < pick) { tokOverride.delete(foldAt[i]); folds.splice(i, 1); foldAt.splice(i, 1); } // the prefix is replaced: its folds are void
 			return true;
-		}
-		return false;
+		};
+		if (cuts.slice(first).some(take)) return true;
+		// a ready summary short of the cut that reaches the view (theory 1.4: a <= cW), the deepest first
+		return cuts.slice(0, first).reverse().some((pick) => ready.has(blocks[pick].entryId!) && take(pick));
 	};
 	if (sumTrigger) {
 		const limit = blocks.findIndex((b) => protectedTurn(b));

@@ -1,7 +1,12 @@
+# RD: the growth g a restart reads from the branch. Three big outputs teach a g far from G0; the warm returns that follow plan
+# with it (0.4.0: a warm return's plan differs by g in what it folds or produces). The mutant restores G0 instead.
 world explicit known ttl=300 true=300 survival=none c=1 sys=3000 window=200000 native interactive
-prompt +0s
-say 60K
+prompt
+call npm 30K
+call npm 20K
+call npm 20K
+say 100
 prompt +60s
 say 100
-prompt +330s
+prompt +60s
 say 100

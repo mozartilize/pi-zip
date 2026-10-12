@@ -448,6 +448,8 @@ pub struct LawStep {
     pub eta: Option<f64>,
     /// a whole-plan step only: the plan it judges has a cut (the source reports it; older sources do not)
     pub cut: Option<bool>,
+    /// the step judges a cut whose summary is produced and ready: its call is spent, priced 0 (theory 1.4; 0.4.0 step 4)
+    pub ready: Option<bool>,
 }
 
 /// One plan the planner would make at this decision point, at one P(warm) (everything else held fixed).
@@ -529,9 +531,6 @@ pub struct ZipState {
 #[serde(rename_all = "camelCase", default)]
 pub struct Fresh {
     pub same: bool,
-    /// rule B: the fresh process planned the live request's cut, but with no summary written in the background it applied nothing and
-    /// started one (warm_defer): the same decision, carried out one turn_end later
-    pub deferred_same: bool,
     pub live: usize,
     pub fresh: usize,
     pub live_mods: usize,
