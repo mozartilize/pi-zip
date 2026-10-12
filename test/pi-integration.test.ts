@@ -10,7 +10,7 @@ import { fileURLToPath } from "node:url";
 import { collapseSystemMessages, getCurrentSystemMessage, normalizeContext, resolveTranscript } from "@earendil-works/pi-ai";
 import { calibrate, collapseSystem, planContext, wireTokensOf } from "../src/plan.ts";
 import { planOpts } from "../src/core.ts";
-import { record } from "../src/learn.ts";
+import { loadStats, record } from "../src/learn.ts";
 import type { Any } from "./helpers.ts";
 // Pi's own draft application (AgentSession._applyBoundaryDrafts uses no instance state): the order of the drafts and the
 // tokensBefore Pi writes for a compaction draft are Pi's, not a re-implementation
@@ -555,6 +555,59 @@ describe("real Pi: a summary prepared while the user was away goes in through Pi
 		const cut = await rig(undefined, { file, tui: true, start: false });
 		await sleep(1_300);
 		expect(cut.narrativeCalls.length).toBe(0);
+	});
+
+	test("a fresh room call teaches the producer latency used after restart", async () => {
+		process.env.PI_ZIP_TTL_SECS = "300";
+		process.env.PI_ZIP_COLD_CAP = "65000";
+		const model = { ...MODEL, provider: "latency", id: "room", contextWindow: 100_000 };
+		const file = template();
+		for (const entry of file) if (entry.message?.role === "assistant") delete entry.message.usage;
+		const r = await rig(undefined, { file, tui: true, start: false, model, latencyMs: 80 });
+		try {
+			await r.runner.emit({ type: "agent_start" } as Any);
+			expect(r.zip.bg).toBeNull();
+			expect(loadStats().models["latency/room"]?.call).toBeUndefined();
+			const response = { ...asst([{ type: "text", text: "done" }]), timestamp: Date.now() };
+			delete response.usage;
+			const id = r.sm.appendMessage(response);
+			const drafts = await r.turnEnd(id, response); // no run plan: the room starts its own fresh call
+			const artifact = drafts.find((e) => e.customType === "pi-zip/summary").data;
+			expect(drafts[0].type).toBe("compaction");
+			expect(r.narrativeCalls).toHaveLength(1);
+			const learned = loadStats().models["latency/room"].call!;
+			expect(learned.ms).toBeGreaterThanOrEqual(80);
+			expect(learned).toEqual({ ms: artifact.cut.ms, tokens: artifact.cut.prefixTokens });
+			expect(r.zip.ent.call).toEqual(learned);
+			await r.shutdown();
+			// Reopen the pre-edit branch: call times are shared by model, even when this branch has no ready artifact.
+			const realSet = globalThis.setTimeout, realNow = Date.now;
+			const deadlines = new Map<Any, number>();
+			const now = realNow();
+			(globalThis as Any).setTimeout = (fn: () => void, ms: number) => {
+				const handle = realSet(fn, ms);
+				deadlines.set(handle, now + ms);
+				return handle;
+			};
+			Date.now = () => now;
+			let restarted: Awaited<ReturnType<typeof rig>> | undefined;
+			try {
+				restarted = await rig(undefined, { file, tui: true, start: false, model });
+				const ctx = restarted.runner.createContext();
+				const view = restarted.sm.buildSessionProjection().entries;
+				const p = planContext(view, restarted.zip.opts(ctx, true, view, 1, true, undefined, false, []).o)!;
+				const touch = Math.max(...file.map((e) => e.message?.timestamp ?? 0));
+				const expected = touch + 300_000 - 1.5 * learned.ms * p.prefixTokens / learned.tokens;
+				expect(restarted.zip.ent.call).toEqual(learned);
+				expect(deadlines.get(restarted.zip.timer)).toBeCloseTo(expected, 5);
+				expect(restarted.narrativeCalls).toHaveLength(0);
+				expect(loadStats().models["latency/room"].call).toEqual(learned);
+			} finally {
+				globalThis.setTimeout = realSet;
+				Date.now = realNow;
+				await restarted?.shutdown();
+			}
+		} finally { await r.shutdown(); }
 	});
 
 	test("a measured-latency timer invalidating a running cut persists its loss after the callback", async () => {
