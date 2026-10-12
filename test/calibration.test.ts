@@ -78,7 +78,7 @@ describe("calibrate: O and c from the branch", () => {
 		expect(cal.c).toBeCloseTo(2.1, 2);
 	});
 
-	test("a run plan's summary is carried by the response right before its compaction entry: that response's read is O", () => {
+	test("a boundary summary measures O only from a response after the compaction entry", () => {
 		const T = Date.parse("2026-10-09T04:00:00Z");
 		const comp = { sourceEntry: { id: "cmp", type: "compaction", timestamp: new Date(T).toISOString(), details: { by: "pi-zip", trigger: "cold" } }, messages: [{ role: "compactionSummary", summary: "s".repeat(20_000), tokensBefore: 0, timestamp: T }] };
 		const e = [comp, at(U("k1", "kept"), T - 9_000), at(A("k2", ["c1"]), T - 8_000), R("kr", "c1", 30_000), at(U("u2", "back after an hour"), T - 2_000), at(A("a1", ["c2"]), T - 1_000), R("r2", "c2", 40_000), at(A("a2"), T + 3_000)];
@@ -86,8 +86,8 @@ describe("calibrate: O and c from the branch", () => {
 		provider(e, 41_000, 1.9, ["a1"], () => 41_000);
 		Object.assign(e[2].sourceEntry.message, { stopReason: "stop", usage: { input: 2, cacheRead: 160_000, cacheWrite: 900, output: 300 } }); // before the summary: the whole old context
 		const cal = calibrate(e);
-		expect(cal.oSource).toBe("summary");
-		expect(cal.O).toBe(41_000);
+		expect(cal.oSource).toBe("default");
+		expect(cal.O).toBe(0);
 	});
 
 	test("a cold summary (nothing read) gives no O: the session's first request stands in, measured on the branch", () => {
@@ -262,9 +262,9 @@ describe("calibrate: per model, Pi's compaction, dropped responses", () => {
 		const e = [comp, at(U("k1", "kept"), T - 9_000), at(A("k2"), T - 8_000)];
 		provider(e, 30_000, 2.2, ["k2"], () => 0);
 		expect(calibrate(e)).toMatchObject({ c: C0, source: "default" });
-		// the same entry persisted as a draft (request-local first) may have been carried by that response: its usage counts
+		// A draft summary also enters after the response; neither door uses its usage as post-summary evidence.
 		const local = [{ ...comp, sourceEntry: { ...comp.sourceEntry, details: { by: "pi-zip" } } }, ...e.slice(1)];
-		expect(calibrate(local).source).toBe("usage");
+		expect(calibrate(local)).toMatchObject({ c: C0, source: "default" });
 	});
 
 	test("/zip folded total: each fold on the scale of the model that made it, not today's c for all", async () => {

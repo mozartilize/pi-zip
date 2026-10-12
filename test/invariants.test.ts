@@ -118,7 +118,7 @@ describe("I1 byte stability: every request of a run sends the same prefix, and i
 		expect(JSON.stringify(projected.slice(0, req1.messages.length))).toBe(JSON.stringify(req1.messages));
 	});
 
-	test("summary: the local view and the persisted compaction carry the same text and the same kept part", async () => {
+	test("summary: requests keep their prefix until a boundary compaction replaces it", async () => {
 		process.env.PI_ZIP_COLD_CAP = "6000";
 		const big = [U("u1", "one"), A("a1", ["c1"]), R("r1", "c1", 44_000), AX("a2", 120_000), U("u2", "two"), A("a3", ["c3"]), R("r3", "c3", 44_000), AX("a4", 120_000), U("u3", "three"), A("a5"), U("u4", "back")];
 		const r = await rig(big, COLD_TS());
@@ -126,14 +126,16 @@ describe("I1 byte stability: every request of a run sends the same prefix, and i
 		await produced(r, big);
 		await r.fire("before_agent_start", {});
 		const req1 = await r.fire("context_with_system", { messages: flat(big) });
-		expect(req1.messages[0].role).toBe("compactionSummary");
+		expect(req1?.messages?.[0]?.role).not.toBe("compactionSummary");
 		const all = [...big, A("a6")];
 		const te = await r.fire("turn_end", turnEnd(all, "a6"));
 		const comp = te.entries.find((e: Any) => e.type === "compaction");
-		expect(comp.summary).toBe(req1.messages[0].summary);
+		expect(comp.summary).toContain("[summary of earlier conversation by pi-zip]");
 		expect(comp.firstKeptEntryId).toBe("u3");
-		expect(norm(flat(project(all, te.entries)).slice(0, req1.messages.length))).toBe(norm(req1.messages));
-		expect(r.notes.at(-1)).toMatch(/summarized 2 requests .* ready while you were away/); // 0.3.1: written at the return, "waited"
+		const projected = flat(project(all, te.entries));
+		expect(projected[0].role).toBe("compactionSummary");
+		expect(norm(projected.slice(1))).toBe(norm(flat(all).slice(8)));
+		expect(r.notes.at(-1)).toMatch(/summarized 2 requests .* written while you worked/); // 0.3.1: written at the return, "waited"
 	});
 
 	test("a summary and folds in one batch: the compaction draft comes first (Pi takes its tokensBefore before any fold makes the usage stale)", async () => {
@@ -145,15 +147,18 @@ describe("I1 byte stability: every request of a run sends the same prefix, and i
 		await produced(r, big);
 		await r.fire("before_agent_start", {});
 		const req1 = await r.fire("context_with_system", { messages: flat(big) });
-		expect(req1.messages[0].role).toBe("compactionSummary");
+		expect(req1?.messages?.[0]?.role).not.toBe("compactionSummary");
 		const all = [...big, A("a6")];
 		const te = await r.fire("turn_end", turnEnd(all, "a6"));
 		// the edits, the commit marker, then the record of the summary call (it finished inside the run: written with the drafts)
-		expect(te.entries.map((e: Any) => e.customType ?? e.type)).toEqual(["compaction", "context_edit", "pi-zip/commit", "pi-zip/summary"]);
+		expect(te.entries[0].type).toBe("compaction");
+		expect(te.entries.at(-1).customType).toBe("pi-zip/summary");
 		expect(te.entries[0].firstKeptEntryId).toBe("u3");
-		expect(te.entries[1].targetId).toBe("r5");
+		expect(te.entries.some((e: Any) => e.type === "context_edit" && e.targetId === "r5")).toBe(true);
 		// the order changes nothing in what the session projects
-		expect(norm(flat(project(all, te.entries)).slice(0, req1.messages.length))).toBe(norm(req1.messages));
+		const projected = flat(project(all, te.entries));
+		expect(projected[0].role).toBe("compactionSummary");
+		expect(projected.find((m: Any) => m.toolCallId === "c5").content).toEqual(req1.messages.find((m: Any) => m.toolCallId === "c5").content);
 	});
 });
 
@@ -194,7 +199,9 @@ describe("one producer prepares the return with one timer", () => {
 		await sleep(100);
 		expect(st.calls).toBe(1);
 		const req = await comeBack(r, undefined, COLD_TS());
-		expect(req.messages[0].role).toBe("compactionSummary");
+		expect(req?.messages?.[0]?.role).not.toBe("compactionSummary");
+		const te = await r.fire("turn_end", turnEnd([...back, A("a6")], "a6"));
+		expect(te.entries[0].type).toBe("compaction");
 		expect(st.calls).toBe(1);
 	});
 
@@ -282,7 +289,9 @@ describe("one producer prepares the return with one timer", () => {
 		await sleep(350);
 		(r.ctx as Any).signal = undefined;
 		const again = await comeBack(r, settled, COLD_TS());
-		expect(again.messages[0].role).toBe("compactionSummary");
+		expect(again?.messages?.[0]?.role).not.toBe("compactionSummary");
+		const te = await r.fire("turn_end", turnEnd([...back, A("a6")], "a6"));
+		expect(te.entries[0].type).toBe("compaction");
 		expect(st.calls).toBe(1);
 	});
 
@@ -319,7 +328,9 @@ describe("one producer prepares the return with one timer", () => {
 		expect(st.calls).toBe(1);
 		await sleep(150);
 		const again = await comeBack(r, undefined, COLD_TS()); // the prompt tried again: the summary is ready
-		expect(again.messages[0].role).toBe("compactionSummary");
+		expect(again?.messages?.[0]?.role).not.toBe("compactionSummary");
+		const te = await r.fire("turn_end", turnEnd([...back, A("a6")], "a6"));
+		expect(te.entries[0].type).toBe("compaction");
 		expect(st.calls).toBe(1);
 	});
 
@@ -396,12 +407,14 @@ describe("one producer prepares the return with one timer", () => {
 
 	const noticeOf = (r: Any) => r.appended.filter((x: Any) => x.customType === "pi-zip/notice" && !x.data?.kind).at(-1)?.data;
 
-	test("item 4(a): the notice carries the native outcome: ok with its timings, or the reason the draft path was taken", async () => {
+	test("item 4(a): native notices carry timings and a closed native door defers the summary", async () => {
 		const run = async (o: Any, piExtra: Any = {}) => {
 			const r = await rig(done, COLD_TS(), { modelRegistry: { complete: mkComplete({ calls: 0 }) } }, { registerEntryRenderer: () => {}, ...piExtra });
 			const settled = await settle(r);
 			await sleep(200);
 			const n = await comeBackNative(r, settled, o);
+			await sleep(5);
+			if (!n.comp) await r.fire("turn_end", turnEnd([...back, A("a6")], "a6"));
 			await sleep(5);
 			return { n, notice: noticeOf(r) };
 		};
@@ -463,7 +476,7 @@ describe("one producer prepares the return with one timer", () => {
 		expect(await idle.handlers.get("session_before_compact")({ type: "session_before_compact", reason: "manual", customInstructions: NATIVE_MARKER + " more" }, idle.ctx)).toEqual({ cancel: true });
 	});
 
-	test("every gate keeps today's path: not idle, the branch already ends in a compaction, nothing for Pi to compact, no ctx.compact, a failed compaction", async () => {
+	test("every closed native gate defers a ready summary to turn_end", async () => {
 		const foreignComp = { type: "compaction", id: "pc", summary: "Pi's own", firstKeptEntryId: "u3", details: {}, fromHook: false };
 		const cases: Array<[string, Any, Any]> = [
 			["not idle", { idle: false }, {}],
@@ -481,14 +494,14 @@ describe("one producer prepares the return with one timer", () => {
 			const n = await comeBackNative(r, settled, o);
 			expect([name, n.compactCalls]).toEqual([name, name === "compaction failed" ? 1 : 0]);
 			expect([name, n.comp]).toEqual([name, null]);
-			// the prepared summary is still the one used, request-locally as before; after a compaction that came later its range is gone
+			// The prepared summary waits for the boundary; after a later compaction its range is gone
 			// (the head moved): a new one is written in the background, and the run goes with its folds alone (0.3.1: written while it waited)
 			const gone = name === "already compacted";
-			expect([name, n.req?.messages?.[0]?.role === "compactionSummary"]).toEqual([name, !gone]);
+			expect([name, n.req?.messages?.[0]?.role === "compactionSummary"]).toEqual([name, false]);
 			await sleep(20);
 			expect([name, st.calls]).toEqual([name, gone ? 2 : 1]);
 			const te = await r.fire("turn_end", turnEnd([...back, A("a6")], "a6"));
-			expect([name, te.entries.filter((e: Any) => e.type === "compaction").length]).toEqual([name, gone ? 0 : 1]); // ... and turn_end persists it
+			expect([name, te.entries.filter((e: Any) => e.type === "compaction").length]).toEqual([name, 1]); // the new artifact may also enter once its range matches
 		}
 	});
 
@@ -558,10 +571,12 @@ describe("never wait: rule A starts early; a summary is used once ready; the one
 		const t0 = Date.now();
 		const req = await prompt(r, settled);
 		expect(Date.now() - t0).toBeLessThan(150);
-		expect(req.messages[0].role).toBe("compactionSummary");
+		expect(req?.messages?.[0]?.role).not.toBe("compactionSummary");
+		const te = await r.fire("turn_end", turnEnd([...back, A("a6")], "a6"));
+		expect(te.entries[0].type).toBe("compaction");
 		expect(st.calls).toBe(1);
 		await sleep(5);
-		expect(noticeOf(r).desc).toMatch(/ready while you were away$/);
+		expect(noticeOf(r).desc).toMatch(/written while you worked$/);
 	});
 
 	test("settle produces despite b2b, which blocks edits only; no UI prepares nothing at settle", async () => {
@@ -824,7 +839,9 @@ describe("never wait: rule A starts early; a summary is used once ready; the one
 		expect(st.calls).toBe(1);
 		expect(st.signals[0].aborted).toBe(false);
 		const req = await prompt(r, settled);
-		expect(req.messages[0].role).toBe("compactionSummary");
+		expect(req?.messages?.[0]?.role).not.toBe("compactionSummary");
+		const te = await r.fire("turn_end", turnEnd([...back, A("a6")], "a6"));
+		expect(te.entries[0].type).toBe("compaction");
 		expect(st.calls).toBe(1);
 		expect(rows("unused_summary")).toEqual([]);
 	});
@@ -898,7 +915,9 @@ describe("never wait: rule A starts early; a summary is used once ready; the one
 			return q.fire("context_with_system", { messages: flat(back) });
 		});
 		expect(Date.now() - t0).toBeLessThan(150);
-		expect(req.messages[0].role).toBe("compactionSummary");
+		expect(req?.messages?.[0]?.role).not.toBe("compactionSummary");
+		const te = await q.fire("turn_end", turnEnd([...back, A("a6")], "a6"));
+		expect(te.entries[0].type).toBe("compaction");
 		expect(st2.calls).toBe(0);
 	});
 });

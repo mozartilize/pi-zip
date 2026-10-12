@@ -162,7 +162,6 @@ describe("core: decide", () => {
 		expect(d.kind).toBe("plan");
 		if (d.kind !== "plan") return;
 		expect(d.o.pause).toBe(true);
-		expect(d.onPre).toBe(false);
 		expect(d.notes).toEqual([]);
 		// no ready summary: the folds alone go now, the cut is produced in the background (nobody waits)
 		expect(d.o.foldsOnly).toBe(true);
@@ -173,9 +172,9 @@ describe("core: decide", () => {
 		// pure: the same inputs give the same decision
 		const again = decideRun({ cold: true, justEdited: true, nat: null, foreign: false, now: big, ready: [], opts: opts(l, 0, true) });
 		expect(again.kind === "plan" && again.produce?.firstKeptEntryId).toBe(key);
-		// once it is ready the same return takes it, and produces nothing
+		// A ready summary waits for turn_end when the native door has not taken it.
 		const taken = decideRun({ cold: true, justEdited: true, nat: null, foreign: false, now: big, ready: [{ key, running: false }], opts: opts(l, 0, true) });
-		expect(taken.kind === "plan" && taken.p?.firstKeptEntryId).toBe(key);
+		expect(taken.kind === "plan" && taken.p?.cutIdx).toBeNull();
 		expect(taken.kind === "plan" && taken.produce).toBeNull();
 		// a call still running is not ready: the folds alone, as without it
 		const running = decideRun({ cold: true, justEdited: true, nat: null, foreign: false, now: big, ready: [{ key, running: true }], opts: opts(l, 0, true) });
@@ -186,30 +185,34 @@ describe("core: decide", () => {
 		expect(d.kind === "plan" && d.o.noSummary).toBe(true);
 		expect(d.kind === "plan" && d.p?.cutIdx).toBeNull();
 	});
-	test("decideRun: a native summary whose cut the plan does not reach: the session as it is, with a note", () => {
-		const d = decideRun({ cold: false, justEdited: true, nat: { key: "nowhere", pre: big, entryId: "c9" }, foreign: false, now: small, ready: [], opts: opts(lam(), 1, false) });
+	test("decideRun: native application carries the joint prompt decision without a folds-only re-plan", () => {
+		const input = opts(lam(), 0, true)(big), p = planContext(big, input.o)!;
+		const d = decideRun({ cold: false, justEdited: true, nat: { ...input, p }, foreign: false, now: small, ready: [], opts: () => { throw new Error("native request must not re-plan"); } });
 		expect(d.kind).toBe("plan");
-		if (d.kind !== "plan") return;
-		expect(d.onPre).toBe(false);
-		expect(d.notes).toEqual([{ type: "native_mismatch", planned: d.p?.firstKeptEntryId ?? null, compacted: "nowhere" }]);
+		if (d.kind !== "plan") throw new Error("no decision");
+		expect(d.p).toBe(p);
+		expect(d.o).toBe(input.o);
+		expect(d.produce).toBeNull();
+		expect(d.notes).toEqual([]);
 	});
-	test("runPlanOf: source settle / runstart / valve; the guard drops a cut that left the projection; sizes count the summary", () => {
+	test("runPlanOf: native folds keep their entry IDs and priced sizes, with positions looked up after the cut", () => {
 		const d = decideRun({ cold: true, justEdited: false, nat: null, foreign: false, now: big, ready: [], opts: opts(lam(), 0, true) });
-		if (d.kind !== "plan" || !d.produce) throw new Error("no plan");
-		const p = d.produce;
-		const base = { p, cal: d.cal, cold: true, onPre: false, native: null, nat: null, folds: p.folds, cut: null, adopted: false, settleIds: [] as string[], ms: 1 };
+		if (d.kind !== "plan" || !d.p) throw new Error("no plan");
+		const p = d.p, base = { p, cal: d.cal, cold: true, native: null, nat: null, folds: p.folds, settleIds: [] as string[], ms: 1 };
 		expect(runPlanOf(base).plan.source).toBe("runstart");
 		expect(runPlanOf({ ...base, settleIds: p.folds.map((t) => t.entryId) }).plan.source).toBe("settle");
 		expect(runPlanOf({ ...base, cold: false }).plan.source).toBe("valve");
-		const cut = { firstKeptEntryId: p.firstKeptEntryId, prefixTokens: 1000, summaryTokens: 100, ms: 7 } as Any;
-		const r = runPlanOf({ ...base, cut, adopted: true });
-		expect(r.cut).toBe(cut);
-		expect(r.plan.ctxAfter).toBeCloseTo(p.ctxAfterFolds - d.cal.c * 900, 6);
-		expect(r.plan.waitMs).toBe(0); // a run plan never waits: its summary is a ready one
-		const gone = runPlanOf({ ...base, cut: { ...cut, firstKeptEntryId: "gone" } });
-		expect(gone.cut).toBeNull();
-		expect(gone.drop).toMatchObject({ type: "guard_drop", where: "run_plan", summary: true });
-		expect(gone.folds).toEqual(p.folds); // the folds alone pass
+		const joint = planContext(big, planOpts(big, [], env(), lam(), false, 0, true).o)!;
+		const native = { firstKeptEntryId: joint.firstKeptEntryId } as Any;
+		const now = [{ sourceEntry: { id: "cmp", type: "compaction" }, messages: [{ role: "compactionSummary", summary: "S" }] }, ...big.slice(joint.cutIdx!)];
+		const r = runPlanOf({ ...base, p: joint, folds: joint.folds, native, now, nat: { before: 100_000, after: 40_000 } });
+		expect(r.plan.cut).toBeNull();
+		expect(r.plan.native).toBe(native);
+		expect(r.folds.map((t) => t.entryId)).toEqual(joint.folds.map((t) => t.entryId));
+		expect(r.plan.ctxBefore).toBe(100_000);
+		expect(r.plan.ctxAfter).toBe(40_000);
+		expect(() => runPlanOf({ ...base, p: joint, native, now, folds: [{ ...joint.folds[0], entryId: "a2" }] })).toThrow("native fold target must be kept after the cut");
+		expect(() => runPlanOf({ ...base, p: joint, native, now: [], folds: joint.folds })).toThrow("native fold target must be kept after the cut");
 	});
 	test("decideTurnEnd: none after a failed turn, b2b after an edited request while warm, a plan only when it changes something", () => {
 		const o = (cutAt?: string, foldsOnly?: boolean, ready?: readonly string[]) => planOpts(small, [], env(), lam(), false, 1, false, cutAt, foldsOnly, ready);
@@ -246,6 +249,17 @@ describe("core: decide", () => {
 		expect(b2b.room?.cutIdx).not.toBeNull(); // b2b blocks the application, not the room wait (theory 1.3 R6)
 		expect(b2b.produce).toBeNull();
 		expect(seen).toEqual([["elsewhere"], []]);
+	});
+	test("decideTurnEnd: the room still judges a large protected context when the ordinary planner returns no plan", () => {
+		const entries = [U("u1", "one"), AX("a1", 240_000), U("u2", "two")];
+		const model = { ...MODEL, contextWindow: 60_000 }, e = env({ model }), l = lam({ model });
+		const seen: (readonly string[] | undefined)[] = [];
+		const d = decideTurnEnd({ failed: false, justEdited: false, pWarm: 1, ready: [], entries,
+			opts: (cutAt, foldsOnly, ready) => (seen.push(ready), planOpts(entries, [], e, l, false, 1, false, cutAt, foldsOnly, ready)) });
+		if (d.kind !== "plan") throw new Error("no decision");
+		expect(d.p).toBeNull(); // protection leaves no legal edit
+		expect(d.room).toBeNull(); // the room planner also respects protection
+		expect(seen).toEqual([[], []]); // it still gets one post-edit room judgement
 	});
 	test("valvePlanOf: a valve plan's sizes, a ready summary (no wait) and the room wait", () => {
 		const p = planContext(big, planOpts(big, [], env(), lam(), false, 0, true).o)!;

@@ -481,11 +481,12 @@ impl GridPt {
     }
 }
 
-/// A decision point (the run plan at a run's first request, or the valve at a turn_end) and its P-grid probe.
+/// A native, run, production or turn_end decision and its P-grid probe.
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Grid {
-    /// "run" | "turn_end"
+    pub room: bool,
+    /// "native" | "run" | "produce" | "turn_end"
     pub at: String,
     pub mode: String,
     pub p: f64,
@@ -575,16 +576,19 @@ pub struct NativeCut {
     pub hash: Option<String>,
 }
 #[derive(Clone, Debug, Default, Deserialize)]
-#[serde(default)]
+#[serde(rename_all = "camelCase", default)]
 pub struct NativeApplied {
     pub key: String,
     pub hash: String,
+    pub tokens_before: f64,
+    pub idle: bool,
 }
 
 /// One request the system sent, and every decision made around it.
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Tick {
+    pub exact_issues: Vec<String>,
     pub native_door: Option<NativeDoor>,
     pub req: usize,
     pub ev: i64,
@@ -879,6 +883,9 @@ impl Run {
         }
         let t = self.tick(i);
         if t.n == 0 {
+            if t.run_plan.as_ref().is_some_and(|p| p.native) {
+                if let Some(g) = t.grids.iter().find(|g| g.at == "native") { return Some(g); }
+            }
             if let Some(g) = t.grids.iter().find(|g| g.at == "run") {
                 return Some(g);
             }
@@ -897,7 +904,7 @@ impl Run {
     /// Assistant requests between the request that issued block b and the decision point (true age; the planner's own age,
     /// counted over the projection, is never larger).
     pub fn age_at(&self, b: &Block, i: usize, at: &str) -> i64 {
-        let asst = if at == "run" { i as i64 } else { i as i64 + 1 };
+        let asst = if at == "run" || at == "native" { i as i64 } else { i as i64 + 1 };
         asst - (b.req + 1)
     }
 }

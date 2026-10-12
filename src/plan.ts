@@ -60,6 +60,27 @@ export function keepRecentTokensFor(settings: Any, model: Any): number {
 	return PI_KEEP_RECENT;
 }
 
+/** Pi's boundary compaction meter: newest valid usage plus trailing messages, else the projected chars/4 estimate.
+ *  Like Pi's estimateProjectedContextTokens, a later fold or compaction invalidates that usage. */
+export function piContextTokens(entries: Any[], branch: Any[]): number {
+	const messages = entries.flatMap((e) => e.messages ?? []);
+	const usage = (m: Any) => {
+		const u = m?.role === "assistant" && !dropped(m) ? m.usage : null;
+		return u ? Number(u.totalTokens) || (Number(u.input) || 0) + (Number(u.output) || 0) + (Number(u.cacheRead) || 0) + (Number(u.cacheWrite) || 0) : 0;
+	};
+	const invalid = branch.reduce((at, e, i) => e.type === "context_edit" || e.type === "compaction" ? i : at, -1);
+	let n = 0, usageAt = -1, usageId = "";
+	for (const e of entries) for (const m of e.messages ?? []) {
+		if (usage(m) > 0) { usageAt = n; usageId = e.sourceEntry?.id; }
+		n++;
+	}
+	if (usageAt >= 0 && branch.findIndex((e) => e.id === usageId) > invalid) {
+		return usage(messages[usageAt]) + messages.slice(usageAt + 1).reduce((t, m) => t + piTokensOf(m), 0);
+	}
+	const system = collapseSystem(messages);
+	return (system ? piTokensOf(system) : 0) + messages.filter((m) => m.role !== "system").reduce((t, m) => t + piTokensOf(m), 0);
+}
+
 const CUT_POINT_ROLES = new Set(["user", "assistant", "bashExecution", "custom", "branchSummary", "compactionSummary"]);
 const TURN_START_ROLES = new Set(["user", "bashExecution", "custom", "branchSummary", "compactionSummary"]);
 
@@ -94,13 +115,6 @@ export function piCanCompact(entries: Any[], keepRecent: number): boolean {
 	return turn >= 0 ? conversation(start, turn) || conversation(turn, cut) : conversation(start, cut);
 }
 
-/** The projection a run plan would have seen without pi-zip's native compaction: `pre` (taken right before it) plus what was appended
- *  after the compaction entry (the prompt and anything sent with it). null when that compaction is no longer the head of `now`. */
-export function spliceNative(pre: Any[], now: Any[], compactionId: string): Any[] | null {
-	if (!compactionId || now[0]?.sourceEntry?.id !== compactionId) return null;
-	const known = new Set(pre.map((e) => e?.sourceEntry?.id).filter((x) => typeof x === "string"));
-	return [...pre, ...now.slice(1).filter((e) => !known.has(e?.sourceEntry?.id))];
-}
 export const G0 = 2_500; // growth per request before the session's own EWMA has data
 
 /** What the law knows at a decision: prices (the class ratios; the explicit ones while the class is not learned yet), growth per
@@ -221,7 +235,7 @@ function requestEst(branch: Any[], id: string): number | null {
 	for (const e of pre) if (e?.type === "context_edit") edit.set(e.targetId, e.replacement);
 	for (let i = at + 1; i < branch.length; i++) {
 		const e = branch[i];
-		if ((e?.type === "message" && e.message?.role !== "toolResult") || (e?.type === "compaction" && e.details?.carried !== false)) break;
+		if ((e?.type === "message" && e.message?.role !== "toolResult")) break;
 		if (e?.type === "custom" && e.customType === COMMIT_CUSTOM) {
 			if (e.data?.carried) for (let j = at + 1; j < i; j++) if (branch[j]?.type === "context_edit") edit.set(branch[j].targetId, branch[j].replacement);
 			break;
@@ -278,9 +292,6 @@ export function calibrate(entries: Any[], sys?: SysInfo, branch: Any[] = [], mod
 	const Snow = S >= 0 ? S : sys ? sysEst(sys) : 0;
 	const head = entries[0]?.sourceEntry?.type === "compaction" ? entries[0].sourceEntry : null;
 	const headMs = head ? Date.parse(head.timestamp) || 0 : 0;
-	// Only a request-local summary was carried before its draft. Room and valve summaries (carried=false), and native summaries,
-	// first enter the next request; the preceding response must be calibrated against the original request rebuilt from the branch.
-	const local = !!head && head.details?.by === PRODUCT && head.details?.via !== "native" && head.details?.carried !== false;
 	// Was the request behind this response sent after the head compaction entry was written? The branch's order says (timestamps tie when
 	// a compaction follows a response in the same millisecond); without the branch the timestamps do.
 	const pos = new Map<string, number>();
@@ -321,13 +332,9 @@ export function calibrate(entries: Any[], sys?: SysInfo, branch: Any[] = [], mod
 		const curEst = cur ? cur.est + addBack(ci, false) : 0;
 		if (cur && (!head || afterHead(cur)) && opening({ real: cur.real, est: curEst })) ev.push({ at: ci, O: cur.real - C0 * curEst, S, src: "first" });
 		if (head) {
-			// the summary at the head was first carried by the first response after its entry, or, for pi-zip's own request-local summary
-			// (a run plan), by the last one before it; Pi's, another extension's or a native pi-zip compaction is never sent before its entry
-			const after = resp.findIndex((r) => afterHead(r)), ours = local;
-			for (const i of after < 0 ? (ours ? [resp.length - 1] : []) : ours ? [after - 1, after] : [after]) {
-				const r = resp[i], prev = resp[i - 1];
-				if (mine(r) && r.read > 0 && r.read < 0.8 * r.real && (!prev || r.read < 0.8 * prev.real)) { ev.push({ at: i, O: r.read, S: sAt(r.nSys), src: "summary" }); break; }
-			}
+			// Only the first response after a compaction can measure its rewritten prefix.
+			const i = resp.findIndex((r) => afterHead(r)), r = resp[i], prev = resp[i - 1];
+			if (mine(r) && r.read > 0 && r.read < 0.8 * r.real && (!prev || r.read < 0.8 * prev.real)) ev.push({ at: i, O: r.read, S: sAt(r.nSys), src: "summary" });
 		}
 		const best = ev.sort((a, b) => b.at - a.at)[0];
 		let O = best ? Math.max(0, best.O + (best.S >= 0 && S >= 0 ? R0 * (Snow - best.S) : 0)) : R0 * Snow, oSource: Scale["oSource"] = best?.src ?? "default";
@@ -357,7 +364,7 @@ export function calibrate(entries: Any[], sys?: SysInfo, branch: Any[] = [], mod
 		let estN = N.est;
 		const cutLater = !!head && !afterHead(N);
 		const later = edits.filter((x) => x.at > N.at);
-		const rebuilt = cutLater && !local && !!N.id ? requestEst(branch, N.id) : null; // what its request carried: the compaction after it removed that from the projection
+		const rebuilt = cutLater && !!N.id ? requestEst(branch, N.id) : null; // what its request carried: the compaction after it removed that from the projection
 		if (rebuilt !== null && rebuilt > 0) estN = rebuilt;
 		else if (later.length || cutLater) {
 			// carried (a run plan): the prompt shrank, or a read stopped early; a cache miss alone (no read at all) proves nothing. The
@@ -367,7 +374,7 @@ export function calibrate(entries: Any[], sys?: SysInfo, branch: Any[] = [], mod
 			while (p >= 0 && !mine(resp[p])) p--;
 			const P = resp[p];
 			const heur = !P || N.real < P.real || (N.read > 0 && N.read < 0.8 * P.real);
-			const carried = !(cutLater && !local) && (cutLater && typeof head.details?.carried === "boolean" ? head.details.carried : heur);
+			const carried = !cutLater && heur;
 			if (!carried && cutLater) return { O, c: C0, real: N.real, est: 0, source: "default", oSource }; // what it carried is summarised away
 			estN += addBack(n, heur && carried);
 		}
@@ -567,13 +574,9 @@ export interface RunPlan {
 	ms: number;
 	scale: Scale; // the token scale the plan was made with (stats and notices of this run use the same one)
 	persisted: boolean;
-	cutVisibleIdx?: number; // where the kept part starts among the projected non-system messages
-	cutKeptFirstMsg?: Any; // ... and that message itself (a disagreeing request view drops the cut)
 	sent?: boolean; // a request view carrying this plan's folds has gone out
-	cutSent?: boolean; // separately tracked when a room summary joins folds already sent
 	noticeTs?: number; // the first request carrying the folds (their notice may wait for the boundary)
 	applied?: Set<string>; // entry ids whose fold the latest request view actually carried (what turn_end must persist, no more)
-	cutTs?: number; // timestamp of the request-local summary message: one value per run, so every request of the run is identical
 	untouched?: number; // real tokens before the earliest edited block: what the first request carrying the plan can still read from the cache
 	waitMs?: number; // how long the turn waited for this plan's summary (only at Pi's compaction room; 0: it was ready)
 	noticed?: boolean; // its notice is already in the transcript (shown when the first request carrying it went out)
@@ -619,8 +622,6 @@ export interface PlanResult {
 	ctxTokens: number; // real: O + c x content
 	ctxAfterFolds: number; // real
 	userTurns: number;
-	cutVisibleIdx: number;
-	cutKeptFirstMsg: Any;
 	fileRecall?: FileRecall; // the summary of this plan names recall files instead of zip_recall (PlanOpts.fileRecall)
 	atRoom?: boolean; // the context after the plan's folds is at Pi's compaction room: Pi would compact (lossy) if nothing is done now
 	atRoomUnedited?: boolean; // the context as it is (no fold, no cut applied) is at Pi's compaction room: a request sent unchanged would trigger it
@@ -808,31 +809,11 @@ export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
 		const limit = blocks.findIndex((b) => protectedTurn(b));
 		summarise(limit >= 0 ? limit : blocks.length - 1);
 	}
-	// where the kept part starts among the projected non-system messages (the request-local view drops everything before it)
-	let cutVisibleIdx = -1;
-	let cutKeptFirstMsg: Any;
-	if (cutIdx !== null) {
-		let vis = 0;
-		let bi = 0;
-		for (const pe of entries) {
-			const msgs: Any[] = pe.messages ?? [];
-			if (!msgs.length) continue;
-			for (const m of msgs) {
-				if (String(m?.role ?? "") === "system") continue;
-				if (bi === cutIdx && cutVisibleIdx < 0) { cutVisibleIdx = vis; cutKeptFirstMsg = m; }
-				vis++;
-			}
-			bi++;
-		}
-	}
 	// a plan with a cut passed the whole plan's law with its call inside summarise; folds only (no summary wanted, or none the laws
 	// accepted: the deeper cuts and the cut-free plan both stand) is judged here
 	if (cutIdx === null && (!folds.length || !planGate(ctxAfterFolds, untouchedEst(blocks, folds, false), 0, false))) return null;
-	return { blocks, calls, folds, cutIdx, firstKeptEntryId: cutIdx !== null ? blocks[cutIdx].entryId : null, prefixTokens, summaryTokensPlanned, sumTrigger: cutIdx !== null ? (sumTrigger ?? trig) : sumTrigger, scale: o.scale ?? UNIT, ctxTokens: real(ctxEst), ctxAfterFolds: real(ctxAfterFolds), userTurns, cutVisibleIdx, cutKeptFirstMsg, ...(o.fileRecall ? { fileRecall: o.fileRecall } : {}), ...(atRoom ? { atRoom } : {}), ...(atRoomUnedited ? { atRoomUnedited } : {}) };
+	return { blocks, calls, folds, cutIdx, firstKeptEntryId: cutIdx !== null ? blocks[cutIdx].entryId : null, prefixTokens, summaryTokensPlanned, sumTrigger: cutIdx !== null ? (sumTrigger ?? trig) : sumTrigger, scale: o.scale ?? UNIT, ctxTokens: real(ctxEst), ctxAfterFolds: real(ctxAfterFolds), userTurns, ...(o.fileRecall ? { fileRecall: o.fileRecall } : {}), ...(atRoom ? { atRoom } : {}), ...(atRoomUnedited ? { atRoomUnedited } : {}) };
 }
-
-const sameMsg = (a: Any, b: Any): boolean =>
-	!!a && !!b && String(a?.role ?? "") === String(b?.role ?? "") && JSON.stringify(a?.content ?? "") === JSON.stringify(b?.content ?? "");
 
 const isSystem = (m: Any) => String(m?.role ?? "") === "system";
 
@@ -867,33 +848,9 @@ export function collapseSystem(messages: Any[]): Any | undefined {
 	};
 }
 
-/**
- * Request-local view of a plan over the COMPLETE transcript (the `context_with_system` form): fold targets are replaced
- * in place, system messages stay exactly where they are (so the request is byte-identical before and after turn_end
- * persists the same edits, I1). With a cut, the view is what Pi projects after the compaction: the replayed system
- * message, the summary, then the kept non-system messages. null = nothing to apply. A cut whose kept boundary cannot be
- * located is dropped (folds still apply); an inconsistent split is never sent.
- */
-/** Fold targets of a plan made on the view before a native compaction, renumbered for the request Pi builds after it: Pi's summary
- *  message first, then the kept part (positions among the non-system messages, as in applyPlanToMessages). */
-export const rebaseFolds = (folds: FoldTarget[], cutVisibleIdx: number): FoldTarget[] =>
-	folds.map((t) => ({ ...t, visIdx: t.visIdx >= 0 && cutVisibleIdx >= 0 && t.visIdx >= cutVisibleIdx ? t.visIdx - cutVisibleIdx + 1 : -1 }));
-
-export function applyPlanToMessages(messages: Any[], plan: RunPlan | null): { messages: Any[]; droppedCut: boolean; applied: Set<string> } | null {
-	if (!plan || plan.persisted || (!plan.folds.length && !plan.cut)) return null;
-	const vis: number[] = []; // indices of the non-system messages
-	messages.forEach((m, i) => { if (!isSystem(m)) vis.push(i); });
-	let cutAt = -1; // index into `messages`
-	let droppedCut = false;
-	if (plan.cut) {
-		const v = plan.cutVisibleIdx ?? -1;
-		cutAt = v >= 0 && v < vis.length ? vis[v] : -1;
-		if (cutAt < 0 || !sameMsg(messages[cutAt], plan.cutKeptFirstMsg)) {
-			plan.cut = null;
-			cutAt = -1;
-			droppedCut = true;
-		}
-	}
+/** Apply only folds to a request; summaries enter through Pi's native or boundary compaction. */
+export function applyPlanToMessages(messages: Any[], plan: RunPlan | null): { messages: Any[]; applied: Set<string> } | null {
+	if (!plan || plan.persisted || !plan.folds.length) return null;
 	// match each result to its target: by position when the position still holds the same result, else by (call id, content) when that is unique
 	const used = new Set<FoldTarget>();
 	const applied = new Set<string>();
@@ -916,7 +873,6 @@ export function applyPlanToMessages(messages: Any[], plan: RunPlan | null): { me
 	const folded = messages.map((m: Any, i: number) => {
 		if (isSystem(m)) return m;
 		v++;
-		if (cutAt >= 0 && i < cutAt) return m; // replaced by the compaction message below
 		if (m?.role !== "toolResult" || textOf(m.content).startsWith(PH_MARK)) return m; // not ours, or the persisted edit already folded it
 		const ck = contentKeyOf(m.content);
 		let t = byPos.get(v);
@@ -931,13 +887,7 @@ export function applyPlanToMessages(messages: Any[], plan: RunPlan | null): { me
 		changed = true;
 		return { ...m, content: [{ type: "text", text: t.ph }] };
 	});
-	if (cutAt >= 0) {
-		const c = plan.cut!;
-		const head = collapseSystem(messages);
-		const kept = folded.slice(cutAt).filter((m: Any) => !isSystem(m));
-		return { messages: [...(head ? [head] : []), { role: "compactionSummary", summary: c.text, tokensBefore: c.prefixTokens, timestamp: plan.cutTs ??= Date.now() }, ...kept], droppedCut, applied };
-	}
-	return changed || droppedCut ? { messages: folded, droppedCut, applied } : null;
+	return changed ? { messages: folded, applied } : null;
 }
 
 export { pickKeyLines };

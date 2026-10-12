@@ -4,7 +4,7 @@
 import { detectCold, modelKey, resolveTtl, type ColdInfo } from "./cache.ts";
 import { validateEdits } from "./guard.ts";
 import { GAP_EDGES, lawPrices, pWarm, type Entry } from "./learn.ts";
-import { calibrate, compactionRoom, planContext, rebaseFolds, sizeOf, spliceNative, untouchedEst, UNIT, type Block, type Cut, type FoldTarget, type Law, type PlanOpts, type PlanResult, type RunPlan, type Scale, type SysInfo } from "./plan.ts";
+import { buildBlocks, calibrate, compactionRoom, planContext, sizeOf, untouchedEst, UNIT, type Block, type Cut, type FoldTarget, type Law, type PlanOpts, type PlanResult, type RunPlan, type Scale, type SysInfo } from "./plan.ts";
 import type { FileRecall } from "./recallfile.ts";
 import { PRODUCT, type Any } from "./util.ts";
 
@@ -244,103 +244,58 @@ export function unready<T extends { p: PlanResult | null }>(r: T, ready: readonl
 	return { r: foldsOnly(), produce: p };
 }
 
-/** The native summary of this run, as the run decision sees it: the projection right before Pi's compaction and that entry. */
-export interface NativeIn { key: string; pre: Any[]; entryId: string }
-
-/**
- * The run plan decision at a run's first request (one plan per edit run). `opts` gives the plan options of this run for some entries
- * (the shell's P(warm) and pause). b2b: a warm return right after an edited request makes no edit (unless Pi's compaction already put
- * this run's summary in). Otherwise the plan, taking the summary in the session (`nat`) or a produced one (`avail`, adopt);
- * a summary Pi's compaction put in is planned on the projection before it (`onPre`), or on the session as it is when that plan cuts
- * elsewhere. `foreign`: another extension's compaction just went in: folds only.
- */
-export function decideRun(x: { cold: boolean; justEdited: boolean; nat: NativeIn | null; foreign: boolean; now: Any[]; ready: readonly Avail[]; opts: (entries: Any[], cutAt?: string, foldsOnly?: boolean, ready?: readonly string[]) => { o: PlanOpts; cal: Scale } }):
-	{ kind: "b2b"; produce: PlanResult | null } | { kind: "plan"; o: PlanOpts; cal: Scale; p: PlanResult | null; onPre: boolean; notes: Note[]; produce: PlanResult | null } {
-	const { cold, nat } = x;
-	const spliced = nat ? spliceNative(nat.pre, x.now, nat.entryId) : null;
-	const notes: Note[] = [];
-	const readyKeys = x.ready.filter((a) => !a.running).map((a) => a.key);
-	const plan = (entries: Any[], cutAt?: string, asNative = false, foldsOnly = false) => {
-		// Native application moved the branch head: its artifact is spent even though READY no longer contains it.
-		const { o, cal } = x.opts(entries, cutAt, foldsOnly, asNative && nat ? [...readyKeys, nat.key] : readyKeys);
-		// the plan that carries the summary Pi's compaction just put in is made in the state nativeSummary planned it in: before that
-		// summary, so it is not "a second summary in this warm stretch" (noSummary, regrowAt). Otherwise a real prompt a token smaller
-		// than before_agent_start's estimate falls below regrowAt, the plan does not cut and the folds priced with it are dropped
-		if (asNative) {
-			o.noSummary = false;
-			delete o.regrowAt;
-		}
-		if (x.foreign) o.noSummary = true; // another extension's compaction just went in: folds only (a summary only at Pi's compaction room)
-		return { o, cal, p: planContext(entries, o) };
+/** A native prompt carries its jointly priced folds; other first requests plan folds and defer summaries to turn_end. */
+export function decideRun(x: { cold: boolean; justEdited: boolean; nat: { o: PlanOpts; cal: Scale; p: PlanResult } | null; foreign: boolean; now: Any[]; ready: readonly Avail[]; opts: (entries: Any[], cutAt?: string, foldsOnly?: boolean, ready?: readonly string[]) => { o: PlanOpts; cal: Scale } }):
+	{ kind: "b2b"; produce: PlanResult | null } | { kind: "plan"; o: PlanOpts; cal: Scale; p: PlanResult | null; notes: Note[]; produce: PlanResult | null } {
+	if (x.nat) return { kind: "plan", ...x.nat, notes: [], produce: null };
+	const mk = (foldsOnly: boolean, cutAt?: string) => {
+		const { o, cal } = x.opts(x.now, cutAt, foldsOnly, x.ready.filter((a) => !a.running).map((a) => a.key));
+		if (x.foreign) o.noSummary = true;
+		return { o, cal, p: planContext(x.now, o) };
 	};
-	// b2b blocks only the application: the summary the plan wants is still produced (theory 1.3 R6)
-	if (!cold && x.justEdited && !nat) {
-		const { p } = plan(x.now);
-		return { kind: "b2b", produce: p && p.cutIdx !== null && !x.ready.some((a) => a.key === p.firstKeptEntryId) ? p : null };
-	}
-	const adopted = (entries: Any[]) => {
-		const first = plan(entries, undefined, !!nat);
-		const { r, note } = adopt(first, (k) => plan(entries, k, !!nat), nat ? [{ key: nat.key, running: false }] : x.ready, "run");
-		if (note) notes.push(note);
-		return r;
-	};
-	let { o, cal, p } = adopted(spliced ?? x.now);
-	let produce: PlanResult | null = null;
-	const onPre = !!nat && !!spliced && !!p && p.cutIdx !== null && p.firstKeptEntryId === nat.key;
-	if (nat && !onPre) {
-		// the summary is in the session, but this plan would not cut there (the prompt, or what came with it, changed the plan): plan on
-		// the session as it is now, with the summary at its head
-		notes.push({ type: "native_mismatch", planned: p?.firstKeptEntryId ?? null, compacted: nat.key });
-		({ o, cal, p } = plan(x.now));
-	}
-	if (!onPre) {
-		// a cut with no ready summary: the folds alone, by the law; the cut is produced unless a summary went in now (theory 1.2 DV7)
-		const u = unready({ o, cal, p }, x.ready, () => plan(x.now, undefined, false, true));
-		({ o, cal, p } = u.r);
-		if (!nat) produce = u.produce;
-	}
-	return { kind: "plan", o, cal, p, onPre, notes, produce };
+	const selected = adopt(mk(false), (k) => mk(false, k), x.ready.filter((a) => !a.running), "run");
+	const first = selected?.r.p;
+	const notes: Note[] = selected?.note ? [selected.note] : [];
+	if (first && first.cutIdx !== null && x.ready.some((a) => !a.running && a.key === first.firstKeptEntryId)) notes.push({ type: "defer", key: first.firstKeptEntryId });
+	const produce = first && first.cutIdx !== null && !x.ready.some((a) => a.key === first.firstKeptEntryId) ? first : null;
+	if (!x.cold && x.justEdited && !x.nat) return { kind: "b2b", produce };
+	return { kind: "plan", ...(selected && (!first || first.cutIdx === null) ? selected.r : mk(true)), notes, produce };
 }
 
-/**
- * The run plan itself, once its summary is known (`cut`: adopted or written now; `native`: Pi's compaction took it). A plan that
- * cannot be persisted is never sent (I1): the guard drops the summary, or everything. Sizes: the notice's "before" is the number Pi's
- * compaction block shows when the summary went in natively.
- */
-export function runPlanOf(x: { p: PlanResult | null; cal: Scale; cold: boolean; onPre: boolean; native: Cut | null; nat: { before: number; after: number } | null; folds: FoldTarget[]; cut: Cut | null; adopted: boolean; settleIds: string[]; ms: number }): { plan: RunPlan; folds: FoldTarget[]; cut: Cut | null; drop?: Note } {
-	const { p, cal, cold, onPre, native, nat } = x;
-	let folds = x.folds, cut = x.cut, drop: Note | undefined;
+/** Native folds retain the prompt decision and use entry IDs to find their positions; other folds are guarded before sending. */
+export function runPlanOf(x: { p: PlanResult | null; cal: Scale; cold: boolean; native: Cut | null; nat: { before: number; after: number } | null; folds: FoldTarget[]; settleIds: string[]; ms: number; now?: Any[] }): { plan: RunPlan; folds: FoldTarget[]; drop?: Note } {
+	const { p, cal, cold, native, nat } = x;
+	let folds = x.folds, drop: Note | undefined;
 	const sameSet = x.settleIds.length === folds.length && x.settleIds.every((id) => folds.some((u) => u.entryId === id));
-	const source: RunPlan["source"] = !cold ? "valve" : x.adopted || (x.settleIds.length > 0 && sameSet) ? "settle" : "runstart";
-	if (p) {
-		const invalid = checkEdits(p.blocks, p.userTurns, folds, cut ?? (onPre ? native : null));
+	const source: RunPlan["source"] = !cold ? "valve" : native || (x.settleIds.length > 0 && sameSet) ? "settle" : "runstart";
+	if (native && p) {
+		const positions = new Map((x.now ?? []).flatMap((e) => (e.messages ?? []).filter((m: Any) => m.role !== "system").map(() => e.sourceEntry?.id)).map((id, visIdx) => [id, visIdx]));
+		folds = folds.map((t) => {
+			const visIdx = positions.get(t.entryId);
+			if (visIdx === undefined) throw new Error("native fold target must be kept after the cut");
+			return { ...t, visIdx };
+		});
+	} else if (p) {
+		const invalid = checkEdits(p.blocks, p.userTurns, folds, null);
 		if (invalid) {
-			drop = { type: "guard_drop", where: "run_plan", reason: invalid, folds: folds.length, summary: !!(cut ?? native) };
-			if (native) folds = []; // the summary is in the session already: only the folds can be dropped
-			else if (cut && checkEdits(p.blocks, p.userTurns, folds, null) === null) cut = null;
-			else { folds = []; cut = null; }
+			drop = { type: "guard_drop", where: "run_plan", reason: invalid, folds: folds.length, summary: false };
+			folds = [];
 		}
-	}
-	const sum = cut ?? (onPre ? native : null); // a summary this plan's sizes do not count yet
-	let ctxBefore = p?.ctxTokens ?? 0;
-	let ctxAfter = (p?.ctxAfterFolds ?? 0) - (sum ? cal.c * (sum.prefixTokens - sum.summaryTokens) : 0);
-	if (nat) {
-		ctxAfter = p ? ctxAfter + (onPre ? nat.before - ctxBefore : 0) : nat.after;
-		ctxBefore = nat.before;
 	}
 	const plan: RunPlan = {
-		source, folds: onPre ? rebaseFolds(folds, p!.cutVisibleIdx) : folds, cut, native: native ?? undefined, ctxBefore, ctxAfter, ms: x.ms, scale: cal, persisted: false,
-		...(!cold && (native || (cut && x.adopted)) ? { ready: "away" as const } : {}),
-		waitMs: 0, cutVisibleIdx: p?.cutVisibleIdx ?? -1, cutKeptFirstMsg: p?.cutKeptFirstMsg, untouched: p ? sizeOf(cal, untouchedEst(p.blocks, folds, !!(cut ?? native))) : sizeOf(cal, 0),
+		source, folds, cut: null, native: native ?? undefined, ctxBefore: nat?.before ?? p?.ctxTokens ?? 0,
+		ctxAfter: nat?.after ?? p?.ctxAfterFolds ?? 0, ms: x.ms, scale: cal, persisted: false,
+		...(!cold && native ? { ready: "away" as const } : {}), waitMs: 0,
+		untouched: p ? sizeOf(cal, untouchedEst(p.blocks, folds, !!native)) : sizeOf(cal, 0),
 	};
-	return { plan, folds, cut, ...(drop ? { drop } : {}) };
+	return { plan, folds, ...(drop ? { drop } : {}) };
 }
 
-/** The decision at a turn_end that has no run plan to persist: none after a failed turn, else the plan at the in-run P(warm) `pWarm`
+/** The turn_end decision, including carried folds: none after a failed turn, else the plan at the in-run P(warm) `pWarm`
  *  (core.ts inRunClock), taking a ready summary (adopt) or, when its cut has none, its folds alone (unready: the cut is produced).
  *  Right after an edited request while the cache is believed warm (b2b) nothing is applied, and the summary is still produced. `p`
  *  null when it changes nothing; `room`: the plan of the room wait (roomOf), which b2b does not block (theory 1.3 R6). */
-export function decideTurnEnd(x: { failed: boolean; justEdited: boolean; pWarm: number; ready: readonly Avail[]; opts: (cutAt?: string, foldsOnly?: boolean, ready?: readonly string[]) => { o: PlanOpts }; entries: Any[] }):
+export function decideTurnEnd(x: { failed: boolean; justEdited: boolean; pWarm: number; ready: readonly Avail[]; opts: (cutAt?: string, foldsOnly?: boolean, ready?: readonly string[]) => { o: PlanOpts }; entries: Any[]; runPlan?: RunPlan | null }):
 	{ kind: "none" } | { kind: "b2b"; produce: PlanResult | null; room: PlanResult | null } | { kind: "plan"; o: PlanOpts; p: PlanResult | null; notes: Note[]; produce: PlanResult | null; room: PlanResult | null } {
 	if (x.failed) return { kind: "none" };
 	const readyKeys = x.ready.filter((a) => !a.running).map((a) => a.key);
@@ -353,7 +308,11 @@ export function decideTurnEnd(x: { failed: boolean; justEdited: boolean; pWarm: 
 	const { r, note } = b2b ? { r: first, note: undefined } : adopt(first, mk, x.ready, "turn_end");
 	const u = b2b ? { r: first, produce: first.p?.cutIdx !== null && first.p && !x.ready.some((a) => a.key === first.p!.firstKeptEntryId) ? first.p : null } : unready(r, x.ready, () => mk(undefined, true));
 	const p = !b2b && u.r.p && (u.r.p.folds.length || u.r.p.cutIdx !== null) ? u.r.p : null;
-	const after = p ? p.ctxAfterFolds - (p.cutIdx !== null ? p.scale.c * (p.prefixTokens - p.summaryTokensPlanned) : 0) : (first.p?.ctxTokens ?? 0);
+	const carried = x.runPlan;
+	const applied = carried?.folds.filter((t) => !carried.applied || carried.applied.has(t.entryId)) ?? [];
+	const before = sizeOf(carried?.scale ?? first.o.scale ?? UNIT, buildBlocks(x.entries, first.o.steerIds).reduce((n, b) => n + b.tokens, 0));
+	const afterFolds = carried ? before - carried.scale.c * applied.reduce((n, t) => n + t.entryTokens - t.phTokens, 0) : (p?.ctxAfterFolds ?? before);
+	const after = afterFolds - (p?.cutIdx !== null && p ? p.scale.c * (p.prefixTokens - p.summaryTokensPlanned) : 0);
 	const room = roomOf(after, first.o, () => planContext(x.entries, x.opts(undefined, false, []).o), p?.cutIdx !== null ? (p?.firstKeptEntryId ?? undefined) : undefined);
 	const produce = room ? null : u.produce;
 	return b2b ? { kind: "b2b", produce, room } : { kind: "plan", o: u.r.o, p, notes: note ? [note] : [], produce, room };

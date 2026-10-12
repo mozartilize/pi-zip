@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { applyPlanToMessages, buildBlocks, compactionRoom, contentKeyOf, planContext, rebaseFolds, settings, spliceNative, type Cut, type FoldTarget, type PlanOpts, type RunPlan } from "../src/plan.ts";
+import { applyPlanToMessages, buildBlocks, compactionRoom, contentKeyOf, planContext, settings, type Cut, type FoldTarget, type PlanOpts, type RunPlan } from "../src/plan.ts";
 import { lawPrices } from "../src/learn.ts";
 import { A, AX, flat, longTurn, R, U, type Any } from "./helpers.ts";
 import { validateEdits } from "../src/guard.ts";
@@ -140,22 +140,7 @@ describe("applyPlanToMessages", () => {
 		const folded = applyPlanToMessages(visible, plan)!.messages;
 		expect(applyPlanToMessages(folded, plan)).toBeNull();
 	});
-	test("a shifted request view drops the cut (never an inconsistent split) but still folds", () => {
-		const sumCtx = [U("u1", "one"), A("a1", ["c1"]), R("r1", "c1", 44_000), AX("a2", 120_000), U("u2", "two"), A("a3", ["c3"]), R("r3", "c3", 44_000), AX("a4", 120_000), U("u3", "three"), A("a5"), U("u4", "back")];
-		const p = planContext(sumCtx, opts({ coldCap: 6000, promptPending: false }))!;
-		const cut: Cut = { firstKeptEntryId: "u3", text: "[summary] TEST", trigger: "cold", count: 2, prefixTokens: p.prefixTokens, summaryTokens: 100, llmOk: true, llmError: null, costUsd: 0, ms: 0 };
-		const mk = (): RunPlan => ({ source: "settle", folds: [], cut: { ...cut }, ctxBefore: 0, ctxAfter: 0, ms: 0, persisted: false, cutVisibleIdx: p.cutVisibleIdx, cutKeptFirstMsg: p.cutKeptFirstMsg });
-		const vis = flat(sumCtx);
-		const ok = applyPlanToMessages(vis, mk())!;
-		expect(ok.messages[0].role).toBe("compactionSummary");
-		expect(ok.messages[0].summary).toBe("[summary] TEST");
-		expect(ok.messages).toHaveLength(vis.length - p.cutVisibleIdx + 1);
-		const shiftedPlan = mk();
-		shiftedPlan.folds = planContext(buildBlocksEntries(), opts({ promptPending: false }))!.folds;
-		const shifted = applyPlanToMessages([{ role: "user", content: "steering" }, ...vis], shiftedPlan)!;
-		expect(shifted.droppedCut).toBe(true);
-		expect(shiftedPlan.cut).toBeNull();
-	});
+
 });
 describe("recall results and reused tool call ids", () => {
 	test("a zip_recall result is never folded (it is the content the model just asked for)", () => {
@@ -378,30 +363,19 @@ describe("age counts only assistant messages the model is sent", () => {
 	});
 });
 
-describe("native compaction: the run plan is made on the view before it and applied to the view after it", () => {
-	// a server that reuses tool call ids: r2 and r3 carry the same id and the same text, both in the kept part; only r3 is folded
-	const same = "same output line\n".repeat(600);
-	const pre = [U("u1", "one"), A("a1", ["c1"]), R("r1", "c1", 9000), A("a2"), U("u2", "two"), A("a3", ["c9"]), R("r2", "c9", 0, same), A("a4", ["c9"]), R("r3", "c9", 0, same), A("a5"), U("u3", "three"), A("a6")];
-	const r3 = pre[8].messages[0] as Any;
-	const fold: FoldTarget = { entryId: "r3", toolCallId: "c9", visIdx: 8, contentKey: contentKeyOf(r3.content), tool: "bash", args: "ls", entryTokens: 2500, phTokens: 50, ph: "[folded by pi-zip · bash ls · handle x]", trig: "cold" };
-	const cutVisibleIdx = 4; // u2
-	const comp = { sourceEntry: { id: "cmp", type: "compaction" }, messages: [{ role: "compactionSummary", summary: "S", tokensBefore: 0, timestamp: 0 }] };
-	const post = [comp, ...pre.slice(4)];
-	const plan = (folds: FoldTarget[]): RunPlan => ({ source: "settle", folds, cut: null, ctxBefore: 0, ctxAfter: 0, ms: 0, persisted: false });
-
-	test("renumbered folds hit their own position (summary first, then the kept part); unrenumbered ones are ambiguous and fold nothing", () => {
-		const out = applyPlanToMessages(flat(post), plan(rebaseFolds([fold], cutVisibleIdx)))!;
+describe("native compaction: folds are planned on the resulting projection", () => {
+	test("duplicate results are folded by their positions after the native summary", () => {
+		const same = "same output line\n".repeat(600);
+		const post = [{ sourceEntry: { id: "cmp", type: "compaction" }, messages: [{ role: "compactionSummary", summary: "S", timestamp: 0 }] }, U("u2", "two"), A("a3", ["c9"]), R("r2", "c9", 0, same), A("a4", ["c9"]), R("r3", "c9", 0, same), U("u3", "three"), A("a6"), U("u4", "back")];
+		const p = planContext(post, opts({ coldCap: 1000, promptPending: false, foldsOnly: true }))!;
+		const folds = p.folds.filter((t) => t.entryId === "r3");
+		expect(folds).toHaveLength(1);
+		expect(folds[0].visIdx).toBe(5);
+		const plan: RunPlan = { source: "settle", folds, cut: null, ctxBefore: 0, ctxAfter: 0, ms: 0, persisted: false };
+		const out = applyPlanToMessages(flat(post), plan)!;
 		expect(out.applied).toEqual(new Set(["r3"]));
-		expect(out.messages[5].content[0].text).toBe(fold.ph); // r3: 8 - 4 + 1
-		expect(out.messages[3].content[0].text).toBe(same); // r2, the look-alike, untouched
-		expect(applyPlanToMessages(flat(post), plan([fold]))).toBeNull();
-		expect(rebaseFolds([{ ...fold, visIdx: 2 }], cutVisibleIdx)[0].visIdx).toBe(-1); // before the cut: summarised, never a position after it
-	});
-
-	test("the splice: the view before the compaction plus only what came after the compaction entry", () => {
-		const prompt = U("u4", "back");
-		expect(spliceNative(pre, [...post, prompt], "cmp")!.map((e) => e.sourceEntry.id)).toEqual([...pre.map((e) => e.sourceEntry.id), "u4"]);
-		expect(spliceNative(pre, [...pre, prompt], "cmp")).toBeNull(); // the compaction is not the head (another one came after it): no splice
+		expect(out.messages[5].content[0].text).toBe(folds[0].ph);
+		expect(out.messages[3].content[0].text).toBe(same);
 	});
 });
 

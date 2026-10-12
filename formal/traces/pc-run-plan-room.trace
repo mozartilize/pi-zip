@@ -1,14 +1,25 @@
-# 0.4.0 step 4 (PC, review fix): a return after a pause whose run plan is its folds alone (its cut is produced in the background)
-# and whose next request, after the 30K output, is at Pi's own threshold: the turn_end that persists the run plan waits at the room for
-# the cut, so Pi does not compact on its own. The mutant persists the run plan alone (step 4 as first committed).
-world explicit known ttl=300 true=300 survival=none c=1 sys=3000 window=128000 native interactive
-prompt +0s
-say 20K
-prompt +60s
+# A cold return carries folds; its turn_end remains at the room and waits for its own paying cut.
+world explicit known ttl=300 true=300 survival=none c=1 sys=3000 window=128000 nonative print
+prompt
 call npm 1K
-say 100
+say 90K
 prompt +60s
-say 60K
+call npm 100
+call npm 100
+call npm 100
+call npm 100
+call npm 100
+call npm 100
+call npm 100
+call npm 100
+call npm 100
+call npm 100
+call npm 100
+call npm 100
+call npm 100
+call npm 100
+call npm 100
+say 20K
 prompt +1h
-call npm 30K
+call npm 40K
 say 100

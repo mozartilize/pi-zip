@@ -381,31 +381,32 @@ describe("real Pi: the request view is identical before and after turn_end persi
 		expect(sysAt(req3)).toEqual(sysAt(req1)); // still in place after persisting
 	});
 
-	test("a summary cut: request N equals request N+1 (replayed system message, summary, kept messages)", async () => {
-		const r = await rig((sm) => populate(sm, 6000)); // long assistant prose: folds alone cannot reach the cap, so a summary is planned (and its uncached call pays: X ~ 70K)
-		sendPrompt(r.sm, "next request");
-		await produced(r);
-		const req1 = await r.request();
-		expect(req1.some((m) => m.role === "compactionSummary")).toBe(true);
-		expect(r.narrativeCalls.length).toBe(1);
-		expect(req1.filter((m) => m.role === "system").length).toBe(1); // collapsed, exactly like Pi's compaction projection
-		const a = r.sm.appendMessage(asst([call("c8")], "toolUse", 10_000_001));
-		r.sm.appendMessage(result("c8", "tiny", 10_000_002));
-		const req2 = await r.request();
-		await r.turnEnd(a, asst([call("c8")], "toolUse"));
-		const req3 = await r.request();
-		for (const mid of [true, false]) {
-			expect(llm(req2.slice(0, req1.length), mid)).toBe(llm(req1, mid));
-			expect(llm(req3, mid)).toBe(llm(req2, mid));
-		}
-	});
-
-	test("a summary and a fold persisted together: Pi's 'Compacted from N' is its usage-based size before the edits, not chars/4 of a half-applied batch", async () => {
+	test("a boundary summary starts in request N+1 and its kept prefix stays byte-identical", async () => {
 		const r = await rig((sm) => populate(sm, 6000));
 		sendPrompt(r.sm, "next request");
 		await produced(r);
 		const req1 = await r.request();
-		expect(req1.some((m) => m.role === "compactionSummary")).toBe(true);
+		expect(req1.some((m) => m.role === "compactionSummary")).toBe(false);
+		const a = r.sm.appendMessage(asst([call("c8")], "toolUse", 10_000_001));
+		r.sm.appendMessage(result("c8", "tiny", 10_000_002));
+		const req2 = await r.request();
+		for (const mid of [true, false]) expect(llm(req2.slice(0, req1.length), mid)).toBe(llm(req1, mid));
+		const drafts = await r.turnEnd(a, asst([call("c8")], "toolUse"));
+		expect(drafts[0].type).toBe("compaction");
+		const req3 = await r.request();
+		expect(req3.some((m) => m.role === "compactionSummary")).toBe(true);
+		const kept = r.sm.buildSessionProjection().entries.find((e: Any) => e.sourceEntry.id === drafts[0].firstKeptEntryId) as Any;
+		const at = req2.findIndex((m) => JSON.stringify(m) === JSON.stringify(kept.messages[0]));
+		const after = req3.findIndex((m) => JSON.stringify(m) === JSON.stringify(kept.messages[0]));
+		for (const mid of [true, false]) expect(llm(req3.slice(after), mid)).toBe(llm(req2.slice(at), mid));
+	});
+
+	test("a summary and a fold persisted together: Pi's 'Compacted from N' is its usage-based size before the edits, not chars/4 of a half-applied batch", async () => {
+		const r = await rig((sm) => populate(sm, 6000), { tui: true });
+		sendPrompt(r.sm, "next request");
+		await produced(r);
+		const req1 = await r.request();
+		expect(req1.some((m) => m.role === "compactionSummary")).toBe(false);
 		// the response that carried the plan reports a real prompt size; the turn's tool result follows it
 		const real = { ...usage, input: 40_000, totalTokens: 40_050 };
 		const a = r.sm.appendMessage({ ...asst([call("c8")], "toolUse", 10_000_001), usage: real });
@@ -413,13 +414,15 @@ describe("real Pi: the request view is identical before and after turn_end persi
 		const piBefore = estimateProjectedContextTokens(r.sm.buildSessionProjection(), r.sm.getBranch()).tokens; // what Pi reads before any draft
 		expect(piBefore).toBe(40_050 + Math.ceil(4_000 / 4)); // usage + the trailing tool result at chars/4
 		const all = await r.turnEnd(a, { ...asst([call("c8")], "toolUse"), usage: real });
-		expect(all.find((d: Any) => d.customType === "pi-zip/commit")).toMatchObject({ type: "custom", data: { carried: true } }); // a run plan: the run's requests had carried these edits
+		expect(all.find((d: Any) => d.customType === "pi-zip/commit")).toMatchObject({ type: "custom", data: { carried: true, next: true } }); // a run plan: the run's requests had carried these edits
 		expect(all.filter((d: Any) => d.type === "custom").map((d: Any) => d.customType)).toEqual(["pi-zip/commit", "pi-zip/summary"]); // the record of the call, which ended inside the run
 		const drafts = all.filter((d: Any) => d.type !== "custom");
 		expect(drafts.map((d: Any) => d.type)).toEqual(["compaction", ...drafts.slice(1).map(() => "context_edit")]);
 		expect(drafts.length).toBeGreaterThan(1); // a fold in the kept part rides along
 		const comp = r.sm.getBranch().find((e: Any) => e.type === "compaction") as Any;
 		expect(comp.tokensBefore).toBe(piBefore);
+		const notice = (r.sm.getBranch().find((e: Any) => e.customType === "pi-zip/notice" && !e.data?.kind) as Any).data;
+		expect(notice.before).toBe(piBefore);
 		expect(comp.details.regrow).toBeGreaterThan(0); // the size the summary started from: a restart restores when the warm-stretch flag lapses
 	});
 
@@ -461,7 +464,7 @@ describe("real Pi: a summary prepared while the user was away goes in through Pi
 	beforeEach(() => { process.env.PI_ZIP_TTL_SECS = "1"; });
 
 	test("a future start deadline is armed on session opening and prepares the return", async () => {
-		const r = await rig(undefined, { file: template(), tui: true, native: false, idle: false, start: false }); // session_start only: no settle ever ran in this process
+		const r = await rig(undefined, { file: template(), tui: true, native: true, idle: true, start: false }); // session_start only: no settle ever ran in this process
 		await sleep(2_300); // the unlearned timer uses the first paying gap, TTL plus one second
 		expect(r.narrativeCalls.length).toBe(1); // old code: 0 (armAway was reached only from settle)
 		await r.beforeAgentStart("next request");
@@ -506,11 +509,11 @@ describe("real Pi: a summary prepared while the user was away goes in through Pi
 		const a = r.sm.appendMessage(asst([call("k1")], "toolUse", 10_000_001));
 		r.sm.appendMessage(result("k1", "tiny", 10_000_002));
 		const drafts = await r.turnEnd(a, asst([call("k1")], "toolUse"));
-		expect(drafts.filter((d: Any) => d.type === "compaction")).toHaveLength(0); // this turn_end persists the run plan (its folds) ...
+		expect(drafts[0].type).toBe("compaction"); // one decision persists folds and takes the ready summary
 		await r.request(); // the next assistant response answers a new Pi request
 		const b2 = r.sm.appendMessage(asst([call("k2")], "toolUse", 10_000_003));
 		r.sm.appendMessage(result("k2", "tiny", 10_000_004));
-		expect((await r.turnEnd(b2, asst([call("k2")], "toolUse"))).filter((d: Any) => d.type === "compaction")).toHaveLength(1); // ... the next one takes the summary
+		expect((await r.turnEnd(b2, asst([call("k2")], "toolUse"))).filter((d: Any) => d.type === "compaction")).toHaveLength(0); // the summary already entered at the first boundary
 		expect(r.narrativeCalls.length).toBe(1);
 	});
 
@@ -532,7 +535,7 @@ describe("real Pi: a summary prepared while the user was away goes in through Pi
 		await r.request(); // the next assistant response answers a new Pi request
 		const b2 = r.sm.appendMessage(asst([call("k2")], "toolUse", 10_000_003));
 		r.sm.appendMessage(result("k2", "tiny", 10_000_004));
-		expect((await r.turnEnd(b2, asst([call("k2")], "toolUse"))).filter((d: Any) => d.type === "compaction")).toHaveLength(1); // the produced summary, at the next decision
+		expect((await r.turnEnd(b2, asst([call("k2")], "toolUse"))).filter((d: Any) => d.type === "compaction")).toHaveLength(0); // the produced summary entered at the first boundary
 		expect(r.narrativeCalls.length).toBe(1); // old code: 2 (the key's call cut at the note, the run plan one turn earlier)
 		expect(r.sm.getEntries().filter((e: Any) => e.type === "custom" && e.customType === "pi-zip/summary" && !e.data?.cut)).toEqual([]); // no call ended unused
 	});
@@ -712,7 +715,7 @@ describe("item 5: a run an extension's message starts (sendMessage with triggerT
 		expect(req.some((m) => m.role === "custom")).toBe(true); // the message that started the run is kept
 	});
 
-	test("a summary prepared while away is adopted by the driven run (one call), and ctx.compact() is never called: it would abort the run that is starting", async () => {
+	test("a driven run defers its ready summary to the first turn_end and never calls ctx.compact()", async () => {
 		const r = await rig(undefined, { file: template(240 * 60_000), tui: true, native: true, idle: true, start: false });
 		await r.settle(); // the end of a run asks the shared producer about the next return
 		await sleep(150);
@@ -720,7 +723,18 @@ describe("item 5: a run an extension's message starts (sendMessage with triggerT
 		const req = await drive(r);
 		expect(r.narrativeCalls.length).toBe(1); // adopted, not written again
 		expect(r.compactCalls.n).toBe(0);
-		expect(req.some((m) => m.role === "compactionSummary")).toBe(true);
+		expect(req.some((m) => m.role === "compactionSummary")).toBe(false);
+		const response = asst([call("driven")], "toolUse");
+		const id = r.sm.appendMessage(response);
+		r.sm.appendMessage(result("driven", "short output"));
+		const before = estimateProjectedContextTokens(r.sm.buildSessionProjection(), r.sm.getBranch()).tokens;
+		const drafts = await r.turnEnd(id, response);
+		expect(drafts[0].type).toBe("compaction");
+		const comp = r.sm.getBranch().find((e: Any) => e.type === "compaction") as Any;
+		const notice = r.sm.getBranch().find((e: Any) => e.customType === "pi-zip/notice" && !e.data?.kind) as Any;
+		expect(comp.tokensBefore).toBe(before);
+		expect(notice.data.before).toBe(before);
+		expect((await r.request()).some((m) => m.role === "compactionSummary")).toBe(true);
 	});
 
 	test("a prompt still goes through before_agent_start once: agent_start after it does not start the run a second time", async () => {
@@ -850,8 +864,7 @@ describe("round 5 on real Pi: rule A starts the warm summary early, nobody waits
 				await sleep(5);
 				expect(r.compactions[0].tokensBefore).toBe(noticeOf(r).before);
 				const rows = readFileSync(ledger, "utf8").trim().split("\n").map((l) => JSON.parse(l));
-				expect(rows.filter((x) => x.type === "native_mismatch")).toEqual([]);
-				expect(rows.find((x) => x.type === "cold_plan")).toMatchObject({ via: "native", onPre: true });
+				expect(rows.find((x) => x.type === "cold_plan")).toMatchObject({ via: "native" });
 				await r.shutdown();
 			} finally {
 				if (before === undefined) delete process.env.PI_ZIP_LEDGER;
@@ -861,11 +874,48 @@ describe("round 5 on real Pi: rule A starts the warm summary early, nobody waits
 		});
 	}
 
-	// the second case: the prompt Pi appends comes out smaller than what before_agent_start announced (pendingPrompt's estimate). The
-	// warm plan must still cut where Pi's compaction just cut (review P2 #5: it hung on real(ctxAfterFolds) >= regrowAt holding with
-	// equality, fell into native_mismatch and dropped the folds priced with the summary)
+	test("native joint pricing carries exactly its folds by entry ID on real Pi, with an exact before-number and no first-request re-plan", async () => {
+		const sm = SessionManager.inMemory(CWD), timestamp = Date.now() - T0 - 60_000, keys: string[] = [];
+		for (let i = 0; i < 18; i++) {
+			keys.push(sm.appendMessage(user(`turn ${i + 1}`, timestamp)));
+			if (i === 12) {
+				sm.appendMessage({ ...asst([call("joint-fold")], "toolUse", timestamp), usage: undefined });
+				sm.appendMessage(result("joint-fold", bulk("joint", 1500), timestamp));
+			}
+			sm.appendMessage({ ...asst([{ type: "text", text: "z ".repeat(6500) }], "stop", timestamp), usage: undefined });
+		}
+		const key = keys[9], text = "## Decisions\n" + "summary ".repeat(500);
+		const entries = sm.buildSessionProjection().entries as Any[];
+		const env = { model: MODEL, cwd: CWD, sys: { text: "You are a coding agent.", tools: [] }, reserve: 16_384, recalled: new Set<string>(), steerIds: new Set<string>(), rereadOnly: false };
+		const o = planOpts(entries, sm.getBranch(), env, { model: MODEL, g: 2500, justEdited: false, summarizedWarm: false }, true, 1, false, key, false, [key]).o;
+		const prepared = planContext(entries, o)!;
+		expect(prepared.cutIdx).not.toBeNull();
+		expect(prepared.folds.length).toBeGreaterThan(0);
+		sm.appendCustomEntry("pi-zip/summary", { head: "", key, usd: 0, cut: { firstKeptEntryId: key, text, trigger: "valve", count: 9, prefixTokens: prepared.prefixTokens, summaryTokens: Math.ceil(text.length / 4), llmOk: true, llmError: null, costUsd: 0, ms: 0, prepared: true } });
+		const r = await rig(undefined, { file: [sm.getHeader() as Any, ...sm.getEntries()], tui: true, native: true, idle: true, start: false });
+		await r.beforeAgentStart("next request");
+		expect(r.compactions).toHaveLength(1);
+		const priced = r.zip.nativeRun.p;
+		expect(priced.folds.length).toBeGreaterThan(0);
+		r.sm.appendMessage(user("next request", Date.now() - T0));
+		const originalOpts = r.zip.opts;
+		r.zip.opts = () => { throw new Error("first native request must not re-plan"); };
+		const request = await r.request();
+		r.zip.opts = originalOpts;
+		expect(r.zip.runPlan.folds.map((t: Any) => t.entryId)).toEqual(priced.folds.map((t: Any) => t.entryId));
+		expect([...r.zip.runPlan.applied]).toEqual(priced.folds.map((t: Any) => t.entryId));
+		expect(request.filter(isFolded)).toHaveLength(priced.folds.length);
+		await sleep(5);
+		expect(r.compactions[0].tokensBefore).toBe(noticeOf(r).before);
+		const response = asst([{ type: "text", text: "done" }], "stop", Date.now() - T0), id = r.sm.appendMessage(response);
+		const drafts = await r.turnEnd(id, response);
+		expect(drafts.filter((d: Any) => d.type === "context_edit").map((d: Any) => d.targetId)).toEqual(priced.folds.map((t: Any) => t.entryId));
+		await r.shutdown();
+	});
+
+	// A smaller actual prompt keeps the native summary and the prompt decision's folds.
 	for (const [label, announced] of [["same prompt", "next request"], ["real prompt smaller than announced", `next request ${"with an expanded template ".repeat(400)}`]] as const) {
-		test(`warm native adoption (${label}): an early summary goes in through Pi's compaction before the prompt, Pi's 'Compacted from N' is the notice's before, no wait, the plan on the pre-compaction projection`, async () => {
+		test(`warm native adoption (${label}): an early summary goes in through Pi's compaction before the prompt, Pi's 'Compacted from N' is the notice's before, no wait, the priced folds are carried by entry ID`, async () => {
 			const ledger = join(mkdtempSync(join(tmpdir(), "pz-r5-native-")), "ledger.jsonl");
 			const before = process.env.PI_ZIP_LEDGER;
 			process.env.PI_ZIP_LEDGER = ledger;
@@ -890,8 +940,7 @@ describe("round 5 on real Pi: rule A starts the warm summary early, nobody waits
 				expect(branch[at].details).toMatchObject({ by: "pi-zip", via: "native", trigger: "valve" });
 				expect(req.some((m: Any) => m.role === "compactionSummary")).toBe(true);
 				const rows = readFileSync(ledger, "utf8").trim().split("\n").map((l) => JSON.parse(l));
-				expect(rows.filter((x) => x.type === "native_mismatch")).toEqual([]);
-				expect(rows.find((x) => x.type === "cold_plan")).toMatchObject({ via: "native", onPre: true });
+				expect(rows.find((x) => x.type === "cold_plan")).toMatchObject({ via: "native" });
 				await sleep(5);
 				const n = noticeOf(r);
 				expect(n.before).toBe(branch[at].tokensBefore);
@@ -961,7 +1010,7 @@ describe("round 5 on real Pi: rule A starts the warm summary early, nobody waits
 // no-UI behaviour moves, and each move is justified in its commit: 0.3.1's (0907ceea..., 0.3.0's decisions with 0.3.1's format, where
 // these scenarios waited for their summaries in line) became this one when 0.4.0 stopped waiting.
 describe("no UI (pi -p, json): the requests and the session of three scenarios hash to a recorded digest", () => {
-	const NOUI_DIGEST = "13a31511a73a58312f55da9860857a99"; // R5_PRINT_DIGEST=1 prints it (0.3.1: 0907ceeacca2be4a8b8f684dd6a47a96)
+	const NOUI_DIGEST = "1b62cac6f4279964e13bb38c03cc5885"; // R5_PRINT_DIGEST=1 prints it (0.3.1: 0907ceeacca2be4a8b8f684dd6a47a96)
 	const sleep = (ms: number) => new Promise((res) => setTimeout(res, ms));
 	const shifted = (agoMs: number, prose: number) => {
 		const sm = SessionManager.inMemory(CWD);
