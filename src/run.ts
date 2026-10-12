@@ -931,7 +931,7 @@ export class Zip implements ZipControl {
 	 * refuses is neither lost nor missing from the totals. null: the call failed or was cancelled.
 	 */
 	private async roomWait(c: PlanResult, ctx: Any): Promise<{ cut: Cut; ms: number } | null> {
-		const head = headOf(this.branch(ctx)), key = c.firstKeptEntryId, b = this.bg, w0 = performance.now();
+		const head = headOf(this.branch(ctx)), key = c.firstKeptEntryId, model = modelKey(ctx.model), b = this.bg, w0 = performance.now();
 		const running = !!b && b.key === key && b.head === head;
 		this.ledger({ type: "room_wait", key, running });
 		let cut: Cut | null = null;
@@ -942,8 +942,7 @@ export class Zip implements ZipControl {
 			} else {
 				this.discardBg("replaced");
 				const got = await this.working(ctx, `${PRODUCT}: writing a summary (the context is close to the window)`, buildCut(c, ctx));
-				this.stats.summaryUsd += got.costUsd;
-				this.record({ head, key: key!, cut: got, usd: got.costUsd });
+				this.completed(got, model, head, key!);
 				cut = { ...got, prepared: true }; // booked now
 			}
 		} catch (err) {
@@ -1136,6 +1135,14 @@ export class Zip implements ZipControl {
 		return undefined;
 	}
 
+	/** Each completed call teaches its starting model and books its artifact once, whether it ran at the room or in the background. */
+	private completed(c: Cut, model: string, head: string, key: string) {
+		const learned = record(model, { explicit: false, total: 0, call: { ms: c.ms, tokens: Math.max(1, c.prefixTokens) } });
+		if (this.entKey === model) this.ent = learned;
+		this.stats.summaryUsd += c.costUsd;
+		this.record({ head, key, cut: c, usd: c.costUsd });
+	}
+
 	/** Write the summary for `p` in the background (its own abort signal: nothing is running, so the run's would be stale). Nothing
 	 *  when one for the same cut of the same projection is ready or being written (false); any other call in flight is ended first. */
 	private startBg(p: PlanResult, ctx: Any): boolean {
@@ -1152,11 +1159,8 @@ export class Zip implements ZipControl {
 		bg.promise = Promise.race([buildCut(p, ctx, controller.signal), new Promise<null>((resolve) => controller.signal.addEventListener("abort", () => resolve(null), { once: true }))])
 			.then((c) => {
 				if (bg.aborted || !c) return null;
-				const learned = record(model, { explicit: false, total: 0, call: { ms: c.ms, tokens: Math.max(1, c.prefixTokens) } });
-				if (this.entKey === model) this.ent = learned;
-				this.stats.summaryUsd += c.costUsd;
+				this.completed(c, model, head, key);
 				this.ledger({ type: "away_summary", key, ms: c.ms, llmOk: c.llmOk, costUsd: c.costUsd, ...this.usageOf(c) });
-				this.record({ head, key, cut: c, usd: c.costUsd });
 				return c;
 			})
 			.catch((err) => {

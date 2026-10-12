@@ -691,7 +691,7 @@ describe("never wait: rule A starts early; a summary is used once ready; the one
 		await sleep(20);
 		expect(st2.calls).toBe(1); // the call b2b produced is the one awaited
 	});
-	test("a call made at the room is a pi-zip/summary record and in the totals at once (a summary the commit refuses is not lost); Esc ends the wait on a running call, not the call", async () => {
+	test("a fresh room call books its artifact and teaches its starting model; Esc ends only the wait on a running call", async () => {
 		const model = { provider: "p", id: "m", contextWindow: 100_000, cost: { cacheWrite: 3, cacheRead: 0.3 }, promptCache: { short: 300 } }; // room 75K
 		const st = { calls: 0, delay: 50 };
 		const r = await rig(done, WARM_TS(), { model, modelRegistry: { complete: mkComplete(st) } });
@@ -699,10 +699,19 @@ describe("never wait: rule A starts early; a summary is used once ready; the one
 		await prompt(r);
 		zip.discardBg("replaced"); // nothing running at the turn_end: the room wait makes its own call
 		const est = zip.stats.summaryUsd;
-		const te = await r.fire("turn_end", turnEnd([...back, ...tail], "r6"));
+		r.ctx.model = { ...model, provider: "room-latency", id: "first" };
+		zip.loadEnt("room-latency/first");
+		const completion = r.fire("turn_end", turnEnd([...back, ...tail], "r6"));
+		await sleep(10);
+		r.ctx.model = { ...model, provider: "room-latency", id: "second" };
+		zip.loadEnt("room-latency/second");
+		const te = await completion;
 		expect(rows("room_wait")[0]).toMatchObject({ key: "u3", running: false });
 		const rec = zip.mine.find((a: Any) => a.cut);
 		expect(rec).toMatchObject({ key: "u3", head: "" });
+		expect(loadStats().models["room-latency/first"].call).toEqual({ ms: rec.cut.ms, tokens: rec.cut.prefixTokens });
+		expect(loadStats().models["room-latency/second"]?.call).toBeUndefined();
+		expect(zip.ent).toBeUndefined();
 		expect(rec.usd).toBeGreaterThan(0);
 		expect(zip.stats.summaryUsd).toBeCloseTo(est + rec.usd, 9); // booked once, when it was made (not again by the commit)
 		expect(te.entries[0]).toMatchObject({ type: "compaction", firstKeptEntryId: "u3", summary: rec.cut.text });
@@ -722,6 +731,25 @@ describe("never wait: rule A starts early; a summary is used once ready; the one
 		expect(ez.bg?.key).toBe("u3"); // still running
 		expect(st2.calls).toBe(1);
 	});
+	test("awaiting a background call at the room learns and books that completion only once", async () => {
+		const model = { provider: "room-latency", id: "awaited", contextWindow: 100_000, cost: { cacheWrite: 3, cacheRead: 0.3 }, promptCache: { short: 300 } };
+		const prior = { ms: 4_000, tokens: 80_000 };
+		record("room-latency/awaited", { explicit: true, total: 0, call: prior });
+		const st = { calls: 0, delay: 80 };
+		const r = await rig(done, WARM_TS(), { model, modelRegistry: { complete: mkComplete(st) } });
+		const zip = await zipOf(r);
+		await prompt(r);
+		const te = await r.fire("turn_end", turnEnd([...back, ...tail], "r6"));
+		expect(rows("room_wait")[0]).toMatchObject({ key: "u3", running: true });
+		const artifacts = zip.mine.filter((a: Any) => a.cut);
+		expect(artifacts).toHaveLength(1);
+		const rec = artifacts[0];
+		expect(loadStats().models["room-latency/awaited"].call).toEqual({ ms: 0.9 * prior.ms + 0.1 * rec.cut.ms, tokens: 0.9 * prior.tokens + 0.1 * rec.cut.prefixTokens });
+		expect(zip.stats.summaryUsd).toBe(rec.usd);
+		expect(te.entries[0]).toMatchObject({ type: "compaction", summary: rec.cut.text });
+		expect(st.calls).toBe(1);
+	});
+
 	test("no UI (print, json) decides as with a UI: the warm return does not wait, the summary is written in the background", async () => {
 		const st = { calls: 0, delay: 200 };
 		const quiet = await rig(done, WARM_TS(), { hasUI: false, mode: "json", modelRegistry: { complete: mkComplete(st) } });
