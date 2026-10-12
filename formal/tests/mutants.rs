@@ -21,11 +21,6 @@ fn available() -> bool {
     ok
 }
 
-/// A copy of the worktree's src with exact replacements in one file: (from, to, how many times `from` occurs; all are replaced).
-fn mutant(name: &str, file: &str, edits: &[(&str, &str, usize)]) -> PathBuf {
-    mutant_files(name, &edits.iter().map(|&(from, to, n)| (file, from, to, n)).collect::<Vec<_>>())
-}
-
 /// The same, with replacements in several files: (file, from, to, how many times `from` occurs).
 fn mutant_files(name: &str, edits: &[(&str, &str, &str, usize)]) -> PathBuf {
     let root = std::env::temp_dir().join(format!("pz-formal-mutant-{}-{name}", std::process::id()));
@@ -282,7 +277,7 @@ fn b2b_no_back_to_back() {
     // 0.4.0: the folds stop at the working view, so a second rewrite needs new candidates: the window slides at the next prompt.
     // traces/b2b-slide.trace is the shrunk counterexample of `check --suite standard --random 3000 --seed 1 --only B2B` on the mutant
     let t = trace_file("b2b-slide.trace");
-    caught_all("m10", "core.ts", &[("if (!x.cold && x.justEdited && !x.nat) return { kind: \"b2b\", produce };", "if (false) return { kind: \"b2b\", produce };", 1), ("const b2b = x.justEdited && x.pWarm >= 0.5;", "const b2b = false;", 1)], &["B2B"], &t);
+    caught("m10", "core.ts", "if (x.justEdited && x.pWarm >= 0.5)", "if (false)", "B2B", &t);
 }
 
 #[test]
@@ -473,9 +468,20 @@ fn native_joint_folds_are_carried_without_replanning() {
         let trace = random_trace(&mut rng);
         if index != 956 && index != 2432 { continue; }
         caught_all("native-folds-replanned", "core.ts", &[(
-            "if (x.nat) return { kind: \"plan\", ...x.nat, notes: [], produce: null };",
+            "if (x.nat) return { kind: \"plan\" as const, ...x.nat, notes: [], produce: null };",
             "if (x.nat) { const { o, cal } = x.opts(x.now, undefined, true, []); return { kind: \"plan\", o, cal, p: planContext(x.now, o), notes: [], produce: null }; }",
             1,
         )], &["A2"], &trace.to_string());
     }
+}
+
+/// Incoming drafts invalidate provider usage before pi-zip's first boundary draft is metered.
+#[test]
+fn en_preceding_boundary_edit_invalidates_usage() {
+    let text = trace_file("en-incoming-edit.trace");
+    if available() {
+        let base = observe(&worktree_src(), &Trace::parse(&text).unwrap());
+        assert!(holds(&base, "G"), "incoming drafts must not count as pi-zip edits in the decision probe");
+    }
+    caught("en3", "run.ts", "piContextTokens(e.context.contextEntries, this.branch(ctx), e.entries)", "piContextTokens(e.context.contextEntries, this.branch(ctx))", "EN", &text);
 }

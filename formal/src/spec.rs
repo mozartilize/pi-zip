@@ -587,12 +587,19 @@ fn recalled_before(r: &R, i: usize, at: &str) -> BTreeSet<String> {
         .collect()
 }
 
+// A boundary persists folds the request already carried; their eligibility was checked at the run decision.
+// Observe the actual request bytes, so a newly proposed fold cannot claim this exemption.
+fn carried_fold(r: &R, i: usize, at: &str, id: &str) -> bool {
+    at != "run" && at != "native" && r.tick(i).view.iter().any(|m| m.ph && m.id.as_deref() == Some(id))
+}
+
 pub fn refolded_recalls(r: &R, i: usize) -> Vec<String> {
     let mut bad = Vec::new();
     for g in r.grids(i) {
         let Some(p) = g.actual().filter(|p| p.edits()) else { continue };
         let rec = recalled_before(r, i, &g.at);
         for f in &p.folds {
+            if carried_fold(r, i, &g.at, f) { continue; }
             if rec.contains(f) {
                 bad.push(format!("{} folds {f}, an output zip_recall returned", g.at));
             }
@@ -614,6 +621,7 @@ pub fn protection_breaches(r: &R, i: usize) -> Vec<String> {
         }
         let prev = u.saturating_sub(1);
         for f in &p.folds {
+            if carried_fold(r, i, &g.at, f) { continue; }
             let Some(b) = r.block(f) else { continue };
             if b.turn + 1 < u {
                 continue; // outside the window

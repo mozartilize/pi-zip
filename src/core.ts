@@ -244,22 +244,37 @@ export function unready<T extends { p: PlanResult | null }>(r: T, ready: readonl
 	return { r: foldsOnly(), produce: p };
 }
 
-/** A native prompt carries its jointly priced folds; other first requests plan folds and defer summaries to turn_end. */
-export function decideRun(x: { cold: boolean; justEdited: boolean; nat: { o: PlanOpts; cal: Scale; p: PlanResult } | null; foreign: boolean; now: Any[]; ready: readonly Avail[]; opts: (entries: Any[], cutAt?: string, foldsOnly?: boolean, ready?: readonly string[]) => { o: PlanOpts; cal: Scale } }):
-	{ kind: "b2b"; produce: PlanResult | null } | { kind: "plan"; o: PlanOpts; cal: Scale; p: PlanResult | null; notes: Note[]; produce: PlanResult | null } {
-	if (x.nat) return { kind: "plan", ...x.nat, notes: [], produce: null };
-	const mk = (foldsOnly: boolean, cutAt?: string) => {
-		const { o, cal } = x.opts(x.now, cutAt, foldsOnly, x.ready.filter((a) => !a.running).map((a) => a.key));
-		if (x.foreign) o.noSummary = true;
-		return { o, cal, p: planContext(x.now, o) };
+/** One candidate search and ready-summary adoption, shared by decisions and production. */
+export function candidateOf(entries: Any[], opts: (cutAt?: string, foldsOnly?: boolean, ready?: readonly string[]) => { o: PlanOpts; cal?: Scale }, avail: readonly Avail[], where: string, foldsOnly = false) {
+	const mk = (cutAt?: string) => {
+		const { o, cal } = opts(cutAt, foldsOnly, avail.map((a) => a.key));
+		return { o, cal: o.scale ?? cal ?? UNIT, p: planContext(entries, o) };
 	};
-	const selected = adopt(mk(false), (k) => mk(false, k), x.ready.filter((a) => !a.running), "run");
-	const first = selected?.r.p;
-	const notes: Note[] = selected?.note ? [selected.note] : [];
-	if (first && first.cutIdx !== null && x.ready.some((a) => !a.running && a.key === first.firstKeptEntryId)) notes.push({ type: "defer", key: first.firstKeptEntryId });
-	const produce = first && first.cutIdx !== null && !x.ready.some((a) => a.key === first.firstKeptEntryId) ? first : null;
-	if (!x.cold && x.justEdited && !x.nat) return { kind: "b2b", produce };
-	return { kind: "plan", ...(selected && (!first || first.cutIdx === null) ? selected.r : mk(true)), notes, produce };
+	return adopt(mk(), mk, avail, where);
+}
+
+/** The application rules have one implementation for prompts, first requests and boundaries. First requests defer summaries;
+ *  native first requests retain the prompt's already priced decision. b2b blocks application only, never production or the room. */
+export function decideEdits(x: { at: "native" | "run" | "turn_end"; justEdited: boolean; pWarm: number; entries: Any[]; ready: readonly Avail[];
+	opts: (cutAt?: string, foldsOnly?: boolean, ready?: readonly string[]) => { o: PlanOpts; cal?: Scale } }) {
+	const { r: first, note } = candidateOf(x.entries, x.opts, x.ready.filter((a) => !a.running), x.at);
+	const p = first.p, has = p && p.cutIdx !== null && x.ready.some((a) => a.key === p.firstKeptEntryId);
+	const produce = p && p.cutIdx !== null && !has ? p : null;
+	if (x.justEdited && x.pWarm >= 0.5) return { kind: "b2b" as const, ...first, p: null, notes: [], produce };
+	const deferred = x.at === "run" && p && p.cutIdx !== null;
+	const u = unready(first, deferred ? [] : x.ready, () => candidateOf(x.entries, x.opts, [], x.at, true).r);
+	return { kind: "plan" as const, ...u.r, notes: [...(note ? [note] : []), ...(deferred && has ? [{ type: "defer", key: p.firstKeptEntryId } as Note] : [])], produce };
+}
+
+/** A native prompt carries its jointly priced folds; other first requests defer summaries to turn_end. */
+export function decideRun(x: { cold: boolean; justEdited: boolean; nat: { o: PlanOpts; cal: Scale; p: PlanResult } | null; foreign: boolean; now: Any[]; ready: readonly Avail[]; opts: (entries: Any[], cutAt?: string, foldsOnly?: boolean, ready?: readonly string[]) => { o: PlanOpts; cal: Scale } }) {
+	if (x.nat) return { kind: "plan" as const, ...x.nat, notes: [], produce: null };
+	return decideEdits({ at: "run", justEdited: x.justEdited, pWarm: x.cold ? 0 : 1, entries: x.now, ready: x.ready,
+		opts: (cutAt, foldsOnly, ready) => {
+			const r = x.opts(x.now, cutAt, foldsOnly, ready);
+			if (x.foreign) r.o.noSummary = true;
+			return r;
+		} });
 }
 
 /** Native folds retain the prompt decision and use entry IDs to find their positions; other folds are guarded before sending. */
@@ -291,31 +306,22 @@ export function runPlanOf(x: { p: PlanResult | null; cal: Scale; cold: boolean; 
 	return { plan, folds, ...(drop ? { drop } : {}) };
 }
 
-/** The turn_end decision, including carried folds: none after a failed turn, else the plan at the in-run P(warm) `pWarm`
- *  (core.ts inRunClock), taking a ready summary (adopt) or, when its cut has none, its folds alone (unready: the cut is produced).
- *  Right after an edited request while the cache is believed warm (b2b) nothing is applied, and the summary is still produced. `p`
- *  null when it changes nothing; `room`: the plan of the room wait (roomOf), which b2b does not block (theory 1.3 R6). */
-export function decideTurnEnd(x: { failed: boolean; justEdited: boolean; pWarm: number; ready: readonly Avail[]; opts: (cutAt?: string, foldsOnly?: boolean, ready?: readonly string[]) => { o: PlanOpts }; entries: Any[]; runPlan?: RunPlan | null }):
-	{ kind: "none" } | { kind: "b2b"; produce: PlanResult | null; room: PlanResult | null } | { kind: "plan"; o: PlanOpts; p: PlanResult | null; notes: Note[]; produce: PlanResult | null; room: PlanResult | null } {
-	if (x.failed) return { kind: "none" };
-	const readyKeys = x.ready.filter((a) => !a.running).map((a) => a.key);
-	const mk = (cutAt?: string, foldsOnly = false) => {
-		const { o } = x.opts(cutAt, foldsOnly, readyKeys);
-		return { o, p: planContext(x.entries, o) };
-	};
-	const first = mk();
-	const b2b = x.justEdited && x.pWarm >= 0.5;
-	const { r, note } = b2b ? { r: first, note: undefined } : adopt(first, mk, x.ready, "turn_end");
-	const u = b2b ? { r: first, produce: first.p?.cutIdx !== null && first.p && !x.ready.some((a) => a.key === first.p!.firstKeptEntryId) ? first.p : null } : unready(r, x.ready, () => mk(undefined, true));
-	const p = !b2b && u.r.p && (u.r.p.folds.length || u.r.p.cutIdx !== null) ? u.r.p : null;
+/** Reconcile carried folds before selection: the planner keeps their exact placeholders and prices the resulting union.
+ *  The same selected edit supplies the single post-edit room judgement and the boundary commit. */
+export function decideTurnEnd(x: { failed: boolean; justEdited: boolean; pWarm: number; ready: readonly Avail[]; opts: (cutAt?: string, foldsOnly?: boolean, ready?: readonly string[]) => { o: PlanOpts }; entries: Any[]; runPlan?: RunPlan | null }) {
+	if (x.failed) return { kind: "none" as const };
 	const carried = x.runPlan;
-	const applied = carried?.folds.filter((t) => !carried.applied || carried.applied.has(t.entryId)) ?? [];
-	const before = sizeOf(carried?.scale ?? first.o.scale ?? UNIT, buildBlocks(x.entries, first.o.steerIds).reduce((n, b) => n + b.tokens, 0));
-	const afterFolds = carried ? before - carried.scale.c * applied.reduce((n, t) => n + t.entryTokens - t.phTokens, 0) : (p?.ctxAfterFolds ?? before);
-	const after = afterFolds - (p?.cutIdx !== null && p ? p.scale.c * (p.prefixTokens - p.summaryTokensPlanned) : 0);
-	const room = roomOf(after, first.o, () => planContext(x.entries, x.opts(undefined, false, []).o), p?.cutIdx !== null ? (p?.firstKeptEntryId ?? undefined) : undefined);
-	const produce = room ? null : u.produce;
-	return b2b ? { kind: "b2b", produce, room } : { kind: "plan", o: u.r.o, p, notes: note ? [note] : [], produce, room };
+	const opts = (cutAt?: string, foldsOnly?: boolean, ready?: readonly string[]) => {
+		const r = x.opts(cutAt, foldsOnly, ready);
+		if (carried) { r.o.scale = carried.scale; r.o.carriedFolds = carried.folds.filter((t) => !carried.applied || carried.applied.has(t.entryId)); }
+		return r;
+	};
+	const d = decideEdits({ ...x, at: "turn_end", opts });
+	const before = sizeOf(d.cal, buildBlocks(x.entries, d.o.steerIds).reduce((n, b) => n + b.tokens, 0));
+	const after = d.p ? d.p.ctxAfterFolds - d.p.scale.c * (d.p.prefixTokens - d.p.summaryTokensPlanned)
+		: before - d.cal.c * (d.o.carriedFolds ?? []).reduce((n, t) => n + t.entryTokens - t.phTokens, 0);
+	const room = roomOf(after, d.o, () => candidateOf(x.entries, opts, [], "room").r.p, d.p?.firstKeptEntryId ?? undefined);
+	return { ...d, produce: room ? null : d.produce, room };
 }
 
 /** The one wait (theory 1.4 R9): when the view after a turn_end's edit (`after`) is still at Pi's compaction room, the plan at the

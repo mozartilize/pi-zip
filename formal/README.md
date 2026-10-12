@@ -73,7 +73,8 @@ say 100
   the agent runs, delivered before the next request: not a new user turn), `wait +gap` (the run ends and time passes without a
   prompt, so what follows happens at the return), `switch` (model), `restart` (a fresh pi process), `foreign SIZE` (another
   extension's compaction, between runs), `compact` (Pi's own compaction: its `prepareCompaction` cut, `fromHook` false; between
-  runs or mid-run), `edit` (another extension's `context_edit` of the oldest output the model still sees; anywhere), `drive +gap`
+  runs or mid-run), `edit` (another extension's `context_edit` of the oldest output the model still sees; anywhere), `boundaryedit` (the same edit
+  drafted by a preceding turn_end handler; applied to Pi's preview before pi-zip runs), `drive +gap`
   (a run an extension's message starts, as Pi 1.1.0 `sendCustomMessage(..., { triggerTurn: true })` -> `_runAgentPrompt` does:
   `agent_start`, the custom message appended, the first request, **no** `before_agent_start`; a new user turn), `nextturn` (a
   custom message Pi stores right after a prompt: a nextTurn message or a `before_agent_start` handler's message; the prompt's turn).

@@ -157,6 +157,7 @@ pub enum Event {
     Foreign { size: u32 },
     Compact,
     Edit,
+    BoundaryEdit,
 }
 impl Event {
     /// Events that start a run: a prompt, or a custom message that triggers a turn.
@@ -165,7 +166,7 @@ impl Event {
     }
     /// Events that happen outside a run and belong to the run they precede.
     pub fn is_special(&self) -> bool {
-        matches!(self, Event::Switch | Event::Restart | Event::Foreign { .. } | Event::Wait { .. } | Event::Compact | Event::Edit)
+        matches!(self, Event::Switch | Event::Restart | Event::Foreign { .. } | Event::Wait { .. } | Event::Compact | Event::Edit | Event::BoundaryEdit)
     }
 }
 
@@ -236,6 +237,7 @@ impl fmt::Display for Event {
             Event::Foreign { size } => write!(f, "foreign {}", k(*size)),
             Event::Compact => write!(f, "compact"),
             Event::Edit => write!(f, "edit"),
+            Event::BoundaryEdit => write!(f, "boundaryedit"),
         }
     }
 }
@@ -335,6 +337,7 @@ impl Trace {
                 "wait" => events.push(Event::Wait { gap: w.get(1).map(|g| num(g.trim_start_matches('+'))).transpose()?.unwrap_or(0) }),
                 "compact" => events.push(Event::Compact),
                 "edit" => events.push(Event::Edit),
+                "boundaryedit" => events.push(Event::BoundaryEdit),
                 "switch" => events.push(Event::Switch),
                 "restart" => events.push(Event::Restart),
                 "foreign" => events.push(Event::Foreign { size: w.get(1).map(|s| num(s)).transpose()?.unwrap_or(2000) }),
