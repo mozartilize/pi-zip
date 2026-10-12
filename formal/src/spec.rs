@@ -267,7 +267,8 @@ pub fn pi_compacts(r: &R, i: usize) -> Option<String> {
     }
     // the room plan's cut must pass the law with its call (R9): a turn_end that decided (its grids) and planned no cut at all had no
     // cut to wait for; a turn_end that made no decision (the run plan's, before 0.4.0's fix) is not excused
-    let te: Vec<_> = prev.grids.iter().filter(|g| g.at == "turn_end").filter_map(|g| g.actual()).collect();
+    let room_judged = prev.grids.iter().any(|g| g.at == "turn_end" && g.room);
+    let te: Vec<_> = prev.grids.iter().filter(|g| g.at == "turn_end" && (!room_judged || g.room)).filter_map(|g| g.actual()).collect();
     let produced = prev.te_ledger.iter().any(|x| x.get("type").and_then(Value::as_str) == Some("produce"));
     if !te.is_empty() && te.iter().all(|p| p.cut.is_none()) && !produced {
         return None;
@@ -314,6 +315,17 @@ pub fn axioms() -> Vec<Prop> {
                   summary still pays its call at its own margin.",
             evidence: Evidence::Conformance,
             f: always(zip_edit() >> pays()),
+        },
+        Prop {
+            id: "EN",
+            name: "exact compaction number",
+            from: &["I1"],
+            why: "every pi-zip summary enters natively at an idle typed prompt or as the first turn_end draft; Pi's actual tokensBefore equals pi-zip's before on both doors",
+            evidence: Evidence::Conformance,
+            f: always(atom("exact_number", |r: &R, i, _| {
+                let t = r.tick(i);
+                t.exact_issues.is_empty() && t.native_door.as_ref().is_none_or(|n| n.applied.as_ref().is_none_or(|a| a.idle && a.tokens_before == n.before.round()))
+            })),
         },
         Prop {
             id: "OC",
@@ -1083,7 +1095,7 @@ pub fn adopted_produced(r: &R, i: usize) -> bool {
 }
 pub fn target_miss(r: &R, i: usize) -> Option<String> {
     let s = &r.st[i];
-    let g = r.tick(i).grids.iter().find(|g| g.at == "run")?;
+    let g = r.tick(i).grids.iter().find(|g| g.at == "native").or_else(|| r.tick(i).grids.iter().find(|g| g.at == "run"))?;
     if s.view_tok <= s.target * (1.0 + TOL_TARGET) {
         return None;
     }
@@ -1123,7 +1135,7 @@ pub fn took_ready(r: &R, i: usize) -> Option<String> {
 
 /// The cut a return's run plan produced in the background because its summary was not ready (run.ts `produce`), if any.
 fn produced_at_return(r: &R, i: usize) -> Option<String> {
-    r.tick(i).run_ledger.iter().find(|x| x.get("type").and_then(Value::as_str) == Some("produce")).and_then(|x| x.get("key").and_then(Value::as_str)).map(String::from)
+    r.tick(i).run_ledger.iter().find(|x| x.get("type").and_then(Value::as_str) == Some("produce") || x.get("type").and_then(Value::as_str) == Some("defer")).and_then(|x| x.get("key").and_then(Value::as_str)).map(String::from)
 }
 
 /// TR for a return that produced its summary (key k) in the background: the request after the first turn_end valve that ran after the
@@ -1133,8 +1145,9 @@ fn produced_at_return(r: &R, i: usize) -> Option<String> {
 fn produced_target_miss(r: &R, i: usize, k: &str) -> Option<String> {
     let done = |x: &Value| x.get("type").and_then(Value::as_str) == Some("away_summary") && x.get("key").and_then(Value::as_str) == Some(k);
     let n = r.obs.ticks.len();
-    let mut ready_before: Option<usize> = None; // the completion was recorded before the turn_end of this request
+    let mut ready_before: Option<usize> = r.tick(i).run_ledger.iter().any(|x| x.get("type").and_then(Value::as_str) == Some("defer") && x.get("key").and_then(Value::as_str) == Some(k)).then_some(i); // a driven or gated return deferred an already ready artifact
     for m in i..n {
+        if ready_before.is_some() { break; }
         if r.tick(m).run_ledger.iter().any(done) {
             ready_before = Some(m);
             break;
@@ -1317,6 +1330,7 @@ pub fn law_mismatch(r: &R, i: usize) -> Option<String> {
 pub fn explain(id: &str, r: &R, i: usize) -> Vec<String> {
     match id {
         "A1" => lossless_issues(r, i),
+        "EN" => r.tick(i).exact_issues.clone(),
         "A2" => pays_fully(r, i).err().into_iter().collect(),
         "A3" => vec![format!(
             "the user waits for a summary call ({}) below Pi's compaction room {:.0}",

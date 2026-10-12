@@ -107,6 +107,7 @@ otherwise. The round-2 excuses (a turn_end valve mid-run, a return a switch made
 
 | | property | from | formula (abridged) | why it follows |
 |---|---|---|---|---|
+| EN | exact compaction number | I1 | □ exact_number | every summary enters natively at an idle typed prompt or as the first turn_end draft; Pi's appended tokensBefore equals pi-zip's before, observed through Pi's draft application and the native entry independently of planner verdicts |
 | OC | one call and one timer | A3 | □(active_calls ≤ 1 ∧ production_timers ≤ 1 ∧ direct_timer_writes = 0) | provider calls and producer-owned timer handles are observed independently of ledger wording; a timer only starts production, whose completion records its artifact |
 | I1 | run stability | A2 | □(¬run_start ∧ ¬zip_edit ∧ ¬env → prefix_kept) ∧ □ persisted_as_sent | a byte change no priced edit explains is an unpriced rewrite; persisting something other than what was sent rewrites at the next request |
 | RD | restart determinism | A2, A3 | □(run_start → fresh_plans_alike) | the law, b2b and one-summary rules must be functions of the session, or a restart re-decides on different state; produced summaries are pi-zip/summary entries (0.4.0), so only a call in flight at the restart is the process's own |
@@ -145,7 +146,7 @@ The NA probe snapshots the session before `before_agent_start`, including ready 
 and whether Pi can compact while idle. It shares the source's folding and structural guard mechanics, but supplies no ready keys
 to that folds-only probe and consumes no native planner verdict. Rust computes cW, c, the allowed ready cut and both economic laws
 with its own class prices. The bridge supplies Pi's idle `abort()` capability as well as `compact()` so native worlds exercise that
-door. A native artifact's application call price is zero even though native application emits no `take` ledger record.
+door. A native artifact's application call price is zero even though native application emits no `take` ledger record. Native decisions and ledger records are captured before the first request; its jointly priced folds carry their entry IDs into the projection after compaction without another law decision. The room grid is observed separately from ready-summary selection, so PC checks the plan that priced the wait.
 
 ## What is proven, what is checked
 
@@ -354,3 +355,7 @@ bb r s f n; specials: switch restart foreign late-restart late-switch compact ed
 Step 5 producer checks also run `bash formal/tui/r7-producer.sh` under the machine lease. The real Pi TUI uses a local fake
 provider, isolated settings and session storage under `formal/out`, and no network. It checks that opening and typing in old
 history starts no call, while a completed run prepares its next return in the background and persists the finished summary.
+
+Step 6 checks run `bash formal/tui/r7-doors.sh` under the machine lease. The real TUI and local fake provider exercise a typed
+prompt, a driven run and a mid-run boundary. Each checks the displayed “Compacted from” against the appended compaction and
+pi-zip's recorded before size. Histories, settings, cache and captured output stay isolated under `formal/out`.

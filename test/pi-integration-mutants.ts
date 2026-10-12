@@ -9,14 +9,14 @@ const mutants = [
 	{
 		name: "room-summary-inherits-sent",
 		check: "request carry metadata must match the actual request view",
-		edit: (source: string) => source.replace("cut: got.cut, cutSent: false, untouched: sc.O,", "cut: got.cut,"),
+		edit: (source: string) => source.replace("carried: false, regrow", "carried: sentBefore, regrow"),
 	},
 	{
 		name: "room-summary-emits-second-notice",
 		check: "one turn emits at most one pi-zip notice",
 		edit: (source: string) => source
 			.replace("!this.runPlan.noticed && (this.runPlan.cut || this.runPlan.native)", "!this.runPlan.noticed")
-			.replace("\n\t\treturn room;", "\n\t\tif (room.noticed) this.noticeFor(ctx, room, [], got.cut, after, 0);\n\t\treturn room;"),
+			.replace("if (!plan.noticed) this.noticeFor", "if (plan.noticed && cut) this.noticeFor(ctx, plan, [], cut, ctxTokens, 0);\n\t\tif (!plan.noticed) this.noticeFor"),
 	},
 ];
 for (const mutant of mutants) {

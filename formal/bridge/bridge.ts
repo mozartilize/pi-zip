@@ -37,7 +37,7 @@ type Any = any;
 const { SessionManager } = await import(join(PI, "dist/core/session-manager.js"));
 const { AgentSession } = await import(join(PI, "dist/core/agent-session.js"));
 const { convertToLlm } = await import(join(PI, "dist/core/messages.js"));
-const { prepareCompaction } = await import(join(PI, "dist/core/compaction/compaction.js"));
+const { prepareCompaction, estimateProjectedContextTokens } = await import(join(PI, "dist/core/compaction/compaction.js"));
 const { CacheWarmer } = await import(join(PI, "dist/core/cache-warmer.js"));
 const piZip = (await import(join(SRC, "index.ts"))).default;
 const { Zip } = await import(join(SRC, "run.ts"));
@@ -141,7 +141,7 @@ Zip.prototype.opts = function (this: Any, ...a: Any[]) {
 	// the P-grid re-plans in exactly this state: the recalled set is a snapshot (the live one grows when zip_recall runs later). opts is
 	// (ctx, pending, entries, pWarm, pause, cutAt): P enters the law only; `mode` is a label (P < 0.5: "cold"), and the one summary per
 	// warm stretch (summarizedWarm, summaryRegrow: the flag a plan at P >= 0.5 gets) is captured for the grid's higher P
-	if (optsSink && !this.__probe) optsSink.push({ pending: a[1], entries: a[2], mode: Number(a[3]) < 0.5 ? "cold" : "warm", sw: !!this.summarizedWarm, regrow: this.summaryRegrow, o: { ...r.o, recalled: new Set(r.o.recalled ?? []) }, live: r.o });
+	if (optsSink && !this.__probe) optsSink.push({ room: /at roomOf \(/.test(new Error().stack ?? ""), pending: a[1], entries: a[2], mode: Number(a[3]) < 0.5 ? "cold" : "warm", sw: !!this.summarizedWarm, regrow: this.summaryRegrow, o: { ...r.o, recalled: new Set(r.o.recalled ?? []) }, live: r.o });
 	return r;
 };
 
@@ -250,6 +250,8 @@ async function runTrace(tr: Any): Promise<Any> {
 	let steerNo = 0;
 	const foreignDropped = new Set<string>(); // user entries a foreign compaction removed (not pi-zip's to keep)
 	const foreignEdited = new Set<string>(); // tool outputs another extension's context_edit rewrote (not pi-zip's)
+	const nativeIssues: string[] = [];
+	let nativeAllowed = false;
 	const hijacked: string[] = []; // compactions pi-zip answered without having asked for them
 	const toolOf = new Map<string, string>(); // tool result entry id -> npm | cat | recall
 	const activeTools = w.tools === "full" ? ["read", "bash", "zip_recall"] : w.tools === "file" ? ["read", "bash"] : ["edit", "write"];
@@ -318,6 +320,7 @@ async function runTrace(tr: Any): Promise<Any> {
 	/** AgentSession.compact() as Pi 1.1.0 runs it for an extension (the integration test's rig): Pi's prepareCompaction decides
 	 *  "Already compacted" / "Nothing to compact", session_before_compact supplies the result, appendCompaction. */
 	async function piCompact(manager: Any, handlers: Map<string, Any>, options: Any) {
+		if (manager === sm && !nativeAllowed) nativeIssues.push("native compaction outside the typed idle prompt");
 		try {
 			const branch = manager.getBranch();
 			const prep = prepareCompaction(branch, { enabled: true, reserveTokens: 16_384, keepRecentTokens: 20_000 });
@@ -347,7 +350,10 @@ async function runTrace(tr: Any): Promise<Any> {
 	const fire = async (inst: Inst, name: string, e: Any) => {
 		const h = inst.handlers.get(name);
 		if (name === "session_start") captured = null;
-		const r = h ? await h(e, inst.ctx) : undefined;
+		let r: Any;
+		nativeAllowed = !inst.probe && name === "before_agent_start";
+		try { r = h ? await h(e, inst.ctx) : undefined; }
+		finally { nativeAllowed = false; }
 		if (name === "session_start") {
 			// the Zip instance index.ts created (captured by the sessionStart wrapper): only its state is read, never written
 			inst.zip = captured;
@@ -488,7 +494,7 @@ async function runTrace(tr: Any): Promise<Any> {
 			if (c.o.foldsOnly) {
 				// the plan it replaced is the production decision (its cut is written in the background): kept as its own decision point
 				// ("produce"), so the law that priced that call is checked too (LW, PW, RC, MP)
-				const k = out.findLastIndex((x: Any) => x.pending === c.pending && x.mode === c.mode && x.o.cutAt === undefined && !x.o.foldsOnly && !x.produce);
+				const k = out.findLastIndex((x: Any) => x.pending === c.pending && x.mode === c.mode && !x.o.foldsOnly && !x.produce);
 				if (k >= 0) out[k] = { ...out[k], produce: true };
 				out.push(c);
 				continue;
@@ -512,7 +518,7 @@ async function runTrace(tr: Any): Promise<Any> {
 		const out: Any[] = [];
 		const actual = Number(cap.o.law?.pWarm ?? 0);
 		const ps = [...new Set([...(probes.pgrid as number[]), actual])].sort((a, b) => a - b);
-		const pre = cap.at === "run" && actual < 0.5 ? preRun : null;
+		const pre = (cap.at === "run" || cap.at === "native") && actual < 0.5 ? preRun : null;
 		// one planner (0.4.0): everything but P is the captured decision's (the pause too); P enters the law, and the two rules that read
 		// P >= 0.5 outside it: b2b and the one summary per warm stretch
 		const sw = pre ? !!pre.sw : !!cap.sw;
@@ -549,7 +555,7 @@ async function runTrace(tr: Any): Promise<Any> {
 				free = { error: String(err) };
 			}
 		}
-		return { at: cap.at, mode: cap.mode, p: actual, pause: !!cap.o.pause, noSummary: !!cap.o.noSummary, regrowAt: cap.o.regrowAt ?? null, g: cap.o.law?.g ?? null, pr: cap.o.law?.pr ?? null, grid: out, free };
+		return { room: !!cap.room, at: cap.at, mode: cap.mode, p: actual, pause: !!cap.o.pause, noSummary: !!cap.o.noSummary, regrowAt: cap.o.regrowAt ?? null, g: cap.o.law?.g ?? null, pr: cap.o.law?.pr ?? null, grid: out, free };
 	}
 
 	// A second pi-zip instance on the live session, never driven: the model's way back to a folded output (its zip_recall, its
@@ -812,7 +818,7 @@ async function runTrace(tr: Any): Promise<Any> {
 		const lossIssues = probes.lossless ? await lossless(desc, view, guardRewrote, zipNew.length > 0 || runStart || envSince.some((e) => e === "compact" || e === "edit" || e === "foreign")) : [];
 		const runPlan = z?.runPlan;
 		const planGrids = decisions(optsSink.filter((c: Any) => !c.pending)).map((c: Any) => gridFor({ ...c, at: c.produce ? "produce" : "run" }));
-		const runLedger = sink.map(slim);
+		const runLedger = [...(runStart ? nativeLedger : []), ...sink.map(slim)];
 		// Pi's cache warmer restarts from every session request (sdk.ts streamFn): it keeps this request's prefix warm while the
 		// session still extends it and the model is the same
 		if (warmer) {
@@ -898,24 +904,36 @@ async function runTrace(tr: Any): Promise<Any> {
 		const rp = z?.runPlan, rpWasPersisted = !!rp?.persisted, rpSent = !!rp?.sent;
 		const te = await fire(live, "turn_end", { type: "turn_end", turnIndex: reqInRun, message: asst, toolResults, messageEntryId: aid, toolResultEntryIds: [], context: boundaryCtx(sm), entries: [] });
 		const drafts: Any[] = te?.entries ?? [];
+		const exactIssues: string[] = nativeIssues.splice(0);
+		const compaction = drafts.find((d: Any) => d.type === "compaction" && d.details?.by === "pi-zip");
+		const piBefore = estimateProjectedContextTokens(sm.buildSessionProjection(), sm.getBranch()).tokens;
+		if (compaction && drafts[0] !== compaction) exactIssues.push("the compaction was not the first boundary draft");
+		if (runStart && runPlan?.cut && !runPlan.native) exactIssues.push("a summary was applied request-locally");
 		const teGrids = decisions(optsSink.filter((c: Any) => !c.pending), sink.some((x: Any) => x.type === "room_wait")).map((c: Any) => gridFor({ ...c, at: c.produce ? "produce" : "turn_end" }));
 		const teLedger = sink.map(slim);
 		optsSink = null;
 		applyDrafts(sm, drafts);
+		if (compaction) {
+			const written = sm.getBranch().findLast((d: Any) => d.type === "compaction" && d.summary === compaction.summary);
+			const reported = sink.find((x: Any) => x.type === "summary" && x.via !== "native")?.tokensBefore;
+			if (written?.tokensBefore !== piBefore || reported !== piBefore) exactIssues.push("Pi's boundary number differs from pi-zip's before");
+		}
 		// I1: what turn_end persisted equals what was sent (the projection now starts with the view of this request)
 		let persistOk: boolean | null = null;
 		const committedSent = !!rp && rpSent && !rpWasPersisted && !!rp.persisted;
-		const roomCut = sink.some((x: Any) => x.type === "room_wait") ? drafts.find((d: Any) => d.type === "compaction")?.firstKeptEntryId : undefined;
-		if (committedSent && roomCut) {
-			// the room wait's summary went in with the run plan (run.ts runRoom): what it keeps must be exactly what the request sent
+		const roomCut = sink.some((x: Any) => x.type === "room_wait") ? compaction?.firstKeptEntryId : undefined;
+		const boundaryCut = compaction?.firstKeptEntryId;
+		if (committedSent && boundaryCut) {
+			// the room wait's summary went in with the run plan (the unified turn_end decision): what it keeps must be exactly what the request sent
 			const now = describeView(sm.buildSessionContext().messages, sm);
-			const k = desc.findIndex((d: Any) => d.id === roomCut), off = now.findIndex((d: Any) => d.id === roomCut);
+			const k = desc.findIndex((d: Any) => d.id === boundaryCut), off = now.findIndex((d: Any) => d.id === boundaryCut);
 			persistOk = k >= 0 && off >= 0 && desc.slice(k).every((d: Any, i: number) => now[off + i]?.h === d.h);
 		} else if (committedSent && drafts.some((d: Any) => d.type === "context_edit" || d.type === "compaction")) {
 			const now = describeView(sm.buildSessionContext().messages, sm).map((d: Any) => d.h);
 			persistOk = desc.every((d: Any, i: number) => now[i] === d.h);
 		}
 		const t: Any = {
+			exactIssues,
 			nativeDoor: runStart ? pendingNative : null,
 			req: reqNo, ev, run: runNo, n: reqInRun, t0, t1, gap: gapMs === null ? null : gapMs / 1000, model: key(), failed: fail,
 			warm: wu.warm, total: wu.total, read: wu.read, out: outTok, rawTok: rawDesc.reduce((a: number, d: Any) => a + d.tok, 0),
@@ -923,12 +941,12 @@ async function runTrace(tr: Any): Promise<Any> {
 			runPlan: runStart && runPlan ? { source: runPlan.source, folds: runPlan.folds.map((f: Any) => f.entryId), cut: runPlan.cut?.firstKeptEntryId ?? runPlan.native?.firstKeptEntryId ?? null, native: !!runPlan.native } : null,
 			runLedger, teLedger,
 			drafts: drafts.map((d: Any) => (d.type === "context_edit" ? { type: d.type, target: d.targetId } : d.type === "compaction" ? { type: d.type, firstKept: d.firstKeptEntryId } : { type: d.type, customType: d.customType })),
-			persistOk, teValve: (!committedSent || !!roomCut) && drafts.some((d: Any) => d.type === "context_edit" || d.type === "compaction"), runRoom: committedSent && !!roomCut,
+			persistOk, teValve: (!committedSent || !!boundaryCut) && drafts.some((d: Any) => d.type === "context_edit" || d.type === "compaction"), runRoom: committedSent && !!roomCut,
 			// the narrative model calls since the previous request's turn_end (away, at the previous turn_end, in this run plan)
 			narr: narrativeCalls.slice(ncSeen, nc1).filter((c) => c.phase !== "probe").map((c) => ({ input: c.input, output: c.output, away: c.phase === "away" })),
 			waitRun: narrativeCalls.slice(nc0, nc1).filter((c) => c.phase === "present").length,
 			waitTe: narrativeCalls.slice(nc1).filter((c) => c.phase === "present").length,
-			grids: [...planGrids, ...teGrids],
+			grids: [...(runStart ? nativeGrids : []), ...planGrids, ...teGrids],
 			zip: { g: z?.g ?? null, justEdited: !!z?.justEdited, summarizedWarm: !!z?.summarizedWarm, summaryRegrow: z?.summaryRegrow ?? null },
 		};
 		ncSeen = nc1;
@@ -985,6 +1003,8 @@ async function runTrace(tr: Any): Promise<Any> {
 	// Native completeness observes the session BEFORE the idle door, not opts() or its ledger. Only folding/guard mechanics
 	// are shared with the source; Rust selects the allowed ready cut and evaluates both laws with its own class prices.
 	let pendingNative: Any = null;
+	let nativeGrids: Any[] = [];
+	let nativeLedger: Any[] = [];
 	function nativeSnapshot(text: string): Any {
 		const z = live.zip, branch = sm.getBranch(), pre = sm.buildSessionProjection().entries;
 		if (!z || !w.native) return null;
@@ -1052,9 +1072,14 @@ async function runTrace(tr: Any): Promise<Any> {
 					preRun = { sw: !!z0.summarizedWarm, je: !!z0.justEdited };
 					pendingNative = nativeSnapshot(text);
 					const nativeIds = new Set(sm.getBranch().map((x: Any) => x.id));
+					optsSink = [];
+					sink = [];
 					await fire(live, "before_agent_start", { type: "before_agent_start", prompt: text, images: [] });
 					const applied = sm.getBranch().findLast((x: Any) => x.type === "compaction" && !nativeIds.has(x.id) && x.details?.by === "pi-zip" && x.details?.via === "native");
-					if (pendingNative && applied) pendingNative.applied = { key: applied.firstKeptEntryId, hash: sha(applied.summary) };
+					nativeLedger = sink.map(slim);
+					nativeGrids = applied ? decisions(optsSink ?? []).map((c: Any) => gridFor({ ...c, at: "native" })) : [];
+					optsSink = null;
+					if (pendingNative && applied) pendingNative.applied = { key: applied.firstKeptEntryId, hash: sha(applied.summary), tokensBefore: applied.tokensBefore, idle: live.ctx.isIdle() };
 					await fire(live, "agent_start", { type: "agent_start" });
 					const userMsg = { role: "user", content: text, timestamp: clock };
 					const uid = sm.appendMessage(userMsg);
@@ -1066,6 +1091,8 @@ async function runTrace(tr: Any): Promise<Any> {
 					break;
 				}
 				case "drive": {
+					nativeGrids = [];
+					nativeLedger = [];
 					// a run an extension's message starts (Pi 1.1.0 sendCustomMessage(..., { triggerTurn: true }) -> _runAgentPrompt):
 					// agent_start, the custom message appended, its message_end, the first request; never before_agent_start
 					await closeRun(ev);

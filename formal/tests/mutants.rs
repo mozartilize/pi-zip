@@ -165,20 +165,10 @@ fn a3_turn_end_does_not_wait() {
     caught("r5b", "core.ts", "if (room === null || after < room) return null;", "if (room === null) return null;", "A3", &trace_file("a3-warm-turn-end.trace"));
 }
 
-/// Never wait at a return: a plan whose summary is not ready (here a restart lost the call still running for it) goes with its folds
-/// alone and produces the summary. The mutant is 0.3.1's run-plan summary at a return: the plan keeps its cut and the request waits
-/// for the call (core.ts without `unready`, run.ts writing the summary in line).
+/// A summary wanted at a return starts in the background. Waiting for that call below the room violates A3.
 #[test]
 fn a3_return_does_not_wait() {
-    caught_files(
-        "r5b2",
-        &[
-            ("core.ts", "\tif (!onPre) {", "\tif (false) {", 1),
-            ("run.ts", ": null; // labelled by the return that adopts it", ": await buildCut(p, ctx); // labelled by the return that adopts it", 1),
-        ],
-        &["A3"],
-        &trace_file("rd-restart-mid-call.trace"),
-    );
+    caught("r5b2", "run.ts", "\n\t\tif (d.produce) this.want(\"run\", ctx, d.produce);", "\n\t\tif (d.produce) await this.roomWait(d.produce, ctx);", "A3", &trace_file("rd-restart-mid-call.trace"));
 }
 
 /// TR restated (architecture section 8): a return without a ready summary reaches the target at the first decision after it is ready.
@@ -204,7 +194,7 @@ fn tr_ready_summary_beyond_cw_is_passed_over() {
 /// plan's cut (theory 1.4 R9). The mutant persists the run plan alone, and the next request reaches Pi's own threshold (PC).
 #[test]
 fn pc_run_plan_turn_end_waits_at_the_room() {
-    caught("r4pc", "run.ts", "const room = failed ? null : await this.runRoom(e, ctx, this.runPlan, o, pIn);", "const room = null;", "PC", &trace_file("pc-run-plan-room.trace"));
+    caught("r4pc", "run.ts", "if (d.room) { // one post-edit judgement", "if (d.room && !runPlan) { // one post-edit judgement", "PC", &trace_file("pc-run-plan-room.trace"));
 }
 
 /// 0.4.0 step 4, WL restated: a summary a decision wants is produced at once and taken at the first decision after it is ready. The
@@ -292,7 +282,7 @@ fn b2b_no_back_to_back() {
     // 0.4.0: the folds stop at the working view, so a second rewrite needs new candidates: the window slides at the next prompt.
     // traces/b2b-slide.trace is the shrunk counterexample of `check --suite standard --random 3000 --seed 1 --only B2B` on the mutant
     let t = trace_file("b2b-slide.trace");
-    caught_all("m10", "core.ts", &[("if (!cold && x.justEdited && !nat) {", "if (false) {", 1), ("const b2b = x.justEdited && x.pWarm >= 0.5;", "const b2b = false;", 1)], &["B2B"], &t);
+    caught_all("m10", "core.ts", &[("if (!x.cold && x.justEdited && !x.nat) return { kind: \"b2b\", produce };", "if (false) return { kind: \"b2b\", produce };", 1), ("const b2b = x.justEdited && x.pWarm >= 0.5;", "const b2b = false;", 1)], &["B2B"], &t);
 }
 
 #[test]
@@ -460,4 +450,32 @@ fn tr_a_driven_run_after_a_failed_request_is_a_turn() {
 fn tr_a_summary_may_keep_from_a_driven_runs_message() {
     let t = trace_file("tr-cut-at-drive.trace");
     caught("trc", "plan.ts", " || (b.kind === \"other\" && b.msg?.role === \"custom\"));", ");", "TR", &t);
+}
+
+/// EN observes the appended number independently of native ledger wording.
+#[test]
+fn en_native_number_is_the_before_size() {
+    caught("en1", "run.ts", "const before = Math.round(p.ctxTokens);", "const before = Math.round(p.ctxTokens) + 1;", "EN", &trace_file("na-ready-native.trace"));
+}
+
+/// Moving the compaction behind folds invalidates Pi's usage-based meter.
+#[test]
+fn en_boundary_compaction_is_the_first_draft() {
+    caught("en2", "run.ts", "if (cut) ours.unshift(", "if (cut) ours.push(", "EN", &trace_file("pc-run-plan-room.trace"));
+}
+
+#[test]
+fn native_joint_folds_are_carried_without_replanning() {
+    use pz_formal::gen::{random_trace, Rng};
+    let mut rng = Rng::new(1);
+    // Both step-6 A2 regressions from the standard suite's random tail (trace indices 34880 and 36356).
+    for index in 0..=2432 {
+        let trace = random_trace(&mut rng);
+        if index != 956 && index != 2432 { continue; }
+        caught_all("native-folds-replanned", "core.ts", &[(
+            "if (x.nat) return { kind: \"plan\", ...x.nat, notes: [], produce: null };",
+            "if (x.nat) { const { o, cal } = x.opts(x.now, undefined, true, []); return { kind: \"plan\", o, cal, p: planContext(x.now, o), notes: [], produce: null }; }",
+            1,
+        )], &["A2"], &trace.to_string());
+    }
 }

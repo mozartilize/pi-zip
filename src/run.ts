@@ -6,9 +6,9 @@ import { dirname, join } from "node:path";
 import { lastMessageMs, lastPrompt, modelKey, payloadRetention, refused, ttlFor } from "./cache.ts";
 import { agentDir, curve, describe, lawPrices, loadStats, pWarm, record, sample, statsPath, GAP_EDGES, type Entry } from "./learn.ts";
 import { repairPayload } from "./guard.ts";
-import { adopt, checkEdits, clock, decideRun, inRunClock, want, decideTurnEnd, grow, headOf, lastRegrow, planOpts, readyOf, roomOf, runPlanOf, scaleOf, summarizedSince, unusedOf, valvePlanOf, SUMMARY_CUSTOM, type Artifact, type Avail, type Env, type Learned } from "./core.ts";
+import { adopt, checkEdits, clock, decideRun, inRunClock, want, decideTurnEnd, grow, headOf, lastRegrow, planOpts, readyOf, runPlanOf, scaleOf, summarizedSince, unusedOf, valvePlanOf, SUMMARY_CUSTOM, type Artifact, type Avail, type Env, type Learned } from "./core.ts";
 import { fmtK, Stats, noticeDesc, noticeText, type NoticeAction, type NoticeData, type ZipControl } from "./notice.ts";
-import { applyPlanToMessages, buildBlocks, countUserTurns, G0, keepRecentTokensFor, piCanCompact, planContext, reserveTokensFor, sizeOf, UNIT, type Block, type Cut, type FoldTarget, type PlanOpts, type PlanResult, type RunPlan, type Scale, type SysInfo } from "./plan.ts";
+import { applyPlanToMessages, buildBlocks, countUserTurns, G0, keepRecentTokensFor, piCanCompact, piContextTokens, planContext, reserveTokensFor, sizeOf, UNIT, type Block, type Cut, type FoldTarget, type PlanOpts, type PlanResult, type RunPlan, type Scale, type SysInfo } from "./plan.ts";
 import { handleFor, PH_MARK, RECALL_TOOL } from "./placeholder.ts";
 import { branchOutputs, recalledHandlesFromBranch, resolveHandlesInBranch } from "./recall.ts";
 import { cleanupRecall, commandNamesRecall, fileRecallFor, materialize, parseRecallPath, recallRoot, recallRootShown, rewriteCommand, sidDir, type FileRecall } from "./recallfile.ts";
@@ -120,13 +120,13 @@ export class Zip implements ZipControl {
 	/** What became of the native path for this run, for the notice (the session file alone says why a summary went the draft way). */
 	private nativeNote: { native: string; ms?: number; askMs?: number } | null = null;
 	// the native path ended for this process, and why: another extension took part in pi-zip's compaction (answered, cancelled or
-	// replaced it, or took its time), or Pi's compaction failed. Summaries then ride along with the first request (the draft path).
+	// replaced it, or took its time), or Pi's compaction failed. Summaries then wait for a turn_end draft.
 	private nativeOff: string | null = null;
 	// this run's return went in through another extension's compaction (it answered pi-zip's): the run plan adds no summary on top of
 	// it (folds only, a summary only at Pi's compaction room), and the summary prepared for the context it replaced is discarded
 	private foreignRun = false;
-	// this run's away summary went in through Pi's compaction before the run: the projection just before it, for the run plan (I1)
-	private nativeRun: { key: string; cut: Cut; before: number; after: number; pre: Any[]; entryId: string } | null = null;
+	// the native summary already went in; its joint decision supplies the first request's folds and notice sizes
+	private nativeRun: { cut: Cut; before: number; after: number; o: PlanOpts; cal: Scale; p: PlanResult } | null = null;
 	// the cache tier (PI_CACHE_RETENTION) of the current model's requests: the payload of its newest request when seen, else the
 	// provider-scoped env resolved once per run (research pi-tricks §3.1); null = nothing known, the process env decides (cache.ts)
 	private retention: { key: string; tier: "short" | "long"; src: "env" | "provider env" | "payload" } | null = null;
@@ -581,7 +581,7 @@ export class Zip implements ZipControl {
 	}
 
 	/** agent_start: handled already by before_agent_start (a prompt), else a run an extension's message started: the same start-of-run
-	 *  handling, minus Pi's compaction (ctx.compact() aborts the run that is starting): the prepared summary is adopted by the run plan. */
+	 *  handling, minus Pi's compaction (ctx.compact() aborts the run that is starting): a prepared summary waits for turn_end. */
 	async agentStart(ctx: Any): Promise<void> {
 		if (this.startHandled) {
 			this.startHandled = false;
@@ -712,15 +712,15 @@ export class Zip implements ZipControl {
 		return a.compaction ? { compaction: a.compaction } : { cancel: true };
 	}
 
-	/** The native path ends for the rest of the process (logged once): from now on summaries ride along with the first request. */
+	/** The native path ends for the rest of the process (logged once): later summaries wait for turn_end. */
 	private endNative(reason: string) {
 		if (this.nativeOff) return;
 		this.nativeOff = reason;
 		this.ledger({ type: "native_off", reason });
 	}
 
-	/** Why Pi's own compaction cannot take this summary now (null: it can). Each reason keeps today's path: the run plan carries the summary
-	 *  request-locally and turn_end persists it as a draft. */
+	/** Why Pi's own compaction cannot take this summary now (null: it can). Each reason defers the summary
+	 *  to a turn_end compaction draft. */
 	private nativeGate(ctx: Any, branch: Any[], pre: Any[]): string | null {
 		if (this.nativeOff) return "off for this process";
 		if (typeof ctx?.compact !== "function") return "no ctx.compact";
@@ -745,8 +745,7 @@ export class Zip implements ZipControl {
 	 * A summary prepared while the user was away goes into the session through Pi's own compaction, before the run (research pi-tricks
 	 * §1b, variant 1): ctx.compact() with session_before_compact answering pi-zip's summary and pi-zip's own tokensBefore (the notice's
 	 * "before", provider scale), so Pi's "[compaction] Compacted from N tokens" shows that number. It takes milliseconds: the summary is
-	 * done. The run plan is then made on the projection as it was before the compaction, so the run's first request carries the same
-	 * bytes as the draft path would have sent; any gate that fails keeps the draft path.
+	 * done. The run plan folds the resulting projection; a closed native door defers the summary to turn_end.
 	 * Pi runs every extension's session_before_compact handler for it (the last answer wins, a cancel stops it): unless pi-zip's own
 	 * entry is the one that went in, fast, the native path ends for the process (endNative). A compaction not finished by the deadline
 	 * is cancelled first, and a summary prepared for a context another extension's compaction has replaced is never used (its head is gone).
@@ -760,20 +759,21 @@ export class Zip implements ZipControl {
 		};
 		// a warm return right after a request that carried an edit makes none (b2b): the run plan would not adopt it either
 		if (!this.cold && this.justEdited) return skip("a warm return right after an edited request makes no edit (b2b)");
-		// the plan the first request will make: the same one (cold or warm, cutting where a produced summary cuts if it is not deeper and
-		// the law accepts that: computeRunPlan adopts it the same way), with the prompt Pi is about to append
+		// Choose the joint edit with the prompt Pi is about to append; a produced cut must be no deeper than this plan.
+		// Its summary enters natively and its folds become the run plan, without another law decision.
 		const pending = pendingPrompt(e);
 		const entries = pending ? [...pre, pending] : pre;
 		const ready = this.ready(branch);
 		const keys = ready.map((a) => a.key);
 		const mk = (cutAt?: string) => {
-			const { o } = this.opts(ctx, !pending, entries, this.pWarm, this.pause, cutAt, false, keys);
-			return { p: planContext(entries, o) };
+			const { o, cal } = this.opts(ctx, !pending, entries, this.pWarm, this.pause, cutAt, false, keys);
+			return { o, cal, p: planContext(entries, o) };
 		};
-		const p = this.adopted(mk(), mk, "native", ready).p;
+		const { o, cal, p } = this.adopted(mk(), mk, "native", ready);
 		const art = p && p.cutIdx !== null ? readyOf(branch, this.mine).find((a) => a.key === p.firstKeptEntryId) : undefined;
 		if (!p || !art?.cut) return skip(!p || p.cutIdx === null ? "the summary does not fit this plan: the plan at the prompt has no cut" : this.bg?.key === p.firstKeptEntryId ? "summary not finished when the prompt came" : "the summary does not fit this plan: the plan at the prompt cuts elsewhere");
 		const cut = art.cut;
+		if (p.folds.some((t) => p.blocks.findIndex((b) => b.entryId === t.entryId) < p.cutIdx!)) throw new Error("native fold target must be kept after the cut");
 		if (checkEdits(p.blocks, p.userTurns, p.folds, cut)) return skip("guard");
 		const gate = this.nativeGate(ctx, branch, pre);
 		if (gate) return skip(gate);
@@ -843,14 +843,14 @@ export class Zip implements ZipControl {
 				this.summarizedWarm = true;
 				this.summaryRegrow = undefined; // its size is not known: this stretch ends at the next cold return
 			}
-			return; // nothing went in: the draft path, the run plan adopts the prepared summary as before
+			return; // nothing went in: the prepared summary waits for turn_end
 		}
 		this.summarizedWarm = true; // one summary per warm stretch, as for a draft (commit)
 		this.summaryRegrow = regrow;
 		// the summary is in the session from now on, whatever the run does: book it here (commit() does not book it again), the way a
 		// draft of the same kind is booked: a cold return's saves a rewrite, a warm one is a valve edit of the warm cache
 		const cutSaved = Math.round(p.scale.c * (cut.prefixTokens - cut.summaryTokens));
-		this.nativeRun = { key: art.key, cut, before, after: Math.round(p.ctxAfterFolds - cutSaved), pre, entryId: entry.id };
+		this.nativeRun = { cut, before, after: Math.round(p.ctxAfterFolds - cutSaved), o, cal, p };
 		const s = this.stats;
 		s.summaries++;
 		s.summarizedTokens += cutSaved;
@@ -951,27 +951,6 @@ export class Zip implements ZipControl {
 		return cut ? { cut, ms: performance.now() - w0 } : null;
 	}
 
-	/**
-	 * The room wait at the turn_end that persists a run plan of folds alone: when the view after those folds is still at Pi's compaction
-	 * room, the room plan's cut c′ is awaited (roomWait) and goes in with the run plan, its compaction draft first (commit). The folds
-	 * stay the run plan's, exactly as its requests carried them. null: no wait, or no summary (the run plan alone); a run plan that
-	 * carries a summary already is left as it is.
-	 */
-	private async runRoom(e: Any, ctx: Any, plan: RunPlan, o: { blocks: Block[]; userTurns: number }, pIn: number): Promise<RunPlan | null> {
-		if (plan.cut || plan.native) return null;
-		const sc = plan.scale, applied = plan.folds.filter((t) => !plan.applied || plan.applied.has(t.entryId));
-		const after = sizeOf(sc, o.blocks.reduce((a, b) => a + b.tokens, 0)) - sc.c * applied.reduce((a, t) => a + t.entryTokens - t.phTokens, 0);
-		const ents = e.context.contextEntries;
-		const mk = () => this.opts(ctx, false, ents, pIn, false, undefined, false, []).o;
-		const c = roomOf(after, mk(), () => planContext(ents, mk()));
-		if (!c) return null;
-		const got = await this.roomWait(c, ctx);
-		const byId = new Set(o.blocks.map((b) => b.entryId));
-		if (!got || checkEdits(o.blocks, o.userTurns, applied.filter((t) => byId.has(t.entryId)), got.cut)) return null; // the run plan alone
-		this.discardBg("replaced");
-		const room: RunPlan = { ...plan, cut: got.cut, cutSent: false, untouched: sc.O, waitMs: got.ms, ctxAfter: plan.ctxAfter - sc.c * (got.cut.prefixTokens - got.cut.summaryTokens) };
-		return room;
-	}
 
 	async context(e: Any, ctx: Any): Promise<Any> {
 		if (!this.active()) return undefined;
@@ -1025,9 +1004,7 @@ export class Zip implements ZipControl {
 	private async computeRunPlan(ctx: Any) {
 		const t0 = performance.now();
 		const now = ((ctx.sessionManager.buildSessionProjection() as Any)?.entries ?? []) as Any[];
-		// a summary that went in through Pi's compaction before the run (nativeSummary): plan on the projection as it was right before
-		// it, plus what came after, so folds, scale and placeholders are exactly what the draft path computes (the run's first request
-		// carries the same bytes); the request Pi builds already starts with the summary
+		// Pi kept the native decision's fold targets by ID: carry that decision, looking up positions in this projection.
 		const nat = this.nativeRun, foreign = this.foreignRun;
 		this.nativeRun = null;
 		this.foreignRun = false;
@@ -1044,30 +1021,23 @@ export class Zip implements ZipControl {
 			return;
 		}
 		for (const n of d.notes) this.ledger(n);
-		const { o, cal, p, onPre } = d;
-		this.lawLedger("run", o);
+		const { o, cal, p } = d;
+		if (!nat) this.lawLedger("run", o);
 		// a cut with no ready summary: the plan is its folds alone (by the law), and the summary is written in the background
 		if (d.produce) this.want("run", ctx, d.produce);
 		const native = nat?.cut ?? null;
 		if (!p && !native) return; // the law does not fire (below the working view, or a rewrite that does not pay back)
 		this.runEdits = true;
 		const trigger = this.cold ? "cold" : "valve";
-		let cut: Cut | null = null;
-		if (!native && p && p.cutIdx !== null) {
-			const art = readyOf(this.branch(ctx), this.mine).find((a) => a.key === p.firstKeptEntryId);
-			cut = art?.cut ? { ...art.cut, trigger, prepared: true } : null; // labelled by the return that adopts it (written early for a warm one, say)
-			if (cut) this.ledger({ type: "take", where: "run", key: p.firstKeptEntryId }); // a ready summary: its call is spent (priced 0)
-		}
-		if (cut || native) this.discardBg("replaced"); // a summary goes in: a call still running reads a projection that is about to end
+
 		const foldMs = performance.now() - t0, settleIds = this.settleIds;
 		// a plan that cannot be persisted must never be sent: the request view would differ from what turn_end can write (I1)
-		const r = runPlanOf({ p, cal, cold: this.cold, onPre, native, nat, folds: p?.folds ?? [], cut, adopted: !!(cut || native), settleIds, ms: foldMs });
+		const r = runPlanOf({ p, cal, cold: this.cold, native, nat, folds: p?.folds ?? [], settleIds, ms: foldMs, now });
 		if (r.drop) this.ledger(r.drop);
 		const { folds } = r;
-		cut = r.cut;
 		this.runPlan = r.plan;
 		const { source, ctxBefore, ctxAfter } = r.plan;
-		this.ledger({ type: "cold_plan", trigger, source, folds: folds.length, summary: !!(cut ?? native), ...(native ? { via: "native", onPre } : {}), ...this.calOf(cal), ctxBefore: Math.round(ctxBefore), ctxAfter: Math.round(ctxAfter), ms: Math.round(foldMs), ...(cut ? { summaryMs: cut.ms, llmOk: cut.llmOk, waitedMs: 0, ...this.usageOf(cut) } : {}) });
+		this.ledger({ type: "cold_plan", trigger, source, folds: folds.length, summary: !!native, ...(native ? { via: "native" } : {}), ...this.calOf(cal), ctxBefore: Math.round(ctxBefore), ctxAfter: Math.round(ctxAfter), ms: Math.round(foldMs) });
 	}
 
 	/** Ledger form of a calibration; ctxBefore/ctxAfter next to it are already real (O + c x estimate). */
@@ -1221,20 +1191,14 @@ export class Zip implements ZipControl {
 		// decision or its room wait (RC)
 		for (const h of recalledHandlesFromBranch(branch)) this.recalled.add(h);
 		const pIn = inRunClock(branch, { model: m, ent: this.entKey === modelKey(m) ? this.ent : undefined, tier: this.tier(m) }, Date.now(), { reqMs: touch, modelKey: this.lastModelKey }).pWarm;
-		if (this.runEdits) {
-			this.runEdits = false;
-			if (!this.runPlan?.sent && this.runPlan && (this.runPlan.folds.length || this.runPlan.cut)) {
-				this.runPlan = null; // never sent (the request failed before the context hook, or nothing matched): persisting it would change a prefix nobody saw
-				return undefined;
-			}
-			if (!this.runPlan) return undefined;
-			// the run has carried its plan since the first request: persist EXACTLY it, even when this turn failed (the prefix was sent and cached)
-			const room = failed ? null : await this.runRoom(e, ctx, this.runPlan, o, pIn);
-			if (room) this.runPlan.persisted = true; // persisted below with the room wait's summary: no request carries it again
-			return this.commit(e, ctx, room ?? this.runPlan, o);
-		}
+		const carried = this.runEdits ? this.runPlan : null;
+		this.runEdits = false;
+		if (carried && !carried.sent) this.runPlan = null;
+		const runPlan = carried?.sent ? carried : null;
+		// A failed response still persists the folds its request actually carried, but makes no new edit.
+		if (failed) return runPlan ? this.commit(e, ctx, runPlan, o) : undefined;
 		const ents = e.context.contextEntries;
-		const d = decideTurnEnd({ failed, justEdited: this.justEdited, pWarm: pIn, ready: this.ready(branch), entries: ents, opts: (cutAt, foldsOnly, ready) => this.opts(ctx, false, ents, pIn, false, cutAt, foldsOnly, ready) });
+		const d = decideTurnEnd({ failed, justEdited: this.justEdited, pWarm: pIn, ready: this.ready(branch), entries: ents, runPlan, opts: (cutAt, foldsOnly, ready) => this.opts(ctx, false, ents, pIn, false, cutAt, foldsOnly, ready) });
 		if (d.kind === "none") return undefined;
 		if (d.kind === "b2b") this.ledger({ type: "b2b_skip", where: "turn_end" });
 		else {
@@ -1243,20 +1207,26 @@ export class Zip implements ZipControl {
 		}
 		if (d.produce) this.want("turn_end", ctx, d.produce);
 		let p = d.kind === "plan" ? d.p : null, cut: Cut | null = null, ready = false, waitMs = 0;
-		if (d.room) { // still at Pi's compaction room after this edit: the one wait
-			const got = await this.roomWait(d.room, ctx);
-			if (got) [p, cut, waitMs] = [d.room, got.cut, got.ms];
-		}
-		if (!cut && p && p.cutIdx !== null) {
+		if (p && p.cutIdx !== null) {
 			const art = readyOf(branch, this.mine).find((a) => a.key === p!.firstKeptEntryId);
-			if (!art?.cut) return undefined; // decideTurnEnd takes only a ready one
-			[cut, ready] = [{ ...art.cut, trigger: "valve", prepared: true }, true];
-			this.ledger({ type: "take", where: "turn_end", key: p.firstKeptEntryId }); // a ready summary: its call is spent (priced 0)
+			if (art?.cut) {
+				[cut, ready] = [{ ...art.cut, trigger: "valve", prepared: true }, true];
+				this.ledger({ type: "take", where: "turn_end", key: p.firstKeptEntryId });
+			}
 		}
-		if (!p) return undefined;
-		if (cut) this.discardBg("replaced"); // a summary goes in: a call still running reads a projection that is about to end
-		const plan = valvePlanOf(p, cut, ready, waitMs, performance.now() - t0);
-		return this.commit(e, ctx, plan, o);
+		if (d.room) { // one post-edit judgement, shared by carried folds, b2b and ordinary decisions
+			const got = await this.roomWait(d.room, ctx);
+			if (got) [p, cut, waitMs, ready] = [d.room, got.cut, got.ms, false];
+		}
+		if (!p && !runPlan) return undefined;
+		if (cut) this.discardBg("replaced");
+		const plan = runPlan
+			? { ...runPlan, cut, ...(cut ? { untouched: runPlan.scale.O, waitMs, ready: ready ? "background" as const : undefined } : {}) }
+			: valvePlanOf(p!, cut, ready, waitMs, performance.now() - t0);
+		if (runPlan && cut) plan.ctxAfter -= plan.scale.c * (cut.prefixTokens - cut.summaryTokens);
+		const out = this.commit(e, ctx, plan, o);
+		if (runPlan) runPlan.persisted = plan.persisted;
+		return out;
 	}
 
 	/**
@@ -1285,7 +1255,7 @@ export class Zip implements ZipControl {
 		const why = valve || !this.cold ? "cache warm · worth it at this size" : this.coldWhy;
 		// reqTs identifies the first request carrying the final view: a folds-only notice keeps its first-request time when announced
 		// at the boundary; a newly joined room summary uses the boundary time, because only the next request can carry it.
-		const data: NoticeData = { v: 2, text: noticeText(notices), before: Math.round(notices[0].tokensBefore), after: Math.round(notices[notices.length - 1].tokensAfter), desc: noticeDesc(notices), why: why || undefined, items, more: Math.max(0, live.length - ITEMS) || undefined, first: !this.noticed && !this.branch(ctx).some((en: Any) => en?.type === "custom" && en.customType === NOTICE_CUSTOM), reqTs: plan.cutSent === false ? Date.now() : (plan.noticeTs ?? Date.now()), ...(cut && (!valve || plan.native) && this.nativeNote ? { native: this.nativeNote.native, ...(this.nativeNote.ms !== undefined ? { nativeMs: this.nativeNote.ms } : {}), ...(this.nativeNote.askMs !== undefined ? { nativeAskMs: this.nativeNote.askMs } : {}) } : {}) };
+		const data: NoticeData = { v: 2, text: noticeText(notices), before: Math.round(notices[0].tokensBefore), after: Math.round(notices[notices.length - 1].tokensAfter), desc: noticeDesc(notices), why: why || undefined, items, more: Math.max(0, live.length - ITEMS) || undefined, first: !this.noticed && !this.branch(ctx).some((en: Any) => en?.type === "custom" && en.customType === NOTICE_CUSTOM), reqTs: plan.cut ? Date.now() : (plan.noticeTs ?? Date.now()), ...(cut && this.nativeNote ? { native: this.nativeNote.native, ...(this.nativeNote.ms !== undefined ? { nativeMs: this.nativeNote.ms } : {}), ...(this.nativeNote.askMs !== undefined ? { nativeAskMs: this.nativeNote.askMs } : {}) } : {}) };
 		this.noticed = true;
 		this.notify(ctx, data.text, data);
 	}
@@ -1293,7 +1263,7 @@ export class Zip implements ZipControl {
 	private commit(e: Any, ctx: Any, plan: RunPlan, o: { t0: number; blocks: Block[]; userTurns: number; usageTotal: number }) {
 		plan.persisted = true;
 		const sc = plan.scale, c = sc.c; // one scale for the whole run: stats, notices and the ledger agree with what the plan compared against the limits
-		const ctxTokens = sizeOf(sc, o.blocks.reduce((a, b) => a + b.tokens, 0));
+		const ctxTokens = plan.cut ? piContextTokens(e.context.contextEntries, this.branch(ctx)) : sizeOf(sc, o.blocks.reduce((a, b) => a + b.tokens, 0));
 		const byId = new Map(o.blocks.map((b) => [b.entryId, b]));
 		const wasApplied = (t: FoldTarget) => !plan.applied || plan.applied.has(t.entryId); // persist what the requests actually carried
 		const live = plan.folds.filter((t) => byId.has(t.entryId) && wasApplied(t));
@@ -1316,14 +1286,14 @@ export class Zip implements ZipControl {
 			plan.persisted = false; // keep the request-local view: never switch the fold set mid-run
 			return undefined;
 		}
-		const sentBefore = !!plan.sent, cutSent = plan.cutSent ?? sentBefore;
-		if (!sentBefore || (cut && !cutSent)) this.nextEdit = plan.untouched ?? 0; // a new room summary is first sent with the next request
+		const sentBefore = !!plan.sent;
+		if (!sentBefore || cut) this.nextEdit = plan.untouched ?? 0; // a new room summary is first sent with the next request
 		const ours: Any[] = live.map((t) => ({ type: "context_edit", targetId: t.entryId, replacement: { content: [{ type: "text", text: t.ph }] } }));
 		for (const t of live) if (t.toolCallId) this.foldedCalls.set(t.toolCallId, handleFor(t.entryId));
 		// the compaction draft goes FIRST: Pi writes its tokensBefore from the newest usage only while no edit follows that usage, so a
 		// fold drafted before it would make Pi's "Compacted from N tokens" the chars/4 of a half-applied projection (research pi-tricks §1a)
-		if (cut) ours.unshift({ type: "compaction", summary: cut.text, firstKeptEntryId: cut.firstKeptEntryId, details: { by: PRODUCT, trigger: cut.trigger, carried: cutSent, regrow }, usage: cut.usage });
-		ours.push({ type: "custom", customType: COMMIT_CUSTOM, data: { carried: sentBefore, ...(cut && sentBefore && !cutSent ? { next: true } : {}) } }); // says who first carried these edits (state.ts, plan.ts calibrate)
+		if (cut) ours.unshift({ type: "compaction", summary: cut.text, firstKeptEntryId: cut.firstKeptEntryId, details: { by: PRODUCT, trigger: cut.trigger, carried: false, regrow }, usage: cut.usage });
+		ours.push({ type: "custom", customType: COMMIT_CUSTOM, data: { carried: sentBefore, ...(cut && sentBefore ? { next: true } : {}) } }); // says who first carried these edits (state.ts, plan.ts calibrate)
 		const before = Math.round(c * live.reduce((a, t) => a + t.entryTokens, 0));
 		const after = Math.round(c * live.reduce((a, t) => a + t.phTokens, 0));
 		const cutSaved = cut ? Math.round(c * (cut.prefixTokens - cut.summaryTokens)) : 0;
@@ -1352,9 +1322,9 @@ export class Zip implements ZipControl {
 			entryTokensBefore: before, entryTokensAfter: after, ctxBefore: Math.round(ctxTokens), ctxAfter: Math.round(ctxTokens - (before - after) - cutSaved), O: Math.round(sc.O), c: Math.round(sc.c * 1000) / 1000, usageTotal: o.usageTotal,
 			coldReason: this.coldReason, prepared: plan.source === "settle", ...(stale ? { staleTargets: stale } : {}),
 		});
-		if (cut) this.ledger({ type: "summary", trigger: cut.trigger, source: plan.source, count: cut.count, prefixTokens: Math.round(c * cut.prefixTokens), summaryTokens: Math.round(c * cut.summaryTokens), ms: cut.ms, waitedMs: Math.round(waitMs), llmOk: cut.llmOk, llmError: cut.llmError, costUsd: cut.costUsd, ...this.usageOf(cut) });
-		// A summary already sent was announced with its request; folds alone wait here so a room summary joins their one notice.
-		if (!plan.noticed) this.noticeFor(ctx, plan, live, cut, ctxTokens, plan.source === "valve" || plan.cutSent === false ? 0 : o.usageTotal);
+		if (cut) this.ledger({ type: "summary", trigger: cut.trigger, source: plan.source, tokensBefore: ctxTokens, count: cut.count, prefixTokens: Math.round(c * cut.prefixTokens), summaryTokens: Math.round(c * cut.summaryTokens), ms: cut.ms, waitedMs: Math.round(waitMs), llmOk: cut.llmOk, llmError: cut.llmError, costUsd: cut.costUsd, ...this.usageOf(cut) });
+		// Native summaries were announced with their request; boundary summaries join the folds in one notice.
+		if (!plan.noticed) this.noticeFor(ctx, plan, live, cut, ctxTokens, plan.source === "valve" || plan.cut ? 0 : o.usageTotal);
 		plan.noticed = true;
 		return { entries: [...e.entries, ...ours] }; // append, never overwrite other extensions' drafts
 	}
