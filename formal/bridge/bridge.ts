@@ -42,6 +42,8 @@ const { CacheWarmer } = await import(join(PI, "dist/core/cache-warmer.js"));
 const piZip = (await import(join(SRC, "index.ts"))).default;
 const { Zip } = await import(join(SRC, "run.ts"));
 const plan = await import(join(SRC, "plan.ts"));
+const core = await import(join(SRC, "core.ts"));
+const { previousNarrative } = await import(join(SRC, "summary.ts"));
 const { handleFor, PH_MARK } = await import(join(SRC, "placeholder.ts"));
 const applyDrafts = (sm: Any, drafts: Any[]) => (AgentSession.prototype as Any)._applyBoundaryDrafts.call({}, sm, drafts) as Any[];
 // warm the lazy import summary.ts makes for its serializer (it would otherwise race the virtual clock once)
@@ -266,6 +268,8 @@ async function runTrace(tr: Any): Promise<Any> {
 			// pi-zip waits for a call still running (it says so in the working line): in a slow world that call answers now
 			ui: { notify: () => {}, setWorkingMessage: (text?: string) => { if (text) for (const f of [...slowCalls]) f(); }, setStatus: () => {} },
 			getSystemPrompt: () => sysText, sessionManager: manager, isIdle: () => true,
+			// Pi provides abort() even while idle; native compaction is instant here, with no foreign handler to cancel.
+			abort: () => {},
 			modelRegistry: {
 				complete: async (_m: Any, req: Any) => {
 					const r = narrativeOf(req);
@@ -888,6 +892,7 @@ async function runTrace(tr: Any): Promise<Any> {
 			persistOk = desc.every((d: Any, i: number) => now[i] === d.h);
 		}
 		const t: Any = {
+			nativeDoor: runStart ? pendingNative : null,
 			req: reqNo, ev, run: runNo, n: reqInRun, t0, t1, gap: gapMs === null ? null : gapMs / 1000, model: key(), failed: fail,
 			warm: wu.warm, total: wu.total, read: wu.read, out: outTok, rawTok: rawDesc.reduce((a: number, d: Any) => a + d.tok, 0),
 			view: desc, zipNew, env: envSince, state0, lossless: lossIssues,
@@ -908,6 +913,7 @@ async function runTrace(tr: Any): Promise<Any> {
 		envSince = [];
 		lastView = view;
 		ticks.push(t);
+		pendingNative = null;
 		reqNo++;
 		reqInRun++;
 	}
@@ -952,6 +958,52 @@ async function runTrace(tr: Any): Promise<Any> {
 		}
 	}
 
+	// Native completeness observes the session BEFORE the idle door, not opts() or its ledger. Only folding/guard mechanics
+	// are shared with the source; Rust selects the allowed ready cut and evaluates both laws with its own class prices.
+	let pendingNative: Any = null;
+	function nativeSnapshot(text: string): Any {
+		const z = live.zip, branch = sm.getBranch(), pre = sm.buildSessionProjection().entries;
+		if (!z || !w.native) return null;
+		const stored = existsSync(STATS) ? JSON.parse(readFileSync(STATS, "utf8")) : {};
+		const learned = { ...z.lam(live.ctx), ent: stored.models?.[key()] };
+		const now = core.clock(branch, learned, clock, { reqMs: z.lastReqMs, modelKey: z.lastModelKey });
+		const prompt = { role: "user", content: text };
+		const entries = [...pre, { sourceEntry: { id: "pending-native", type: "message", message: prompt }, messages: [prompt] }];
+		const { o } = core.planOpts(entries, branch, z.env(live.ctx), learned, false, now.pWarm, now.pause);
+		// Obtain F without asking whether a summary pays. No ready argument or captured live opts participates in this probe.
+		const folded = plan.planContext(entries, { ...o, foldsOnly: true, law: { ...o.law, pWarm: 0 }, trace: [] });
+		const bs = folded?.blocks ?? plan.buildBlocks(entries, o.steerIds);
+		const folds = folded?.folds ?? [], byId = new Map(folds.map((f: Any) => [f.entryId, f]));
+		const c = o.scale.c, O = o.scale.O, room = plan.compactionRoom(live.ctx.model, o.reserve);
+		const cap = plan.coldTarget(40_000, O, room), total = bs.reduce((a: number, b: Any) => a + (byId.get(b.entryId)?.phTokens ?? b.tokens), 0);
+		const prev = bs[0]?.kind === "summary" ? bs[0].tokens : 0;
+		const turns = plan.countUserTurns(bs), protectedAt = bs.findIndex((b: Any) => b.userTurn >= turns - 1);
+		const floor = prev + bs.reduce((a: number, b: Any) => a + (b.userTurn >= turns - 1 ? byId.get(b.entryId)?.phTokens ?? b.tokens : 0), 0);
+		const head = branch.filter((e: Any) => e.type === "compaction").at(-1)?.id ?? "";
+		const artifacts = branch.filter((e: Any) => e.type === "custom" && e.customType === "pi-zip/summary" && e.data?.cut && e.data.head === head).map((e: Any) => e.data);
+		let prefix = 0;
+		const cuts: Any[] = [];
+		for (let i = 0; i < bs.length; i++) {
+			const b = bs[i];
+			if (i >= (prev ? 2 : 1) && (protectedAt < 0 || i <= protectedAt) && plan.isCutBlock(b)) {
+				const sum = Math.max(Math.min(Math.max(prefix / 10, 1000), 8000), prev);
+				const art = artifacts.findLast((a: Any) => a.key === b.entryId && a.cut.firstKeptEntryId === b.entryId);
+				const keptFolds = folds.filter((f: Any) => bs.findIndex((x: Any) => x.entryId === f.entryId) >= i);
+				cuts.push({ key: b.entryId, prefix: c * prefix, summary: c * sum, read: c * (Math.max(prefix - prev, 0) + (prev ? Math.ceil((previousNarrative(String(bs[0].msg?.summary ?? ""))?.text ?? "").length / 4) : 0)), written: c * Math.min(sum, 4000), ready: !!art, guard: !core.checkEdits(bs, turns, keptFolds, { firstKeptEntryId: b.entryId }), hash: art ? sha(art.cut.text) : null });
+			}
+			prefix += byId.get(b.entryId)?.phTokens ?? b.tokens;
+		}
+		const foreign = branch.some((e: Any) => e.type === "compaction" && e.details?.by !== "pi-zip");
+		return {
+			open: live.ctx.isIdle() && !z.nativeOff && !foreign && branch.at(-1)?.type !== "compaction" && !!prepareCompaction(branch, { enabled: true, reserveTokens: 16_384, keepRecentTokens: 20_000 }),
+			p: now.pWarm, g: learned.g, known: !!learned.ent?.cls,
+			b2b: now.pWarm >= 0.5 && learned.justEdited,
+			noSummary: now.pWarm >= 0.5 && learned.summarizedWarm && !(learned.summaryRegrow > 0 && O + c * total >= learned.summaryRegrow) && O + c * total < room,
+			before: O + c * bs.reduce((a: number, b: Any) => a + b.tokens, 0),
+			afterFolds: O + c * total, target: cap, floor: O + c * (floor + 1000), cuts, applied: null,
+		};
+	}
+
 	let pendingProbe: { snapshot: Any[]; userMsg: Any; liveState?: Any } | null = null;
 	install();
 	try {
@@ -974,7 +1026,11 @@ async function runTrace(tr: Any): Promise<Any> {
 					statsAtPrompt = existsSync(STATS) ? readFileSync(STATS, "utf8") : "";
 					const z0: Any = live.zip ?? {};
 					preRun = { sw: !!z0.summarizedWarm, je: !!z0.justEdited };
+					pendingNative = nativeSnapshot(text);
+					const nativeIds = new Set(sm.getBranch().map((x: Any) => x.id));
 					await fire(live, "before_agent_start", { type: "before_agent_start", prompt: text, images: [] });
+					const applied = sm.getBranch().findLast((x: Any) => x.type === "compaction" && !nativeIds.has(x.id) && x.details?.by === "pi-zip" && x.details?.via === "native");
+					if (pendingNative && applied) pendingNative.applied = { key: applied.firstKeptEntryId, hash: sha(applied.summary) };
 					await fire(live, "agent_start", { type: "agent_start" });
 					const userMsg = { role: "user", content: text, timestamp: clock };
 					const uid = sm.appendMessage(userMsg);

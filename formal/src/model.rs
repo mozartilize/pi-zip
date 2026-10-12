@@ -545,10 +545,47 @@ pub struct Fresh {
     pub fixed_by_all: bool,
 }
 
+/// Session facts sampled before a typed idle prompt, independently of the native planner's opts and ledger.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct NativeDoor {
+    pub open: bool,
+    pub p: f64,
+    pub g: f64,
+    pub known: bool,
+    pub b2b: bool,
+    pub no_summary: bool,
+    pub before: f64,
+    pub after_folds: f64,
+    pub target: f64,
+    pub floor: f64,
+    pub cuts: Vec<NativeCut>,
+    pub applied: Option<NativeApplied>,
+}
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct NativeCut {
+    pub key: String,
+    pub prefix: f64,
+    pub summary: f64,
+    pub read: f64,
+    pub written: f64,
+    pub ready: bool,
+    pub guard: bool,
+    pub hash: Option<String>,
+}
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct NativeApplied {
+    pub key: String,
+    pub hash: String,
+}
+
 /// One request the system sent, and every decision made around it.
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Tick {
+    pub native_door: Option<NativeDoor>,
     pub req: usize,
     pub ev: i64,
     pub run: i64,

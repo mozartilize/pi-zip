@@ -806,11 +806,13 @@ export class Zip implements ZipControl {
 		// the law accepts that: computeRunPlan adopts it the same way), with the prompt Pi is about to append
 		const pending = pendingPrompt(e);
 		const entries = pending ? [...pre, pending] : pre;
+		const ready = this.ready(branch);
+		const keys = ready.map((a) => a.key);
 		const mk = (cutAt?: string) => {
-			const { o } = this.opts(ctx, !pending, entries, this.pWarm, this.pause, cutAt);
+			const { o } = this.opts(ctx, !pending, entries, this.pWarm, this.pause, cutAt, false, keys);
 			return { p: planContext(entries, o) };
 		};
-		const p = this.adopted(mk(), mk, "native", this.ready(branch)).p;
+		const p = this.adopted(mk(), mk, "native", ready).p;
 		const art = p && p.cutIdx !== null ? readyOf(branch, this.mine).find((a) => a.key === p.firstKeptEntryId) : undefined;
 		if (!p || !art?.cut) return skip(!p || p.cutIdx === null ? "the summary does not fit this plan: the plan at the prompt has no cut" : this.bg?.key === p.firstKeptEntryId ? "summary not finished when the prompt came" : "the summary does not fit this plan: the plan at the prompt cuts elsewhere");
 		const cut = art.cut;
