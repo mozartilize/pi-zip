@@ -629,7 +629,7 @@ describe("item 5: a run an extension's message starts (sendMessage with triggerT
 		await prompted.beforeAgentStart("next request");
 		sendPrompt(prompted.sm, "next request");
 		const pReq = await prompted.request();
-		await new Promise((res) => setTimeout(res, 50)); // a summary either starts in the background (rule B): its call is made off the request path
+		await new Promise((res) => setTimeout(res, 50)); // a summary starts in the background: its call is made off the request path
 		expect(driven.narrativeCalls.length).toBe(prompted.narrativeCalls.length);
 		expect(dReq.some(isFolded)).toBe(pReq.some(isFolded));
 		expect(dReq.some((m) => m.role === "compactionSummary")).toBe(pReq.some((m) => m.role === "compactionSummary"));
@@ -648,8 +648,8 @@ describe("the notice's why line says the cache was judged cold, as the warm one 
 });
 
 // Round 5: the incident (0.3.0, a warm prompt 1 min 48 s after a run that ended at 111.5K; the user waited 39 s for a summary, which went in
-// as a draft whose "Compacted from N" Pi took from the post-summary request). Rules A and B against Pi's own session and draft code.
-describe("round 5 on real Pi: rule A starts the warm summary early, rule B never makes the user wait for it while the cache is warm", () => {
+// as a draft whose "Compacted from N" Pi took from the post-summary request). Rule A and the background production against Pi's own session and draft code.
+describe("round 5 on real Pi: rule A starts the warm summary early, nobody waits for it while the cache is warm", () => {
 	const sleep = (ms: number) => new Promise((res) => setTimeout(res, ms));
 	const template = (agoMs: number) => {
 		const sm = SessionManager.inMemory(CWD);

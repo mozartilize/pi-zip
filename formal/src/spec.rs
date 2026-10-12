@@ -1132,6 +1132,19 @@ fn produced_target_miss(r: &R, i: usize, k: &str) -> Option<String> {
     if refused {
         return None;
     }
+    // theory 1.4 plan (R5): no cut paid with its call (no c), and the ready summary cuts beyond cW: a ready summary is used up to cW
+    // when there is no c, so one beyond it is passed over (one up to cW is judged as ready, and a refusal there is the clause above)
+    let plans = || te.grids.iter().filter(|g| g.at == "turn_end").filter_map(|g| g.actual());
+    let priced = |l: &&LawStep| l.at == "summary" && l.ready != Some(true);
+    let beyond_w = plans().all(|p| p.cut.is_none())
+        && plans().any(|p| {
+            // the cuts from cW on are judged in order, each with its call: the first priced summary step is cW's
+            let w = p.law.iter().find(priced).and_then(|l| l.key.as_deref());
+            w.is_some() && w != Some(k) && p.law.iter().filter(priced).any(|l| l.key.as_deref() == Some(k))
+        });
+    if beyond_w {
+        return None;
+    }
     Some(format!("the summary for {k} the return at req {i} produced was ready before req {m}'s turn_end, which left {:.0} tokens (target {:.0}) and no law refused", s.view_tok, s.target))
 }
 
@@ -1423,7 +1436,7 @@ pub fn classify(id: &str, r: &R, v: &Violation) -> String {
             if r.decision_for(v.at).is_some_and(|g| g.at == "run" && g.p >= 0.5) {
                 "warm return: the run plan summarises while the user waits (B2)".into()
             } else if r.decision_for(v.at).is_some_and(|g| g.at == "turn_end" && g.p >= 0.5) {
-                "warm turn_end: the valve summarises while the user waits below the room (rule B)".into()
+                "warm turn_end: the valve summarises while the user waits below the room".into()
             } else if env.iter().any(|e| e == "switch") {
                 "cold return by a model switch (nothing to foresee while away)".into()
             } else if env.iter().any(|e| e == "foreign") {

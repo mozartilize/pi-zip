@@ -849,6 +849,37 @@ describe("never wait: rule A starts early; a summary is used once ready; the one
 		await sleep(20);
 		expect(st2.calls).toBe(1); // the call b2b produced is the one awaited
 	});
+	test("a call made at the room is a pi-zip/summary record and in the totals at once (a summary the commit refuses is not lost); Esc ends the wait on a running call, not the call", async () => {
+		const model = { provider: "p", id: "m", contextWindow: 100_000, cost: { cacheWrite: 3, cacheRead: 0.3 }, promptCache: { short: 300 } }; // room 75K
+		const st = { calls: 0, delay: 50 };
+		const r = await rig(done, WARM_TS(), { model, modelRegistry: { complete: mkComplete(st) } });
+		const zip = await zipOf(r);
+		await prompt(r);
+		zip.discardBg("replaced"); // nothing running at the turn_end: the room wait makes its own call
+		const est = zip.stats.summaryUsd;
+		const te = await r.fire("turn_end", turnEnd([...back, ...tail], "r6"));
+		expect(rows("room_wait")[0]).toMatchObject({ key: "u3", running: false });
+		const rec = zip.mine.find((a: Any) => a.cut);
+		expect(rec).toMatchObject({ key: "u3", head: "" });
+		expect(rec.usd).toBeGreaterThan(0);
+		expect(zip.stats.summaryUsd).toBeCloseTo(est + rec.usd, 9); // booked once, when it was made (not again by the commit)
+		expect(te.entries[0]).toMatchObject({ type: "compaction", firstKeptEntryId: "u3", summary: rec.cut.text });
+		// Esc while the turn_end waits for the call already running: the wait ends at once, the call goes on and is used once ready
+		const st2 = { calls: 0, delay: 2_000 };
+		const e = await rig(done, WARM_TS(), { model, modelRegistry: { complete: mkComplete(st2) } });
+		const ez = await zipOf(e);
+		await prompt(e);
+		const esc = new AbortController();
+		e.ctx.signal = esc.signal;
+		setTimeout(() => esc.abort(), 50);
+		const t0 = Date.now();
+		const te2 = await e.fire("turn_end", turnEnd([...back, ...tail], "r6"));
+		expect(Date.now() - t0).toBeLessThan(1_000); // 0.4.0 before this fix: the whole call
+		expect(rows("room_wait").at(-1)).toMatchObject({ key: "u3", running: true });
+		expect(te2?.entries?.some((x: Any) => x.type === "compaction")).toBeFalsy();
+		expect(ez.bg?.key).toBe("u3"); // still running
+		expect(st2.calls).toBe(1);
+	});
 	test("no UI (print, json) decides as with a UI: the warm return does not wait, the summary is written in the background", async () => {
 		const st = { calls: 0, delay: 200 };
 		const quiet = await rig(done, WARM_TS(), { hasUI: false, mode: "json", modelRegistry: { complete: mkComplete(st) } });

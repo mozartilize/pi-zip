@@ -1,0 +1,22 @@
+world explicit known ttl=300 true=300 survival=none c=1.7 sys=3000 window=200000 native print
+prompt +0s
+say 20K
+prompt +60s
+call npm 4.0K
+say 100
+prompt +60s
+call recall
+say 18.0K
+prompt +60s
+call npm 100
+call npm 100
+say 100
+prompt +60s
+call npm 100
+call cat 20K
+call npm 100
+fail error
+prompt +330s
+call recall
+call recall
+say 100

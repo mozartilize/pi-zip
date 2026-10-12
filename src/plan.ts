@@ -581,7 +581,7 @@ export interface RunPlan {
 export interface PlanOpts {
 	law?: Law; // prices, g and P(warm): the only input that depends on P; default: the explicit class ratios at P = 0
 	pause?: boolean; // a return after a pause (the absence outlived the requested cache lifetime) or a model switch: the previous user turn's re-readable outputs may fold
-	trace?: (LawTerms & { where: "summary" | "plan" })[]; // every law evaluation is pushed here (ledger)
+	trace?: (LawTerms & { where: "summary" | "plan"; cut?: boolean; ready?: boolean; key?: string })[]; // every law evaluation is pushed here (ledger)
 	reserve?: number; // Pi's compaction reserveTokens (default 16384)
 	steerIds?: Set<string>; // user entries that are mid-run steering or follow-up messages, not new user turns
 	scale?: Scale; // real = O + c x content estimate (calibrate); default UNIT = the estimates are taken as real
@@ -655,10 +655,11 @@ export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
 	const coldCap = (coldTarget(o.coldCap ?? s.coldCap, O, room) - O) / c;
 	const law: Law = o.law ?? { pr: lawPrices(undefined, false), g: G0, pWarm: 0 };
 	// `cut`: a whole-plan step records whether the plan it judges has a cut (and so carries its summary call); the formal checker pins the
-	// call to 0 for a folds-only plan and to the summary step's call for a cut; `ready`: the cut's summary is ready (its call is 0)
-	const gate = (where: "summary" | "plan", B: number, A: number, r: number | null, call: number, T: number, Tsuf?: number, cut?: boolean, isReady?: boolean): boolean => {
+	// call to 0 for a folds-only plan and to the summary step's call for a cut; `ready`: the cut's summary is ready (its call is 0);
+	// `key`: a summary step's cut (its first kept entry)
+	const gate = (where: "summary" | "plan", B: number, A: number, r: number | null, call: number, T: number, Tsuf?: number, cut?: boolean, isReady?: boolean, key?: string): boolean => {
 		const t = lawTerms(B, A, law.pWarm, r, law.pr, law.g, call, T);
-		o.trace?.push({ where, ...t, ...(Tsuf !== undefined ? { Tsuf } : {}), ...(cut !== undefined ? { cut } : {}), ...(isReady ? { ready: true } : {}) });
+		o.trace?.push({ where, ...t, ...(Tsuf !== undefined ? { Tsuf } : {}), ...(cut !== undefined ? { cut } : {}), ...(isReady ? { ready: true } : {}), ...(key !== undefined ? { key } : {}) });
 		return t.ok;
 	};
 	const foldMin = o.foldMin ?? s.foldMin;
@@ -776,13 +777,15 @@ export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
 		const total = acc;
 		let first = cuts.length - 1;
 		for (let k = 0; k < cuts.length; k++) if (total - pre[cuts[k]] + S(pre[cuts[k]]) <= coldCap) { first = k; break; }
-		const take = (pick: number): boolean => {
+		/** `spent`: a ready cut is priced at call 0 (a pinned cut, or a ready summary when no cut pays with its call); c itself is
+		 *  chosen with every call priced (theory 1.4 plan: a ready summary never cuts deeper than c, or than cW without c). */
+		const take = (pick: number, spent: boolean): boolean => {
 			const X = c * pre[pick], Sr = c * S(pre[pick]);
 			// the call is the narrative call summary.ts makes: uncached input of the prefix without the previous summary, plus that
 			// summary's narrative, which it merges (not its lists), + output of at most the narrative budget; 0 for a ready summary
-			const isReady = ready.has(blocks[pick].entryId!);
+			const isReady = spent && ready.has(blocks[pick].entryId!);
 			const call = isReady ? 0 : law.pr.input * c * (Math.max(pre[pick] - prevSum, 0) + prevNarr) + law.pr.out * c * Math.min(S(pre[pick]), NARRATIVE_MAX);
-			if (!gate("summary", X, Sr, null, call, Sr, undefined, undefined, isReady)) return false; // the summary call must pay for itself
+			if (!gate("summary", X, Sr, null, call, Sr, undefined, undefined, isReady, blocks[pick].entryId ?? undefined)) return false; // the summary call must pay for itself
 			if (!(pre[pick] >= 2 * S(pre[pick]))) return false;
 			// what the plan leaves: the context with its folds (those inside the prefix too: the prefix is measured as folded, `pre`) minus
 			// what the summary replaces plus the summary
@@ -793,9 +796,10 @@ export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
 			for (let i = folds.length - 1; i >= 0; i--) if (foldAt[i] < pick) { tokOverride.delete(foldAt[i]); folds.splice(i, 1); foldAt.splice(i, 1); } // the prefix is replaced: its folds are void
 			return true;
 		};
-		if (cuts.slice(first).some(take)) return true;
-		// a ready summary short of the cut that reaches the view (theory 1.4: a <= cW), the deepest first
-		return cuts.slice(0, first).reverse().some((pick) => ready.has(blocks[pick].entryId!) && take(pick));
+		if (pinned !== undefined) return cuts.some((pick) => take(pick, true)); // adopt's cut a <= c: its call may be spent
+		if (cuts.slice(first).some((pick) => take(pick, false))) return true;
+		// no cut pays with its call: a ready summary no deeper than the cut that reaches the view (theory 1.4 R5: a <= cW), the deepest first
+		return cuts.slice(0, first + 1).reverse().some((pick) => ready.has(blocks[pick].entryId!) && take(pick, true));
 	};
 	if (sumTrigger) {
 		const limit = blocks.findIndex((b) => protectedTurn(b));
