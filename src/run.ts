@@ -1182,10 +1182,10 @@ export class Zip implements ZipControl {
 		if (carried && !carried.sent) this.runPlan = null;
 		const runPlan = carried?.sent ? carried : null;
 		// A failed response still persists the folds its request actually carried, but makes no new edit.
-		if (failed) return runPlan ? this.commit(e, ctx, runPlan, o) : undefined;
 		const ents = e.context.contextEntries;
 		const d = decideTurnEnd({ failed, justEdited: this.justEdited, pWarm: pIn, ready: this.ready(branch), entries: ents, runPlan, opts: (cutAt, foldsOnly, ready) => this.opts(ctx, false, ents, pIn, false, cutAt, foldsOnly, ready) });
-		if (d.kind === "none") return undefined;
+		if (runPlan) runPlan.folds = d.runPlan!.folds;
+		if (d.kind === "none") return runPlan ? this.commit(e, ctx, runPlan, o) : undefined;
 		if (d.kind === "b2b") this.ledger({ type: "b2b_skip", where: "turn_end" });
 		else {
 			for (const n of d.notes) this.ledger(n);
@@ -1249,8 +1249,7 @@ export class Zip implements ZipControl {
 		const sc = plan.scale, c = sc.c; // one scale for the whole run: stats, notices and the ledger agree with what the plan compared against the limits
 		const ctxTokens = plan.cut ? piContextTokens(e.context.contextEntries, this.branch(ctx), e.entries) : sizeOf(sc, o.blocks.reduce((a, b) => a + b.tokens, 0));
 		const byId = new Map(o.blocks.map((b) => [b.entryId, b]));
-		const wasApplied = (t: FoldTarget) => !plan.applied || plan.applied.has(t.entryId); // persist what the requests actually carried
-		const live = plan.folds.filter((t) => byId.has(t.entryId) && wasApplied(t));
+		const live = plan.folds.filter((t) => byId.has(t.entryId));
 		const stale = plan.folds.length - live.length; // e.g. Pi auto-compaction removed them from the projection
 		const cut = plan.cut && byId.has(plan.cut.firstKeptEntryId) ? plan.cut : null;
 		if (!live.length && !cut) {
