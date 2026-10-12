@@ -1,0 +1,14 @@
+# 0.4.0 step 4 (WL restated): a summary a decision wants is produced at once and taken at the first decision after it is ready. Print
+# mode, so no away timer: the cold return at req 4 produces its cut in the background; the next return finds it ready and takes it.
+# The mutant hides ready summaries from the decisions (run.ts ready), so that return prices the cut again and produces it once more.
+world automatic known ttl=300 true=300 survival=none c=1 sys=3000 window=200000 native print
+prompt +0s
+call npm 20K
+say 25.7K
+prompt +60s
+call npm 100
+say 100
+prompt +330s
+say 100
+prompt +330s
+say 100

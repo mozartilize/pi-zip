@@ -6,7 +6,7 @@ import { dirname, join } from "node:path";
 import { lastMessageMs, lastPrompt, modelKey, payloadRetention, refused, ttlFor } from "./cache.ts";
 import { agentDir, curve, describe, lawPrices, loadStats, pWarm, record, sample, statsPath, GAP_EDGES, type Entry } from "./learn.ts";
 import { repairPayload } from "./guard.ts";
-import { adopt, checkEdits, clock, decideRun, inRunClock, decideSettle, decideTurnEnd, grow, headOf, lastRegrow, planOpts, readyOf, runPlanOf, scaleOf, summarizedSince, unusedOf, valvePlanOf, SUMMARY_CUSTOM, type Artifact, type Avail, type Env, type Learned } from "./core.ts";
+import { adopt, checkEdits, clock, decideRun, inRunClock, decideSettle, decideTurnEnd, grow, headOf, lastRegrow, planOpts, readyOf, roomOf, runPlanOf, scaleOf, summarizedSince, unusedOf, valvePlanOf, SUMMARY_CUSTOM, type Artifact, type Avail, type Env, type Learned } from "./core.ts";
 import { fmtK, Stats, noticeDesc, noticeText, type NoticeAction, type NoticeData, type ZipControl } from "./notice.ts";
 import { applyPlanToMessages, buildBlocks, countUserTurns, G0, keepRecentTokensFor, piCanCompact, planContext, reserveTokensFor, sizeOf, UNIT, type Block, type Cut, type FoldTarget, type PlanOpts, type PlanResult, type RunPlan, type Scale, type SysInfo } from "./plan.ts";
 import { handleFor, PH_MARK, RECALL_TOOL } from "./placeholder.ts";
@@ -1081,6 +1081,29 @@ export class Zip implements ZipControl {
 		return cut ? { cut, ms: performance.now() - w0 } : null;
 	}
 
+	/**
+	 * The room wait at the turn_end that persists a run plan of folds alone: when the view after those folds is still at Pi's compaction
+	 * room, the room plan's cut c′ is awaited (roomWait) and goes in with the run plan, its compaction draft first (commit). The folds
+	 * stay the run plan's, exactly as its requests carried them. null: no wait, or no summary (the run plan alone); a run plan that
+	 * carries a summary already is left as it is.
+	 */
+	private async runRoom(e: Any, ctx: Any, plan: RunPlan, o: { blocks: Block[]; userTurns: number }, pIn: number): Promise<RunPlan | null> {
+		if (plan.cut || plan.native) return null;
+		const sc = plan.scale, applied = plan.folds.filter((t) => !plan.applied || plan.applied.has(t.entryId));
+		const after = sizeOf(sc, o.blocks.reduce((a, b) => a + b.tokens, 0)) - sc.c * applied.reduce((a, t) => a + t.entryTokens - t.phTokens, 0);
+		const ents = e.context.contextEntries;
+		const mk = () => this.opts(ctx, false, ents, pIn, false, undefined, false, []).o;
+		const c = roomOf(after, mk(), () => planContext(ents, mk()));
+		if (!c) return null;
+		const got = await this.roomWait(c, ctx);
+		const byId = new Set(o.blocks.map((b) => b.entryId));
+		if (!got || checkEdits(o.blocks, o.userTurns, applied.filter((t) => byId.has(t.entryId)), got.cut)) return null; // the run plan alone
+		this.discardBg("replaced");
+		const room: RunPlan = { ...plan, cut: got.cut, waitMs: got.ms, ctxAfter: plan.ctxAfter - sc.c * (got.cut.prefixTokens - got.cut.summaryTokens) };
+		if (room.noticed) this.noticeFor(ctx, room, [], got.cut, after, 0); // its folds were announced with its first request
+		return room;
+	}
+
 	async context(e: Any, ctx: Any): Promise<Any> {
 		if (!this.active()) return undefined;
 		if (this.starting) await this.starting; // agent_start's start-of-run handling of a driven run
@@ -1439,6 +1462,14 @@ export class Zip implements ZipControl {
 		const u = msg?.usage;
 		const usageTotal = u ? (u.input ?? 0) + (u.cacheRead ?? 0) + (u.cacheWrite ?? 0) : 0;
 		const o = { t0, blocks, userTurns, usageTotal };
+		// P(warm) in-run: the learned curve at the time since the newest response (a long tool call is an absence like any other)
+		const m = ctx?.model ?? this.model, branch = this.branch(ctx);
+		const touch = Math.max(this.lastReqMs, msg?.stopReason === "error" ? 0 : Number(msg?.timestamp) || 0); // the response that ended this turn is the newest touch
+		// a recall made in this run by a built-in tool on a recall file (file recall) is in the branch only: zip_recall's own hook
+		// marks its handles at once, a read, grep or bash of a recall file would otherwise be folded again at this turn_end, by its
+		// decision or its room wait (RC)
+		for (const h of recalledHandlesFromBranch(branch)) this.recalled.add(h);
+		const pIn = inRunClock(branch, { model: m, ent: this.entKey === modelKey(m) ? this.ent : undefined, tier: this.tier(m) }, Date.now(), { reqMs: touch, modelKey: this.lastModelKey }).pWarm;
 		if (this.runEdits) {
 			this.runEdits = false;
 			if (!this.runPlan?.sent && this.runPlan && (this.runPlan.folds.length || this.runPlan.cut)) {
@@ -1447,22 +1478,19 @@ export class Zip implements ZipControl {
 			}
 			if (!this.runPlan) return undefined;
 			// the run has carried its plan since the first request: persist EXACTLY it, even when this turn failed (the prefix was sent and cached)
-			return this.commit(e, ctx, this.runPlan, o);
+			const room = failed ? null : await this.runRoom(e, ctx, this.runPlan, o, pIn);
+			if (room) this.runPlan.persisted = true; // persisted below with the room wait's summary: no request carries it again
+			return this.commit(e, ctx, room ?? this.runPlan, o);
 		}
-		// P(warm) in-run: the learned curve at the time since the newest response (a long tool call is an absence like any other)
-		const m = ctx?.model ?? this.model, branch = this.branch(ctx);
-		// a recall made in this run by a built-in tool on a recall file (file recall) is in the branch only: zip_recall's own hook
-		// marks its handles at once, a read, grep or bash of a recall file would otherwise be folded again at this turn_end (RC)
-		for (const h of recalledHandlesFromBranch(branch)) this.recalled.add(h);
-		const touch = Math.max(this.lastReqMs, msg?.stopReason === "error" ? 0 : Number(msg?.timestamp) || 0); // the response that ended this turn is the newest touch
-		const pIn = inRunClock(branch, { model: m, ent: this.entKey === modelKey(m) ? this.ent : undefined, tier: this.tier(m) }, Date.now(), { reqMs: touch, modelKey: this.lastModelKey }).pWarm;
 		const ents = e.context.contextEntries;
 		const d = decideTurnEnd({ failed, justEdited: this.justEdited, pWarm: pIn, ready: this.ready(branch), entries: ents, opts: (cutAt, foldsOnly, ready) => this.opts(ctx, false, ents, pIn, false, cutAt, foldsOnly, ready) });
 		if (d.kind === "none") return undefined;
 		if (d.kind === "b2b") { // the request that just ended carried a fresh edit: no warm edit on the very next one (no back-to-back warm rewrites)
 			this.ledger({ type: "b2b_skip", where: "turn_end" });
 			if (d.produce) this.produce(d.produce, ctx, "turn_end");
-			return undefined;
+			if (!d.room) return undefined;
+			const got = await this.roomWait(d.room, ctx); // b2b does not block the room wait (theory 1.3 R6)
+			return got ? this.commit(e, ctx, valvePlanOf(d.room, got.cut, false, got.ms, performance.now() - t0), o) : undefined;
 		}
 		// nothing below the working view; above it the plan the law accepts at the in-run P (I6, F10), from the next request on: with a
 		// ready summary, or its folds alone while the summary is written in the background

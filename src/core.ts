@@ -338,10 +338,9 @@ export function runPlanOf(x: { p: PlanResult | null; cal: Scale; cold: boolean; 
 /** The decision at a turn_end that has no run plan to persist: none after a failed turn, else the plan at the in-run P(warm) `pWarm`
  *  (core.ts inRunClock), taking a ready summary (adopt) or, when its cut has none, its folds alone (unready: the cut is produced).
  *  Right after an edited request while the cache is believed warm (b2b) nothing is applied, and the summary is still produced. `p`
- *  null when it changes nothing; `room`: the plan of the room wait (`roomPlan`: its own cut, made at once while the turn waits),
- *  when the view after the decision's edit is still at Pi's compaction room. */
+ *  null when it changes nothing; `room`: the plan of the room wait (roomOf), which b2b does not block (theory 1.3 R6). */
 export function decideTurnEnd(x: { failed: boolean; justEdited: boolean; pWarm: number; ready: readonly Avail[]; opts: (cutAt?: string, foldsOnly?: boolean, ready?: readonly string[]) => { o: PlanOpts }; entries: Any[] }):
-	{ kind: "none" } | { kind: "b2b"; produce: PlanResult | null } | { kind: "plan"; o: PlanOpts; p: PlanResult | null; notes: Note[]; produce: PlanResult | null; room: PlanResult | null } {
+	{ kind: "none" } | { kind: "b2b"; produce: PlanResult | null; room: PlanResult | null } | { kind: "plan"; o: PlanOpts; p: PlanResult | null; notes: Note[]; produce: PlanResult | null; room: PlanResult | null } {
 	if (x.failed) return { kind: "none" };
 	const readyKeys = x.ready.filter((a) => !a.running).map((a) => a.key);
 	const mk = (cutAt?: string, foldsOnly = false) => {
@@ -349,19 +348,27 @@ export function decideTurnEnd(x: { failed: boolean; justEdited: boolean; pWarm: 
 		return { o, p: planContext(x.entries, o) };
 	};
 	const first = mk();
+	const roomFor = (after: number, taken?: string) => roomOf(after, first.o, () => planContext(x.entries, x.opts(undefined, false, []).o), taken);
 	if (x.justEdited && x.pWarm >= 0.5) {
-		const p = first.p;
-		return { kind: "b2b", produce: p && p.cutIdx !== null && !x.ready.some((a) => a.key === p.firstKeptEntryId) ? p : null };
+		const p = first.p, room = roomFor(p?.ctxTokens ?? 0);
+		return { kind: "b2b", produce: !room && p && p.cutIdx !== null && !x.ready.some((a) => a.key === p.firstKeptEntryId) ? p : null, room };
 	}
 	const { r, note } = adopt(first, mk, x.ready, "turn_end");
 	const u = unready(r, x.ready, () => mk(undefined, true));
 	const p = u.r.p && (u.r.p.folds.length || u.r.p.cutIdx !== null) ? u.r.p : null;
-	// the one wait (theory 1.4): the view after this edit is still at Pi's compaction room, and the plan's own cut pays with its call
-	const c = first.p;
-	const room = compactionRoom(u.r.o.model, u.r.o.reserve);
-	const after = p ? p.ctxAfterFolds - (p.cutIdx !== null ? p.scale.c * (p.prefixTokens - p.summaryTokensPlanned) : 0) : (c?.ctxTokens ?? 0);
-	const atRoom = !!c && c.cutIdx !== null && room !== null && after >= room && c.firstKeptEntryId !== p?.firstKeptEntryId;
-	return { kind: "plan", o: u.r.o, p, notes: note ? [note] : [], produce: atRoom ? null : u.produce, room: atRoom ? c : null };
+	const after = p ? p.ctxAfterFolds - (p.cutIdx !== null ? p.scale.c * (p.prefixTokens - p.summaryTokensPlanned) : 0) : (first.p?.ctxTokens ?? 0);
+	const room = roomFor(after, p && p.cutIdx !== null ? (p.firstKeptEntryId ?? undefined) : undefined);
+	return { kind: "plan", o: u.r.o, p, notes: note ? [note] : [], produce: room ? null : u.produce, room };
+}
+
+/** The one wait (theory 1.4 R9): when the view after a turn_end's edit (`after`) is still at Pi's compaction room, the plan at the
+ *  in-run p with no pause and no ready summaries (`plan`: every call priced), if it has a cut c′ (which then passed the law with its
+ *  call) other than the one the edit takes already (`taken`); else null. `o`: the decision's options (model, reserve). */
+export function roomOf(after: number, o: PlanOpts, plan: () => PlanResult | null, taken?: string): PlanResult | null {
+	const room = compactionRoom(o.model, o.reserve);
+	if (room === null || after < room) return null;
+	const c = plan();
+	return c && c.cutIdx !== null && c.firstKeptEntryId !== taken ? c : null;
 }
 
 /** The valve plan of a turn_end (persisted at once; `cut`: its summary, ready, or the room wait's; `waitMs`: the room wait). */

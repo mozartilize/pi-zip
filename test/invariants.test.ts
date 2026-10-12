@@ -814,6 +814,41 @@ describe("never wait: rule A starts early; a summary is used once ready; the one
 		expect(rows("room_wait")).toHaveLength(1);
 		expect(warm.calls).toBe(1);
 	});
+	test("the room wait also follows a run plan of folds and a b2b turn_end: a turn_end still at Pi's compaction room waits for the cut, compaction draft first", async () => {
+		const model = { provider: "p", id: "m", contextWindow: 100_000, cost: { cacheWrite: 3, cacheRead: 0.3 }, promptCache: { short: 300 } }; // room 75K
+		// a return after a pause: the run plan is the folds alone (about 91K after them), its cut is written in the background
+		const st = { calls: 0, delay: 200 };
+		const r = await rig(done, WARM_TS(), { model, modelRegistry: { complete: mkComplete(st) } });
+		r.ctx.sessionManager.getBranch = () => branchOf(done, Date.now() - 600_000);
+		r.ctx.sessionManager.buildSessionProjection = () => ({ entries: back });
+		await r.fire("before_agent_start", {});
+		const req = await r.fire("context_with_system", { messages: flat(back) });
+		expect(req?.messages?.[0]?.role).not.toBe("compactionSummary");
+		expect(rows("cold_plan")[0]).toMatchObject({ summary: false });
+		expect(rows("cold_plan")[0].folds).toBeGreaterThan(0);
+		const t0 = Date.now();
+		const te = await r.fire("turn_end", turnEnd([...back, ...tail], "r6"));
+		expect(Date.now() - t0).toBeGreaterThanOrEqual(100); // 0.4.0 before this fix: the run plan was persisted and nothing waited
+		const kinds = te.entries.map((e: Any) => e.customType ?? e.type);
+		expect(kinds[0]).toBe("compaction"); // first, so Pi's "Compacted from N" reads the newest usage
+		expect(kinds.filter((k: string) => k === "context_edit").length).toBe(rows("cold_plan")[0].folds); // the folds the run carried, exactly
+		expect(rows("room_wait")[0]).toMatchObject({ key: "u3", running: true });
+		await sleep(20);
+		expect(st.calls).toBe(1);
+		// b2b: right after an edited request while warm nothing new is applied, but the room wait is not blocked (theory 1.3 R6)
+		const st2 = { calls: 0, delay: 200 };
+		const b = await rig(done, WARM_TS(), { model, modelRegistry: { complete: mkComplete(st2) } });
+		(await zipOf(b)).justEdited = true;
+		const req2 = await prompt(b);
+		expect(req2?.messages?.[0]?.role).not.toBe("compactionSummary");
+		const t1 = Date.now();
+		const te2 = await b.fire("turn_end", turnEnd([...back, ...tail], "r6"));
+		expect(Date.now() - t1).toBeGreaterThanOrEqual(100);
+		expect(rows("b2b_skip").map((x) => x.where)).toEqual(["run", "turn_end"]);
+		expect(te2.entries[0]).toMatchObject({ type: "compaction", firstKeptEntryId: "u3" });
+		await sleep(20);
+		expect(st2.calls).toBe(1); // the call b2b produced is the one awaited
+	});
 	test("no UI (print, json) decides as with a UI: the warm return does not wait, the summary is written in the background", async () => {
 		const st = { calls: 0, delay: 200 };
 		const quiet = await rig(done, WARM_TS(), { hasUI: false, mode: "json", modelRegistry: { complete: mkComplete(st) } });

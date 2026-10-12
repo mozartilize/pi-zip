@@ -224,6 +224,15 @@ describe("core: decide", () => {
 		if (tight.kind !== "plan") throw new Error("no plan");
 		expect(tight.room?.cutIdx).not.toBeNull(); // wait for the plan's own cut
 		expect(tight.produce).toBeNull(); // the wait makes it: no background call besides
+		// the room plan prices every call: it is planned with no ready summaries (theory 1.3 R9), whatever the decision may take
+		const seen: (readonly string[] | undefined)[] = [];
+		const e = env({ model: { ...MODEL, contextWindow: 60_000 } }), l = lam({ model: { ...MODEL, contextWindow: 60_000 } });
+		const opts = (cutAt?: string, foldsOnly?: boolean, ready?: readonly string[]) => (seen.push(ready), planOpts(big, [], e, l, false, 0, false, cutAt, foldsOnly, ready));
+		const b2b = decideTurnEnd({ failed: false, justEdited: true, pWarm: 1, ready: [{ key: "elsewhere", running: false }], entries: big, opts });
+		if (b2b.kind !== "b2b") throw new Error("no b2b");
+		expect(b2b.room?.cutIdx).not.toBeNull(); // b2b blocks the application, not the room wait (theory 1.3 R6)
+		expect(b2b.produce).toBeNull();
+		expect(seen).toEqual([["elsewhere"], []]);
 	});
 	test("valvePlanOf: a valve plan's sizes, a ready summary (no wait) and the room wait", () => {
 		const p = planContext(big, planOpts(big, [], env(), lam(), false, 0, true).o)!;

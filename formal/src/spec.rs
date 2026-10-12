@@ -10,7 +10,7 @@
 use crate::law::{call_of, class_prices, law, summary_call, Prices};
 use crate::logic::*;
 use crate::model::*;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use crate::logic::Violation;
 use serde_json::Value;
 
@@ -171,11 +171,22 @@ fn not_pushed_to_room() -> F<R> {
 fn not_produced_by_i0() -> F<R> {
     atom("not_produced_by_i0", |r: &R, i, env: &Env| {
         let i0 = lookup(env, "i0") as usize;
-        match (produced_at_return(r, i0), took_ready(r, i)) {
+        match (produced_at_return(r, i0), took_ready(r, i).or_else(|| room_waited(r, i))) {
             (Some(p), Some(t)) if p == t => !unpreparable(r, i0),
             _ => true,
         }
     })
+}
+/// The cut the room wait at the turn_end before request i awaited (run.ts roomWait: the room plan's own cut), if any.
+pub fn room_waited(r: &R, i: usize) -> Option<String> {
+    if i == 0 {
+        return None;
+    }
+    r.tick(i - 1).te_ledger.iter().find(|x| x.get("type").and_then(Value::as_str) == Some("room_wait")).and_then(|x| x.get("key").and_then(Value::as_str)).map(String::from)
+}
+/// A rewrite the room wait made (theory 1.4 R6: b2b does not block it).
+fn not_room_wait() -> F<R> {
+    atom("not_room_wait", |r: &R, i, _| room_waited(r, i).is_none())
 }
 /// The summary a return at i0 wants could not have been prepared while away (see not_produced_by_i0).
 fn unpreparable(r: &R, i0: usize) -> bool {
@@ -239,6 +250,46 @@ fn not_regrown() -> F<R> {
 fn warm_summary_not_withheld() -> F<R> {
     atom("warm_summary_not_withheld", |r: &R, i, _| withheld(r, i).is_none())
 }
+/// PC: the request is not left at Pi's own compaction threshold by a turn_end that could have waited for a pi-zip summary.
+fn room_wait_kept() -> F<R> {
+    atom("room_wait_kept", |r: &R, i, _| pi_compacts(r, i).is_none())
+}
+/// Pi's threshold, 8,192 tokens (COMPACT_MARGIN) above pi-zip's room.
+pub const COMPACT_MARGIN: f64 = 8_192.0;
+/// PC at request i: a request inside a run whose context is at Pi's own threshold, after a turn_end that did not fail, did not wait at
+/// the room and wrote no summary, while a summary could have freed room (the floor is below the room).
+pub fn pi_compacts(r: &R, i: usize) -> Option<String> {
+    let t = r.tick(i);
+    if i == 0 || t.n == 0 {
+        return None;
+    }
+    let (prev, s) = (r.tick(i - 1), &r.st[i]);
+    let threshold = s.room + COMPACT_MARGIN;
+    if prev.failed.is_some() || s.view_tok < threshold || s.floor + SUMMARY_FLOOR * r.trace.world.c >= s.room {
+        return None;
+    }
+    if prev.te_ledger.iter().any(|x| x.get("type").and_then(Value::as_str) == Some("room_wait")) {
+        return None;
+    }
+    if prev.drafts.iter().any(|d| d.get("type").and_then(Value::as_str) == Some("compaction")) {
+        return None;
+    }
+    // the room plan's cut must pass the law with its call (R9): a turn_end that decided (its grids) and planned no cut at all had no
+    // cut to wait for; a turn_end that made no decision (the run plan's, before 0.4.0's fix) is not excused
+    let te: Vec<_> = prev.grids.iter().filter(|g| g.at == "turn_end").filter_map(|g| g.actual()).collect();
+    let produced = prev.te_ledger.iter().any(|x| x.get("type").and_then(Value::as_str) == Some("produce"));
+    if !te.is_empty() && te.iter().all(|p| p.cut.is_none()) && !produced {
+        return None;
+    }
+    let b2b = prev.te_ledger.iter().any(|x| x.get("type").and_then(Value::as_str) == Some("b2b_skip"));
+    let run_plan = r.tick(i - 1).n == 0 && r.tick(i - 1).run_plan.is_some();
+    Some(format!(
+        "req {i} sends {:.0} tokens, at Pi's own threshold {threshold:.0}, after a turn_end ({}) that neither waited at the room nor wrote a summary",
+        s.view_tok,
+        if b2b { "a b2b skip" } else if run_plan { "the one that persists the run plan" } else { "a decision" }
+    ))
+}
+
 /// Residuals: the property's failures at this request that no known root cause (TRIAGE.md (a)) explains.
 fn rd_residual() -> F<R> {
     atom("fresh_plans_alike_or_known_cause", |r: &R, i, _| r.tick(i).fresh.as_ref().is_none_or(|f| f.same || f.fixed_by_known || pinned_live(r, i)))
@@ -335,9 +386,10 @@ pub fn derived() -> Vec<Prop> {
             name: "no back-to-back warm rewrites",
             from: &["A2"],
             why: "a rewrite planned at a warm cache right after a rewrite pays the cache write twice for one saving (a return pi-zip \
-                  believes cold is excused here, as in A2: learning the cache's real lifetime is outside this spec).",
+                  believes cold is excused here, as in A2: learning the cache's real lifetime is outside this spec). 0.4.0: the room wait \
+                  is not blocked by b2b (theory 1.3 R6), so a rewrite it makes is excused.",
             evidence: Evidence::Conformance,
-            f: always(zip_edit() >> !next(zip_edit() & cache_warm() & planned_warm())),
+            f: always(zip_edit() >> !next(zip_edit() & cache_warm() & planned_warm() & not_room_wait())),
         },
         Prop {
             id: "MP",
@@ -381,7 +433,9 @@ pub fn derived() -> Vec<Prop> {
                   with the flag lifted, may withhold a summary whose summary step and whole-plan step (the call priced) the law accepts \
                   with Phi >= 1 + WL_MARGIN only while the rule allows it: a pi-zip summary (or another extension's compaction) was made \
                   since the last cold plan and the context has not grown back to the size that summary started from. A flag that never \
-                  lapses, or one a restart restored for a stretch a cold return had ended, withholds summaries that pay.",
+                  lapses, or one a restart restored for a stretch a cold return had ended, withholds summaries that pay. (c) Restated in \
+                  0.4.0: a summary a decision wants is produced at once and applied at the first decision after it is ready, so no \
+                  decision produces again a summary whose call returned while its range is still the session's prefix.",
             evidence: Evidence::Conformance,
             f: always(warm_summary_not_withheld()),
         },
@@ -422,6 +476,17 @@ pub fn derived() -> Vec<Prop> {
                   right after a fold says whether the cache survived (a cut, which replaces the prefix, is exempt as in the code).",
             evidence: Evidence::Conformance,
             f: always(head_kept()),
+        },
+        Prop {
+            id: "PC",
+            name: "Pi's own compaction is not left to happen",
+            from: &["A1", "A3"],
+            why: "Pi compacts on its own, lossily, before the next response once the context passes its threshold (window - reserve, \
+                  8,192 tokens above pi-zip's room): a request of a run at that threshold whose turn_end neither waited for a pi-zip \
+                  summary (the room wait, theory 1.4 R9; b2b does not block it, R6) nor wrote one leaves the compaction to Pi, unless \
+                  the protected turns alone fill the room. The wait is the one Pi would impose anyway (A3); a failed call is excused.",
+            evidence: Evidence::Conformance,
+            f: always(room_wait_kept()),
         },
         Prop {
             id: "RDr",
@@ -882,8 +947,55 @@ fn pays_by_margin(s: &LawStep) -> bool {
     s.ok && s.phi.is_none_or(|phi| phi >= 1.0 + WL_MARGIN)
 }
 
+/// WL (c), 0.4.0 step 4 (architecture section 8, WL restated: a warm summary that pays is produced at once and applied at the first
+/// decision after it is ready): a decision at request i (its run hook or its turn_end) asks for a summary whose call already returned
+/// (run.ts `away_summary`) and whose range is still the session's prefix (no compaction of any kind, no foreign edit, since that call
+/// started): the ready summary is priced and produced again instead of taken.
+pub fn ready_produced_again(r: &R, i: usize) -> Option<String> {
+    let s = |x: &Value, k: &str| x.get(k).and_then(Value::as_str).map(String::from);
+    let mut epoch = 0u32; // bumped by every change of the session's prefix
+    let mut started: BTreeMap<String, u32> = BTreeMap::new();
+    let mut ready: BTreeSet<String> = BTreeSet::new();
+    for m in 0..=i {
+        let t = r.tick(m);
+        if t.env.iter().any(|e| matches!(e.as_str(), "compact" | "foreign" | "edit")) || t.run_plan.as_ref().is_some_and(|p| p.native) {
+            epoch += 1;
+            ready.clear();
+        }
+        for (led, at) in [(&t.run_ledger, "run"), (&t.te_ledger, "turn_end")] {
+            for x in led.iter() {
+                let (ty, key) = (s(x, "type").unwrap_or_default(), s(x, "key"));
+                let Some(k) = key else { continue };
+                match ty.as_str() {
+                    "away_summary_start" | "produce" if m == i && ready.contains(&k) && (ty == "away_summary_start" || x.get("running").is_none()) => {
+                        return Some(format!("the {at} decision at req {i} produced {k} again ({ty}), whose summary was ready"));
+                    }
+                    "away_summary_start" => {
+                        started.insert(k, epoch);
+                    }
+                    "away_summary" if started.get(&k) == Some(&epoch) => {
+                        ready.insert(k);
+                    }
+                    "take" => {
+                        ready.remove(&k);
+                    }
+                    _ => {}
+                }
+            }
+            if at == "turn_end" && t.drafts.iter().any(|d| d.get("type").and_then(Value::as_str) == Some("compaction")) {
+                epoch += 1;
+                ready.clear();
+            }
+        }
+    }
+    None
+}
+
 /// WL at request i: what is withheld, and why it is not excused.
 pub fn withheld(r: &R, i: usize) -> Option<String> {
+    if let Some(w) = ready_produced_again(r, i) {
+        return Some(w);
+    }
     let t = r.tick(i);
     // (a) the valve is asked at every warm turn_end
     let asked = r.grids(i).iter().any(|g| g.at == "turn_end");
@@ -1040,7 +1152,9 @@ pub fn probe_mismatch(r: &R, i: usize) -> Option<String> {
         let pt = g.actual()?;
         let real_f: BTreeSet<String> = t.drafts.iter().filter(|d| d["type"] == "context_edit").filter_map(|d| d["target"].as_str().map(String::from)).collect();
         let real_c = t.drafts.iter().find(|d| d["type"] == "compaction").and_then(|d| d["firstKept"].as_str().map(String::from));
-        if real_f != set(&pt.folds) || real_c != pt.cut {
+        // a room wait at the turn_end that persists the run plan: the cut is the room plan's, the folds the run plan's (as sent)
+        let folds_differ = if t.run_room { t.run_plan.as_ref().is_some_and(|rp| real_f != set(&rp.folds)) } else { real_f != set(&pt.folds) };
+        if folds_differ || real_c != pt.cut {
             return Some(format!("valve: real folds {real_f:?} cut {real_c:?}, probe folds {:?} cut {:?}", pt.folds, pt.cut));
         }
     }
@@ -1170,6 +1284,7 @@ pub fn explain(id: &str, r: &R, i: usize) -> Vec<String> {
         "MH" => head_breach(r, i).into_iter().collect(),
         "NT" => summary_waste(r, i).into_iter().collect(),
         "WL" => withheld(r, i).into_iter().collect(),
+        "PC" => pi_compacts(r, i).into_iter().collect(),
         "TR" => target_miss(r, i).into_iter().collect(),
         "LW" => law_mismatch(r, i).into_iter().collect(),
         "G" => probe_mismatch(r, i).into_iter().collect(),
@@ -1358,6 +1473,7 @@ pub fn classify(id: &str, r: &R, v: &Violation) -> String {
         }
         "WL" => match withheld(r, v.at) {
             Some(w) if w.contains("asked no valve") => "a warm turn_end that asks no valve".into(),
+            Some(w) if w.contains("whose summary was ready") => "a ready summary produced again instead of taken".into(),
             Some(w) if w.contains("no summary since the last cold plan") => {
                 if (0..=v.at).any(|m| r.tick(m).env.iter().any(|e| e == "restart")) { "the flag outlives the stretch: restored after a restart for a stretch a cold return ended".into() } else { "the flag outlives the stretch".into() }
             }
@@ -1365,6 +1481,12 @@ pub fn classify(id: &str, r: &R, v: &Violation) -> String {
             None => "other".into(),
         },
         "PW" => "edit inside the protected turns".into(),
+        "PC" => match pi_compacts(r, v.at) {
+            Some(w) if w.contains("b2b") => "left at Pi's threshold after a b2b skip".into(),
+            Some(w) if w.contains("run plan") => "left at Pi's threshold after the run plan's turn_end".into(),
+            Some(_) => "left at Pi's threshold after a decision".into(),
+            None => "other".into(),
+        },
         _ => String::new(),
     }
 }
