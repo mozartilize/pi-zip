@@ -83,6 +83,15 @@ describe("I1 byte stability: every request of a run sends the same prefix, and i
 		const te = await r.fire("turn_end", turnEnd(all, "a6", 1));
 		return { r, req1, req2, all, te, projected: flat(project(all, te.entries)) };
 	}
+	/** Nobody waits for a summary: the first try of a cold return starts the one its plan wants in the background and goes with its
+	 *  folds alone; a later decision takes it once it is ready (here: the prompt tried again). */
+	async function produced(r: Any, entries: Any[]) {
+		await r.fire("before_agent_start", {});
+		const first = await r.fire("context_with_system", { messages: flat(entries) });
+		expect(first?.messages?.[0]?.role).not.toBe("compactionSummary");
+		for (let i = 0; i < 300 && !r.ctx.__done; i++) await sleep(10); // the summary loads Pi's serializer lazily: the first call takes a while
+		await sleep(1);
+	}
 
 	test("fold only: request 2 repeats request 1's prefix, and the persisted projection equals it", async () => {
 		const { req1, req2, projected, te, r } = await runCold(cold);
@@ -112,8 +121,9 @@ describe("I1 byte stability: every request of a run sends the same prefix, and i
 	test("summary: the local view and the persisted compaction carry the same text and the same kept part", async () => {
 		process.env.PI_ZIP_COLD_CAP = "6000";
 		const big = [U("u1", "one"), A("a1", ["c1"]), R("r1", "c1", 44_000), AX("a2", 120_000), U("u2", "two"), A("a3", ["c3"]), R("r3", "c3", 44_000), AX("a4", 120_000), U("u3", "three"), A("a5"), U("u4", "back")];
-		const complete = async () => ({ stopReason: "stop", content: [{ type: "text", text: "## Decisions\nnarrative" }], usage: { cost: { total: 0.01 } } });
-		const r = await rig(big, COLD_TS(), { modelRegistry: { complete } });
+		const r = await rig(big, COLD_TS());
+		r.ctx.modelRegistry = { complete: async () => ((r.ctx as Any).__done = true, { stopReason: "stop", content: [{ type: "text", text: "## Decisions\nnarrative" }], usage: { cost: { total: 0.01 } } }) };
+		await produced(r, big);
 		await r.fire("before_agent_start", {});
 		const req1 = await r.fire("context_with_system", { messages: flat(big) });
 		expect(req1.messages[0].role).toBe("compactionSummary");
@@ -123,21 +133,23 @@ describe("I1 byte stability: every request of a run sends the same prefix, and i
 		expect(comp.summary).toBe(req1.messages[0].summary);
 		expect(comp.firstKeptEntryId).toBe("u3");
 		expect(norm(flat(project(all, te.entries)).slice(0, req1.messages.length))).toBe(norm(req1.messages));
-		expect(r.notes[0]).toMatch(/summarized 2 requests .* waited [\d.]+ s/);
+		expect(r.notes.at(-1)).toMatch(/summarized 2 requests .* ready while you were away/); // 0.3.1: written at the return, "waited"
 	});
 
 	test("a summary and folds in one batch: the compaction draft comes first (Pi takes its tokensBefore before any fold makes the usage stale)", async () => {
 		process.env.PI_ZIP_COLD_CAP = "6000";
 		// the cut lands at u3; the previous turn's re-readable output r5 (ls) folds by relax, in the kept part
 		const big = [U("u1", "one"), A("a1", ["c1"]), R("r1", "c1", 44_000), AX("a2", 120_000), U("u2", "two"), A("a3", ["c3"]), R("r3", "c3", 44_000), AX("a4", 120_000), U("u3", "three"), A("a5", ["c5"]), R("r5", "c5", 30_000), A("a5e"), U("u4", "back")];
-		const complete = async () => ({ stopReason: "stop", content: [{ type: "text", text: "## Decisions\nnarrative" }], usage: { cost: { total: 0.01 } } });
-		const r = await rig(big, COLD_TS(), { modelRegistry: { complete } });
+		const r = await rig(big, COLD_TS());
+		r.ctx.modelRegistry = { complete: async () => ((r.ctx as Any).__done = true, { stopReason: "stop", content: [{ type: "text", text: "## Decisions\nnarrative" }], usage: { cost: { total: 0.01 } } }) };
+		await produced(r, big);
 		await r.fire("before_agent_start", {});
 		const req1 = await r.fire("context_with_system", { messages: flat(big) });
 		expect(req1.messages[0].role).toBe("compactionSummary");
 		const all = [...big, A("a6")];
 		const te = await r.fire("turn_end", turnEnd(all, "a6"));
-		expect(te.entries.map((e: Any) => e.type)).toEqual(["compaction", "context_edit", "custom"]); // the edits, then the commit marker
+		// the edits, the commit marker, then the record of the summary call (it finished inside the run: written with the drafts)
+		expect(te.entries.map((e: Any) => e.customType ?? e.type)).toEqual(["compaction", "context_edit", "pi-zip/commit", "pi-zip/summary"]);
 		expect(te.entries[0].firstKeptEntryId).toBe("u3");
 		expect(te.entries[1].targetId).toBe("r5");
 		// the order changes nothing in what the session projects
@@ -250,7 +262,7 @@ describe("F12 summary prepared while the user is away (timer at 0.8 x TTL)", () 
 		expect(st.calls).toBe(1);
 	});
 
-	test("a summary still being written when the cold user returns: only the remainder is waited for, and nothing is built twice", async () => {
+	test("a summary still being written when the cold user returns: nobody waits, the run goes with its folds alone, nothing is built twice and the next decision takes it", async () => {
 		const st = { calls: 0, delay: 250 };
 		const working: (string | undefined)[] = [];
 		const r = await rig(done, COLD_TS(), { modelRegistry: { complete: mkComplete(st) }, ui: { notify: () => {}, setWorkingMessage: (t?: string) => working.push(t) } });
@@ -259,24 +271,29 @@ describe("F12 summary prepared while the user is away (timer at 0.8 x TTL)", () 
 		expect(st.calls).toBe(1);
 		const t0 = Date.now();
 		const req = await comeBack(r, settled, COLD_TS());
-		expect(Date.now() - t0).toBeLessThan(250); // less than a full call
-		expect(req.messages[0].role).toBe("compactionSummary");
+		expect(Date.now() - t0).toBeLessThan(50); // 0.3.1: the remainder of the call
+		expect(req?.messages?.[0]?.role).not.toBe("compactionSummary");
 		expect(st.calls).toBe(1);
-		// Pi's working line while the user waits, then cleared. In Pi 1.1.0 Esc there aborts the whole prompt: the line says so
-		expect(working).toEqual(["pi-zip: finishing the summary it started while you were away · Esc cancels this prompt", undefined]);
+		expect(working).toEqual([]); // nothing to wait for, nothing on Pi's working line
+		// the run's first turn_end persists its folds; once the call is done, the next decision (a turn_end) takes the summary
+		await r.fire("turn_end", turnEnd([...back, A("a6", ["c6"]), R("r6", "c6", 400)], "r6"));
+		await sleep(300);
+		const te = await r.fire("turn_end", turnEnd([...back, A("a6", ["c6"]), R("r6", "c6", 400), A("a7")], "a7", 1));
+		expect(te.entries.find((e: Any) => e.type === "compaction")).toMatchObject({ firstKeptEntryId: "u3" });
+		expect(st.calls).toBe(1);
 	});
 
-	test("Esc while waiting (Pi cancels the prompt): pi-zip stops waiting at once, adds no cut, and the summary goes on for the next try", async () => {
+	test("Esc at a return while the summary is being written (Pi cancels the prompt): nothing applied, and the summary goes on for the next try", async () => {
 		const st = { calls: 0, delay: 300, signals: [] as Any[] };
 		const r = await rig(done, COLD_TS(), { modelRegistry: { complete: mkComplete(st) } });
 		const settled = await settle(r);
 		await sleep(150);
 		const esc = new AbortController();
 		(r.ctx as Any).signal = esc.signal;
-		setTimeout(() => esc.abort(), 30);
+		esc.abort();
 		const t0 = Date.now();
 		const req = await comeBack(r, settled, COLD_TS());
-		expect(Date.now() - t0).toBeLessThan(250);
+		expect(Date.now() - t0).toBeLessThan(50);
 		expect(req).toBeUndefined(); // the request never goes out: nothing is applied ...
 		expect(r.notes).toEqual([]); // ... nor announced
 		expect(await r.fire("turn_end", { ...turnEnd([...back, A("a6")], "a6"), message: { role: "assistant", stopReason: "aborted", usage: {} } })).toBeUndefined(); // ... nor persisted
@@ -290,7 +307,7 @@ describe("F12 summary prepared while the user is away (timer at 0.8 x TTL)", () 
 		expect(st.calls).toBe(1);
 	});
 
-	test("Esc while waiting, with a fold in the kept part: that fold is not applied, announced or persisted either (the request never went out)", async () => {
+	test("Esc at a return, with a fold in the kept part: that fold is not applied, announced or persisted either (the request never went out)", async () => {
 		const done2 = [U("u1", "one"), A("a1", ["c1"]), R("r1", "c1", 44_000), AX("a2", 120_000), U("u2", "two"), A("a3", ["c3"]), R("r3", "c3", 44_000), AX("a4", 120_000), U("u3", "three"), A("a5", ["c5"]), R("r5", "c5", 30_000), A("a5e")];
 		const back2 = [...done2, U("u4", "back")];
 		const st = { calls: 0, delay: 300 };
@@ -299,7 +316,7 @@ describe("F12 summary prepared while the user is away (timer at 0.8 x TTL)", () 
 		await sleep(150);
 		const esc = new AbortController();
 		(r.ctx as Any).signal = esc.signal;
-		setTimeout(() => esc.abort(), 30);
+		esc.abort();
 		r.ctx.sessionManager.getBranch = () => [...branchOf(done2, COLD_TS()), settled.entries.at(-1)];
 		r.ctx.sessionManager.buildSessionProjection = () => ({ entries: back2 });
 		await r.fire("before_agent_start", {});
@@ -309,15 +326,22 @@ describe("F12 summary prepared while the user is away (timer at 0.8 x TTL)", () 
 		expect(st.calls).toBe(1);
 	});
 
-	test("print/json mode (no UI): settle does nothing and starts nothing; a cold return that needs a summary computes it then", async () => {
-		const st = { calls: 0 };
+	test("print/json mode (no UI): settle does nothing and starts nothing; a cold return that needs a summary produces it in the background, as with a UI", async () => {
+		const st = { calls: 0, delay: 100 };
 		const r = await rig(done, COLD_TS(), { hasUI: false, mode: "print", modelRegistry: { complete: mkComplete(st) } });
 		expect(await settle(r)).toBeUndefined();
 		await sleep(200);
 		expect(st.calls).toBe(0); // no timer, no background work
+		const t0 = Date.now();
 		const req = await comeBack(r, undefined, COLD_TS());
-		expect(req.messages[0].role).toBe("compactionSummary");
-		expect(st.calls).toBe(1); // built at the cold return, awaited
+		expect(Date.now() - t0).toBeLessThan(50); // 0.3.1: built at the cold return, awaited
+		expect(req?.messages?.[0]?.role).not.toBe("compactionSummary");
+		await sleep(20);
+		expect(st.calls).toBe(1);
+		await sleep(150);
+		const again = await comeBack(r, undefined, COLD_TS()); // the prompt tried again: the summary is ready
+		expect(again.messages[0].role).toBe("compactionSummary");
+		expect(st.calls).toBe(1);
 	});
 
 	test("/zip off cancels a pending timer", async () => {
@@ -606,30 +630,35 @@ describe("F12 summary prepared while the user is away (timer at 0.8 x TTL)", () 
 			const n = await comeBackNative(r, settled, o);
 			expect([name, n.compactCalls]).toEqual([name, name === "compaction failed" ? 1 : 0]);
 			expect([name, n.comp]).toEqual([name, null]);
-			expect([name, n.req?.messages?.[0]?.role]).toEqual([name, "compactionSummary"]); // the request carries it request-locally, as before
-			// the prepared summary is still the one used; after a compaction that came later its range is gone (the head moved): written again
-			expect([name, st.calls]).toEqual([name, name === "already compacted" ? 2 : 1]);
+			// the prepared summary is still the one used, request-locally as before; after a compaction that came later its range is gone
+			// (the head moved): a new one is written in the background, and the run goes with its folds alone (0.3.1: written while it waited)
+			const gone = name === "already compacted";
+			expect([name, n.req?.messages?.[0]?.role === "compactionSummary"]).toEqual([name, !gone]);
+			await sleep(20);
+			expect([name, st.calls]).toEqual([name, gone ? 2 : 1]);
 			const te = await r.fire("turn_end", turnEnd([...back, A("a6")], "a6"));
-			expect([name, te.entries.filter((e: Any) => e.type === "compaction").length]).toEqual([name, 1]); // ... and turn_end persists it
+			expect([name, te.entries.filter((e: Any) => e.type === "compaction").length]).toEqual([name, gone ? 0 : 1]); // ... and turn_end persists it
 		}
 	});
 
-	test("a summary still being written at the return is not pushed through Pi's compaction: the remainder is waited for, as before", async () => {
+	test("a summary still being written at the return is not pushed through Pi's compaction, nor waited for: the run goes with its folds alone", async () => {
 		const st = { calls: 0, delay: 250 };
 		const r = await rig(done, COLD_TS(), { modelRegistry: { complete: mkComplete(st) } });
 		const settled = await settle(r);
 		await sleep(150);
+		const t0 = Date.now();
 		const n = await comeBackNative(r, settled);
+		expect(Date.now() - t0).toBeLessThan(50);
 		expect(n.compactCalls).toBe(0);
-		expect(n.req.messages[0].role).toBe("compactionSummary");
+		expect(n.req?.messages?.[0]?.role).not.toBe("compactionSummary");
 		expect(st.calls).toBe(1);
 	});
 });
 
 // =============================================================================================================
-// Round 5 (the 39 s warm wait of 0.3.0): rule A starts a summary a warm return would make when the run ends; rule B never makes the
-// user wait for one while the cache is warm (unless the context is at Pi's compaction room), and only with a UI.
-describe("round 5: rules A (start early) and B (never wait while warm)", () => {
+// Round 5 (the 39 s warm wait of 0.3.0): rule A starts a summary a warm return would make when the run ends. 0.4.0: nobody waits for a
+// summary, warm or cold, with a UI or without, except at a turn_end still at Pi's compaction room (Pi would stop for its own there).
+describe("never wait: rule A starts early; a summary is used once ready; the one wait is at Pi's compaction room", () => {
 	const done = [U("u1", "one"), A("a1", ["c1"]), R("r1", "c1", 44_000), AX("a2", 120_000), U("u2", "two"), A("a3", ["c3"]), R("r3", "c3", 44_000), AX("a4", 120_000), U("u3", "three"), A("a5")];
 	const back = [...done, U("u4", "back")];
 	const tail = [A("a6", ["c6"]), R("r6", "c6", 400)];
@@ -705,22 +734,23 @@ describe("round 5: rules A (start early) and B (never wait while warm)", () => {
 		expect(st.calls).toBe(1);
 	});
 
-	test("B at the prompt: no finished summary for the warm cut: no wait, nothing applied (not even the folds), the summary starts in the background", async () => {
+	test("a warm prompt with no finished summary for its cut: no wait, its folds alone by the law, the summary starts in the background; a later turn_end takes it", async () => {
 		const st = { calls: 0, delay: 300 };
 		const r = await rig(done, WARM_TS(), { modelRegistry: { complete: mkComplete(st) } }, R5); // a fresh process: no settle ran
 		const t0 = Date.now();
 		const req = await prompt(r);
 		expect(Date.now() - t0).toBeLessThan(150); // 0.3.0: the whole call (300 ms here; 39 s in the incident)
-		expect(req).toBeUndefined(); // nothing applied: the law priced folds and summary together
+		expect(req?.messages?.[0]?.role).not.toBe("compactionSummary");
 		await sleep(20);
 		expect(st.calls).toBe(1); // ... and the summary is being written
-		expect(rows("warm_defer")[0]).toMatchObject({ where: "run", key: "u3", running: false });
-		// the first turn_end: still being written: no wait there either, nothing persisted
+		expect(rows("produce")[0]).toMatchObject({ where: "run", key: "u3" });
+		// the first turn_end: still being written: no wait there either, no summary persisted
 		const t1 = Date.now();
-		expect(await r.fire("turn_end", turnEnd([...back, ...tail], "r6"))).toBeUndefined();
+		const te1 = await r.fire("turn_end", turnEnd([...back, ...tail], "r6"));
 		expect(Date.now() - t1).toBeLessThan(150);
+		expect(te1?.entries?.some((e: Any) => e.type === "compaction") ?? false).toBe(false);
 		expect(st.calls).toBe(1);
-		// a later turn_end, once it is done: the valve adopts it (a draft the next request first carries)
+		// a later turn_end, once it is done: the valve takes it (a draft the next request first carries)
 		await sleep(350);
 		const te = await r.fire("turn_end", turnEnd([...back, ...tail, A("a7")], "a7"));
 		expect(te.entries.map((e: Any) => e.customType ?? e.type)).toEqual(["compaction", "pi-zip/commit", "pi-zip/summary"]); // the record of the call, written with the drafts (it ended inside the run)
@@ -730,72 +760,75 @@ describe("round 5: rules A (start early) and B (never wait while warm)", () => {
 		await sleep(5);
 		expect(noticeOf(r).desc).toMatch(/written while you worked$/);
 	});
-
-	test("B waits at Pi's compaction room (Pi would compact, lossily, otherwise); below it, the same warm return does not", async () => {
+	test("the one wait: a turn_end still at Pi's compaction room after its edit awaits the plan's own cut (the call already running for it); a prompt never waits, nor a turn_end below the room", async () => {
 		const run = async (contextWindow: number) => {
 			const st = { calls: 0, delay: 200 };
 			const r = await rig(done, WARM_TS(), { model: { provider: "p", id: "m", contextWindow, cost: { cacheWrite: 3, cacheRead: 0.3 }, promptCache: { short: 300 } }, modelRegistry: { complete: mkComplete(st) } });
 			const t0 = Date.now();
 			const req = await prompt(r);
 			const ms = Date.now() - t0;
+			const t1 = Date.now();
+			const te = await r.fire("turn_end", turnEnd([...back, ...tail], "r6"));
+			const teMs = Date.now() - t1;
 			await sleep(20);
-			return { ms, summary: req?.messages?.[0]?.role === "compactionSummary", calls: st.calls };
+			return { ms, summary: req?.messages?.[0]?.role === "compactionSummary", teMs, teSummary: !!te?.entries?.some((e: Any) => e.type === "compaction"), calls: st.calls };
 		};
-		const room = await run(100_000); // ~80K tokens against a room of 75K: atRoom
-		expect(room.summary).toBe(true);
-		expect(room.ms).toBeGreaterThanOrEqual(190); // waited for the whole call, as 0.3.0
+		const room = await run(100_000); // ~80K tokens against a room of 75K
+		expect(room.summary).toBe(false); // 0.3.1: the prompt waited for the whole call
+		expect(room.ms).toBeLessThan(150);
+		expect(room.teSummary).toBe(true); // the turn_end at the room waits for the call the prompt started, and persists its summary
+		expect(room.teMs).toBeGreaterThanOrEqual(100);
+		expect(rows("room_wait")[0]).toMatchObject({ key: "u3", running: true });
+		expect(room.calls).toBe(1); // no second call
 		const roomy = await run(1_000_000);
-		expect(roomy.summary).toBe(false); // 0.3.0: true, after the same wait
-		expect(roomy.ms).toBeLessThan(150);
+		expect(roomy.summary).toBe(false);
+		expect(roomy.teSummary).toBe(false);
+		expect(roomy.ms + roomy.teMs).toBeLessThan(150);
 		expect(roomy.calls).toBe(1);
 	});
-
-	test("ledger fix: a summary computed during a no-UI cold return of a session with a prepared plan records the time waited (0.3.0: 0)", async () => {
-		process.env.PI_ZIP_TTL_SECS = "1";
-		const done2 = [...done.slice(0, -1), A("a5", ["c5"]), R("r5", "c5", 30_000), A("a5e")]; // the last turn has an output to fold
-		const back2 = [...done2, U("u4", "back")];
-		const ui = await rig(done2, COLD_TS(), { modelRegistry: { complete: mkComplete({ calls: 0 }) } });
-		const settled = await ui.fire("agent_before_settle", { context: { contextEntries: done2 }, entries: [] }); // an interactive process left its plan
-		expect(settled.entries.at(-1)).toMatchObject({ customType: "pi-zip/plan" });
-		const st = { calls: 0, delay: 200 };
-		const r = await rig(done2, COLD_TS(), { hasUI: false, mode: "json", modelRegistry: { complete: mkComplete(st) } });
-		r.ctx.sessionManager.getBranch = () => [...branchOf(done2, COLD_TS()), settled.entries.at(-1)];
-		r.ctx.sessionManager.buildSessionProjection = () => ({ entries: back2 });
-		await r.fire("before_agent_start", {});
-		const req = await r.fire("context_with_system", { messages: flat(back2) });
-		expect(req.messages[0].role).toBe("compactionSummary");
-		await r.fire("turn_end", turnEnd([...back2, ...tail], "r6"));
-		const sum = rows("summary").at(-1);
-		expect(sum.source).toBe("settle");
-		expect(sum.waitedMs).toBeGreaterThanOrEqual(190); // the session and the request are 0.3.0's; only this ledger figure (and /zip's) changed
-	});
-
-	test("B waits when the request as it is (nothing applied) is at the room, even though the plan's folds alone would bring it below", async () => {
+	test("the room is judged on the view after the decision's edit: a turn_end whose folds alone bring it below the room does not wait; one whose folds the law refuses does", async () => {
 		// done: about 123K real before the plan, 91K after its folds (the outputs before the cut). Room between the two: 131,576 - 24,576
-		const st = { calls: 0, delay: 200 };
-		const r = await rig(done, WARM_TS(), { model: { provider: "p", id: "m", contextWindow: 131_576, cost: { cacheWrite: 3, cacheRead: 0.3 }, promptCache: { short: 300 } }, modelRegistry: { complete: mkComplete(st) } });
-		const t0 = Date.now();
-		const req = await prompt(r);
-		// before: deferred, so the 123K request went out unchanged above Pi's compaction room (Pi would compact it, lossily)
-		expect(req?.messages?.[0]?.role).toBe("compactionSummary");
-		expect(Date.now() - t0).toBeGreaterThanOrEqual(190);
-		expect(rows("warm_defer")).toEqual([]);
+		const run = async (ageMs: number) => {
+			const st = { calls: 0, delay: 200 };
+			const r = await rig(done, WARM_TS(), { model: { provider: "p", id: "m", contextWindow: 131_576, cost: { cacheWrite: 3, cacheRead: 0.3 }, promptCache: { short: 300 } }, modelRegistry: { complete: mkComplete(st) } });
+			const req = await prompt(r);
+			expect(req?.messages?.[0]?.role).not.toBe("compactionSummary"); // 0.3.1: the prompt waited (the request as it was was at the room)
+			const end = turnEnd([...back, ...tail], "r6");
+			r.ctx.sessionManager.getBranch = () => branchOf(done, Date.now() - ageMs); // the newest response, as the in-run clock reads it
+			const t0 = Date.now();
+			const te = await r.fire("turn_end", { ...end, message: { ...end.message, timestamp: Date.now() - ageMs } });
+			const ms = Date.now() - t0;
+			await sleep(20);
+			return { ms, te, calls: st.calls };
+		};
+		// the newest response 10 minutes old (a long tool call): the cache is believed gone, the folds alone pay and leave 91K
+		const cold = await run(600_000);
+		expect(cold.ms).toBeLessThan(150);
+		expect(cold.te.entries.map((e: Any) => e.type)).toEqual(["context_edit", "context_edit", "custom"]);
+		expect(rows("room_wait")).toEqual([]);
+		expect(cold.calls).toBe(1); // written in the background
+		// warm: the folds alone do not pay for the rewrite, so the view stays at the room: the turn waits for the summary
+		const warm = await run(0);
+		expect(warm.ms).toBeGreaterThanOrEqual(100);
+		expect(warm.te.entries[0]).toMatchObject({ type: "compaction", firstKeptEntryId: "u3" });
+		expect(rows("room_wait")).toHaveLength(1);
+		expect(warm.calls).toBe(1);
 	});
-
-	test("no UI (print, json): the warm return waits for the summary as in 0.3.0; with a UI the same return does not", async () => {
+	test("no UI (print, json) decides as with a UI: the warm return does not wait, the summary is written in the background", async () => {
 		const st = { calls: 0, delay: 200 };
 		const quiet = await rig(done, WARM_TS(), { hasUI: false, mode: "json", modelRegistry: { complete: mkComplete(st) } });
-		expect(await settle(quiet)).toBeUndefined();
+		expect(await settle(quiet)).toBeUndefined(); // nothing at settle without a UI (the process exits right after it)
 		const t0 = Date.now();
 		const req = await prompt(quiet);
-		expect(Date.now() - t0).toBeGreaterThanOrEqual(190);
-		expect(req.messages[0].role).toBe("compactionSummary");
-		expect(rows("warm_defer")).toEqual([]);
+		expect(Date.now() - t0).toBeLessThan(150); // 0.3.1: the whole call, in the request
+		expect(req?.messages?.[0]?.role).not.toBe("compactionSummary");
+		await sleep(20);
+		expect(st.calls).toBe(1);
+		expect(rows("produce")[0]).toMatchObject({ where: "run", key: "u3" });
 		const st2 = { calls: 0, delay: 200 };
 		const ui = await rig(done, WARM_TS(), { modelRegistry: { complete: mkComplete(st2) } });
-		expect(await prompt(ui)).toBeUndefined(); // 0.3.0: the summary, after the wait
+		expect(JSON.stringify(await prompt(ui))).toBe(JSON.stringify(req)); // the same request with a UI
 	});
-
 	test("runAway never leaks a background summary: one for its cut is kept (no second call); a context rewritten while away drops the early one (aborted, booked)", async () => {
 		process.env.PI_ZIP_TTL_SECS = "0.3"; // the timer fires at 240 ms
 		// (1) the cold plan cuts where the early summary cuts: the timer keeps it
@@ -846,13 +879,13 @@ describe("round 5: rules A (start early) and B (never wait while warm)", () => {
 		expect(Date.now() - t0).toBeLessThan(150);
 		expect(req.messages[0].role).toBe("compactionSummary");
 		expect(st.calls).toBe(2);
-		expect(rows("warm_defer")).toEqual([]);
+		expect(rows("produce")).toEqual([]); // ready: nothing to produce
 	});
 
 	test("a warm cut that moves to another branch: the call for the old one ends, recorded as unused at once; the new cut's starts in the background; nothing waits", async () => {
 		const st = { calls: 0, delay: 200, signals: [] as Any[] };
 		const r = await rig(done, WARM_TS(), { modelRegistry: { complete: mkComplete(st) } });
-		expect(await prompt(r)).toBeUndefined(); // B: deferred, the summary for u3 is being written
+		expect(await prompt(r)).toBeUndefined(); // no ready summary, and the folds alone do not pay warm: the summary for u3 is being written
 		await sleep(20);
 		expect(st.calls).toBe(1);
 		// the session as the next turn_end sees it no longer has u3 (another branch of the same size): the plan cuts elsewhere
@@ -863,7 +896,7 @@ describe("round 5: rules A (start early) and B (never wait while warm)", () => {
 		expect(te.entries.map((e: Any) => e.customType ?? e.type)).toEqual(["pi-zip/summary"]); // nothing applied; only the record of the ended call
 		expect(te.entries[0].data).toMatchObject({ key: "u3", estimated: true, lost: "replaced" });
 		expect(st.signals[0].aborted).toBe(true);
-		expect(rows("warm_defer").at(-1)).toMatchObject({ where: "turn_end", key: "xu3", running: false });
+		expect(rows("produce").at(-1)).toMatchObject({ where: "turn_end", key: "xu3" });
 		await sleep(20);
 		expect(st.calls).toBe(2); // one call in flight at a time
 	});
@@ -913,7 +946,7 @@ describe("round 5: rules A (start early) and B (never wait while warm)", () => {
 		expect(recs[0]).toMatchObject({ key: "u3", lost: "shutdown", estimated: true });
 		expect(recs[0].cut).toBeUndefined();
 		expect(recs[0].usd).toBeGreaterThan(0);
-		// the restarted process: the lost call is in the totals, and it decides as with no summary at all (deferred, its own call, no wait)
+		// the restarted process: the lost call is in the totals, and it decides as with no summary at all (its own call in the background, no wait)
 		const st2 = { calls: 0, delay: 200 };
 		const q = await rig(done, WARM_TS(), { modelRegistry: { complete: mkComplete(st2) } });
 		const base = q.ctx.sessionManager.getBranch;

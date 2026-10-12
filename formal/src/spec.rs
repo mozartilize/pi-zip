@@ -12,6 +12,7 @@ use crate::logic::*;
 use crate::model::*;
 use std::collections::BTreeSet;
 use crate::logic::Violation;
+use serde_json::Value;
 
 /// How a property is established (README: proven / bounded-checked / conformance).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -91,7 +92,7 @@ fn persisted_as_sent() -> F<R> {
 }
 /// A fresh pi process, given the same session and clock, sends the same first request of this run.
 fn fresh_plans_alike() -> F<R> {
-    atom("fresh_plans_alike", |r: &R, i, _| r.tick(i).fresh.as_ref().is_none_or(|f| f.same || f.deferred_same))
+    atom("fresh_plans_alike", |r: &R, i, _| r.tick(i).fresh.as_ref().is_none_or(|f| f.same))
 }
 /// Nothing is lost at this request: every message other than a folded output or a summary is sent byte for byte, every output
 /// the model does not see verbatim comes back byte for byte from zip_recall, a request pi-zip summarised away is quoted verbatim,
@@ -118,7 +119,7 @@ fn pays() -> F<R> {
 }
 /// The user waited for a summary model call before this request (interactive mode).
 fn user_waits() -> F<R> {
-    atom("user_waits", |r: &R, i, _| r.trace.world.interactive && (r.tick(i).wait_run > 0 || (i > 0 && r.tick(i - 1).wait_te > 0)))
+    atom("user_waits", |r: &R, i, _| r.tick(i).wait_run > 0 || (i > 0 && r.tick(i - 1).wait_te > 0))
 }
 /// The live process's plan at this return cut where a summary call it still had running cuts, the law accepting that cut (core.ts
 /// adopt with `running`). Since 0.4.0 a finished summary is a pi-zip/summary entry a fresh process reads too; only a call in flight
@@ -129,10 +130,6 @@ pub fn pinned_live(r: &R, i: usize) -> bool {
             && p.get("running").and_then(serde_json::Value::as_bool) == Some(true)
             && matches!(p.get("where").and_then(serde_json::Value::as_str), Some("run") | Some("native"))
     })
-}
-/// The model was switched since the previous request: the cache dies at the prompt, nothing could be prepared while away.
-fn switched() -> F<R> {
-    atom("switched", |r: &R, i, _| r.tick(i).env.iter().any(|e| e == "switch"))
 }
 /// The decision behind this request was at or above Pi's compaction room.
 fn at_room() -> F<R> {
@@ -165,6 +162,26 @@ fn not_pushed_to_room() -> F<R> {
         let i0 = lookup(env, "i0") as usize;
         i == 0 || r.st[i - 1].view_tok + r.st[i].appended < r.st[i].room || r.st[i0].view_tok >= r.st[i0].room
     })
+}
+/// The edit at this request takes the summary the cold plan frozen in i0 produced in the background because it could not be ready
+/// then (0.4.0 step 4: nobody waits; the summary goes in at the first decision after it is ready): not a regret of the cold plan, it
+/// had no summary to apply. It could not be ready when nothing prepares a return (no UI), when something happened during the absence
+/// (a restart, a switch, another compaction, a summary prepared for another cut), when the call is slow, or when the call the away
+/// timer started was still running. A return that simply found nothing prepared (the away timer never armed) is not excused.
+fn not_produced_by_i0() -> F<R> {
+    atom("not_produced_by_i0", |r: &R, i, env: &Env| {
+        let i0 = lookup(env, "i0") as usize;
+        match (produced_at_return(r, i0), took_ready(r, i)) {
+            (Some(p), Some(t)) if p == t => !unpreparable(r, i0),
+            _ => true,
+        }
+    })
+}
+/// The summary a return at i0 wants could not have been prepared while away (see not_produced_by_i0).
+fn unpreparable(r: &R, i0: usize) -> bool {
+    let w = &r.trace.world;
+    let running = r.tick(i0).run_ledger.iter().any(|x| x.get("type").and_then(Value::as_str) == Some("produce") && x.get("running").is_some());
+    !w.interactive || w.slow || !r.tick(i0).env.is_empty() || running
 }
 fn after_i0() -> F<R> {
     atom("after_i0", |_r: &R, i, env: &Env| i > lookup(env, "i0") as usize)
@@ -224,7 +241,7 @@ fn warm_summary_not_withheld() -> F<R> {
 }
 /// Residuals: the property's failures at this request that no known root cause (TRIAGE.md (a)) explains.
 fn rd_residual() -> F<R> {
-    atom("fresh_plans_alike_or_known_cause", |r: &R, i, _| r.tick(i).fresh.as_ref().is_none_or(|f| f.same || f.deferred_same || f.fixed_by_known || pinned_live(r, i)))
+    atom("fresh_plans_alike_or_known_cause", |r: &R, i, _| r.tick(i).fresh.as_ref().is_none_or(|f| f.same || f.fixed_by_known || pinned_live(r, i)))
 }
 fn mp_residual() -> F<R> {
     atom("monotone_or_known_cause", |r: &R, i, _| mp_breaches(r, i).iter().all(|(m, _)| MP_KNOWN.iter().any(|k| m.contains(k))))
@@ -260,11 +277,12 @@ pub fn axioms() -> Vec<Prop> {
             id: "A3",
             name: "never in the way",
             from: &[],
-            why: "README rule 3: a summary model call is prepared while the user is away, or (round 5, rules A/B) written in the background \
-                  while the cache is warm; the user waits for one only at Pi's compaction room, or at a return a model switch made cold \
-                  (no away time to prepare it in). A warm wait below the room is never excused.",
+            why: "axiom IV (you never wait for pi-zip): a summary model call is written in the background (away, at the end of a run, \
+                  or produced when a decision wants a summary that is not ready) and used at the first decision after it is ready; the \
+                  only wait is Pi's own room, where Pi would stop for its compaction otherwise. With or without a UI (sub-agents too); \
+                  0.3.1's excuses (a no-UI session, a return a model switch made cold) are gone.",
             evidence: Evidence::Conformance,
-            f: always(user_waits() >> (at_room() | switched())),
+            f: always(user_waits() >> at_room()),
         },
     ]
 }
@@ -340,7 +358,7 @@ pub fn derived() -> Vec<Prop> {
                   compaction room, where the edit is forced) in between, means the cold plan \
                   was dominated by doing that edit then.",
             evidence: Evidence::Conformance,
-            f: always(cold_plan() >> freeze("i0", index(), !quiet_since_i0().until_within(K_REGRET, after_i0() & zip_edit() & planned_warm() & quiet_through_i() & not_pushed_to_room()))),
+            f: always(cold_plan() >> freeze("i0", index(), !quiet_since_i0().until_within(K_REGRET, after_i0() & zip_edit() & planned_warm() & quiet_through_i() & not_pushed_to_room() & not_produced_by_i0()))),
         },
         Prop {
             id: "NT",
@@ -667,7 +685,8 @@ pub fn pays_fully(r: &R, i: usize) -> Result<(), String> {
     let Some(e) = edit_sizes(r, i) else { return Ok(()) };
     let room = Some(r.st[i].room);
     let gg = g.g.unwrap_or(2500.0);
-    let call = if e.sum > 0.0 { summary_call(pr, e.read, e.written) } else { 0.0 };
+    // a ready summary's call was spent when it was produced (theory 1.4: the application prices it at 0, as the planner does)
+    let call = if e.sum > 0.0 && took_ready(r, i).is_none() { summary_call(pr, e.read, e.written) } else { 0.0 };
     // pays: K <= 0 or gain >= K, up to the estimate's error: the planner decides on chars/4 estimates it calibrates, the spec judges
     // on the request's real size, so the verdict may differ by TOL of the gross terms of K (the rewrite, the reads saved, the call)
     let pays = |b: f64, a: f64, t: &crate::law::Terms| {
@@ -729,10 +748,13 @@ pub fn a2_class(r: &R, i: usize) -> String {
     // every law step the planner evaluated, on its own estimates of B and A but with the spec's call, says it pays: the request's
     // real size says otherwise
     let carried = if i > 0 { r.st[i - 1].prev_sum } else { 0.0 };
+    // a ready summary's call is spent (theory 1.4): 0 in every step, as the planner and pays_fully price it
+    let ready = took_ready(r, i).is_some();
     let by_estimate = code_pr.is_some_and(|pr| {
         !p.law.is_empty()
             && p.law.iter().filter(|step| step.at != "summary" || p.cut.is_some()).all(|step| {
                 let (call, t) = match step.at.as_str() {
+                    _ if ready => (0.0, step.a),
                     "summary" => (summary_call(pr, step.b - carried, step.a.min(NARRATIVE_EST)), step.a),
                     _ => (if p.cut.is_some() { summary_call(pr, p.prefix - carried, p.sum.min(NARRATIVE_EST)) } else { 0.0 }, step.a),
                 };
@@ -937,7 +959,68 @@ pub fn target_miss(r: &R, i: usize) -> Option<String> {
     if refused {
         return None;
     }
+    // 0.4.0 step 4 (architecture section 8, TR restated): a return whose summary is not ready goes with its folds alone and produces it
+    // (nobody waits); the target is reached at the first decision after it is ready
+    if let Some(k) = produced_at_return(r, i) {
+        return produced_target_miss(r, i, &k);
+    }
     Some(format!("cold plan leaves {:.0} tokens, target {:.0}, floor {:.0}, and no law refused a summary", s.view_tok, s.target, s.floor))
+}
+
+/// The cut of the ready summary the decision behind request i took (run.ts `take`: produced earlier, its call already spent), if any.
+pub fn took_ready(r: &R, i: usize) -> Option<String> {
+    let led: &[Value] = if i > 0 && r.tick(i - 1).te_valve { &r.tick(i - 1).te_ledger } else if r.tick(i).n == 0 { &r.tick(i).run_ledger } else { return None };
+    led.iter().find(|x| x.get("type").and_then(Value::as_str) == Some("take")).and_then(|x| x.get("key").and_then(Value::as_str)).map(String::from)
+}
+
+/// The cut a return's run plan produced in the background because its summary was not ready (run.ts `produce`), if any.
+fn produced_at_return(r: &R, i: usize) -> Option<String> {
+    r.tick(i).run_ledger.iter().find(|x| x.get("type").and_then(Value::as_str) == Some("produce")).and_then(|x| x.get("key").and_then(Value::as_str)).map(String::from)
+}
+
+/// TR for a return that produced its summary (key k) in the background: the request after the first turn_end valve that ran after the
+/// call for k finished reaches the target, unless the law refused that decision's plan with the summary priced as ready (it is a
+/// priced rewrite now), a b2b skip held it, or the protected turns fill the target. A call that never finishes (failed,
+/// ended, the trace ends first) defers it for good.
+fn produced_target_miss(r: &R, i: usize, k: &str) -> Option<String> {
+    let done = |x: &Value| x.get("type").and_then(Value::as_str) == Some("away_summary") && x.get("key").and_then(Value::as_str) == Some(k);
+    let n = r.obs.ticks.len();
+    let mut ready_before: Option<usize> = None; // the completion was recorded before the turn_end of this request
+    for m in i..n {
+        if r.tick(m).run_ledger.iter().any(done) {
+            ready_before = Some(m);
+            break;
+        }
+        if m + 1 < n && r.tick(m).te_ledger.iter().any(done) {
+            ready_before = Some(m + 1);
+            break;
+        }
+    }
+    // the first turn_end from then on that decides (asks the valve: not the one that persists the run plan, nor a failed one)
+    let asked = |m: usize| {
+        let t = r.tick(m);
+        t.te_valve || t.te_ledger.iter().any(|x| matches!(x.get("type").and_then(Value::as_str), Some("b2b_skip")) || (x.get("type").and_then(Value::as_str) == Some("law") && x.get("where").and_then(Value::as_str) == Some("turn_end")))
+    };
+    let m = (ready_before?..n).find(|&m| asked(m))?;
+    let j = m + 1; // the request that carries the decision of that turn_end
+    if j >= n || r.tick(j).n == 0 {
+        return None; // the run ended first: the next return decides (a cold one is checked by TR itself)
+    }
+    let s = &r.st[j];
+    if s.view_tok <= s.target * (1.0 + TOL_TARGET) || s.floor + SUMMARY_FLOOR * r.trace.world.c >= s.target * (1.0 - TOL) {
+        return None;
+    }
+    let te = r.tick(m);
+    if te.te_ledger.iter().any(|x| x.get("type").and_then(Value::as_str) == Some("b2b_skip")) {
+        return None;
+    }
+    // excused only when the law refused the ready summary priced as ready (its call spent: 0); a refusal that priced the call again is
+    // the bug this clause is for
+    let refused = te.grids.iter().filter(|g| g.at == "turn_end").filter_map(|g| g.actual()).any(|p| p.law.iter().any(|l| !l.ok && l.ready == Some(true)));
+    if refused {
+        return None;
+    }
+    Some(format!("the summary for {k} the return at req {i} produced was ready before req {m}'s turn_end, which left {:.0} tokens (target {:.0}) and no law refused", s.view_tok, s.target))
 }
 
 pub fn probe_mismatch(r: &R, i: usize) -> Option<String> {
@@ -1040,7 +1123,12 @@ pub fn law_mismatch(r: &R, i: usize) -> Option<String> {
                 // the call is a real uncached model call that reads the conversation the summary replaces (B = X, the prefix, minus the
                 // previous summary it carries forward; the call reads only that summary's narrative, which this floor leaves out): whatever each version's pricing, it costs at least half of that
                 // at the input price (half: the planner's calibrated estimate against the request's real size of the previous summary)
-                if s.at == "summary" && s.a < s.b && s.k.is_some() {
+                // a ready summary's call is spent: priced exactly 0 (theory 1.4), never anything between
+                if s.ready == Some(true) {
+                    if call.abs() > 1e-6 * s.b.max(1.0) {
+                        return Some(format!("{} {} at P={}: a ready summary's call is priced {call:.0}, not 0", g.at, s.at, pt.p));
+                    }
+                } else if s.at == "summary" && s.a < s.b && s.k.is_some() {
                     let carried = r.st[i].prev_sum.max(if i > 0 { r.st[i - 1].prev_sum } else { 0.0 });
                     let floor = 0.5 * (s.b - carried).max(0.0);
                     if call < floor {

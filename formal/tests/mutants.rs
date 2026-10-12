@@ -23,6 +23,11 @@ fn available() -> bool {
 
 /// A copy of the worktree's src with exact replacements in one file: (from, to, how many times `from` occurs; all are replaced).
 fn mutant(name: &str, file: &str, edits: &[(&str, &str, usize)]) -> PathBuf {
+    mutant_files(name, &edits.iter().map(|&(from, to, n)| (file, from, to, n)).collect::<Vec<_>>())
+}
+
+/// The same, with replacements in several files: (file, from, to, how many times `from` occurs).
+fn mutant_files(name: &str, edits: &[(&str, &str, &str, usize)]) -> PathBuf {
     let root = std::env::temp_dir().join(format!("pz-formal-mutant-{}-{name}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(root.join("src")).unwrap();
@@ -33,13 +38,12 @@ fn mutant(name: &str, file: &str, edits: &[(&str, &str, usize)]) -> PathBuf {
     }
     std::fs::copy(src.join("../package.json"), root.join("package.json")).unwrap();
     std::os::unix::fs::symlink(src.join("../node_modules").canonicalize().unwrap(), root.join("node_modules")).unwrap();
-    let path = root.join("src").join(file);
-    let mut text = std::fs::read_to_string(&path).unwrap();
-    for (from, to, n) in edits {
+    for (file, from, to, n) in edits {
+        let path = root.join("src").join(file);
+        let text = std::fs::read_to_string(&path).unwrap();
         assert_eq!(text.matches(from).count(), *n, "{name}: the mutation site {from:?} must occur {n} time(s) in {file}");
-        text = text.replace(from, to);
+        std::fs::write(&path, text.replace(from, to)).unwrap();
     }
-    std::fs::write(&path, text).unwrap();
     root.join("src")
 }
 
@@ -68,12 +72,16 @@ fn caught(name: &str, file: &str, from: &str, to: &str, prop: &str, trace: &str)
 }
 
 fn caught_all(name: &str, file: &str, edits: &[(&str, &str, usize)], props: &[&str], trace: &str) {
+    caught_files(name, &edits.iter().map(|&(from, to, n)| (file, from, to, n)).collect::<Vec<_>>(), props, trace)
+}
+
+fn caught_files(name: &str, edits: &[(&str, &str, &str, usize)], props: &[&str], trace: &str) {
     if !available() {
         return;
     }
     let t = Trace::parse(trace).unwrap();
     let base = observe(&worktree_src(), &t);
-    let m = mutant(name, file, edits);
+    let m = mutant_files(name, edits);
     let _cleanup = Cleanup(m.parent().unwrap().to_path_buf());
     let run = observe(&m, &t);
     for prop in props {
@@ -98,6 +106,14 @@ fn summary_prepared_away(gap: &str) -> String {
     let mut v = vec![W, "prompt", "say 150K", "prompt +1h"];
     v.extend(std::iter::repeat_n("call npm 100", 3));
     v.extend(["say 100", gap, "say 100"]);
+    lines(&v)
+}
+
+/// The same, with a run after the return long enough for a later decision to take a summary produced at the return.
+fn summary_prepared_away_run(gap: &str) -> String {
+    let mut v = vec![W, "prompt", "say 150K", "prompt +1h"];
+    v.extend(std::iter::repeat_n("call npm 100", 3));
+    v.extend(["say 100", gap, "call npm 100", "call npm 100", "say 100"]);
     lines(&v)
 }
 
@@ -136,37 +152,57 @@ fn a1_users_quoted_by_the_summary() {
 #[test]
 fn lw_summary_call_is_priced() {
     let t = lines(&["world explicit known ttl=300 true=300 survival=none c=1 sys=30000 window=200000 native interactive", "prompt", "say 25K", "prompt +60s", "say 100", "prompt +60s", "say 100", "prompt +1h", "say 100"]);
-    caught_all("m25", "plan.ts", &[("gate(\"summary\", X, Sr, null, call, Sr)", "gate(\"summary\", X, Sr, null, 0, Sr)", 1)], &["LW"], &t);
+    caught_all("m25", "plan.ts", &[("gate(\"summary\", X, Sr, null, call, Sr, undefined, undefined, isReady)", "gate(\"summary\", X, Sr, null, 0, Sr, undefined, undefined, isReady)", 1)], &["LW"], &t);
 }
 
 /// Review P1-3: LW pins the call of a whole-plan step both ways. A plan with a cut that reaches the plan gate with no call (the summary
 /// priced separately only), and a folds-only plan that carries one, are both caught. (Backing the call out of K for every plan step let
-/// both through: the old LW only compared a call it found with the summary step's.)
+/// both through: the old LW only compared a call it found with the summary step's.) 0.4.0: in print mode, so nothing is prepared while
+/// away and the return's production decision prices the call (a summary prepared away is ready: its call is 0 in both steps).
 #[test]
 fn lw_plan_step_call_is_pinned_both_ways() {
-    caught_all("lw1", "plan.ts", &[("if (!planGate(ctxAfterFolds - (pre[pick] - S(pre[pick])), 0, call, true)) continue;", "if (!planGate(ctxAfterFolds - (pre[pick] - S(pre[pick])), 0, 0, true)) continue;", 1)], &["LW"], &summary_prepared_away("prompt +1h"));
+    caught_all("lw1", "plan.ts", &[("if (!planGate(ctxAfterFolds - (pre[pick] - S(pre[pick])), 0, call, true, isReady)) return false;", "if (!planGate(ctxAfterFolds - (pre[pick] - S(pre[pick])), 0, 0, true, isReady)) return false;", 1)], &["LW"], &summary_prepared_away("prompt +1h").replacen(" interactive", " print", 1));
     caught_all("lw2", "plan.ts", &[("!planGate(ctxAfterFolds, untouchedEst(blocks, folds, false), 0, false)", "!planGate(ctxAfterFolds, untouchedEst(blocks, folds, false), 1000, false)", 1)], &["LW"], &fold_and_recall());
 }
 
-/// Round 5, rule B: the warm valve at a turn_end writes its summary in the background (adopted at a later turn_end) instead of making
-/// the user wait; the mutant is 0.3.0's turn_end (always wait).
+/// Never wait (0.4.0 step 4): a turn_end whose plan wants a summary that is not ready takes its folds alone and produces the summary in
+/// the background; it waits only when the view after its edit is still at Pi's compaction room. The mutant judges the room at 0 (every
+/// turn_end with a cut waits for it: 0.3.0's valve summary at turn_end).
 #[test]
-fn a3_warm_turn_end_does_not_wait() {
-    caught("r5b", "core.ts", "if (!hasUI || p.atRoom || p.atRoomUnedited) return \"wait\";", "return \"wait\";", "A3", &trace_file("a3-warm-turn-end.trace"));
+fn a3_turn_end_does_not_wait() {
+    caught("r5b", "core.ts", "after >= room", "after >= 0", "A3", &trace_file("a3-warm-turn-end.trace"));
 }
 
-/// Round 5, rule B at a warm prompt: a warm return after a restart that lost the summary call still running (rd-restart-mid-call.trace;
-/// since 0.4.0 a summary finished before the restart is in the session, so b2-restart.trace finds it ready); with rule B it waits for
-/// nothing (the summary is written in the background), while the mutant (warm returns never defer) is 0.3.0's B2 wait.
+/// Never wait at a return: a plan whose summary is not ready (here a restart lost the call still running for it) goes with its folds
+/// alone and produces the summary. The mutant is 0.3.1's run-plan summary at a return: the plan keeps its cut and the request waits
+/// for the call (core.ts without `unready`, run.ts writing the summary in line).
 #[test]
-fn a3_warm_return_does_not_wait() {
-    caught("r5b2", "run.ts", "if (!this.cold && !native && p && p.cutIdx !== null && this.warmSummary(p, ctx, \"run\") === \"defer\") return;", "", "A3", &trace_file("rd-restart-mid-call.trace"));
+fn a3_return_does_not_wait() {
+    caught_files(
+        "r5b2",
+        &[
+            ("core.ts", "\tif (!onPre) {", "\tif (false) {", 1),
+            ("run.ts", ": null; // labelled by the return that adopts it", ": await buildCut(p, ctx); // labelled by the return that adopts it", 1),
+        ],
+        &["A3"],
+        &trace_file("rd-restart-mid-call.trace"),
+    );
 }
 
+/// TR restated (architecture section 8): a return without a ready summary reaches the target at the first decision after it is ready.
+/// The mutant forgets which summaries are ready, so the turn_end prices the spent call again and refuses the summary.
 #[test]
-fn a3_away_timer() {
-    caught("m07", "run.ts", "this.armAway(delay, () => void this.runAway(p, ctx));", "void 0;", "A3", &summary_prepared_away("prompt +1h"));
-    caught("m08", "run.ts", "export const AWAY_FRACTION = 0.8;", "export const AWAY_FRACTION = 1.15;", "A3", &summary_prepared_away("prompt +330s"));
+fn tr_produced_summary_goes_in_once_ready() {
+    caught("r4tr", "plan.ts", "const ready = new Set(o.ready ?? []);", "const ready = new Set<string>();", "TR", &trace_file("tr-produced.trace"));
+}
+
+/// The away timer prepares the summary a return after a pause wants, so the return's free rewrite carries it. 0.4.0: nobody waits,
+/// so a missing timer (m07) or one that fires after the return (m08) shows as a regret, not a wait: the return goes without the
+/// summary and a warm decision of the same run applies it (NR; the return could have prepared it, so it is not excused).
+#[test]
+fn nr_away_timer() {
+    caught("m07", "run.ts", "this.armAway(delay, () => void this.runAway(p, ctx));", "void 0;", "NR", &summary_prepared_away_run("prompt +1h"));
+    caught("m08", "run.ts", "export const AWAY_FRACTION = 0.8;", "export const AWAY_FRACTION = 1.15;", "NR", &summary_prepared_away_run("prompt +330s"));
 }
 
 #[test]
@@ -223,7 +259,7 @@ fn b2b_no_back_to_back() {
     // 0.4.0: the folds stop at the working view, so a second rewrite needs new candidates: the window slides at the next prompt.
     // traces/b2b-slide.trace is the shrunk counterexample of `check --suite standard --random 3000 --seed 1 --only B2B` on the mutant
     let t = trace_file("b2b-slide.trace");
-    caught_all("m10", "core.ts", &[("if (!cold && x.justEdited && !nat) return { kind: \"b2b\" };", "", 1), ("if (x.justEdited && x.pWarm >= 0.5) return { kind: \"b2b\" };", "", 1)], &["B2B"], &t);
+    caught_all("m10", "core.ts", &[("if (!cold && x.justEdited && !nat) {", "if (false) {", 1), ("if (x.justEdited && x.pWarm >= 0.5) {", "if (false) {", 1)], &["B2B"], &t);
 }
 
 #[test]
@@ -244,7 +280,7 @@ fn rc_recall_is_never_refolded() {
 #[test]
 fn pw_protection_windows() {
     caught("m13", "plan.ts", "if (o.pause) take(", "if (true) take(", "PW", &trace_of(&[WC, "prompt", "call cat 20K", "say 100", "prompt +60s", "say 100"]));
-    caught("m14", "plan.ts", "const PROTECT_USER_TURNS = 2;", "const PROTECT_USER_TURNS = 1;", "PW", &trace_of(&[W, "prompt", "say 100", "prompt +60s", "say 60K", "prompt +60s", "say 100"]));
+    caught("m14", "plan.ts", "const PROTECT_USER_TURNS = 2;", "const PROTECT_USER_TURNS = 1;", "PW", &trace_of(&[W, "prompt", "say 100", "prompt +60s", "say 60K", "prompt +60s", "call npm 100", "call npm 100", "say 100"]));
 }
 
 #[test]
@@ -252,17 +288,6 @@ fn mp_residual_new_mechanism() {
     let t = trace_of(&[WC, "prompt", "call cat 26.3K", "say 100", "prompt +60s", "say 100"]);
     // the previous turn's candidates depend on P (v0.3.1's warm-only relax, inverted): MP is structural only while P stays in the law
     caught_all("m28", "plan.ts", &[("if (o.pause) take(", "if (law.pWarm >= 0.5) take(", 1)], &["MP", "MPr"], &t);
-}
-
-/// N6: a cold return right after a model switch to a model of the same provider planned in O = R0 x system, c = C0 (the session had
-/// measured c = 1.7): the planner believed a 376K context where the real one was 415K, and NT (believed context against the real floor)
-/// saw a summary that removes "almost nothing". `traces/n6-switch.trace` is the shrunk counterexample of
-/// `check --suite none --random 15000 --seed 7` on a2885b1 (the mutant is that source's behaviour: the previous model's scale is not
-/// carried over). It passes on the fixed src.
-#[test]
-fn nt_no_thrash() {
-    let t = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("traces/n6-switch.trace")).unwrap();
-    caught("m30", "plan.ts", "const o = transfer && !best ? sameProviderScale(want) : null;", "const o = null;", "NT", &t);
 }
 
 #[test]

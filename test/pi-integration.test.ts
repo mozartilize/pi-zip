@@ -184,6 +184,15 @@ beforeEach(() => { for (const [k, v] of Object.entries(ENV)) { saved[k] = proces
 afterEach(() => { for (const k of Object.keys(ENV)) { if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k]; } });
 
 const isFolded = (m: Any) => m.role === "toolResult" && JSON.stringify(m.content).includes("[folded by pi-zip");
+/** Nobody waits for a summary: the first request of a return whose plan wants one goes with its folds alone and starts it in the
+ *  background; once it is written, the prompt tried again takes it (a later decision). */
+const produced = async (r: Any) => {
+	const first = await r.request();
+	expect(first.some((m: Any) => m.role === "compactionSummary")).toBe(false);
+	await new Promise((res) => setTimeout(res, 50));
+	expect(r.narrativeCalls.length).toBe(1);
+	await r.beforeAgentStart();
+};
 
 describe("real Pi: the request view is identical before and after turn_end persists the edits (I1)", () => {
 	test("folds: system update stays in place, aborted turn does not block the save, request N+1 starts with request N's bytes", async () => {
@@ -221,6 +230,7 @@ describe("real Pi: the request view is identical before and after turn_end persi
 	test("a summary cut: request N equals request N+1 (replayed system message, summary, kept messages)", async () => {
 		const r = await rig((sm) => populate(sm, 6000)); // long assistant prose: folds alone cannot reach the cap, so a summary is planned (and its uncached call pays: X ~ 70K)
 		sendPrompt(r.sm, "next request");
+		await produced(r);
 		const req1 = await r.request();
 		expect(req1.some((m) => m.role === "compactionSummary")).toBe(true);
 		expect(r.narrativeCalls.length).toBe(1);
@@ -239,6 +249,7 @@ describe("real Pi: the request view is identical before and after turn_end persi
 	test("a summary and a fold persisted together: Pi's 'Compacted from N' is its usage-based size before the edits, not chars/4 of a half-applied batch", async () => {
 		const r = await rig((sm) => populate(sm, 6000));
 		sendPrompt(r.sm, "next request");
+		await produced(r);
 		const req1 = await r.request();
 		expect(req1.some((m) => m.role === "compactionSummary")).toBe(true);
 		// the response that carried the plan reports a real prompt size; the turn's tool result follows it
@@ -248,7 +259,8 @@ describe("real Pi: the request view is identical before and after turn_end persi
 		const piBefore = estimateProjectedContextTokens(r.sm.buildSessionProjection(), r.sm.getBranch()).tokens; // what Pi reads before any draft
 		expect(piBefore).toBe(40_050 + Math.ceil(4_000 / 4)); // usage + the trailing tool result at chars/4
 		const all = await r.turnEnd(a, { ...asst([call("c8")], "toolUse"), usage: real });
-		expect(all.at(-1)).toMatchObject({ type: "custom", customType: "pi-zip/commit", data: { carried: true } }); // a run plan: the run's requests had carried these edits
+		expect(all.find((d: Any) => d.customType === "pi-zip/commit")).toMatchObject({ type: "custom", data: { carried: true } }); // a run plan: the run's requests had carried these edits
+		expect(all.filter((d: Any) => d.type === "custom").map((d: Any) => d.customType)).toEqual(["pi-zip/commit", "pi-zip/summary"]); // the record of the call, which ended inside the run
 		const drafts = all.filter((d: Any) => d.type !== "custom");
 		expect(drafts.map((d: Any) => d.type)).toEqual(["compaction", ...drafts.slice(1).map(() => "context_edit")]);
 		expect(drafts.length).toBeGreaterThan(1); // a fold in the kept part rides along
@@ -341,7 +353,7 @@ describe("real Pi: a summary prepared while the user was away goes in through Pi
 		expect(r.narrativeCalls.length).toBe(1);
 	});
 
-	test("the prompt after the first key takes the running call: no second call, the summary is in the request, the wait is the remainder", async () => {
+	test("the prompt after the first key does not wait for the running call: its folds go alone, and a later decision takes the summary (no second call)", async () => {
 		const r = await rig(undefined, { file: template(240 * 60_000), tui: true, native: false, idle: false, start: false, latencyMs: 2_000 });
 		r.typeKey("h");
 		await sleep(1_000); // typing the prompt takes 1 s of the 2 s call
@@ -351,11 +363,19 @@ describe("real Pi: a summary prepared while the user was away goes in through Pi
 		const req1 = await r.request();
 		const waited = performance.now() - t0;
 		expect(r.narrativeCalls.length).toBe(1); // the call the key started, not a second one
-		expect(req1.some((m) => m.role === "compactionSummary")).toBe(true);
-		// it still waited for the rest of the call (~1 s), not all of it (2 s for a call started at the prompt); bounds with ~0.8 s of slack
-		// either way for a loaded machine (review P2: the old 150-500 ms window on a 600 ms call was flaky)
-		expect(waited).toBeGreaterThan(200);
-		expect(waited).toBeLessThan(1_800);
+		expect(req1.some((m) => m.role === "compactionSummary")).toBe(false);
+		expect(req1.some(isFolded)).toBe(true);
+		expect(waited).toBeLessThan(500); // 0.3.1: the rest of the call (~1 s)
+		// the run's turn_end once the call is done: the summary goes in as its first draft
+		await sleep(1_300);
+		const a = r.sm.appendMessage(asst([call("k1")], "toolUse", 10_000_001));
+		r.sm.appendMessage(result("k1", "tiny", 10_000_002));
+		const drafts = await r.turnEnd(a, asst([call("k1")], "toolUse"));
+		expect(drafts.filter((d: Any) => d.type === "compaction")).toHaveLength(0); // this turn_end persists the run plan (its folds) ...
+		const b2 = r.sm.appendMessage(asst([call("k2")], "toolUse", 10_000_003));
+		r.sm.appendMessage(result("k2", "tiny", 10_000_004));
+		expect((await r.turnEnd(b2, asst([call("k2")], "toolUse"))).filter((d: Any) => d.type === "compaction")).toHaveLength(1); // ... the next one takes the summary
+		expect(r.narrativeCalls.length).toBe(1);
 	});
 
 	// 0.3.1 live, first restart: durable-subagents posted a display-only note at session start ("1 workflow was paused"). After the final
@@ -371,7 +391,14 @@ describe("real Pi: a summary prepared while the user was away goes in through Pi
 		await r.beforeAgentStart("hello");
 		sendPrompt(r.sm, "hello");
 		const req1 = await r.request();
-		expect(req1.some((m) => m.role === "compactionSummary")).toBe(true);
+		expect(req1.some((m) => m.role === "compactionSummary")).toBe(false); // still being written: nobody waits for it
+		await sleep(400);
+		const a = r.sm.appendMessage(asst([call("k1")], "toolUse", 10_000_001));
+		r.sm.appendMessage(result("k1", "tiny", 10_000_002));
+		await r.turnEnd(a, asst([call("k1")], "toolUse"));
+		const b2 = r.sm.appendMessage(asst([call("k2")], "toolUse", 10_000_003));
+		r.sm.appendMessage(result("k2", "tiny", 10_000_004));
+		expect((await r.turnEnd(b2, asst([call("k2")], "toolUse"))).filter((d: Any) => d.type === "compaction")).toHaveLength(1); // the key's summary, at the next decision
 		expect(r.narrativeCalls.length).toBe(1); // old code: 2 (the key's call cut at the note, the run plan one turn earlier)
 		expect(r.sm.getEntries().filter((e: Any) => e.type === "custom" && e.customType === "pi-zip/summary" && !e.data?.cut)).toEqual([]); // no call ended unused
 	});
@@ -549,9 +576,10 @@ describe("item 5: a run an extension's message starts (sendMessage with triggerT
 	test("a driven run after a gap longer than the TTL gets the cold plan (old code: no plan, a full cold rewrite of the whole context)", async () => {
 		const r = await rig(undefined, { file: template(240 * 60_000), tui: true, native: false, idle: false, start: false });
 		const req = await drive(r);
-		expect(req.some((m) => m.role === "compactionSummary")).toBe(true); // the summary the folds alone could not replace
+		expect(req.some(isFolded)).toBe(true); // the cold plan's folds; its summary is written in the background (nobody waits)
+		expect(req.some((m) => m.role === "compactionSummary")).toBe(false);
+		await sleep(20);
 		expect(r.narrativeCalls.length).toBe(1);
-		expect(req.some(isFolded) || req.some((m) => m.role === "compactionSummary")).toBe(true);
 		expect(req.some((m) => m.role === "custom")).toBe(true); // the message that started the run is kept
 	});
 
@@ -572,8 +600,9 @@ describe("item 5: a run an extension's message starts (sendMessage with triggerT
 		await r.runner.emit({ type: "agent_start" } as Any);
 		sendPrompt(r.sm, "next request");
 		const req = await r.request();
-		expect(r.narrativeCalls.length).toBe(1);
-		expect(req.filter((m) => m.role === "compactionSummary")).toHaveLength(1);
+		await sleep(20);
+		expect(r.narrativeCalls.length).toBe(1); // one start of the run: one summary call
+		expect(req.some(isFolded)).toBe(true);
 	});
 
 	// review P2: before_agent_start fired, then the prompt failed before its run started (Pi's image normalisation throws between the two):
@@ -737,26 +766,29 @@ describe("round 5 on real Pi: rule A starts the warm summary early, rule B never
 		expect(Math.abs(n.before - comp.tokensBefore) / comp.tokensBefore).toBeLessThan(0.05); // the notice's before is pi-zip's estimate of the same request
 	});
 
-	test("no UI on real Pi (pi -p, json): the warm prompt waits for the summary in the request, as in 0.3.0", async () => {
+	test("no UI on real Pi (pi -p, json): the warm prompt does not wait either; the summary is written in the background, as with a UI", async () => {
 		const r = await rig(undefined, { file: template(60_000), tui: false, native: true, idle: true, start: false, latencyMs: 300 });
 		const { req, waited } = await prompt(r);
-		expect(waited).toBeGreaterThanOrEqual(280);
-		expect(req.some((m: Any) => m.role === "compactionSummary")).toBe(true);
+		expect(waited).toBeLessThan(250); // 0.3.1: the whole call, in the request
+		expect(req === undefined || !req.some((m: Any) => m.role === "compactionSummary")).toBe(true);
 		expect(r.compactCalls.n).toBe(0);
+		await sleep(20);
+		expect(r.narrativeCalls.length).toBe(1);
 		const ui = await rig(undefined, { file: template(60_000), tui: true, native: true, idle: true, start: false, latencyMs: 300 });
-		expect((await prompt(ui)).waited).toBeLessThan(250); // 0.3.0: the same 300 ms
+		const noTs = (x: Any) => JSON.stringify(x, (k, v) => (k === "timestamp" ? undefined : v));
+		expect(noTs((await prompt(ui)).req)).toBe(noTs(req)); // the same request with a UI
 	});
 });
 
-// Round 5: without a UI (pi -p, --mode json; rpc binds one on Pi 1.1) nothing runs in the background, so rules A and B change nothing there. Every request
-// and every session entry of three no-UI scenarios (a warm return that summarises, a warm turn_end valve that summarises, a cold return
-// that summarises), normalised only for what differs from run to run (entry ids and the handles made from them, timestamps, measured
-// durations), hash to the digest 0.3.0's decision code gives with 0.3.1's summary and placeholder format: the sumfmt branch (0.3.0 plus
-// the format changes, without rules A/B; head 343615f) with this test copied in, run with R5_PRINT_DIGEST=1. Before the format merge
-// the same scenarios hashed to 0.3.0's own digest (d7d6ff5: bb2e4238ae92a40c61f71564ae7a465d). The claim covers the session and the
-// requests only: the ledger's waitedMs changed as a fix (README, CHANGELOG; test "ledger fix" in invariants.test.ts).
-describe("round 5: no UI (pi -p, json) sends the same requests and writes the same session as 0.3.0, byte for byte", () => {
-	const NOUI_DIGEST_030 = "0907ceeacca2be4a8b8f684dd6a47a96"; // printed by this test on sumfmt 343615f (0.3.0 + 0.3.1 format; R5_PRINT_DIGEST=1)
+// Without a UI (pi -p, --mode json; rpc binds one on Pi 1.1) pi-zip decides as with one (0.4.0): nobody waits for a summary, it is
+// written in the background and the next decision takes it; only settle's preparation for a return is skipped (the process exits).
+// Every request and every session entry of three no-UI scenarios (a warm return that summarises, a warm return right after an edit, a
+// cold return that summarises), normalised only for what differs from run to run (entry ids and the handles made from them,
+// timestamps, measured durations), hash to the digest below, printed by this test with R5_PRINT_DIGEST=1. It moves only when the
+// no-UI behaviour moves, and each move is justified in its commit: 0.3.1's (0907ceea..., 0.3.0's decisions with 0.3.1's format, where
+// these scenarios waited for their summaries in line) became this one when 0.4.0 stopped waiting.
+describe("no UI (pi -p, json): the requests and the session of three scenarios hash to a recorded digest", () => {
+	const NOUI_DIGEST = "13a31511a73a58312f55da9860857a99"; // R5_PRINT_DIGEST=1 prints it (0.3.1: 0907ceeacca2be4a8b8f684dd6a47a96)
 	const sleep = (ms: number) => new Promise((res) => setTimeout(res, ms));
 	const shifted = (agoMs: number, prose: number) => {
 		const sm = SessionManager.inMemory(CWD);
@@ -782,20 +814,24 @@ describe("round 5: no UI (pi -p, json) sends the same requests and writes the sa
 		// 0.3.1 rows and placeholders carry the local time of the output (MM-DD HH:MM), which moves with the clock
 		return s.replace(/\b\d\d-\d\d \d\d:\d\d\b/g, "D").replace(/\d+(\.\d+)? ?(ms|s)\b/g, "T").replace(/[0-9a-f]{8}-[0-9a-f-]{27}/g, "U");
 	};
+	// a summary call started in the background finishes before the next event (the model answers at once): the transcript does not
+	// depend on how fast this machine runs it
 	const prompt = async (r: Any, log: (x: Any) => void, text: string) => {
 		await r.beforeAgentStart(text);
 		r.sm.appendMessage(user(text, Date.now() - T0));
 		log(await r.request());
+		await sleep(50);
 	};
 	const step = async (r: Any, log: (x: Any) => void, n: number, input: number, out: string, prose = "") => {
 		const a = r.sm.appendMessage({ ...asst([...(prose ? [{ type: "text", text: prose }] : []), call(`s${n}`)], "toolUse", 30_000_000 + 2 * n), usage: big(input) });
 		r.sm.appendMessage(result(`s${n}`, out, 30_000_001 + 2 * n));
 		log(await r.turnEnd(a, { ...asst([call(`s${n}`)], "toolUse"), usage: big(input) }));
+		await sleep(50);
 		log(await r.request());
 	};
 	const scenarios = async () => {
 		const parts: string[] = [];
-		// warm return 60 s after a big run: the warm run plan summarises (the user waits, as in 0.3.0), drafts at the first turn_end
+		// warm return 60 s after a big run: its summary is written in the background, the first turn_end takes it (0.3.1: the prompt waited)
 		parts.push(await transcript(async (r, log) => {
 			await prompt(r, log, "warm return");
 			await step(r, log, 1, 110_000, "small");
@@ -803,7 +839,7 @@ describe("round 5: no UI (pi -p, json) sends the same requests and writes the sa
 			log(await r.settle());
 		}, shifted(60_000, 6000)));
 		// a warm prompt right after a request that carried an edit (b2b: no warm edit at the prompt; the state a restarted process
-		// restores, set here directly): its first turn_end valve summarises, and the user waits for it, as in 0.3.0
+		// restores, set here directly): its summary is still produced, and its first turn_end valve takes it (0.3.1: the turn_end waited)
 		parts.push(await transcript(async (r, log) => {
 			const { Zip } = await import("../src/run.ts");
 			const orig = (Zip.prototype as Any).beginRun;
@@ -824,25 +860,26 @@ describe("round 5: no UI (pi -p, json) sends the same requests and writes the sa
 			await step(r, log, 2, 111_000, "small");
 			log(await r.settle());
 		}, shifted(60_000, 6000)));
-		// a cold return (past the TTL) that summarises
+		// a cold return (past the TTL) that summarises: its folds at once, its summary at the turn_end after the run plan's
 		parts.push(await transcript(async (r, log) => {
 			await prompt(r, log, "cold return");
 			await step(r, log, 1, 110_000, "small");
+			await step(r, log, 2, 111_000, "small");
 			log(await r.settle());
 		}, shifted(400_000, 6000)));
 		return parts;
 	};
 
-	test("three no-UI scenarios hash to 0.3.0's digest; with a UI the warm return of the first one does not wait", async () => {
+	test("three no-UI scenarios hash to the recorded digest; each summarises with one call nobody waits for, as with a UI", async () => {
 		const parts = await scenarios();
 		const digest = createHash("sha256").update(parts.join("\n")).digest("hex").slice(0, 32);
 		if (process.env.R5_PRINT_DIGEST) console.log("R5 NO-UI DIGEST", digest, parts.map((p) => createHash("sha256").update(p).digest("hex").slice(0, 12)).join(" "));
-		// every scenario summarises (a compaction draft: the warm run plan's, the warm turn_end valve's, the cold run plan's), each with one
-		// narrative call made inside the hook (waited for)
+		// every scenario summarises (a compaction draft at a turn_end after its call finished), each with one narrative call made in the
+		// background (0.3.1: inside the hook, waited for)
 		for (const p of parts) expect([p.includes('"type":"compaction"'), /"narrativeCalls":1\b/.test(p)]).toEqual([true, true]);
 		expect(parts[1]).toContain('"trigger":"valve"');
-		expect(digest).toBe(NOUI_DIGEST_030);
-		// the same warm return with a UI: no summary in its first request (0.3.0: the summary, after the wait)
+		expect(digest).toBe(NOUI_DIGEST);
+		// the same warm return with a UI and a slow call: no summary in its first request, and no wait
 		const ui = await rig(undefined, { file: shifted(60_000, 6000), tui: true, native: true, idle: true, start: false, latencyMs: 300 });
 		await ui.beforeAgentStart("warm return");
 		ui.sm.appendMessage(user("warm return", Date.now() - T0));
