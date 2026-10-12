@@ -219,7 +219,21 @@ fn pc_run_plan_turn_end_waits_at_the_room() {
 /// mutant hides ready summaries from the decisions (run.ts ready), so the next return produces the same cut again (WL (c)).
 #[test]
 fn wl_ready_summary_is_taken_not_produced_again() {
-    caught("r4wl", "run.ts", "return readyOf(branch, this.mine).map((a) => ({ key: a.key, running: false }));", "return [];", "WL", &trace_file("wl-ready-taken.trace"));
+    // Exercise the draft decision: the native door consumes this artifact before that decision can produce it again.
+    caught("r4wl", "run.ts", "return readyOf(branch, this.mine).map((a) => ({ key: a.key, running: false }));", "return [];", "WL", &trace_file("wl-ready-taken.trace").replace(" native ", " nonative "));
+}
+
+/// Native completeness must catch a ready cut priced as a new call at the idle door, even if the request takes it later.
+#[test]
+fn na_native_door_prices_ready_cuts_at_zero() {
+    caught(
+        "na1",
+        "run.ts",
+        "this.opts(ctx, !pending, entries, this.pWarm, this.pause, cutAt, false, keys);",
+        "this.opts(ctx, !pending, entries, this.pWarm, this.pause, cutAt);",
+        "NA",
+        &trace_file("na-ready-native.trace"),
+    );
 }
 
 /// The away timer prepares the summary a return after a pause wants, so the return's free rewrite carries it. 0.4.0: nobody waits,
@@ -389,7 +403,8 @@ fn trace_file(name: &str) -> String {
 /// 75K) and a summary that pays (Phi 5.3) is withheld. NT holds on the src: the second summary comes after the regrowth.
 #[test]
 fn wl_the_one_summary_flag_lapses() {
-    let t = trace_file("wl-regrow.trace");
+    // Keep the draft entry path this flag mutant targets; native adoption books the summary before the run.
+    let t = trace_file("wl-regrow.trace").replace(" native ", " nonative ");
     caught_all(
         "wl1",
         "plan.ts",

@@ -8,7 +8,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { collapseSystemMessages, getCurrentSystemMessage, normalizeContext, resolveTranscript } from "@earendil-works/pi-ai";
-import { collapseSystem } from "../src/plan.ts";
+import { collapseSystem, planContext } from "../src/plan.ts";
+import { planOpts } from "../src/core.ts";
 import type { Any } from "./helpers.ts";
 // Pi's own draft application (AgentSession._applyBoundaryDrafts uses no instance state): the order of the drafts and the
 // tokensBefore Pi writes for a compaction draft are Pi's, not a re-implementation
@@ -687,6 +688,52 @@ describe("round 5 on real Pi: rule A starts the warm summary early, nobody waits
 		expect(shut.narrativeCalls.length).toBe(0);
 		expect(shut.inputListeners.size).toBe(0);
 	});
+
+	for (const [label, kept, p, ago] of [["initial plan", 11, 1, 60_000], ["pinned plan", 1, 0, 3_600_000]] as const) {
+		test(`native adoption prices a ready cut at zero in the ${label}`, async () => {
+			const dir = mkdtempSync(join(tmpdir(), "pz-native-price-")), ledger = join(dir, "ledger.jsonl");
+			const before = process.env.PI_ZIP_LEDGER;
+			process.env.PI_ZIP_LEDGER = ledger;
+			try {
+				process.env.PI_ZIP_COLD_CAP = "40000";
+				const sm = SessionManager.inMemory(CWD);
+				const keys: string[] = [];
+				for (let i = 0; i < 18; i++) {
+					keys.push(sm.appendMessage(user(`turn ${i + 1}`, Date.now() - T0 - ago)));
+					sm.appendMessage({ ...asst([{ type: "text", text: "z ".repeat(6500) }], "stop", Date.now() - T0 - ago), usage: undefined });
+				}
+				const entries = sm.buildSessionProjection().entries as Any[];
+				const env = { model: MODEL, cwd: CWD, sys: { text: "You are a coding agent.", tools: [] }, reserve: 16_384, recalled: new Set<string>(), steerIds: new Set<string>(), rereadOnly: false };
+				const learned = { model: MODEL, g: 2500, justEdited: false, summarizedWarm: false };
+				const key = keys[kept];
+				const opts = (ready: string[]) => planOpts(entries, sm.getBranch(), env, learned, true, p, false, undefined, false, ready).o;
+				if (p === 1) expect(planContext(entries, opts([]))?.cutIdx ?? null).toBeNull();
+				else expect(planContext(entries, { ...opts([]), cutAt: key })?.cutIdx ?? null).toBeNull();
+				const readyPlan = planContext(entries, { ...opts([key]), cutAt: key })!;
+				expect(readyPlan.firstKeptEntryId).toBe(key);
+				const text = "## Decisions\n" + "summary ".repeat(500);
+				sm.appendCustomEntry("pi-zip/summary", { head: "", key, usd: 0, cut: { firstKeptEntryId: key, text, trigger: "valve", count: kept, prefixTokens: readyPlan.prefixTokens, summaryTokens: Math.ceil(text.length / 4), llmOk: true, llmError: null, costUsd: 0, ms: 0, prepared: true } });
+				const r = await rig(undefined, { file: [sm.getHeader() as Any, ...sm.getEntries()], tui: true, native: true, idle: true, start: false });
+				await r.beforeAgentStart();
+				expect(r.compactCalls.n).toBe(1);
+				expect(r.compactions[0]).toMatchObject({ summary: text, firstKeptEntryId: key, details: { via: "native" } });
+				r.sm.appendMessage(user("next request", Date.now() - T0));
+				const req = await r.request();
+				expect(req.find((m: Any) => m.role === "compactionSummary")?.summary).toBe(text);
+				expect(r.narrativeCalls).toHaveLength(0);
+				await sleep(5);
+				expect(r.compactions[0].tokensBefore).toBe(noticeOf(r).before);
+				const rows = readFileSync(ledger, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+				expect(rows.filter((x) => x.type === "native_mismatch")).toEqual([]);
+				expect(rows.find((x) => x.type === "cold_plan")).toMatchObject({ via: "native", onPre: true });
+				await r.shutdown();
+			} finally {
+				if (before === undefined) delete process.env.PI_ZIP_LEDGER;
+				else process.env.PI_ZIP_LEDGER = before;
+				rmSync(dir, { recursive: true, force: true });
+			}
+		});
+	}
 
 	// the second case: the prompt Pi appends comes out smaller than what before_agent_start announced (pendingPrompt's estimate). The
 	// warm plan must still cut where Pi's compaction just cut (review P2 #5: it hung on real(ctxAfterFolds) >= regrowAt holding with

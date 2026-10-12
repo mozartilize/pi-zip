@@ -440,6 +440,16 @@ pub fn derived() -> Vec<Prop> {
             f: always(warm_summary_not_withheld()),
         },
         Prop {
+            id: "NA",
+            name: "the open native door takes a ready summary that pays",
+            from: &["A2", "A3"],
+            why: "completeness at the idle prompt: given ready artifacts in the session, the spec chooses the deepest guarded cut no \
+                  deeper than c (or cW without c), using its own law and class prices; if that cut pays with call price zero and \
+                  the native door is open, outside b2b and Q2, it must enter natively before the first request.",
+            evidence: Evidence::Conformance,
+            f: always(atom("native_ready_applied", |r: &R, i, _| native_withheld(r, i).is_none())),
+        },
+        Prop {
             id: "TR",
             name: "target reachability",
             from: &["A2"],
@@ -991,6 +1001,27 @@ pub fn ready_produced_again(r: &R, i: usize) -> Option<String> {
     None
 }
 
+/// Native completeness uses pre-door artifacts and sizes, not a `take`, `native_skip`, or the planner's law verdicts.
+pub fn native_withheld(r: &R, i: usize) -> Option<String> {
+    let n = r.tick(i).native_door.as_ref()?;
+    if !r.trace.world.native || !n.open || n.b2b || n.no_summary || n.after_folds <= n.target.max(n.floor) || n.cuts.is_empty() {
+        return None;
+    }
+    let pr = class_prices(if n.known { r.trace.world.cls } else { Class::Explicit }, r.trace.world.tier == Tier::Long);
+    let after = |c: &NativeCut| n.after_folds - c.prefix + c.summary;
+    let pays = |c: &NativeCut, call: f64| c.prefix >= 2.0 * c.summary
+        && law(c.prefix, c.summary, n.p, None, Some(pr), n.g, call, c.summary).ok
+        && law(n.before, after(c), n.p, Some(r.st[i].room), Some(pr), n.g, call, after(c)).ok;
+    let cw = n.cuts.iter().position(|c| after(c) <= n.target).unwrap_or(n.cuts.len() - 1);
+    let bound = (cw..n.cuts.len()).find(|&k| pays(&n.cuts[k], summary_call(pr, n.cuts[k].read, n.cuts[k].written))).unwrap_or(cw);
+    let c = n.cuts[..=bound].iter().rev().find(|c| c.ready && c.guard && pays(c, 0.0))?;
+    // Inspect the compaction actually appended at the idle door, including the artifact's text identity.
+    if n.applied.as_ref().is_some_and(|a| a.key == c.key && c.hash.as_deref() == Some(a.hash.as_str())) {
+        return None;
+    }
+    Some(format!("idle native door withheld ready cut {} at P={} (B={:.0}, A={:.0}, call=0)", c.key, n.p, n.before, after(c)))
+}
+
 /// WL at request i: what is withheld, and why it is not excused.
 pub fn withheld(r: &R, i: usize) -> Option<String> {
     if let Some(w) = ready_produced_again(r, i) {
@@ -1079,8 +1110,14 @@ pub fn target_miss(r: &R, i: usize) -> Option<String> {
     Some(format!("cold plan leaves {:.0} tokens, target {:.0}, floor {:.0}, and no law refused a summary", s.view_tok, s.target, s.floor))
 }
 
-/// The cut of the ready summary the decision behind request i took (run.ts `take`: produced earlier, its call already spent), if any.
+/// The cut of a ready summary applied natively before the prompt or taken by a decision (its call is already spent).
 pub fn took_ready(r: &R, i: usize) -> Option<String> {
+    // Native application precedes the run and emits no `take`; read the actual native cut, independently of ledger wording.
+    if r.tick(i).n == 0 {
+        if let Some(p) = r.tick(i).run_plan.as_ref().filter(|p| p.native) {
+            return p.cut.clone();
+        }
+    }
     let led: &[Value] = if i > 0 && r.tick(i - 1).te_valve { &r.tick(i - 1).te_ledger } else if r.tick(i).n == 0 { &r.tick(i).run_ledger } else { return None };
     led.iter().find(|x| x.get("type").and_then(Value::as_str) == Some("take")).and_then(|x| x.get("key").and_then(Value::as_str)).map(String::from)
 }
@@ -1297,6 +1334,7 @@ pub fn explain(id: &str, r: &R, i: usize) -> Vec<String> {
         "MH" => head_breach(r, i).into_iter().collect(),
         "NT" => summary_waste(r, i).into_iter().collect(),
         "WL" => withheld(r, i).into_iter().collect(),
+        "NA" => native_withheld(r, i).into_iter().collect(),
         "PC" => pi_compacts(r, i).into_iter().collect(),
         "TR" => target_miss(r, i).into_iter().collect(),
         "LW" => law_mismatch(r, i).into_iter().collect(),
@@ -1366,6 +1404,7 @@ fn mp_mechanism(g: &Grid, p: &GridPt, q: &GridPt) -> String {
 /// rows of TRIAGE.md.
 pub fn classify(id: &str, r: &R, v: &Violation) -> String {
     match id {
+        "NA" => "idle native door withheld a ready summary that pays".into(),
         "NR" => {
             let i0 = v.at;
             let Some(&j) = v.witnesses.iter().filter(|&&w| w > i0).max() else { return "other".into() };

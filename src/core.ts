@@ -261,7 +261,8 @@ export function decideRun(x: { cold: boolean; justEdited: boolean; nat: NativeIn
 	const notes: Note[] = [];
 	const readyKeys = x.ready.filter((a) => !a.running).map((a) => a.key);
 	const plan = (entries: Any[], cutAt?: string, asNative = false, foldsOnly = false) => {
-		const { o, cal } = x.opts(entries, cutAt, foldsOnly, readyKeys);
+		// Native application moved the branch head: its artifact is spent even though READY no longer contains it.
+		const { o, cal } = x.opts(entries, cutAt, foldsOnly, asNative && nat ? [...readyKeys, nat.key] : readyKeys);
 		// the plan that carries the summary Pi's compaction just put in is made in the state nativeSummary planned it in: before that
 		// summary, so it is not "a second summary in this warm stretch" (noSummary, regrowAt). Otherwise a real prompt a token smaller
 		// than before_agent_start's estimate falls below regrowAt, the plan does not cut and the folds priced with it are dropped
