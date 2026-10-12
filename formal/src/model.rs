@@ -652,7 +652,16 @@ pub struct Refresh {
 
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default)]
+pub struct ProducerObs {
+    pub calls: u32,
+    pub timers: u32,
+    pub writes: u32,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
 pub struct Obs {
+    pub producer: ProducerObs,
     pub ok: bool,
     pub errors: Vec<String>,
     pub blocks: Vec<BlockObs>,

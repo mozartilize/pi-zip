@@ -87,6 +87,19 @@ describe("learned cache survival", () => {
 		expect(pWarm(q, 100, 300).p).toBeCloseTo(pWarm(q, 1000, 300).p); // a contradiction is pooled, never inverted
 	});
 
+	test("call duration and prefix size survive a restart without changing class or survival", () => {
+		record("cache/model", { explicit: true, total: 50_000, gapS: 360, alive: true }, path);
+		record("cache/model", { explicit: false, total: 0, call: { ms: 40_000, tokens: 80_000 } }, path);
+		const first = loadStats(path).models["cache/model"];
+		expect(first.call).toEqual({ ms: 40_000, tokens: 80_000 });
+		expect(first.cls).toBe("explicit");
+		expect(first.n).toBe(1);
+		record("cache/model", { explicit: false, total: 0, call: { ms: Infinity, tokens: 80_000 } }, path);
+		expect(loadStats(path).models["cache/model"].call).toEqual(first.call);
+		record("cache/model", { explicit: false, total: 0, call: { ms: 20_000, tokens: 40_000 } }, path);
+		expect(loadStats(path).models["cache/model"].call).toEqual({ ms: 38_000, tokens: 76_000 });
+	});
+
 	test("persistence round-trip, and a corrupt or malformed file is ignored (then rewritten)", () => {
 		record("a/b", { explicit: true, total: 60_000, gapS: 365, alive: false }, path);
 		const f = loadStats(path);

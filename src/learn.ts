@@ -42,7 +42,7 @@ const PRIOR_WEIGHT = { alive: 2, dead: 0.25 };
 // caches: 0 / 704 / 1792 / 3200). Also the head every edit leaves untouched on an automatic cache (plan.ts), so returns stay observable.
 export const MIN_EXPECT = 8192;
 
-export interface Entry { cls?: CacheClass; bins: Record<string, [number, number]>; n: number } // bin index -> [alive, dead] (decayed counts)
+export interface Entry { cls?: CacheClass; bins: Record<string, [number, number]>; n: number; call?: { ms: number; tokens: number } } // bin index -> [alive, dead] (decayed counts)
 interface File { v: 1; models: Record<string, Entry> }
 
 /** Pi's agent directory (settings.json, sessions): PI_CODING_AGENT_DIR, else ~/.pi/agent. */
@@ -67,7 +67,7 @@ export function loadStats(path = statsPath()): File {
 		for (const [k, e] of Object.entries<Any>(j.models)) {
 			const bins: Entry["bins"] = {};
 			for (const [b, c] of Object.entries<Any>(e?.bins ?? {})) if (Number(b) < GAP_EDGES.length - 1 && GAP_EDGES[Number(b)] !== undefined && Array.isArray(c) && fin(c[0]) && fin(c[1])) bins[b] = [c[0], c[1]];
-			out.models[k] = { bins, n: fin(e?.n) ? e.n : 0, ...(e?.cls === "explicit" || e?.cls === "automatic" ? { cls: e.cls } : {}) };
+			out.models[k] = { bins, n: fin(e?.n) ? e.n : 0, ...(fin(e?.call?.ms) && e.call.ms > 0 && fin(e?.call?.tokens) && e.call.tokens > 0 ? { call: { ms: e.call.ms, tokens: e.call.tokens } } : {}), ...(e?.cls === "explicit" || e?.cls === "automatic" ? { cls: e.cls } : {}) };
 		}
 		return out;
 	} catch {
@@ -89,10 +89,14 @@ export function sample(expect: number, cacheRead: number, total = Infinity, edit
 }
 
 /** Fold one response into the stats (re-read, update, atomic write: concurrent sessions share the file). Returns the model's entry. */
-export function record(key: string, u: { explicit: boolean; total: number; gapS?: number; alive?: boolean | null }, path = statsPath()): Entry {
+export function record(key: string, u: { explicit: boolean; total: number; gapS?: number; alive?: boolean | null; call?: { ms: number; tokens: number } }, path = statsPath()): Entry {
 	const f = loadStats(path);
 	const e = (f.models[key] ??= { bins: {}, n: 0 });
 	let dirty = false;
+	if (u.call && fin(u.call.ms) && u.call.ms > 0 && fin(u.call.tokens) && u.call.tokens > 0) {
+		e.call = e.call ? { ms: 0.9 * e.call.ms + 0.1 * u.call.ms, tokens: 0.9 * e.call.tokens + 0.1 * u.call.tokens } : u.call;
+		dirty = true;
+	}
 	if (u.explicit && e.cls !== "explicit") (e.cls = "explicit"), (dirty = true); // sticky: a write premium once reported stays
 	else if (!e.cls && u.total >= 2048) (e.cls = "automatic"), (dirty = true);
 	const b = u.gapS !== undefined && typeof u.alive === "boolean" ? binOf(u.gapS) : -1;
@@ -105,9 +109,9 @@ export function record(key: string, u: { explicit: boolean; total: number; gapS?
 	}
 	if (dirty) {
 		// entries of other models with no survival sample (n = 0: only a class, from a model tried once) are dropped, except an explicit
-		// class: it is sticky (a write premium once reported stays) and another live process may rely on it; the model being recorded
+		// class or measured call time: another live process may rely on them; the model being recorded
 		// keeps its own, so its class survives a restart while it is in use
-		for (const [k, x] of Object.entries(f.models)) if (k !== key && !(x.n > 0) && x.cls !== "explicit") delete f.models[k];
+		for (const [k, x] of Object.entries(f.models)) if (k !== key && !(x.n > 0) && x.cls !== "explicit" && !x.call) delete f.models[k];
 		try {
 			mkdirSync(dirname(path), { recursive: true });
 			const tmp = `${path}.${process.pid}.tmp`;

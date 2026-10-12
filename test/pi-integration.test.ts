@@ -459,9 +459,9 @@ describe("real Pi: a summary prepared while the user was away goes in through Pi
 	};
 	beforeEach(() => { process.env.PI_ZIP_TTL_SECS = "1"; });
 
-	test("a resumed process arms the away timer from the branch's last request: the summary is ready before the return (7)", async () => {
+	test("a future start deadline is armed on session opening and prepares the return", async () => {
 		const r = await rig(undefined, { file: template(), tui: true, native: false, idle: false, start: false }); // session_start only: no settle ever ran in this process
-		await sleep(1_300); // the timer fires at 0.8 x the 1 s TTL after the last response
+		await sleep(2_300); // the unlearned timer uses the first paying gap, TTL plus one second
 		expect(r.narrativeCalls.length).toBe(1); // old code: 0 (armAway was reached only from settle)
 		await r.beforeAgentStart("next request");
 		sendPrompt(r.sm, "next request");
@@ -478,35 +478,16 @@ describe("real Pi: a summary prepared while the user was away goes in through Pi
 		}
 	});
 
-	// Restart speed: opening an old session costs nothing (above), but the user's first prompt then waits for the whole summary. The first
-	// raw keystroke says they are here to work: start the summary then, so the typing time is not wasted.
-	test("a reopened session whose cache is dead starts its cold summary on the first keystroke, never consumes or alters it, and unsubscribes", async () => {
+	test("opening and typing in old history starts no call and installs no terminal listener", async () => {
 		const r = await rig(undefined, { file: template(240 * 60_000), tui: true, native: false, idle: false, start: false });
-		await sleep(300);
-		expect(r.narrativeCalls.length).toBe(0); // opened, not typed: no call (and one listener waits)
-		expect(r.inputListeners.size).toBe(1);
-		expect(r.typeKey("\x1b[I")).toBe("\x1b[I"); // a focus report is not the user
-		expect(r.typeKey("\x1b[?0u")).toBe("\x1b[?0u"); // nor is a kitty-keyboard reply
-		await sleep(50);
+		expect(r.inputListeners.size).toBe(0);
+		for (const key of ["h", "i", "\x03", "/", "q"]) r.typeKey(key);
+		await sleep(100);
 		expect(r.narrativeCalls.length).toBe(0);
-		// the planning (projection, planContext, the summary's synchronous part) runs after the key reached the editor, never inside the
-		// input listener, where it would delay the key on a big session (review P2, first-key latency; old code: inside it)
-		const proj = r.sm.buildSessionProjection.bind(r.sm);
-		let inListener = 0, typing = false;
-		(r.sm as Any).buildSessionProjection = (...a: Any[]) => { if (typing) inListener++; return (proj as Any)(...a); };
-		typing = true;
-		expect(r.typeKey("h")).toBe("h"); // the data goes on to Pi untouched
-		typing = false;
-		expect(inListener).toBe(0);
-		await sleep(100);
-		expect(r.narrativeCalls.length).toBe(1);
-		expect(r.inputListeners.size).toBe(0); // unsubscribed at the first key of a prompt
-		r.typeKey("i");
-		await sleep(100);
-		expect(r.narrativeCalls.length).toBe(1);
+		await r.shutdown();
 	});
 
-	test("the prompt after the first key does not wait for the running call: its folds go alone, and a later decision takes the summary (no second call)", async () => {
+	test("the first prompt starts background production without waiting and a later decision takes it", async () => {
 		const r = await rig(undefined, { file: template(240 * 60_000), tui: true, native: false, idle: false, start: false, latencyMs: 2_000 });
 		r.typeKey("h");
 		await sleep(1_000); // typing the prompt takes 1 s of the 2 s call
@@ -515,12 +496,12 @@ describe("real Pi: a summary prepared while the user was away goes in through Pi
 		sendPrompt(r.sm, "hello");
 		const req1 = await r.request();
 		const waited = performance.now() - t0;
-		expect(r.narrativeCalls.length).toBe(1); // the call the key started, not a second one
+		expect(r.narrativeCalls.length).toBe(1); // the call the first decision started, not a second one
 		expect(req1.some((m) => m.role === "compactionSummary")).toBe(false);
 		expect(req1.some(isFolded)).toBe(true);
 		expect(waited).toBeLessThan(500); // 0.3.1: the rest of the call (~1 s)
 		// the run's turn_end once the call is done: the summary goes in as its first draft
-		await sleep(1_300);
+		await sleep(2_100);
 		const a = r.sm.appendMessage(asst([call("k1")], "toolUse", 10_000_001));
 		r.sm.appendMessage(result("k1", "tiny", 10_000_002));
 		const drafts = await r.turnEnd(a, asst([call("k1")], "toolUse"));
@@ -532,16 +513,13 @@ describe("real Pi: a summary prepared while the user was away goes in through Pi
 		expect(r.narrativeCalls.length).toBe(1);
 	});
 
-	// 0.3.1 live, first restart: durable-subagents posted a display-only note at session start ("1 workflow was paused"). After the final
-	// answer it opened a turn (it could have started a run), so the first-key plan, counting the prompt as one more turn on top, protected
-	// only the note and cut there; the real prompt joins the note's turn (a prompt right after its starter is one turn) and the run plan
-	// cut one turn earlier: the key's summary was thrown away (booked unused) and the user waited for a second one, in full.
-	test("a display-only custom message after the final answer: the first-key summary cuts where the prompt's run plan cuts (no second call)", async () => {
+	// A display-only entry can start a turn; the actual prompt decides production on the resulting projection.
+	test("a display-only entry before a prompt leaves one background call for that prompt", async () => {
 		const r = await rig(undefined, { file: template(240 * 60_000), tui: true, native: false, idle: false, start: false, latencyMs: 300 });
 		r.sm.appendCustomMessageEntry("dsa-note", "1 subagent workflow was paused when pi quit", true);
 		r.typeKey("h");
 		await sleep(50);
-		expect(r.narrativeCalls.length).toBe(1);
+		expect(r.narrativeCalls.length).toBe(0);
 		await r.beforeAgentStart("hello");
 		sendPrompt(r.sm, "hello");
 		const req1 = await r.request();
@@ -553,121 +531,18 @@ describe("real Pi: a summary prepared while the user was away goes in through Pi
 		await r.request(); // the next assistant response answers a new Pi request
 		const b2 = r.sm.appendMessage(asst([call("k2")], "toolUse", 10_000_003));
 		r.sm.appendMessage(result("k2", "tiny", 10_000_004));
-		expect((await r.turnEnd(b2, asst([call("k2")], "toolUse"))).filter((d: Any) => d.type === "compaction")).toHaveLength(1); // the key's summary, at the next decision
+		expect((await r.turnEnd(b2, asst([call("k2")], "toolUse"))).filter((d: Any) => d.type === "compaction")).toHaveLength(1); // the produced summary, at the next decision
 		expect(r.narrativeCalls.length).toBe(1); // old code: 2 (the key's call cut at the note, the run plan one turn earlier)
 		expect(r.sm.getEntries().filter((e: Any) => e.type === "custom" && e.customType === "pi-zip/summary" && !e.data?.cut)).toEqual([]); // no call ended unused
 	});
 
-	// review P1-1: the usual "open, look, leave" (Ctrl+D, Ctrl+C twice, Esc, arrows, /quit, /resume to another session) is not typing a
-	// prompt; the old code started the paid call at the first of those keys (isKeystroke accepts control keys and "/")
-	test("keys that do not type a prompt start nothing: Ctrl+C, Ctrl+D, Esc, arrows, /quit, /resume; the listener stays until a prompt is typed", async () => {
-		const r = await rig(undefined, { file: template(240 * 60_000), tui: true, native: false, idle: false, start: false });
-		for (const k of ["\x04", "\x03", "\x03", "\x1b", "\x1b[A", "\x1b[B", "\r", "/", "q", "u", "i", "t"]) {
-			r.typeKey(k);
-			await sleep(5);
-		}
-		await sleep(100);
-		expect(r.editor.text).toBe("/quit");
-		expect(r.narrativeCalls.length).toBe(0); // old code: 1, started by Ctrl+D
-		expect(r.inputListeners.size).toBe(1);
-		r.typeKey("\x03"); // cleared; then /resume pasted
-		r.typeKey("\x1b[200~/resume\x1b[201~");
-		await sleep(100);
-		expect(r.narrativeCalls.length).toBe(0);
-		await r.shutdown(); // left without typing a prompt: no call, no listener
-		expect(r.inputListeners.size).toBe(0);
-		expect(r.narrativeCalls.length).toBe(0);
-	});
-
-	// review P1-2: arming used the declared TTL and the key planned with P(warm) = 0, while the prompt judges the return with the learned
-	// survival; a restart inside a learned-warm window paid for a summary the warm prompt then threw away
-	test("a cache learned to outlive its declared TTL: a restart past the TTL but inside the learned window arms nothing and typing starts no call", async () => {
-		const savedTtl = process.env.PI_ZIP_TTL_SECS, savedStats = process.env.PI_ZIP_CACHE_STATS;
-		delete process.env.PI_ZIP_TTL_SECS; // the learned survival is used only without the test override (cache.ts detectCold)
-		process.env.PI_ZIP_CACHE_STATS = join(mkdtempSync(join(tmpdir(), "pi-zip-learned-")), "cache-survival.json");
-		// p/m (declared 300 s) was read in full four times after gaps of 360-420 s (GLM-like)
-		writeFileSync(process.env.PI_ZIP_CACHE_STATS, JSON.stringify({ v: 1, models: { "p/m": { cls: "explicit", bins: { "6": [4, 0], "7": [4, 0] }, n: 8 } } }));
-		try {
-			const r = await rig(undefined, { file: template(380_000), tui: true, native: false, idle: false, start: false }); // 380 s: past 300 s
-			// the return is warm: no cold summary is armed. Rule A arms the summary the WARM plan makes (this context is big enough for one),
-			// and the warm prompt then uses it (old code: a summary planned at P(warm) = 0, thrown away by the warm prompt)
-			expect(r.inputListeners.size).toBe(1);
-			r.typeKey("h");
-			await sleep(150);
-			expect(r.narrativeCalls.length).toBe(1);
-			await r.beforeAgentStart("hello");
-			sendPrompt(r.sm, "hello");
-			const req = await r.request();
-			expect(req.some((m) => m.role === "compactionSummary")).toBe(true); // the summary the key started, adopted
-			expect(r.narrativeCalls.length).toBe(1); // ... not written a second time
-			// the same session past the learned window (bin 8, 420-480 s, never observed: the declared TTL's prior decides): armed, and typing starts it
-			const late = await rig(undefined, { file: template(2 * 3_600_000), tui: true, native: false, idle: false, start: false });
-			expect(late.inputListeners.size).toBe(1);
-			late.typeKey("h");
-			await sleep(150);
-			expect(late.narrativeCalls.length).toBe(1);
-		} finally {
-			if (savedTtl === undefined) delete process.env.PI_ZIP_TTL_SECS; else process.env.PI_ZIP_TTL_SECS = savedTtl;
-			process.env.PI_ZIP_CACHE_STATS = savedStats;
-		}
-	});
-
-	test("a command typed and erased, then a prompt: the first character of the prompt starts the summary", async () => {
-		const r = await rig(undefined, { file: template(240 * 60_000), tui: true, native: false, idle: false, start: false });
-		for (const k of ["/", "m", "\x7f", "\x7f"]) r.typeKey(k);
-		await sleep(50);
-		expect(r.narrativeCalls.length).toBe(0);
-		r.typeKey(" "); // whitespace alone is not a prompt
-		await sleep(50);
-		expect(r.narrativeCalls.length).toBe(0);
-		r.typeKey("f");
-		await sleep(100);
-		expect(r.narrativeCalls.length).toBe(1);
-		expect(r.inputListeners.size).toBe(0);
-	});
-
-	test("a session opened and closed without typing makes no call; one with no UI (pi -p, a subagent) never listens", async () => {
-		const r = await rig(undefined, { file: template(240 * 60_000), tui: true, native: false, idle: false, start: false });
-		expect(r.inputListeners.size).toBe(1);
-		await r.shutdown();
-		expect(r.inputListeners.size).toBe(0);
-		r.typeKey("h");
-		await sleep(150);
-		expect(r.narrativeCalls.length).toBe(0);
-		const quiet = await rig(undefined, { file: template(240 * 60_000), tui: false, start: false });
-		expect(quiet.inputListeners.size).toBe(0);
-		quiet.typeKey("h");
-		await sleep(150);
-		expect(quiet.narrativeCalls.length).toBe(0);
-	});
-
-	test("a key when the cold plan has no summary starts nothing; a prompt without any key leaves no listener behind", async () => {
-		const sm = SessionManager.inMemory(CWD);
-		populate(sm, 0); // short prose: folds reach the cap, no cut
-		const small = [sm.getHeader() as Any, ...sm.getEntries()];
-		const shift = Date.now() - 240 * 60_000 - Math.max(...small.map((e) => e.message?.timestamp ?? 0));
-		for (const e of small) {
-			if (typeof e.message?.timestamp === "number") e.message.timestamp += shift;
-			if (typeof e.timestamp === "string" && e.type !== undefined && e.type !== "session") e.timestamp = new Date(Date.parse(e.timestamp) + shift).toISOString();
-		}
-		const a = await rig(undefined, { file: small, tui: true, native: false, idle: false, start: false });
-		a.typeKey("h");
-		await sleep(100);
-		expect(a.narrativeCalls.length).toBe(0);
-		const b = await rig(undefined, { file: template(240 * 60_000), tui: true, native: false, idle: false, start: false, latencyMs: 50 });
-		expect(b.inputListeners.size).toBe(1);
-		await b.beforeAgentStart("typed elsewhere"); // a prompt that did not come through the keyboard: the listener goes away
-		expect(b.inputListeners.size).toBe(0);
-	});
-
-	test("a restart between the 0.8 mark and the TTL starts the call at once, as the live process's timer would have (formal A3)", async () => {
+	test("a restart whose start deadline is past opens quietly", async () => {
 		process.env.PI_ZIP_TTL_SECS = "30";
-		const r = await rig(undefined, { file: template(27_000), tui: true, native: false, idle: false, start: false }); // 27 s of 30: past 24 s (0.8), before 30 s
-		await sleep(400);
-		expect(r.narrativeCalls.length).toBe(1); // the user may come back after the TTL: the summary is ready
-		const early = await rig(undefined, { file: template(5_000), tui: true, native: false, idle: false, start: false }); // before the mark: a timer, not a call
-		await sleep(400);
-		expect(early.narrativeCalls.length).toBe(0);
+		const r = await rig(undefined, { file: template(27_000), tui: true, native: false, idle: false, start: false });
+		await sleep(100);
+		expect(r.narrativeCalls.length).toBe(0);
+		expect(r.inputListeners.size).toBe(0);
+		await r.shutdown();
 	});
 
 	test("a process that is not interactive, or a session that ended mid-run, prepares nothing", async () => {
@@ -681,29 +556,21 @@ describe("real Pi: a summary prepared while the user was away goes in through Pi
 		expect(cut.narrativeCalls.length).toBe(0);
 	});
 
-	test("Pi's compaction while the user is away: the timer plans again on the context as it is, the summary is for the return (8)", async () => {
+	test("the timer re-plans after a compaction instead of using a cached settle plan", async () => {
 		process.env.PI_ZIP_TTL_SECS = "0.1";
 		const r = await rig(undefined, { file: template(3_600_000), tui: true, native: false, idle: false, start: false });
-		r.narrativeCalls.length = 0;
-		await r.settle(); // the plan made now has a cut at the old context
+		// A prior summary suppresses warm production but leaves the paying pause timer.
 		const branch = r.sm.getBranch() as Any[];
-		const keep = branch.filter((e) => e.type === "message" && e.message.role === "user")[3]; // Pi's own compaction keeps from the 4th prompt on
-		r.sm.appendCompaction("Pi's own summary of the early part", keep.id, 12_000, undefined, false);
-		await sleep(250); // the timer fires at 0.8 x 100 ms
-		await r.beforeAgentStart("next request");
-		sendPrompt(r.sm, "next request");
-		const req1 = await r.request();
-		const summaries = req1.filter((m) => m.role === "compactionSummary");
-		expect(summaries).toHaveLength(1);
-		expect(JSON.stringify(summaries[0])).toContain("narrative"); // pi-zip's summary of the new context, prepared while away (old code: Pi's, then a second call while the user waits)
-		// two calls, both while away: rule A's early one at settle (a warm return would have summarised the old context too), dropped when
-		// the timer found the context rewritten, and the away timer's, adopted (0.3.0: the timer's only)
-		expect(r.narrativeCalls.length).toBe(2);
-		// ... for the context as it is: what Pi's compaction replaced (the first prompts) is not in what the call reads (old code: it is)
-		const read = JSON.stringify(r.narrativeCalls.at(-1));
+		const keep = branch.filter((e) => e.type === "message" && e.message.role === "user")[3];
+		r.sm.appendCompaction("short history", keep.id, 12_000, { by: "pi-zip", regrow: 200_000 }, true);
+		await r.runner.emit({ type: "session_start", reason: "resume" } as Any);
+		await r.settle();
+		await sleep(1_250);
+		expect(r.narrativeCalls.length).toBe(1);
+		const read = JSON.stringify(r.narrativeCalls[0]);
 		expect(read).toContain("request 4");
 		expect(read).not.toContain("request 1");
-		expect(read).not.toContain("request 2");
+		await r.shutdown();
 	});
 });
 describe("item 5: a run an extension's message starts (sendMessage with triggerTurn) never fires before_agent_start; agent_start does", () => {
@@ -740,7 +607,7 @@ describe("item 5: a run an extension's message starts (sendMessage with triggerT
 
 	test("a summary prepared while away is adopted by the driven run (one call), and ctx.compact() is never called: it would abort the run that is starting", async () => {
 		const r = await rig(undefined, { file: template(240 * 60_000), tui: true, native: true, idle: true, start: false });
-		r.typeKey("h"); // the first key of the reopened session starts the summary
+		await r.settle(); // the end of a run asks the shared producer about the next return
 		await sleep(150);
 		expect(r.narrativeCalls.length).toBe(1);
 		const req = await drive(r);
@@ -830,19 +697,15 @@ describe("round 5 on real Pi: rule A starts the warm summary early, nobody waits
 	};
 	beforeEach(() => { process.env.PI_ZIP_TTL_SECS = "300"; });
 
-	test("A after a restart: a reopened session whose cache is alive and whose warm plan cuts starts that summary on the first key; opening alone costs nothing", async () => {
-		const r = await rig(undefined, { file: template(60_000), tui: true, native: false, idle: false, start: false }); // 1 min after the run: warm
-		await sleep(200);
-		expect(r.narrativeCalls.length).toBe(0); // opened, nothing typed
-		expect(r.inputListeners.size).toBe(1); // 0.3.0: 0 (only a dead cache armed the key)
+	test("a warm restart stays quiet through typing until a decision wants production", async () => {
+		const r = await rig(undefined, { file: template(60_000), tui: true, native: false, idle: false, start: false });
 		r.typeKey("h");
 		await sleep(100);
-		expect(r.narrativeCalls.length).toBe(1);
-		const shut = await rig(undefined, { file: template(60_000), tui: true, native: false, idle: false, start: false });
-		await shut.shutdown(); // opened and closed without typing
+		expect(r.narrativeCalls.length).toBe(0);
+		expect(r.inputListeners.size).toBe(0);
+		await prompt(r);
 		await sleep(100);
-		expect(shut.narrativeCalls.length).toBe(0);
-		expect(shut.inputListeners.size).toBe(0);
+		expect(r.narrativeCalls.length).toBe(1);
 	});
 
 	for (const [label, kept, p, ago] of [["initial plan", 11, 1, 60_000], ["pinned plan", 1, 0, 3_600_000]] as const) {

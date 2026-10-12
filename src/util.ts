@@ -111,17 +111,3 @@ export function tokensOf(m: Any): number {
 	}
 	return Math.ceil(chars / 4);
 }
-
-/** Is this raw terminal input the user typing? Reports the terminal sends by itself (focus in/out, cursor position, cell size, device
- *  attributes and mode replies, a kitty-keyboard flags reply, mouse events, OSC/DCS/APC strings) are not. Everything else is: a letter,
- *  a control key, an arrow or function key (CSI), a paste. Only a filter: whether the user is typing a prompt is decided from the
- *  editor text after the key (run.ts armOnFirstKey); the data is never touched. */
-export function isKeystroke(data: string): boolean {
-	if (!data) return false;
-	if (/^\x1b\[[IO]$/.test(data)) return false; // focus in / out
-	if (/^\x1b\[\?[\d;:]*[\$a-zA-Z]/.test(data)) return false; // private-mode replies: device attributes, DECRPM, kitty flags (CSI ? ... u)
-	if (/^\x1b\[\d+(;\d+)*[Rt]$/.test(data)) return false; // cursor position report, cell / window size report
-	if (/^\x1b\[<[\d;]*[Mm]$/.test(data)) return false; // SGR mouse
-	if (/^\x1b[\]P_^X]/.test(data)) return false; // OSC, DCS, APC, PM, SOS strings
-	return true;
-}

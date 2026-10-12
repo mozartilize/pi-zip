@@ -129,7 +129,7 @@ export default function piZip(pi: ExtensionAPI) {
 		checkRecall(ctx);
 		zip.refreshFolded(ctx);
 		zip.welcome(ctx);
-		zip.resumeAway(ctx); // a resumed session: arm the away timer from its last request, as the settle after it would have
+		zip.armProducer(ctx);
 		return r;
 	});
 	// a run an extension's message starts (sendMessage with triggerTurn) never fires before_agent_start; agent_start always fires
@@ -149,7 +149,7 @@ export default function piZip(pi: ExtensionAPI) {
 	pi.on("before_provider_request", (e) => zip.providerRequest(e));
 	pi.on("tool_call", (e, ctx) => zip.toolCall(e, ctx)); // a recall file named by a built-in tool: this machine's copy, written on demand
 	// Pi's idle cache warming: observed only (the return value is undefined, so Pi's own decision stands); an older Pi never fires it
-	pi.on("cache_warming_decision", (e) => zip.cacheWarmingDecision(e));
+	pi.on("cache_warming_decision", (e, ctx) => zip.cacheWarmingDecision(e, ctx));
 	pi.on("message_end", (e, ctx) => zip.messageEnd(e.message, ctx));
 	pi.on("session_shutdown", () => zip.shutdown());
 }
