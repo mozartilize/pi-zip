@@ -3,7 +3,7 @@
 // events, keeps what only the process holds (the summary call in the background, the timers) and carries out what these return.
 import { detectCold, modelKey, resolveTtl, type ColdInfo } from "./cache.ts";
 import { validateEdits } from "./guard.ts";
-import { lawPrices, pWarm, type Entry } from "./learn.ts";
+import { GAP_EDGES, lawPrices, pWarm, type Entry } from "./learn.ts";
 import { calibrate, compactionRoom, planContext, rebaseFolds, sizeOf, spliceNative, untouchedEst, UNIT, type Block, type Cut, type FoldTarget, type Law, type PlanOpts, type PlanResult, type RunPlan, type Scale, type SysInfo } from "./plan.ts";
 import type { FileRecall } from "./recallfile.ts";
 import { PRODUCT, type Any } from "./util.ts";
@@ -349,17 +349,14 @@ export function decideTurnEnd(x: { failed: boolean; justEdited: boolean; pWarm: 
 		return { o, p: planContext(x.entries, o) };
 	};
 	const first = mk();
-	const roomFor = (after: number, taken?: string) => roomOf(after, first.o, () => planContext(x.entries, x.opts(undefined, false, []).o), taken);
-	if (x.justEdited && x.pWarm >= 0.5) {
-		const p = first.p, room = roomFor(p?.ctxTokens ?? 0);
-		return { kind: "b2b", produce: !room && p && p.cutIdx !== null && !x.ready.some((a) => a.key === p.firstKeptEntryId) ? p : null, room };
-	}
-	const { r, note } = adopt(first, mk, x.ready, "turn_end");
-	const u = unready(r, x.ready, () => mk(undefined, true));
-	const p = u.r.p && (u.r.p.folds.length || u.r.p.cutIdx !== null) ? u.r.p : null;
+	const b2b = x.justEdited && x.pWarm >= 0.5;
+	const { r, note } = b2b ? { r: first, note: undefined } : adopt(first, mk, x.ready, "turn_end");
+	const u = b2b ? { r: first, produce: first.p?.cutIdx !== null && first.p && !x.ready.some((a) => a.key === first.p!.firstKeptEntryId) ? first.p : null } : unready(r, x.ready, () => mk(undefined, true));
+	const p = !b2b && u.r.p && (u.r.p.folds.length || u.r.p.cutIdx !== null) ? u.r.p : null;
 	const after = p ? p.ctxAfterFolds - (p.cutIdx !== null ? p.scale.c * (p.prefixTokens - p.summaryTokensPlanned) : 0) : (first.p?.ctxTokens ?? 0);
-	const room = roomFor(after, p && p.cutIdx !== null ? (p.firstKeptEntryId ?? undefined) : undefined);
-	return { kind: "plan", o: u.r.o, p, notes: note ? [note] : [], produce: room ? null : u.produce, room };
+	const room = roomOf(after, first.o, () => planContext(x.entries, x.opts(undefined, false, []).o), p?.cutIdx !== null ? (p?.firstKeptEntryId ?? undefined) : undefined);
+	const produce = room ? null : u.produce;
+	return b2b ? { kind: "b2b", produce, room } : { kind: "plan", o: u.r.o, p, notes: note ? [note] : [], produce, room };
 }
 
 /** The one wait (theory 1.4 R9): when the view after a turn_end's edit (`after`) is still at Pi's compaction room, the plan at the
@@ -378,23 +375,32 @@ export const valvePlanOf = (p: PlanResult, cut: Cut | null, ready: boolean, wait
 	untouched: sizeOf(p.scale, untouchedEst(p.blocks, p.folds, !!cut)), ...(cut ? { waitMs } : {}), ...(cut && ready ? { ready: "background" as const } : {}),
 });
 
-/** The plans at settle: the return after a pause (`cold`: P = 0, pause) and, unless the newest request carried an edit (b2b), the
- *  return within the cache life (`warm`: P = 1), each taking a produced summary (adopt). */
-export function decideSettle(x: { justEdited: boolean; avail: readonly Avail[]; entries: Any[]; cold: (cutAt?: string) => { o: PlanOpts; cal: Scale }; warm: (cutAt?: string) => { o: PlanOpts } }): { p: PlanResult | null; cal: Scale; w: PlanResult | null; notes: Note[] } {
-	const notes: Note[] = [];
-	const mc = (cutAt?: string) => {
-		const { o, cal } = x.cold(cutAt);
-		return { cal, p: planContext(x.entries, o) };
-	};
-	const c = adopt(mc(), mc, x.avail, "settle_cold");
-	if (c.note) notes.push(c.note);
-	const { p, cal } = c.r;
-	let w: PlanResult | null = null;
-	if (!x.justEdited) {
-		const mk = (cutAt?: string) => ({ p: planContext(x.entries, x.warm(cutAt).o) });
-		const { r, note } = adopt(mk(), mk, x.avail, "settle");
-		if (note) notes.push(note);
-		w = r.p;
+/** One producer rule, triggered by a decision, settle, or the timer. Decisions supply the cut their call-priced plan wants.
+ *  Settle also asks about a return at 30 s; the timer asks only about the first paying pause. Produced/running cuts are never
+ *  produced again. The timer's deadline remains relative to the last touch, so re-planning cannot slide it into the future. */
+export function want(x: { at: "decision" | "settle" | "timer"; now: number; lastTouch: number; ttlMs: number; survival: (gapS: number) => number;
+	avail: readonly Avail[]; candidate?: PlanResult | null; plan: (p: number, pause: boolean, avail: readonly Avail[]) => PlanResult | null;
+	latency: (p: PlanResult) => number }): { p: PlanResult; start: number; gapS?: number } | null {
+	const fresh = (p: PlanResult | null | undefined) => p && p.cutIdx !== null && !x.avail.some((a) => a.key === p.firstKeptEntryId) ? p : null;
+	if (x.at === "decision") {
+		const p = fresh(x.candidate);
+		return p ? { p, start: x.now } : null;
 	}
-	return { p, cal, w, notes };
+	if (!x.lastTouch) return null;
+	if (x.at === "settle") {
+		const p = fresh(x.plan(x.survival(30), false, x.avail));
+		if (p && !x.avail.some((a) => a.running)) return { p, start: x.now };
+	}
+	// A summary already produced (or running) that the cold return can take covers that return.
+	const cold = x.plan(0, true, x.avail);
+	if (cold?.cutIdx !== null && cold && x.avail.some((a) => a.key === cold.firstKeptEntryId)) return null;
+	const tau = x.ttlMs / 1000;
+	const gaps = [...new Set([tau, tau + 1, ...GAP_EDGES.filter((g) => g >= tau).flatMap((g) => [g, g + 1]), 7200])].sort((a, b) => a - b);
+	for (const gapS of gaps) {
+		const p = x.plan(x.survival(gapS), true, []);
+		if (!p || p.cutIdx === null) continue;
+		if (!fresh(p)) return null;
+		return { p, start: x.lastTouch + gapS * 1000 - 1.5 * x.latency(p), gapS };
+	}
+	return null;
 }

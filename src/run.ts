@@ -1,19 +1,19 @@
 // The per-session shell behind index.ts: Pi's events, the run plan (F8) and the warm valve (F10) carried out and persisted at
-// turn_end, settle preparation and the away-timer for the summary (F12). The decisions themselves are pure functions in core.ts.
+// turn_end, the producer and its timer for the summary (F12). The decisions themselves are pure functions in core.ts.
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { lastMessageMs, lastPrompt, modelKey, payloadRetention, refused, ttlFor } from "./cache.ts";
 import { agentDir, curve, describe, lawPrices, loadStats, pWarm, record, sample, statsPath, GAP_EDGES, type Entry } from "./learn.ts";
 import { repairPayload } from "./guard.ts";
-import { adopt, checkEdits, clock, decideRun, inRunClock, decideSettle, decideTurnEnd, grow, headOf, lastRegrow, planOpts, readyOf, roomOf, runPlanOf, scaleOf, summarizedSince, unusedOf, valvePlanOf, SUMMARY_CUSTOM, type Artifact, type Avail, type Env, type Learned } from "./core.ts";
+import { adopt, checkEdits, clock, decideRun, inRunClock, want, decideTurnEnd, grow, headOf, lastRegrow, planOpts, readyOf, roomOf, runPlanOf, scaleOf, summarizedSince, unusedOf, valvePlanOf, SUMMARY_CUSTOM, type Artifact, type Avail, type Env, type Learned } from "./core.ts";
 import { fmtK, Stats, noticeDesc, noticeText, type NoticeAction, type NoticeData, type ZipControl } from "./notice.ts";
 import { applyPlanToMessages, buildBlocks, countUserTurns, G0, keepRecentTokensFor, piCanCompact, planContext, reserveTokensFor, sizeOf, UNIT, type Block, type Cut, type FoldTarget, type PlanOpts, type PlanResult, type RunPlan, type Scale, type SysInfo } from "./plan.ts";
 import { handleFor, PH_MARK, RECALL_TOOL } from "./placeholder.ts";
 import { branchOutputs, recalledHandlesFromBranch, resolveHandlesInBranch } from "./recall.ts";
 import { cleanupRecall, commandNamesRecall, fileRecallFor, materialize, parseRecallPath, recallRoot, recallRootShown, rewriteCommand, sidDir, type FileRecall } from "./recallfile.ts";
 import { buildCut } from "./summary.ts";
-import { type Any, COMMIT_CUSTOM, envInt, isKeystroke, PRODUCT, textOf, tok4 } from "./util.ts";
+import { type Any, COMMIT_CUSTOM, envInt, PRODUCT, textOf, tok4 } from "./util.ts";
 import { pendingSummary, replayGrowth } from "./state.ts";
 import { fmtLife, type CardData, type ChartBin, type StateWord } from "./ui.ts";
 
@@ -25,14 +25,6 @@ export const NOTICE_CUSTOM = "pi-zip/notice"; // a fold/summary notice kept in t
 export { checkEdits, SUMMARY_CUSTOM };
 /** Written by 0.3.x for a background summary nobody adopted: still read, so the totals of an older session stay honest. */
 const LEGACY_UNUSED_CUSTOM = "pi-zip/unused-summary";
-export const AWAY_FRACTION = 0.8; // the away-timer fires this far into the cache lifetime
-/** Pi's idle cache warmer decides before each refresh at 0.9 x TTL, at least 10 s before expiry (core/cache-warmer.js getCacheWarmingDelayMs);
- *  undefined: a lifetime of 10 s or less, which Pi never warms. */
-export const warmingDelayMs = (ttlMs: number): number | undefined => (ttlMs <= 10_000 ? undefined : Math.max(1, Math.floor(Math.min(ttlMs * 0.9, ttlMs - 10_000))));
-/** How long after a due warming decision pi-zip concludes that none is coming (15 s at a 5-minute TTL). */
-const warmingMargin = (ttlMs: number): number => Math.max(1_000, Math.min(15_000, 0.05 * ttlMs));
-/** A refresh lands this soon after a "warm" decision (it is one tiny request): 10 s at a 5-minute TTL. */
-const warmCheckMs = (ttlMs: number): number => Math.min(10_000, ttlMs / 8);
 // Other context managers rewrite the view too (F14); two writers give unpredictable results, so we pause and keep only the Guard.
 const CONFLICT_RE = /billion-context|bc-pi|magic-context|smart-compact|hot-compact|context-prune|pi-vcc|context-mode|prefix-cache/i;
 
@@ -482,43 +474,10 @@ export class Zip implements ZipControl {
 		this.ledger({ type: "session_start", off: this.off, quiet: this.quiet, conflict: this.conflict, ...(recallFilesRemoved ? { recallFilesRemoved } : {}) });
 	}
 
-	/** A resumed (or restarted, reloaded, forked) process arms the away timer from the branch's last request, as `settle` would have after
-	 *  it (formal TRIAGE (a) 7): the summary for the next cold return is prepared while the user is away, not while they wait. Only when
-	 *  the session ended on a finished response (a run cut off mid-tool has no settle point) and the plan for it has a cut. Called after
-	 *  the recall mode is known (it decides which outputs fold, so which plan the return will make). */
-	resumeAway(ctx: Any) {
-		try {
-			const branch = this.branch(ctx);
-			if (!this.active() || !ctx?.hasUI || !ctx?.model) return;
-			const last = [...branch].reverse().find((en: Any) => en?.type === "message" && en.message);
-			const m = last?.message;
-			if (m?.role !== "assistant" || m.stopReason === "toolUse") return;
-			const entries = ((ctx.sessionManager.buildSessionProjection() as Any)?.entries ?? []) as Any[];
-			if (!entries.length) return;
-			this.loadEnt(modelKey(ctx.model));
-			const { o } = this.opts(ctx, true, entries, 0, true);
-			const p = planContext(entries, o);
-			const now = this.judgeNow(ctx, branch);
-			let delayMs: number | null = null;
-			if (p && p.cutIdx !== null) {
-				const at = lastMessageMs(branch);
-				// only while the cache the session left is not yet dead (a restart between the 0.8 mark and the TTL starts the call at once, as
-				// the live process's timer would have already): a session left longer than that returns cold, and the run plan of its next
-				// prompt handles it. Opening or /resuming an old session to browse it must not start a paid summary call.
-				delayMs = this.scheduleSummary(p, ctx, at || undefined, true);
-				this.ledger({ type: "away_resumed", timerMs: delayMs, lastRequestMs: at });
-			}
-			// the cache is already dead: opening the session costs nothing, but a prompt being typed says the user is here to work, and that
-			// prompt's plan wants exactly this summary; start it then so the typing time is not wasted. Only when the prompt itself will
-			// judge the return cold (learned survival, as beginRun): a cache that outlives its declared TTL gets a warm return, whose plan
-			// would throw a summary started here away.
-			if (delayMs !== null && delayMs < 0 && now.cold) this.armOnFirstKey(ctx);
-			// rule A after a restart: the cache is still alive and the warm return would summarise. The live process started that summary
-			// when the run ended; a reopened one starts it on the first key of a prompt (opening and closing the session costs nothing)
-			else if (!now.cold && this.warmCutNow(ctx, entries, now)) this.armOnFirstKey(ctx);
-		} catch (err) {
-			this.ledger({ type: "error", where: "resume_away", error: errText(err) });
-		}
+	/** Opening a session only arms a future producer deadline; browsing old history never starts a call. */
+	armProducer(ctx: Any) {
+		const branch = this.branch(ctx), last = [...branch].reverse().find((en) => en?.type === "message" && en.message)?.message;
+		if (last?.role === "assistant" && last.stopReason !== "toolUse") this.want("timer", ctx, undefined, undefined, true);
 	}
 
 	/** What a process that never left would know: growth g, "the newest response carried an edit" and "a summary was made in this warm
@@ -604,7 +563,6 @@ export class Zip implements ZipControl {
 	}
 
 	shutdown() {
-		this.disarmKey();
 		this.cancelTimer();
 		// a call still running is lost with the process: aborted, recorded as one unused call at the input it is billed for (a restarted
 		// process decides without it, as without any summary in flight); finished summaries are in the session already, or written now
@@ -659,7 +617,6 @@ export class Zip implements ZipControl {
 		this.liveCtx = ctx;
 		this.inRun = true;
 		this.cancelTimer(); // the user is back: nothing is started behind their back any more
-		this.disarmKey();
 		this.model = ctx?.model;
 		this.cold = false;
 		this.pause = false;
@@ -906,105 +863,10 @@ export class Zip implements ZipControl {
 		this.ledger({ type: "summary", via: "native", handlerMs, trigger, source: this.cold ? "settle" : "valve", count: cut.count, tokensBefore: before, prefixTokens: Math.round(p.scale.c * cut.prefixTokens), summaryTokens: Math.round(p.scale.c * cut.summaryTokens), ms: cut.ms, compactMs: ms, askMs, waitedMs: 0, llmOk: cut.llmOk, llmError: cut.llmError, costUsd: cut.costUsd, ...this.usageOf(cut) });
 	}
 
-	/** The unsubscribe of the first-keystroke listener (resumeAway), null when none is armed. */
-	private keyOff: (() => void) | null = null;
-	private disarmKey() {
-		const off = this.keyOff;
-		this.keyOff = null;
-		try {
-			off?.();
-		} catch {}
-	}
-
-	/** The return a prompt typed now would be, judged as beginRun judges it (learned survival, the request's tier). */
-	private judgeNow(ctx: Any, branch: Any[]): { cold: boolean; pWarm: number; pause: boolean } {
-		this.loadEnt(modelKey(ctx.model));
-		const d = clock(branch, { model: ctx.model, ent: this.ent, tier: this.tier(ctx.model) }, Date.now(), { reqMs: this.lastReqMs, modelKey: this.lastModelKey });
-		return { cold: d.cold, pWarm: d.pWarm, pause: d.pause };
-	}
-
-	/** The plan a warm prompt typed now would make, when it summarises (null: it makes none, or no edit at all right after an edited
-	 *  request), with the P(warm) and pause that prompt's run plan will use. */
-	private warmCutNow(ctx: Any, entries: Any[], now: { pWarm: number; pause: boolean }): PlanResult | null {
-		if (this.justEdited) return null;
-		const mk = (cutAt?: string) => {
-			const { o } = this.opts(ctx, true, entries, now.pWarm, now.pause, cutAt);
-			return { p: planContext(entries, o) };
-		};
-		const p = this.adopted(mk(), mk, "key", this.avail(this.branch(ctx))).p;
-		return p && p.cutIdx !== null ? p : null;
-	}
-
-	/** A reopened session whose cache is dead and whose cold plan would summarise, or whose cache is still alive and whose warm plan would
-	 *  (rule A: the live process would have started it when the run ended): start that summary once the user is typing a prompt
-	 *  (Pi API ctx.ui.onTerminalInput; never consumes or alters the data). A key alone is not enough: Ctrl+C, Ctrl+D, Esc, arrows and
-	 *  `/quit` or `/resume` are how a session is left without working in it. After each key (once Pi's editor has taken it) the editor
-	 *  text decides: non-empty and not a command (`/...`). The prompt that follows takes the summary if it is ready, else its folds
-	 *  alone; the call goes on and a later decision takes it (no second call). A session opened and closed without typing a prompt makes no
-	 *  call (shutdown unsubscribes). Nothing without a UI (`pi -p`, a subagent) or without ctx.ui.getEditorText. */
-	private armOnFirstKey(ctx: Any) {
-		this.disarmKey();
-		const ui = ctx?.ui;
-		if (!ctx?.hasUI || typeof ui?.onTerminalInput !== "function" || typeof ui?.getEditorText !== "function") return;
-		let queued = false;
-		try {
-			const off = ui.onTerminalInput((data: string) => {
-				if (queued || !isKeystroke(data)) return undefined; // a terminal report (focus, cursor position, cell size, ...) is not the user
-				queued = true;
-				// after Pi's editor handled this key (the listener runs before it), off the input path: the planning below must not delay the key
-				setImmediate(() => {
-					queued = false;
-					if (this.keyOff !== off) return; // disarmed meanwhile (a prompt, a run, shutdown)
-					let text = "";
-					try {
-						text = String(ui.getEditorText() ?? "");
-					} catch {}
-					const t = text.trimStart();
-					if (!t || t.startsWith("/")) return; // nothing typed yet, or a command (/quit, /resume, /model, ...): stay armed
-					this.disarmKey();
-					this.startOnKey(ctx);
-				});
-				return undefined; // the input goes on to Pi untouched
-			});
-			this.keyOff = off;
-			this.ledger({ type: "key_armed" });
-		} catch (err) {
-			this.ledger({ type: "error", where: "arm_key", error: errText(err) });
-		}
-	}
-
-	/** The user is typing a prompt: plan the return again on the session as it is now (a /model or /tree before it may have changed
-	 *  it), judged cold or warm as the prompt will judge it, with the P(warm) and pause its own run plan will use, and, when that plan
-	 *  has a cut, write the summary in the background, as the away timer (cold) or the end of the run (warm, rule A) would have. */
-	private startOnKey(ctx: Any) {
-		try {
-			if (!this.active() || this.bg) return;
-			const entries = ((ctx.sessionManager.buildSessionProjection() as Any)?.entries ?? []) as Any[];
-			if (!entries.length || !ctx?.model) return;
-			const now = this.judgeNow(ctx, this.branch(ctx));
-			if (!now.cold) {
-				const w = this.warmCutNow(ctx, entries, now);
-				if (!w) return;
-				this.startBg(w, ctx);
-				this.ledger({ type: "key_start", key: w.firstKeptEntryId, warm: true });
-				return;
-			}
-			const { o } = this.opts(ctx, true, entries, now.pWarm, now.pause);
-			const p = planContext(entries, o);
-			if (!p || p.cutIdx === null) return;
-			this.awaySig = this.contextSig(ctx);
-			this.startBg(p, ctx);
-			this.ledger({ type: "key_start", key: p.firstKeptEntryId });
-		} catch (err) {
-			this.ledger({ type: "error", where: "start_on_key", error: errText(err) });
-		}
-	}
-
 	private cancelTimer() {
 		this.timerGen++;
 		if (this.timer) clearTimeout(this.timer);
 		this.timer = null;
-		this.awayPlan = null;
 	}
 
 	/** The call in flight, if any, ends unused: aborted, and recorded at once (in the session it belongs to, whatever the aborted call
@@ -1060,15 +922,6 @@ export class Zip implements ZipControl {
 		return readyOf(branch, this.mine).map((a) => ({ key: a.key, running: false }));
 	}
 
-	/** produce(c) (theory 1.4 R8): the summary for this plan's cut is written in the background, unless a call is running (one call at
-	 *  a time; it is used once ready, if a plan then still wants it) or the summary is ready already. A running call whose range is no
-	 *  longer the session's prefix (the branch builds another projection, or its cut left it) is void: it is ended first (startBg). */
-	private produce(p: PlanResult, ctx: Any, where: "run" | "turn_end") {
-		const b = this.bg, head = headOf(this.branch(ctx));
-		const running = !!b && b.head === head && p.blocks.some((x) => x.entryId === b.key);
-		if (!running) this.startBg(p, ctx);
-		this.ledger({ type: "produce", where, key: p.firstKeptEntryId, ...(running ? { running: b!.key } : {}) });
-	}
 
 	/**
 	 * The one wait (theory 1.4, R9): at a turn_end whose view after the decision's edit is still at Pi's compaction room, the plan's own
@@ -1188,14 +1041,14 @@ export class Zip implements ZipControl {
 		// never dropped here: the run plan below carries it
 		if (d.kind === "b2b") {
 			this.ledger({ type: "b2b_skip", where: "run" });
-			if (d.produce) this.produce(d.produce, ctx, "run");
+			if (d.produce) this.want("run", ctx, d.produce);
 			return;
 		}
 		for (const n of d.notes) this.ledger(n);
 		const { o, cal, p, onPre } = d;
 		this.lawLedger("run", o);
 		// a cut with no ready summary: the plan is its folds alone (by the law), and the summary is written in the background
-		if (d.produce) this.produce(d.produce, ctx, "run");
+		if (d.produce) this.want("run", ctx, d.produce);
 		const native = nat?.cut ?? null;
 		if (!p && !native) return; // the law does not fire (below the working view, or a rewrite that does not pay back)
 		this.runEdits = true;
@@ -1228,190 +1081,65 @@ export class Zip implements ZipControl {
 		return u ? { summaryUsage: { input: u.input, output: u.output, cacheRead: u.cacheRead, cacheWrite: u.cacheWrite } } : {};
 	}
 
-	/**
-	 * Prepare the next return while the user is away (interactive only; print and json mode exit right after settle, so there is
-	 * nothing to prepare and nothing is ever started in the background). The plans themselves are local and free; only a summary needs
-	 * a model call. Rule A: when even a warm return (the next prompt within the cache's lifetime) would summarise, that summary is
-	 * started now: it is needed either way, and the user does not wait for it at the return. A cold plan that cuts elsewhere (or not at
-	 * all) gets the away timer: its summary is started 0.8 x TTL after the last request, if the user has not come back by then.
-	 */
+	/** Settle writes pending artifact records; only an interactive session prepares another return. */
 	async settle(e: Any, ctx: Any): Promise<Any> {
 		this.inRun = false;
-		const recs = this.drafts(); // summaries recorded during the run go with the settle drafts
-		const out = await this.prepare(e, ctx);
-		return recs.length ? { entries: [...(out?.entries ?? e.entries), ...recs] } : out;
+		const recs = this.drafts();
+		this.want("settle", ctx, undefined, e.context.contextEntries);
+		return recs.length ? { entries: [...e.entries, ...recs] } : undefined;
 	}
-	private async prepare(e: Any, ctx: Any): Promise<Any> {
-		if (!this.active() || !ctx.hasUI) return undefined;
+
+	/** The shell for core.want: one background start and one timer slot, shared by all three triggers. */
+	private want(at: "run" | "turn_end" | "settle" | "timer", ctx: Any, candidate?: PlanResult | null, entries?: Any[], futureOnly = false) {
+		const decision = at === "run" || at === "turn_end";
+		if (!this.active() || !ctx?.model || (!decision && (!ctx.hasUI || this.inRun))) return;
 		try {
-			const t0 = performance.now();
-			const entries = e.context.contextEntries;
-			// rule A: the plan a warm return would make (none right after an edited request: that return makes no edit, b2b). If it summarises,
-			// the summary is needed whether the user comes back warm or not at all soon, so it is written now, not at 0.8 x TTL
-			const { p, cal, w, notes } = decideSettle({
-				justEdited: this.justEdited, avail: this.avail(this.branch(ctx)), entries,
-				cold: (cutAt) => this.opts(ctx, true, entries, 0, true, cutAt), warm: (cutAt) => this.opts(ctx, true, entries, 1, false, cutAt),
+			this.liveCtx = ctx;
+			this.loadEnt(modelKey(ctx.model));
+			const branch = this.branch(ctx), view = entries ?? ctx.sessionManager.buildSessionProjection().entries;
+			const now = Date.now(), ttlMs = ttlFor(ctx.model, branch, this.tier(ctx.model));
+			// Only a call whose range left the current prefix may be replaced outside the room.
+			if (this.bg && (this.bg.head !== headOf(branch) || !(candidate ? candidate.blocks.some((b) => b.entryId === this.bg!.key) : view.some((e: Any) => e.sourceEntry?.id === this.bg!.key)))) this.discardBg("replaced");
+			const w = want({ at: decision ? "decision" : at, now, lastTouch: Math.max(this.lastReqMs, lastMessageMs(branch)), ttlMs, avail: this.avail(branch), candidate,
+				survival: (g) => process.env.PI_ZIP_TTL_SECS ? (g <= ttlMs / 1000 ? 1 : 0) : pWarm(this.ent, g, ttlMs / 1000).p,
+				plan: (p, pause, have) => {
+					const keys = have.map((a) => a.key), mk = (cutAt?: string) => ({ p: planContext(view, this.opts(ctx, true, view, p, pause, cutAt, false, keys).o) });
+					return adopt(mk(), mk, have, "want").r.p;
+				}, latency: (p) => this.ent?.call ? this.ent.call.ms * p.prefixTokens / this.ent.call.tokens : 0,
 			});
-			for (const n of notes) this.ledger(n);
-			this.cancelTimer();
-			const cKey = p && p.cutIdx !== null ? p.firstKeptEntryId : null;
-			const wKey = w && w.cutIdx !== null ? w.firstKeptEntryId : null;
-			// a call for neither return's cut is never used
-			if (this.bg && this.bg.key !== cKey && this.bg.key !== wKey) this.discardBg("replaced");
-			const early = !!wKey && this.startBg(w!, ctx);
-			// the away timer, always: for a cold plan with a cut no summary covers yet it starts that summary; for one an early summary
-			// already covers it does nothing (startBg keeps it); for one without a cut, or no plan at all (below the working view), it does
-			// nothing either. In every case, if Pi's own compaction or another extension's edit rewrites the context while the user is away,
-			// runAway plans again on the context as it is and drops a summary (an early one too) written for the old one
-			const scheduledMs = this.scheduleSummary(p ?? w, ctx);
-			this.ledger({ type: "settle_plan", folds: p?.folds.length ?? 0, summary: cKey !== null, timerMs: scheduledMs, ...(cKey ? { coldCut: cKey } : {}), ...(wKey ? { warmCut: wKey, early } : {}), ...this.calOf(cal), ctxBefore: Math.round(p?.ctxTokens ?? w?.ctxTokens ?? 0), ms: Math.round(performance.now() - t0) });
-			if (!p || (!p.folds.length && p.cutIdx === null)) return undefined;
-			// ids only: placeholders and summary text are recomputed (they are pure functions of the session), never stored a second time
-			const data = { policy: PRODUCT, ts: Date.now(), targets: p.folds.map((t) => t.entryId), cutKey: p.firstKeptEntryId };
-			return { entries: [...e.entries, { type: "custom", customType: PLAN_CUSTOM, data }] };
-		} catch (err) {
-			this.ledger({ type: "error", where: "settle", error: errText(err) });
-			return undefined; // never break the session
-		}
-	}
-
-	/** Start the away-timer for a summary; returns the delay in ms (-1: `alive` was asked for and the cache is already dead, nothing is armed).
-	 *  `alive` (a resumed process): arm only while the last request's cache has not expired yet (now < last + TTL; the delay is 0 from the
-	 *  0.8 mark on, where the live process's timer would already have fired). unref'd: it never keeps the process alive. */
-	private scheduleSummary(p: PlanResult | null, ctx: Any, lastMs?: number, alive = false): number {
-		const ttl = ttlFor(ctx.model, this.branch(ctx), this.tier(ctx.model));
-		const last = lastMs ?? (this.lastReqMs || Date.now());
-		const warm = this.idleWarming() ? warmingDelayMs(ttl) : undefined;
-		if (warm !== undefined) {
-			// Pi keeps the cache warm between runs (cacheWarming "idle") and decides before each refresh, at its warming delay: a summary
-			// written now would be thrown away at a warm return, so it waits for Pi's decision (cacheWarmingDecision); should none come
-			// (Pi is not warming this request after all), it starts just after the decision was due
-			const due = last + warm + warmingMargin(ttl) - Date.now();
-			if (alive && Date.now() >= last + ttl) return -1;
-			this.awaySig = this.contextSig(ctx);
-			this.awayPlan = { p, ctx };
-			const delay = Math.max(0, due);
-			this.armAway(delay, () => this.startAway("no warming decision"));
-			return Math.round(delay);
-		}
-		const due = last + AWAY_FRACTION * ttl - Date.now();
-		if (alive && Date.now() >= last + ttl) return -1;
-		this.awaySig = this.contextSig(ctx);
-		const delay = Math.max(0, due);
-		this.armAway(delay, () => void this.runAway(p, ctx));
-		return Math.round(delay);
-	}
-
-	/** What the model would see of the branch, by its newest context entry: a message, edit, compaction or summary (our own bookkeeping
-	 *  entries and other extensions' custom entries change nothing). A different one at the timer than at settle means something
-	 *  rewrote the context in between (Pi's compaction, another extension's edit). */
-	private awaySig = "";
-	private contextSig(ctx: Any): string {
-		const branch = this.branch(ctx);
-		for (let i = branch.length - 1; i >= 0; i--) {
-			const t = branch[i]?.type;
-			if (t === "message" || t === "context_edit" || t === "compaction" || t === "branch_summary" || t === "custom_message") return `${t}:${branch[i].id}`;
-		}
-		return "";
-	}
-
-	/** One timer for the away summary (unref'd: it never keeps the process alive); a newer one, or the user's return, cancels it. */
-	private armAway(delayMs: number, fn: () => void) {
-		if (this.timer) clearTimeout(this.timer);
-		const gen = ++this.timerGen;
-		this.timer = setTimeout(() => {
-			this.timer = null;
-			if (gen === this.timerGen && this.active()) fn(); // else the user came back, or we were switched off
-		}, Math.max(0, delayMs));
-		this.timer.unref?.();
-	}
-
-	// ---- Pi's own idle cache warming (research pi-tricks §3.3): observed, never answered ----------------------------------------
-	private awayPlan: { p: PlanResult | null; ctx: Any } | null = null; // a summary (or none: a re-plan if the context changes) waiting for Pi's warming decision
-	/** Does Pi refresh the cache between runs by itself? (settings cacheWarming "idle"; the default "streaming" warms only during a run)
-	 *  Pi reads it from the global settings only (settings-manager getCacheWarmingMode: warming costs money), so a project-level "idle"
-	 *  in the merged settings warms nothing: the global file decides; only when it cannot be read do the merged settings. */
-	private idleWarming(): boolean {
-		try {
-			if (this.pi.getSettings?.()?.cacheWarming !== "idle") return false;
-		} catch {
-			return false;
-		}
-		try {
-			const global = JSON.parse(readFileSync(join(agentDir(), "settings.json"), "utf8"));
-			return global?.cacheWarming === "idle";
-		} catch {
-			return true;
-		}
-	}
-	private startAway(reason: string) {
-		const a = this.awayPlan;
-		this.awayPlan = null;
-		if (!a) return;
-		this.ledger({ type: "away_unblocked", reason });
-		void this.runAway(a.p, a.ctx);
-	}
-	/** cache_warming_decision: Pi is about to refresh the cache ("warm") or to let it expire ("stop"). Only observed: never answered.
-	 *  While Pi warms, the away summary waits; once Pi stops, it is prepared as without warming (the cache now expires on its own). */
-	cacheWarmingDecision(e: Any): undefined {
-		const action = e?.action;
-		this.ledger({ type: "cache_warming", action, warmCost: e?.warmCost, missCost: e?.missCost, p: e?.continuationProbability, waiting: !!this.awayPlan });
-		const a = this.awayPlan;
-		if (!a || !this.active()) return undefined;
-		if (action === "stop") {
-			this.armAway(0, () => {
-				this.awayPlan = a;
-				this.startAway("Pi stopped warming");
-			});
-			return undefined;
-		}
-		if (action !== "warm") return undefined;
-		// Pi refreshes now, unless another extension overrides the decision (its answer is not visible here): a refresh shows up as a
-		// cache_warm usage entry within seconds. With one, wait for the next decision; without one, Pi stopped: prepare the summary now.
-		const t = Date.now(), ttl = ttlFor(a.ctx.model, this.branch(a.ctx), this.tier(a.ctx.model));
-		this.ledger({ type: "away_postponed", reason: "Pi warms the cache" });
-		this.armAway(warmCheckMs(ttl), () => {
-			this.awayPlan = a;
-			let done = NaN; // when the refresh finished: its cache_warm entry is appended right before Pi schedules the next decision
-			for (const en of this.branch(a.ctx)) if (en?.type === "usage" && en.kind === "cache_warm" && Date.parse(en.timestamp) >= t) done = Date.parse(en.timestamp);
-			if (Number.isNaN(done)) return this.startAway("no refresh after a warm decision");
-			// Pi's next decision is due one warming delay after the refresh finished (cache-warmer.js schedule), not after the decision
-			this.armAway(done + (warmingDelayMs(ttl) ?? ttl) + warmingMargin(ttl) - Date.now(), () => {
-				this.awayPlan = a;
-				this.startAway("no warming decision");
-			});
-		});
-		return undefined;
-	}
-
-	private async runAway(p0: PlanResult | null, ctx: Any) {
-		if (!this.active()) return;
-		let p = p0;
-		if (this.contextSig(ctx) === this.awaySig && (!p0 || p0.cutIdx === null)) return; // nothing was planned and nothing changed
-		if (this.contextSig(ctx) !== this.awaySig) {
-			// something rewrote the context since the plan was made (Pi's own compaction, another extension's edit): the summary prepared
-			// for the old plan would be discarded at the return (its cut is not this plan's). Plan again on the session as it is now.
-			try {
-				const entries = ((ctx.sessionManager.buildSessionProjection() as Any)?.entries ?? []) as Any[];
-				const { o } = this.opts(ctx, true, entries, 0, true);
-				const q = entries.length ? planContext(entries, o) : null;
-				this.ledger({ type: "away_replan", from: p0?.firstKeptEntryId ?? null, to: q?.firstKeptEntryId ?? null });
-				// a call started before (an early one, rule A) reads a context that no longer exists: never used, whatever its cut
-				this.discardBg("replaced");
-				if (!q || q.cutIdx === null) return;
-				p = q;
-			} catch (err) {
-				this.ledger({ type: "error", where: "away_replan", error: errText(err) });
-				return;
+			if (!decision) this.cancelTimer();
+			if (decision && candidate) this.ledger({ type: "produce", where: at, key: candidate.firstKeptEntryId, ...(this.bg ? { running: this.bg.key } : {}) });
+			if (!w) return;
+			const delay = w.start - now;
+			this.ledger({ type: "want", at, key: w.p.firstKeptEntryId, start: w.start, gapS: w.gapS, timerMs: Math.max(0, Math.round(delay)) });
+			if (delay <= 0) {
+				if (!futureOnly && !this.bg) this.startBg(w.p, ctx);
+				// After the warm start, ask the same rule for the pause's deadline.
+				if (at === "settle") this.want("timer", ctx, undefined, view);
+			} else if (!decision) {
+				const gen = ++this.timerGen;
+				this.timer = setTimeout(() => {
+					this.timer = null;
+					if (gen === this.timerGen) this.want("timer", ctx);
+				}, delay);
+				this.timer.unref?.();
 			}
+		} catch (err) { this.ledger({ type: "error", where: "want", error: errText(err) }); }
+	}
+
+	/** Pi's idle warming is a cache touch, never a producer wake or an answer to Pi's decision. */
+	cacheWarmingDecision(e: Any, ctx: Any): undefined {
+		if (e?.action === "warm") {
+			this.lastReqMs = Date.now();
+			this.want("timer", ctx, undefined, undefined, true);
 		}
-		if (p) this.startBg(p, ctx); // keeps a summary for this very cut (an early one, say); ends any other call
+		return undefined;
 	}
 
 	/** Write the summary for `p` in the background (its own abort signal: nothing is running, so the run's would be stale). Nothing
 	 *  when one for the same cut of the same projection is ready or being written (false); any other call in flight is ended first. */
 	private startBg(p: PlanResult, ctx: Any): boolean {
-		const branch = this.branch(ctx), head = headOf(branch), key = p.firstKeptEntryId;
+		const branch = this.branch(ctx), head = headOf(branch), key = p.firstKeptEntryId, model = modelKey(ctx.model);
 		if (key === null) return false;
 		if (this.bg && this.bg.key === key && this.bg.head === head) return false;
 		if (readyOf(branch, this.mine).some((a) => a.key === key)) return false;
@@ -1425,6 +1153,8 @@ export class Zip implements ZipControl {
 			.then((c) => {
 				end();
 				if (bg.aborted) return null; // recorded as unused when it was ended
+				const learned = record(model, { explicit: false, total: 0, call: { ms: c.ms, tokens: Math.max(1, c.prefixTokens) } });
+				if (this.entKey === model) this.ent = learned;
 				this.stats.summaryUsd += c.costUsd;
 				this.ledger({ type: "away_summary", key, ms: c.ms, llmOk: c.llmOk, costUsd: c.costUsd, ...this.usageOf(c) });
 				this.record({ head, key, cut: c, usd: c.costUsd });
@@ -1503,19 +1233,13 @@ export class Zip implements ZipControl {
 		const ents = e.context.contextEntries;
 		const d = decideTurnEnd({ failed, justEdited: this.justEdited, pWarm: pIn, ready: this.ready(branch), entries: ents, opts: (cutAt, foldsOnly, ready) => this.opts(ctx, false, ents, pIn, false, cutAt, foldsOnly, ready) });
 		if (d.kind === "none") return undefined;
-		if (d.kind === "b2b") { // the request that just ended carried a fresh edit: no warm edit on the very next one (no back-to-back warm rewrites)
-			this.ledger({ type: "b2b_skip", where: "turn_end" });
-			if (d.produce) this.produce(d.produce, ctx, "turn_end");
-			if (!d.room) return undefined;
-			const got = await this.roomWait(d.room, ctx); // b2b does not block the room wait (theory 1.3 R6)
-			return got ? this.commit(e, ctx, valvePlanOf(d.room, got.cut, false, got.ms, performance.now() - t0), o) : undefined;
+		if (d.kind === "b2b") this.ledger({ type: "b2b_skip", where: "turn_end" });
+		else {
+			for (const n of d.notes) this.ledger(n);
+			if (d.o.trace?.length) this.lawLedger("turn_end", d.o);
 		}
-		// nothing below the working view; above it the plan the law accepts at the in-run P (I6, F10), from the next request on: with a
-		// ready summary, or its folds alone while the summary is written in the background
-		for (const n of d.notes) this.ledger(n);
-		if (d.o.trace?.length) this.lawLedger("turn_end", d.o);
-		if (d.produce) this.produce(d.produce, ctx, "turn_end");
-		let p = d.p, cut: Cut | null = null, ready = false, waitMs = 0;
+		if (d.produce) this.want("turn_end", ctx, d.produce);
+		let p = d.kind === "plan" ? d.p : null, cut: Cut | null = null, ready = false, waitMs = 0;
 		if (d.room) { // still at Pi's compaction room after this edit: the one wait
 			const got = await this.roomWait(d.room, ctx);
 			if (got) [p, cut, waitMs] = [d.room, got.cut, got.ms];

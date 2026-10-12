@@ -1,6 +1,6 @@
 // The pure decision core (src/core.ts): view, clock, law, plan and decide as functions of (branch, Λ, now).
 import { describe, expect, test } from "bun:test";
-import { checkEdits, clock, coldReturnAfter, inRunClock, decideRun, decideSettle, decideTurnEnd, adopt, artifactsOf, grow, headOf, lastRegrow, lawOf, planOpts, readyOf, unready, unusedOf, runPlanOf, scaleOf, summarizedSince, valvePlanOf, type Env, type Learned } from "../src/core.ts";
+import { checkEdits, clock, coldReturnAfter, inRunClock, decideRun, want, decideTurnEnd, adopt, artifactsOf, grow, headOf, lastRegrow, lawOf, planOpts, readyOf, unready, unusedOf, runPlanOf, scaleOf, summarizedSince, valvePlanOf, type Env, type Learned } from "../src/core.ts";
 import { planContext, UNIT, type PlanResult } from "../src/plan.ts";
 import { replayGrowth } from "../src/state.ts";
 import { A, AX, R, U, type Any } from "./helpers.ts";
@@ -254,10 +254,15 @@ describe("core: decide", () => {
 		expect(valvePlanOf(p, cut, true, 0, 1)).toMatchObject({ waitMs: 0, ready: "background" });
 		expect(valvePlanOf(p, cut, false, 42, 1).waitMs).toBe(42);
 	});
-	test("decideSettle: the cold plan always; the warm plan unless the newest request carried an edit", () => {
-		const x = (justEdited: boolean) => decideSettle({ justEdited, avail: [], entries: big, cold: () => planOpts(big, [], env(), lam(), true, 0, true), warm: (cutAt) => planOpts(big, [], env(), lam(), true, 1, false, cutAt) });
-		expect(x(true).p).not.toBeNull();
-		expect(x(true).w).toBeNull();
-		expect(x(false).w).not.toBeNull();
+	test("want schedules the first paying pause from the last touch and measured call time", () => {
+		const p = planContext(big, planOpts(big, [], env(), lam(), true, 0, true).o)!;
+		const x = { at: "timer" as const, now: 100_000, lastTouch: 80_000, ttlMs: 300_000, avail: [], survival: (g: number) => g <= 300 ? 1 : 0,
+			plan: (prob: number) => prob < 0.5 ? p : null, latency: () => 40_000 };
+		expect(want(x)).toMatchObject({ p, start: 321_000, gapS: 301 });
+		expect(want({ ...x, now: 350_000 })?.start).toBe(321_000); // fixed deadline: due now, no drift
+		expect(want({ ...x, avail: [{ key: p.firstKeptEntryId!, running: true }] })).toBeNull();
+		expect(want({ ...x, at: "decision", candidate: p })?.start).toBe(x.now);
+		expect(want({ ...x, at: "settle", plan: () => p })?.start).toBe(x.now);
+		expect(want({ ...x, plan: () => null })).toBeNull();
 	});
 });

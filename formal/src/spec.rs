@@ -163,16 +163,13 @@ fn not_pushed_to_room() -> F<R> {
         i == 0 || r.st[i - 1].view_tok + r.st[i].appended < r.st[i].room || r.st[i0].view_tok >= r.st[i0].room
     })
 }
-/// The edit at this request takes the summary the cold plan frozen in i0 produced in the background because it could not be ready
-/// then (0.4.0 step 4: nobody waits; the summary goes in at the first decision after it is ready): not a regret of the cold plan, it
-/// had no summary to apply. It could not be ready when nothing prepares a return (no UI), when something happened during the absence
-/// (a restart, a switch, another compaction, a summary prepared for another cut), when the call is slow, or when the call the away
-/// timer started was still running. A return that simply found nothing prepared (the away timer never armed) is not excused.
+/// A later decision taking the summary the cold return produced is the specified not-ready case, not a regret of an edit that
+/// could have used that summary. Timer scheduling is checked separately; NR still checks warm folds and unrelated summaries.
 fn not_produced_by_i0() -> F<R> {
     atom("not_produced_by_i0", |r: &R, i, env: &Env| {
         let i0 = lookup(env, "i0") as usize;
         match (produced_at_return(r, i0), took_ready(r, i).or_else(|| room_waited(r, i))) {
-            (Some(p), Some(t)) if p == t => !unpreparable(r, i0),
+            (Some(p), Some(t)) if p == t => false,
             _ => true,
         }
     })
@@ -187,12 +184,6 @@ pub fn room_waited(r: &R, i: usize) -> Option<String> {
 /// A rewrite the room wait made (theory 1.4 R6: b2b does not block it).
 fn not_room_wait() -> F<R> {
     atom("not_room_wait", |r: &R, i, _| room_waited(r, i).is_none())
-}
-/// The summary a return at i0 wants could not have been prepared while away (see not_produced_by_i0).
-fn unpreparable(r: &R, i0: usize) -> bool {
-    let w = &r.trace.world;
-    let running = r.tick(i0).run_ledger.iter().any(|x| x.get("type").and_then(Value::as_str) == Some("produce") && x.get("running").is_some());
-    !w.interactive || w.slow || !r.tick(i0).env.is_empty() || running
 }
 fn after_i0() -> F<R> {
     atom("after_i0", |_r: &R, i, env: &Env| i > lookup(env, "i0") as usize)
@@ -323,6 +314,14 @@ pub fn axioms() -> Vec<Prop> {
                   summary still pays its call at its own margin.",
             evidence: Evidence::Conformance,
             f: always(zip_edit() >> pays()),
+        },
+        Prop {
+            id: "OC",
+            name: "one call and one timer",
+            from: &["A3"],
+            why: "the producer has at most one active summary call and one production timer; firing a timer never writes a session entry directly.",
+            evidence: Evidence::Conformance,
+            f: always(atom("one_call_one_timer", |r: &R, _, _| r.obs.producer.calls <= 1 && r.obs.producer.timers <= 1 && r.obs.producer.writes == 0)),
         },
         Prop {
             id: "A3",

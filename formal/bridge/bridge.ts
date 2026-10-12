@@ -62,12 +62,22 @@ class FakeDate extends RealDate {
 		return clock;
 	}
 }
-type Timer = { id: number; due: number; fn: () => void; dead: boolean };
+let producer = { calls: 0, timers: 0, writes: 0 };
+let timerFiring = false;
+const producerOwner = new AsyncLocalStorage<Any>();
+const activeCalls = new Set<object>();
+type Timer = { owner?: Any; id: number; due: number; fn: () => void; dead: boolean };
 let timers: Timer[] = [];
 let tid = 0;
 function fakeSetTimeout(fn: Any, ms?: number, ...a: Any[]) {
-	const t: Timer = { id: ++tid, due: clock + Math.max(0, Number(ms) || 0), fn: () => fn(...a), dead: false };
+	const owner = producerOwner.getStore();
+	const t: Timer = { owner, id: ++tid, due: clock + Math.max(0, Number(ms) || 0), fn: () => {
+		const before = timerFiring;
+		timerFiring = !!owner;
+		try { fn(...a); } finally { timerFiring = before; }
+	}, dead: false };
 	timers.push(t);
+	if (owner) producer.timers = Math.max(producer.timers, timers.filter((t) => !t.dead && t.owner === owner).length);
 	return { _t: t, unref() { return this; }, ref() { return this; }, hasRef: () => false, [Symbol.toPrimitive]: () => t.id };
 }
 function fakeClearTimeout(h: Any) {
@@ -112,12 +122,16 @@ Zip.prototype.sessionStart = function (this: Any, ctx: Any) {
 Zip.prototype.ledger = function (rec: Any) {
 	(this.__sink ?? sink).push(rec);
 };
-// a summary written in the background (Zip.startBg: the away timer, the first key, rule A, produce) is no wait, whenever it runs: its model
+// A summary written in the background (Zip.startBg: the shared producer) is no wait, whenever it runs: its model
 // call is tagged through the async context it was started in (the bridge's narrative model answers at once, so timing cannot tell)
 const bgCall = new AsyncLocalStorage<boolean>();
 const origStartBg = (Zip.prototype as Any).startBg;
 (Zip.prototype as Any).startBg = function (this: Any, ...a: Any[]) {
 	return bgCall.run(true, () => origStartBg.apply(this, a));
+};
+const origWant = (Zip.prototype as Any).want;
+if (origWant) (Zip.prototype as Any).want = function (this: Any, ...a: Any[]) {
+	return this.__probe ? origWant.apply(this, a) : producerOwner.run(this, () => origWant.apply(this, a));
 };
 const origOpts = Zip.prototype.opts;
 Zip.prototype.opts = function (this: Any, ...a: Any[]) {
@@ -201,6 +215,8 @@ async function runTrace(tr: Any): Promise<Any> {
 	timers = [];
 	slowCalls.clear();
 	narrativeCalls = [];
+	producer = { calls: 0, timers: 0, writes: 0 };
+	activeCalls.clear();
 	sink = [];
 	captured = null;
 	rmSync(join(WORK, "xdg"), { recursive: true, force: true });
@@ -256,7 +272,7 @@ async function runTrace(tr: Any): Promise<Any> {
 			registerCommand: () => {},
 			registerEntryRenderer: () => {},
 			registerToolRenderer: () => {},
-			appendEntry: (t: string, d: Any) => { if (!probe) manager.appendCustomEntry(t, d); },
+			appendEntry: (t: string, d: Any) => { if (!probe) { if (timerFiring) producer.writes++; manager.appendCustomEntry(t, d); } },
 			getAllTools: () => [],
 			getCommands: () => [],
 			getActiveTools: () => activeTools,
@@ -271,7 +287,14 @@ async function runTrace(tr: Any): Promise<Any> {
 			// Pi provides abort() even while idle; native compaction is instant here, with no foreign handler to cancel.
 			abort: () => {},
 			modelRegistry: {
-				complete: async (_m: Any, req: Any) => {
+				complete: async (_m: Any, req: Any, options?: Any) => {
+					const call = {}, end = () => activeCalls.delete(call);
+					if (!probe) {
+						activeCalls.add(call);
+						producer.calls = Math.max(producer.calls, activeCalls.size);
+						options?.signal?.addEventListener("abort", end, { once: true });
+					}
+					try {
 					const r = narrativeOf(req);
 					// the call's real tokens (the world's c per chars/4 token): an uncached read of the prompt, the narrative written
 					narrativeCalls.push({ phase: probe ? "probe" : bgCall.getStore() && phase === "present" ? "background" : phase, at: clock, input: Math.ceil(w.c * r.usage.input), output: Math.ceil(w.c * r.usage.output) });
@@ -280,10 +303,11 @@ async function runTrace(tr: Any): Promise<Any> {
 						await new Promise<void>((resolve) => {
 							const done = () => { if (slowCalls.delete(done)) resolve(); };
 							slowCalls.add(done);
-							fakeSetTimeout(done, SLOW_MS);
+							producerOwner.run(undefined, () => fakeSetTimeout(done, SLOW_MS));
 						});
 					}
 					return r;
+					} finally { end(); options?.signal?.removeEventListener("abort", end); }
 				},
 			},
 		};
@@ -1157,7 +1181,7 @@ async function runTrace(tr: Any): Promise<Any> {
 		timers = [];
 		uninstall();
 	}
-	return { id: tr.id, ok: errors.length === 0, errors, world: w, blocks, ticks, refreshes };
+	return { id: tr.id, producer, ok: errors.length === 0, errors, world: w, blocks, ticks, refreshes };
 }
 
 /** The real lawTerms on a list of numeric points (the symbolic lemmas are also checked against the code itself). */

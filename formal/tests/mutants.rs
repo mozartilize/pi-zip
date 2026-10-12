@@ -109,14 +109,6 @@ fn summary_prepared_away(gap: &str) -> String {
     lines(&v)
 }
 
-/// The same, with a run after the return long enough for a later decision to take a summary produced at the return.
-fn summary_prepared_away_run(gap: &str) -> String {
-    let mut v = vec![W, "prompt", "say 150K", "prompt +1h"];
-    v.extend(std::iter::repeat_n("call npm 100", 3));
-    v.extend(["say 100", gap, "call npm 100", "call npm 100", "say 100"]);
-    lines(&v)
-}
-
 #[test]
 fn a1_recall_through_the_tool() {
     caught("m01", "recall.ts", "const out = recallSections(items, { grep, range, offset, limit });", "const out = recallSections(items, { grep, range, offset, limit }); out.text = out.text.slice(0, 300);", "A1", &fold_and_recall());
@@ -223,26 +215,27 @@ fn wl_ready_summary_is_taken_not_produced_again() {
     caught("r4wl", "run.ts", "return readyOf(branch, this.mine).map((a) => ({ key: a.key, running: false }));", "return [];", "WL", &trace_file("wl-ready-taken.trace").replace(" native ", " nonative "));
 }
 
-/// Native completeness must catch a ready cut priced as a new call at the idle door, even if the request takes it later.
+/// Native completeness must catch a ready summary withheld at the idle door, even if the request takes it later.
 #[test]
-fn na_native_door_prices_ready_cuts_at_zero() {
+fn na_native_door_takes_a_ready_summary() {
     caught(
         "na1",
         "run.ts",
-        "this.opts(ctx, !pending, entries, this.pWarm, this.pause, cutAt, false, keys);",
-        "this.opts(ctx, !pending, entries, this.pWarm, this.pause, cutAt);",
+        "if (!p || !art?.cut) return skip",
+        "if (true || !p || !art?.cut) return skip",
         "NA",
         &trace_file("na-ready-native.trace"),
     );
 }
 
-/// The away timer prepares the summary a return after a pause wants, so the return's free rewrite carries it. 0.4.0: nobody waits,
-/// so a missing timer (m07) or one that fires after the return (m08) shows as a regret, not a wait: the return goes without the
-/// summary and a warm decision of the same run applies it (NR; the return could have prepared it, so it is not excused).
+/// Production availability is now an explicit NR excuse. Overlapping calls are a separate safety property.
 #[test]
-fn nr_away_timer() {
-    caught("m07", "run.ts", "this.armAway(delay, () => void this.runAway(p, ctx));", "void 0;", "NR", &summary_prepared_away_run("prompt +1h"));
-    caught("m08", "run.ts", "export const AWAY_FRACTION = 0.8;", "export const AWAY_FRACTION = 1.15;", "NR", &summary_prepared_away_run("prompt +330s"));
+fn one_call_and_one_timer() {
+    let trace = lines(&["world explicit known ttl=300 true=300 survival=none c=1 sys=3000 window=200000 nonative interactive slow", "prompt", "say 150K", "prompt +1h", "say 100", "prompt +1h", "call npm 100", "say 100"]);
+    caught("producer-overlap", "run.ts", "if (!futureOnly && !this.bg) this.startBg(w.p, ctx);", "if (!futureOnly && !this.bg) { this.startBg(w.p, ctx); this.bg = null; this.startBg(w.p, ctx); }", "OC", &trace);
+    let warming = trace.replace("interactive slow", "interactive warming");
+    caught("producer-timers", "run.ts", "if (!decision) this.cancelTimer();", "void 0;", "OC", &warming);
+    caught("producer-writes", "run.ts", "this.timer = null;\n\t\t\t\t\tif (gen === this.timerGen)", "this.timer = null; this.pi.appendEntry(\"pi-zip/summary\", {});\n\t\t\t\t\tif (gen === this.timerGen)", "OC", &trace);
 }
 
 #[test]
@@ -299,7 +292,7 @@ fn b2b_no_back_to_back() {
     // 0.4.0: the folds stop at the working view, so a second rewrite needs new candidates: the window slides at the next prompt.
     // traces/b2b-slide.trace is the shrunk counterexample of `check --suite standard --random 3000 --seed 1 --only B2B` on the mutant
     let t = trace_file("b2b-slide.trace");
-    caught_all("m10", "core.ts", &[("if (!cold && x.justEdited && !nat) {", "if (false) {", 1), ("if (x.justEdited && x.pWarm >= 0.5) {", "if (false) {", 1)], &["B2B"], &t);
+    caught_all("m10", "core.ts", &[("if (!cold && x.justEdited && !nat) {", "if (false) {", 1), ("const b2b = x.justEdited && x.pWarm >= 0.5;", "const b2b = false;", 1)], &["B2B"], &t);
 }
 
 #[test]
