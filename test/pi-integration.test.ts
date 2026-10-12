@@ -10,7 +10,7 @@ import { fileURLToPath } from "node:url";
 import { collapseSystemMessages, getCurrentSystemMessage, normalizeContext, resolveTranscript } from "@earendil-works/pi-ai";
 import { buildBlocks, calibrate, collapseSystem, editAllowed, planContext, UNIT, wireTokensOf } from "../src/plan.ts";
 import { decideTurnEnd, planOpts } from "../src/core.ts";
-import { loadStats, record } from "../src/learn.ts";
+import { lawPrices, loadStats, record } from "../src/learn.ts";
 import type { Any } from "./helpers.ts";
 // Pi's own draft application (AgentSession._applyBoundaryDrafts uses no instance state): the order of the drafts and the
 // tokensBefore Pi writes for a compaction draft are Pi's, not a re-implementation
@@ -347,6 +347,59 @@ describe("boundary decision regressions", () => {
 });
 
 describe("mixed room boundary", () => {
+	for (const outcome of ["room", "below room", "aborted"] as const) test(`an incoming edit of a carried target preserves the boundary decision (${outcome})`, async () => {
+		delete process.env.PI_ZIP_COLD_CAP;
+		let target = "", kept = "";
+		const r = await rig((sm) => {
+			sm.appendMessage(user("first"));
+			sm.appendMessage({ ...asst([{ type: "text", text: "p".repeat(300_000) }, call("large"), call("small")], "toolUse"), usage: undefined });
+			target = sm.appendMessage(result("large", "a".repeat(200_000)));
+			kept = sm.appendMessage(result("small", "b".repeat(20_000)));
+			sm.appendMessage(user("previous"));
+			sm.appendMessage({ ...asst([{ type: "text", text: "q".repeat(120_000) }]), usage: undefined });
+			sm.appendMessage(user("current"));
+		}, { start: false, tui: true, model: { ...MODEL, contextWindow: 200_000 }, boundary: (e) => ({ entries: [...e.entries,
+			{ type: "context_edit", targetId: target, replacement: { content: [{ type: "text", text: "incoming replacement" }] } },
+		] }) });
+		await r.beforeAgentStart();
+		let probability = 0;
+		const originalOpts = r.zip.opts.bind(r.zip);
+		r.zip.opts = (...args: Any[]) => {
+			const o = originalOpts(...args).o;
+			o.scale = UNIT; o.law = { pr: lawPrices("explicit", false), g: 1000, pWarm: probability };
+			return { o, cal: UNIT };
+		};
+		const request = await r.request();
+		expect(request.filter(isFolded)).toHaveLength(2);
+		expect([...r.zip.runPlan.applied]).toEqual([target, kept]);
+		await r.runner.emitBeforeProviderRequest({});
+		const response = { ...asst([call("growth")], outcome === "aborted" ? "aborted" : "toolUse"), timestamp: Date.now(), usage: undefined };
+		const id = r.sm.appendMessage(response);
+		await r.runner.emitMessageEnd({ type: "message_end", message: response } as Any);
+		expect(r.zip.justEdited).toBe(true);
+		probability = 1;
+		r.sm.appendMessage(result("growth", "g".repeat(outcome === "room" ? 320_000 : 40_000)));
+		const records: Any[] = [], ledger = r.zip.ledger.bind(r.zip);
+		r.zip.ledger = (note: Any) => { records.push(note); ledger(note); };
+		const drafts = await r.turnEnd(id, response);
+		expect(records.some((n) => n.type === "b2b_skip" && n.where === "turn_end")).toBe(outcome !== "aborted");
+		expect(records.filter((n) => n.type === "room_wait")).toHaveLength(outcome === "room" ? 1 : 0);
+		expect(drafts[0]).toMatchObject({ type: "context_edit", targetId: target });
+		const compaction = drafts.find((d) => d.type === "compaction");
+		if (outcome === "room") {
+			expect(compaction).toBeDefined();
+			expect(drafts[1]).toBe(compaction); // pi-zip's first draft follows the incoming edit
+			expect(compaction.details.carried).toBe(false);
+			const projection = r.sm.buildSessionProjection();
+			expect(buildBlocks(projection.entries).reduce((n, b) => n + b.tokens, 0)).toBeLessThan(175_424);
+			const persisted = r.sm.getBranch().findLast((e: Any) => e.type === "compaction") as Any;
+			const notice = r.sm.getBranch().findLast((e: Any) => e.customType === "pi-zip/notice" && !e.data?.kind) as Any;
+			expect(notice.data.before).toBe(persisted.tokensBefore);
+		} else expect(compaction).toBeUndefined();
+		expect(drafts.filter((d) => d.type === "context_edit").map((d) => d.targetId)).toEqual([target, kept]);
+		expect(r.zip.runPlan.persisted).toBe(true);
+		await r.shutdown();
+	});
 	test("carried views and one notice follow the real Pi requests across the room boundary", async () => {
 		const r = await rig((sm) => {
 			populate(sm, 3500);

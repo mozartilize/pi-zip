@@ -587,7 +587,7 @@ export interface RunPlan {
 }
 
 export interface PlanOpts {
-	carriedFolds?: readonly FoldTarget[]; // already sent folds: retain their exact placeholders when pricing the boundary edit
+	carriedFolds?: readonly FoldTarget[]; // reconciled sent folds: retain their exact placeholders when pricing the boundary edit
 	law?: Law; // prices, g and P(warm): the only input that depends on P; default: the explicit class ratios at P = 0
 	pause?: boolean; // a return after a pause (the absence outlived the requested cache lifetime) or a model switch: the previous user turn's re-readable outputs may fold
 	trace?: (LawTerms & { where: "summary" | "plan"; cut?: boolean; ready?: boolean; key?: string })[]; // every law evaluation is pushed here (ledger)
@@ -681,7 +681,7 @@ export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
 	if (!(ctxEst > coldCap)) return null; // below the working view nothing is planned (I6)
 	const trig = law.pWarm < 0.5 ? "cold" : "valve"; // a label for the ledger and the summary's trigger only
 	const tokOverride = new Map<number, number>();
-	const folds: FoldTarget[] = [...(o.carriedFolds ?? [])].filter((t) => blocks.some((b) => b.entryId === t.entryId && !b.edited));
+	const folds: FoldTarget[] = [...(o.carriedFolds ?? [])];
 	for (const t of folds) tokOverride.set(blocks.findIndex((b) => b.entryId === t.entryId), t.phTokens);
 	const visOfBlock: number[] = []; // block idx -> index among the non-system projected messages (the numbering a request view uses)
 	{

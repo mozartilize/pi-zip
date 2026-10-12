@@ -22,7 +22,7 @@ const mutants = [
 		name: "boundary-discards-new-folds",
 		pattern: "an output becoming 60 requests old",
 		check: "expect(received).toEqual(expected)",
-		edit: (source: string) => source.replace("const live = plan.folds.filter((t) => byId.has(t.entryId) && wasApplied(t));", "const live = plan.folds.filter((t) => byId.has(t.entryId) && wasApplied(t) && (!plan.carriedIds || plan.carriedIds.has(t.entryId)));")
+		edit: (source: string) => source.replace("const live = plan.folds.filter((t) => byId.has(t.entryId));", "const live = plan.folds.filter((t) => byId.has(t.entryId) && (!plan.carriedIds || plan.carriedIds.has(t.entryId)));")
 	},
 	{
 		name: "boundary-ignores-incoming-edit",

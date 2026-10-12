@@ -269,7 +269,7 @@ const WC: &str = "world explicit known ttl=300 true=300 survival=none c=1.7 sys=
 #[test]
 fn i1_persisted_equals_sent() {
     let t = trace_of(&[W, "prompt", "call npm 45K", "say 100", "prompt +60s", "say 100", "prompt +1h", "call npm 100", "say 100"]);
-    caught("m09", "run.ts", "const live = plan.folds.filter((t) => byId.has(t.entryId) && wasApplied(t));", "const live = plan.folds.filter((t) => byId.has(t.entryId) && wasApplied(t)).slice(plan.source === \"valve\" ? 0 : 1);", "I1", &t);
+    caught("m09", "run.ts", "const live = plan.folds.filter((t) => byId.has(t.entryId));", "const live = plan.folds.filter((t) => byId.has(t.entryId)).slice(plan.source === \"valve\" ? 0 : 1);", "I1", &t);
 }
 
 #[test]

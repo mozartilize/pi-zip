@@ -309,19 +309,20 @@ export function runPlanOf(x: { p: PlanResult | null; cal: Scale; cold: boolean; 
 /** Reconcile carried folds before selection: the planner keeps their exact placeholders and prices the resulting union.
  *  The same selected edit supplies the single post-edit room judgement and the boundary commit. */
 export function decideTurnEnd(x: { failed: boolean; justEdited: boolean; pWarm: number; ready: readonly Avail[]; opts: (cutAt?: string, foldsOnly?: boolean, ready?: readonly string[]) => { o: PlanOpts }; entries: Any[]; runPlan?: RunPlan | null }) {
-	if (x.failed) return { kind: "none" as const };
-	const carried = x.runPlan;
+	const blocks = buildBlocks(x.entries), live = new Set(blocks.filter((b) => !b.edited).map((b) => b.entryId));
+	const carried = x.runPlan ? { ...x.runPlan, folds: x.runPlan.folds.filter((t) => live.has(t.entryId) && (!x.runPlan!.applied || x.runPlan!.applied.has(t.entryId))) } : null;
+	if (x.failed) return { kind: "none" as const, runPlan: carried };
 	const opts = (cutAt?: string, foldsOnly?: boolean, ready?: readonly string[]) => {
 		const r = x.opts(cutAt, foldsOnly, ready);
-		if (carried) { r.o.scale = carried.scale; r.o.carriedFolds = carried.folds.filter((t) => !carried.applied || carried.applied.has(t.entryId)); }
+		if (carried) { r.o.scale = carried.scale; r.o.carriedFolds = carried.folds; }
 		return r;
 	};
 	const d = decideEdits({ ...x, at: "turn_end", opts });
-	const before = sizeOf(d.cal, buildBlocks(x.entries, d.o.steerIds).reduce((n, b) => n + b.tokens, 0));
+	const before = sizeOf(d.cal, blocks.reduce((n, b) => n + b.tokens, 0));
 	const after = d.p ? d.p.ctxAfterFolds - d.p.scale.c * (d.p.prefixTokens - d.p.summaryTokensPlanned)
 		: before - d.cal.c * (d.o.carriedFolds ?? []).reduce((n, t) => n + t.entryTokens - t.phTokens, 0);
 	const room = roomOf(after, d.o, () => candidateOf(x.entries, opts, [], "room").r.p, d.p?.firstKeptEntryId ?? undefined);
-	return { ...d, produce: room ? null : d.produce, room };
+	return { ...d, produce: room ? null : d.produce, room, runPlan: carried };
 }
 
 /** The one wait (theory 1.4 R9): when the view after a turn_end's edit (`after`) is still at Pi's compaction room, the plan at the
