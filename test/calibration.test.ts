@@ -392,6 +392,7 @@ describe("every limit and every number on the right scale", () => {
 		const { ctx } = fakeCtx(all, { branch });
 		await f.handlers.get("before_agent_start")({}, ctx);
 		const req = await f.handlers.get("context_with_system")({ messages: flat(all) }, ctx);
+		await f.handlers.get("turn_end")({ entries: [], turnIndex: 1, message: { role: "assistant", usage: {} }, context: { contextEntries: all } }, ctx);
 		await new Promise((r) => setTimeout(r, 5));
 		const notice = f.appended.find((x: Any) => x.customType === "pi-zip/notice")!.data;
 		// what the provider would bill for the request as sent: O + c x the content of the folded view

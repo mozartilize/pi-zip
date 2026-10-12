@@ -1611,7 +1611,7 @@ describe("in-turn folds through the real extension: one user message, 60 tool ca
 		expect(c2.render(200)).toEqual(wide);
 	});
 
-	test("the notice is in the transcript when the first request carrying the plan goes out (top of the turn), once per plan", async () => {
+	test("the folds notice waits for the boundary, once per turn, retaining the first request timestamp", async () => {
 		process.env.PI_ZIP_COLD_CAP = "8000";
 		const entries = session();
 		const r = await rig(entries, COLD_TS(), {}, { registerEntryRenderer: () => {} });
@@ -1619,13 +1619,14 @@ describe("in-turn folds through the real extension: one user message, 60 tool ca
 		await r.fire("context_with_system", { messages: flat(entries) });
 		await sleep(5);
 		const early = r.appended.filter((x: Any) => x.customType === "pi-zip/notice");
-		expect(early.length).toBe(1); // before the model answered
-		expect(early[0].data.after).toBeLessThan(early[0].data.before);
-		expect(Math.abs(early[0].data.reqTs - Date.now())).toBeLessThan(1_000); // when that request went out: the renderer finds its response by it
+		expect(early.length).toBe(0); // the room summary, if needed, joins this turn's folds notice
 		await r.fire("context_with_system", { messages: flat(entries) }); // the run's second request
 		await r.fire("turn_end", turnEnd([...entries, ...tail, A("a63")], "a63", 1));
 		await sleep(5);
-		expect(r.appended.filter((x: Any) => x.customType === "pi-zip/notice").length).toBe(1); // not again at turn_end
+		const kept = r.appended.filter((x: Any) => x.customType === "pi-zip/notice");
+		expect(kept.length).toBe(1);
+		expect(kept[0].data.after).toBeLessThan(kept[0].data.before);
+		expect(Math.abs(kept[0].data.reqTs - Date.now())).toBeLessThan(1_000); // still locates the folds' first response
 	});
 
 	test("an allowlist that hides zip_recall, read, grep and bash: only rereadable outputs fold, placeholders point at re-reading", async () => {

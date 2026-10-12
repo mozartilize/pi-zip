@@ -310,6 +310,23 @@ by the per-trace verdicts only. m03 and m04 are now caught by A1 itself (0 → 5
 `tests/mutants.rs` keeps one mutant per property as a regression test (A1 ×5, A2/LW, A3 ×4, I1, RC ×3, PW ×4, B2B, NT, TR ×3, GC ×4,
 WB, MH, LW ×2, MPr, RDr, WL ×3, PC; round 4 added WL, PW over `nextturn`, GC over `drive` and two TR over `drive`; round 5 two A3 over rule B, see TRIAGE.md) and shows that W, G and LW's arithmetic fail on a tampered observation.
 
+## Checks in real Pi integration
+
+Calibration and notices have two additional invariants in `test/pi-integration.test.ts`, where Pi's real extension runner,
+session projection and boundary draft application run. The formal bridge does not observe transcript notices, and its token
+calibration properties allow a tolerance rather than checking carry metadata directly.
+
+* **Request carry metadata:** `sent`, applied fold IDs, compaction `carried` and fold commit `carried` must agree with the summary
+  text and tool-result replacements actually present in the last emitted Pi request, matched by content and source tool-call ID.
+  The expectation comes from request messages, independently of the metadata being checked.
+* **One notice per turn (K7):** count actual fold/summary `pi-zip/notice` entries appended between a turn's first request or prompt
+  and its boundary; the count must be at most one. State cards and command responses are separate entry kinds.
+
+Every integration rig checks these invariants after requests, after boundaries and at test teardown. The mixed room regression
+also checks calibration, live and restarted edit bookkeeping, exact Pi `tokensBefore`, combined notice sizes and wait information,
+and an aborted turn. Run `bun run test/pi-integration-mutants.ts` to restore the inherited summary carry flag and duplicate room
+notice independently in disposable source copies; each must fail its corresponding invariant through the real Pi rig.
+
 ## How to run
 
 Prerequisites: Rust (offline is fine: serde and serde_json only), bun, and a pi-zip checkout whose `node_modules` resolves

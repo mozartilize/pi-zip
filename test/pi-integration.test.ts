@@ -8,7 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { collapseSystemMessages, getCurrentSystemMessage, normalizeContext, resolveTranscript } from "@earendil-works/pi-ai";
-import { collapseSystem, planContext } from "../src/plan.ts";
+import { calibrate, collapseSystem, planContext, wireTokensOf } from "../src/plan.ts";
 import { planOpts } from "../src/core.ts";
 import type { Any } from "./helpers.ts";
 // Pi's own draft application (AgentSession._applyBoundaryDrafts uses no instance state): the order of the drafts and the
@@ -62,6 +62,7 @@ interface RigOpts {
 	idle?: boolean; // ctx.isIdle() (default true)
 	start?: boolean; // emit before_agent_start right away (default true)
 	settings?: Any;
+	model?: Any;
 	// another extension's session_before_compact handler (Pi runs every extension's for pi-zip's compaction too), loaded before or after pi-zip
 	foreign?: { at: "before" | "after"; on: (e: Any, ctx: Any) => Any };
 	latencyMs?: number; // the summary's model call takes this long
@@ -72,7 +73,9 @@ async function rig(setup: (sm: SessionManager) => void = populate, opts: RigOpts
 	if (!opts.file) setup(sm);
 	// the real loader, from the real entry file: exactly how `pi -e` loads the extension
 	const bus = createEventBus();
-	const loaded = await discoverAndLoadExtensions([fileURLToPath(new URL("../src/index.ts", import.meta.url))], CWD, "/tmp/pi-zip-integration-agent", bus);
+	const source = process.env.PI_ZIP_TEST_SRC ?? fileURLToPath(new URL("../src", import.meta.url));
+	const { Zip } = await import(join(source, "run.ts"));
+	const loaded = await discoverAndLoadExtensions([join(source, "index.ts")], CWD, "/tmp/pi-zip-integration-agent", bus);
 	expect(loaded.errors).toEqual([]);
 	const runtime = loaded.runtime;
 	let extensions = loaded.extensions;
@@ -92,6 +95,25 @@ async function rig(setup: (sm: SessionManager) => void = populate, opts: RigOpts
 	};
 	const runner = new ExtensionRunner(extensions, runtime, CWD, sm, registry);
 	const noop = () => {};
+	const checks = { carry: [] as string[], notices: [] as string[] };
+	integrationChecks.push(checks);
+	let zip: Any;
+	let actualRequest: Any[] | null = null;
+	let turn = 0, ended = false;
+	const noticeCounts = new Map<number, number>();
+	const appendEntry = (type: string, data: Any) => {
+		if (type === "pi-zip/notice" && !data?.kind) {
+			const count = (noticeCounts.get(turn) ?? 0) + 1;
+			noticeCounts.set(turn, count);
+			if (count > 1) checks.notices.push(`turn ${turn}: ${count} notices`);
+		}
+		sm.appendCustomEntry(type, data);
+	};
+	const containsCut = (messages: Any[] | null, cut: Any) => !!messages?.some((m) => m.role === "compactionSummary" && m.summary === (cut.text ?? cut.summary));
+	const containsFold = (messages: Any[] | null, targetId: string, content: Any) => {
+		const target = sm.getBranch().find((e: Any) => e.id === targetId) as Any;
+		return !!messages?.some((m) => m.role === target?.message?.role && m.toolCallId === target?.message?.toolCallId && JSON.stringify(m.content) === JSON.stringify(content));
+	};
 	const compactions: Any[] = [];
 	const compactCalls = { n: 0, ended: 0 };
 	let compacting: AbortController | null = null; // Pi's _compactionAbortController: ctx.abort() reaches it (abort -> abortCompaction)
@@ -125,8 +147,8 @@ async function rig(setup: (sm: SessionManager) => void = populate, opts: RigOpts
 		})();
 	};
 	runner.bindCore(
-		{ sendMessage: noop, sendUserMessage: noop, appendEntry: (t: string, d: Any) => sm.appendCustomEntry(t, d), setSessionName: noop, getSessionName: () => undefined, setLabel: noop, getActiveTools: () => ["read", "bash", "zip_recall"], getAllTools: () => [], getSettings: () => opts.settings ?? {}, setActiveTools: noop, refreshTools: noop, getCommands: () => [], setModel: async () => false, getThinkingLevel: () => "off", setThinkingLevel: noop } as Any,
-		{ getModel: () => MODEL, getScopedModels: () => [], isIdle: () => opts.idle !== false && !compacting, isProjectTrusted: () => true, getSignal: () => undefined, abort: () => compacting?.abort(), hasPendingMessages: () => false, shutdown: noop, getContextUsage: () => undefined, compact: opts.native ? piCompact : (o: Any) => o?.onError?.(new Error("rig: no compaction")), getSystemPrompt: () => "You are a coding agent." } as Any,
+		{ sendMessage: noop, sendUserMessage: noop, appendEntry, setSessionName: noop, getSessionName: () => undefined, setLabel: noop, getActiveTools: () => ["read", "bash", "zip_recall"], getAllTools: () => [], getSettings: () => opts.settings ?? {}, setActiveTools: noop, refreshTools: noop, getCommands: () => [], setModel: async () => false, getThinkingLevel: () => "off", setThinkingLevel: noop } as Any,
+		{ getModel: () => opts.model ?? MODEL, getScopedModels: () => [], isIdle: () => opts.idle !== false && !compacting, isProjectTrusted: () => true, getSignal: () => undefined, abort: () => compacting?.abort(), hasPendingMessages: () => false, shutdown: noop, getContextUsage: () => undefined, compact: opts.native ? piCompact : (o: Any) => o?.onError?.(new Error("rig: no compaction")), getSystemPrompt: () => "You are a coding agent." } as Any,
 	);
 	// Pi's TUI hands raw input to the extensions' listeners in order (TuiBase.handleTerminalInput): one may consume it or replace the data
 	const inputListeners = new Set<(data: string) => Any>();
@@ -152,7 +174,25 @@ async function rig(setup: (sm: SessionManager) => void = populate, opts: RigOpts
 	if (opts.tui) runner.setUIContext({ notify: noop, setWorkingMessage: noop, setStatus: noop, setWidget: noop, getEditorText: () => editor.text, onTerminalInput: (h: (data: string) => Any) => (inputListeners.add(h), () => inputListeners.delete(h)) } as Any, "tui");
 	const projectionMessages = () => sm.buildSessionContext().messages as Any[];
 	/** One request as Pi sends it: the agent state is the session projection; the extension transforms it. */
-	const request = async () => (await runner.emitContext(projectionMessages())) as Any[];
+	const request = async () => {
+		if (ended) { turn++; ended = false; }
+		const messages = await runner.emitContext(projectionMessages()) as Any[];
+		actualRequest = structuredClone(messages);
+		const plan = zip.runPlan;
+		if (plan && !plan.persisted) {
+			let carriesView = !!(plan.cut || plan.native) && containsCut(messages, plan.cut ?? plan.native);
+			for (const fold of plan.folds) {
+				const carried = containsFold(messages, fold.entryId, [{ type: "text", text: fold.ph }]);
+				carriesView ||= carried;
+				if (!!plan.applied?.has(fold.entryId) !== carried) checks.carry.push("applied fold flag disagrees with request");
+			}
+			if (!!plan.sent !== carriesView) checks.carry.push("sent flag disagrees with request");
+			if (plan.sent && (plan.cut || plan.native) && !containsCut(messages, plan.cut ?? plan.native)) checks.carry.push("sent summary absent from request");
+		}
+		await new Promise((resolve) => setTimeout(resolve, 5));
+		assertIntegrationChecks();
+		return messages;
+	};
 	const build = (drafts: Any[]) => {
 		const preview = SessionManager.inMemory(CWD, undefined, [sm.getHeader() as Any, ...sm.getBranch()]);
 		apply(preview, drafts);
@@ -162,8 +202,17 @@ async function rig(setup: (sm: SessionManager) => void = populate, opts: RigOpts
 	/** What Pi's agent session does at turn_end: boundary handlers propose entries, the drafts are applied to the real session. */
 	const turnEnd = async (assistantEntryId: string, message: Any) => {
 		const out = await runner.emitBoundary({ type: "turn_end", turnIndex: 1, message, toolResults: [], messageEntryId: assistantEntryId, toolResultEntryIds: [], outcome: message.stopReason === "aborted" ? "aborted" : "completed" } as Any, build as Any);
-		apply(sm, out.entries as Any[]);
-		return out.entries as Any[];
+		const drafts = out.entries as Any[];
+		const marker = drafts.find((d) => d.type === "custom" && d.customType === "pi-zip/commit");
+		for (const draft of drafts) {
+			if (draft.type === "compaction" && draft.details?.by === "pi-zip" && draft.details.carried !== containsCut(actualRequest, draft)) checks.carry.push("summary carried flag disagrees with request");
+			if (draft.type === "context_edit" && marker && marker.data.carried !== containsFold(actualRequest, draft.targetId, draft.replacement.content)) checks.carry.push("fold carried flag disagrees with request");
+		}
+		apply(sm, drafts);
+		await new Promise((resolve) => setTimeout(resolve, 5));
+		assertIntegrationChecks();
+		ended = true;
+		return drafts;
 	};
 	/** The end of a run: agent_before_settle (pi-zip plans the next cold return and, interactive, arms the away timer). */
 	const settle = async () => {
@@ -172,17 +221,38 @@ async function rig(setup: (sm: SessionManager) => void = populate, opts: RigOpts
 		return out.entries as Any[];
 	};
 	const apply = (manager: SessionManager, drafts: Any[]) => (AgentSession.prototype as Any)._applyBoundaryDrafts.call({}, manager, drafts) as Any[];
-	const beforeAgentStart = (text = "next request") => runner.emitBeforeAgentStart(text, undefined, { cwd: CWD } as Any);
-	await runner.emit({ type: "session_start", reason: "startup" } as Any);
+	const beforeAgentStart = async (text = "next request") => {
+		await new Promise((resolve) => setTimeout(resolve, 5));
+		turn++; ended = false;
+		return runner.emitBeforeAgentStart(text, undefined, { cwd: CWD } as Any);
+	};
+	const start = (Zip.prototype as Any).sessionStart;
+	(Zip.prototype as Any).sessionStart = function (this: Any, ...args: Any[]) { zip = this; return start.apply(this, args); };
+	try { await runner.emit({ type: "session_start", reason: "startup" } as Any); }
+	finally { (Zip.prototype as Any).sessionStart = start; }
 	if (opts.start !== false) await beforeAgentStart();
 	const shutdown = () => runner.emit({ type: "session_shutdown" } as Any);
-	return { sm, runner, request, turnEnd, settle, beforeAgentStart, narrativeCalls, projectionMessages, compactions, compactCalls, foreignCalls, inputListeners, typeKey, editor, shutdown };
+	return { sm, runner, request, turnEnd, settle, beforeAgentStart, narrativeCalls, projectionMessages, compactions, compactCalls, foreignCalls, inputListeners, typeKey, editor, shutdown, zip, checks, noticeCounts };
 }
 
+// These checks observe Pi's actual request messages and emitted transcript entries, independently of plan flags.
+const integrationChecks: { carry: string[]; notices: string[] }[] = [];
+const assertIntegrationChecks = () => {
+	for (const check of integrationChecks) {
+		expect(check.carry, "request carry metadata must match the actual request view").toEqual([]);
+		expect(check.notices, "one turn emits at most one pi-zip notice").toEqual([]);
+	}
+};
 const saved: Record<string, string | undefined> = {};
 const ENV = { PI_ZIP_COLD_CAP: "3000", PI_ZIP_TTL_SECS: "300" };
 beforeEach(() => { for (const [k, v] of Object.entries(ENV)) { saved[k] = process.env[k]; process.env[k] = v; } });
-afterEach(() => { for (const k of Object.keys(ENV)) { if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k]; } });
+afterEach(() => {
+	try { assertIntegrationChecks(); }
+	finally {
+		integrationChecks.length = 0;
+		for (const k of Object.keys(ENV)) { if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k]; }
+	}
+});
 
 const isFolded = (m: Any) => m.role === "toolResult" && JSON.stringify(m.content).includes("[folded by pi-zip");
 /** Nobody waits for a summary: the first request of a return whose plan wants one goes with its folds alone and starts it in the
@@ -194,6 +264,88 @@ const produced = async (r: Any) => {
 	expect(r.narrativeCalls.length).toBe(1);
 	await r.beforeAgentStart();
 };
+
+describe("mixed room boundary", () => {
+	test("carried views and one notice follow the real Pi requests across the room boundary", async () => {
+		const r = await rig((sm) => {
+			populate(sm, 3500);
+			for (const entry of sm.getBranch() as Any[]) if (entry.message?.role === "assistant") delete entry.message.usage;
+		}, { tui: true, model: { ...MODEL, provider: "room", contextWindow: 100_000 }, latencyMs: 20 });
+		sendPrompt(r.sm, "next request");
+		const request = await r.request();
+		expect(request.some(isFolded)).toBe(true);
+		expect(request.some((m) => m.role === "compactionSummary")).toBe(false);
+		const scale = r.zip.runPlan.scale;
+		expect(scale.c).toBe(1.5);
+		const real = Math.round(scale.O + scale.c * request.filter((m) => m.role !== "system").reduce((n, m) => n + wireTokensOf(m), 0));
+		await r.runner.emitBeforeProviderRequest({});
+		expect(r.zip.pending.edited).toBe(true); // this request first carried the folds
+		const response = { ...asst([call("room")], "toolUse"), provider: "room", timestamp: Date.now(), usage: { ...usage, input: real, totalTokens: real } };
+		const responseId = r.sm.appendMessage(response);
+		await r.runner.emitMessageEnd({ type: "message_end", message: response } as Any);
+		expect(r.zip.nextEdit).toBeNull();
+		r.sm.appendMessage(result("room", "short output"));
+		const piBefore = estimateProjectedContextTokens(r.sm.buildSessionProjection(), r.sm.getBranch()).tokens;
+		const drafts = await r.turnEnd(responseId, response);
+		const compaction = drafts.find((d) => d.type === "compaction");
+		expect(compaction).toBeDefined();
+		expect(compaction.details.carried).toBe(false);
+		expect((r.sm.getBranch().find((e: Any) => e.type === "compaction") as Any).tokensBefore).toBe(piBefore);
+		expect(drafts.find((d) => d.customType === "pi-zip/commit").data).toEqual({ carried: true, next: true });
+		expect(r.zip.nextEdit).toBe(scale.O); // the summary rewrites everything after the system prefix
+		const branch = r.sm.getBranch() as Any[];
+		const restarted = await rig(undefined, { file: [r.sm.getHeader() as Any, ...branch], tui: true, start: false, model: { ...MODEL, provider: "room", contextWindow: 100_000 } });
+		expect(restarted.zip.nextEdit).toBe(scale.O);
+		await restarted.request();
+		await restarted.runner.emitBeforeProviderRequest({});
+		expect(restarted.zip.pending).toMatchObject({ edited: true, expect: scale.O });
+		await restarted.shutdown();
+		const calibrated = calibrate(r.sm.buildSessionProjection().entries, undefined, branch, "room/m");
+		expect(calibrated.source).toBe("usage");
+		expect(calibrated.c).toBeCloseTo(1.5, 2);
+		expect(calibrated.est).toBeGreaterThan(50_000); // the unsummarized request, including its actual folds
+		const notices = branch.filter((e) => e.customType === "pi-zip/notice" && !e.data?.kind);
+		expect(notices).toHaveLength(1);
+		expect(notices[0].data.desc).toContain("zipped");
+		expect(notices[0].data.desc).toContain("summarized");
+		expect(notices[0].data.desc).toContain("waited");
+		expect(notices[0].data.after).toBeLessThan(real / 2);
+		const next = await r.request();
+		expect(next.some((m) => m.role === "compactionSummary" && m.summary === compaction.summary)).toBe(true);
+		await r.runner.emitBeforeProviderRequest({});
+		expect(r.zip.pending).toMatchObject({ edited: true, expect: scale.O });
+		const nextResponse = { ...asst([{ type: "text", text: "done" }]), provider: "room", timestamp: Date.now(), usage: { ...usage, input: 10_000, totalTokens: 10_000 } };
+		const nextId = r.sm.appendMessage(nextResponse);
+		await r.runner.emitMessageEnd({ type: "message_end", message: nextResponse } as Any);
+		expect(r.zip.justEdited).toBe(true);
+		const { carriedEdits, replayGrowth } = await import("../src/state.ts");
+		const history = r.sm.getBranch() as Any[];
+		expect(carriedEdits(history).has(history.findIndex((e) => e.id === responseId))).toBe(true);
+		expect(carriedEdits(history).has(history.findIndex((e) => e.id === nextId))).toBe(true);
+		expect(replayGrowth(history, 2500).justEdited).toBe(true);
+		await r.shutdown();
+	});
+
+	test("an aborted room turn persists only its carried folds and one notice", async () => {
+		const r = await rig((sm) => {
+			populate(sm, 3500);
+			for (const entry of sm.getBranch() as Any[]) if (entry.message?.role === "assistant") delete entry.message.usage;
+		}, { tui: true, model: { ...MODEL, provider: "room-abort", contextWindow: 100_000 }, latencyMs: 20 });
+		sendPrompt(r.sm, "next request");
+		expect((await r.request()).some(isFolded)).toBe(true);
+		await r.runner.emitBeforeProviderRequest({});
+		const response = { ...asst([{ type: "text", text: "interrupted" }], "aborted"), provider: "room-abort", timestamp: Date.now() };
+		const id = r.sm.appendMessage(response);
+		await r.runner.emitMessageEnd({ type: "message_end", message: response } as Any);
+		const drafts = await r.turnEnd(id, response);
+		expect(drafts.some((d) => d.type === "compaction")).toBe(false);
+		expect(drafts.filter((d) => d.type === "context_edit").length).toBeGreaterThan(0);
+		expect(drafts.find((d) => d.customType === "pi-zip/commit").data).toEqual({ carried: true });
+		expect(r.zip.nextEdit).toBeNull();
+		expect(r.sm.getBranch().filter((e: Any) => e.customType === "pi-zip/notice" && !e.data?.kind)).toHaveLength(1);
+		await r.shutdown();
+	});
+});
 
 describe("real Pi: the request view is identical before and after turn_end persists the edits (I1)", () => {
 	test("folds: system update stays in place, aborted turn does not block the save, request N+1 starts with request N's bytes", async () => {
@@ -373,6 +525,7 @@ describe("real Pi: a summary prepared while the user was away goes in through Pi
 		r.sm.appendMessage(result("k1", "tiny", 10_000_002));
 		const drafts = await r.turnEnd(a, asst([call("k1")], "toolUse"));
 		expect(drafts.filter((d: Any) => d.type === "compaction")).toHaveLength(0); // this turn_end persists the run plan (its folds) ...
+		await r.request(); // the next assistant response answers a new Pi request
 		const b2 = r.sm.appendMessage(asst([call("k2")], "toolUse", 10_000_003));
 		r.sm.appendMessage(result("k2", "tiny", 10_000_004));
 		expect((await r.turnEnd(b2, asst([call("k2")], "toolUse"))).filter((d: Any) => d.type === "compaction")).toHaveLength(1); // ... the next one takes the summary
@@ -397,6 +550,7 @@ describe("real Pi: a summary prepared while the user was away goes in through Pi
 		const a = r.sm.appendMessage(asst([call("k1")], "toolUse", 10_000_001));
 		r.sm.appendMessage(result("k1", "tiny", 10_000_002));
 		await r.turnEnd(a, asst([call("k1")], "toolUse"));
+		await r.request(); // the next assistant response answers a new Pi request
 		const b2 = r.sm.appendMessage(asst([call("k2")], "toolUse", 10_000_003));
 		r.sm.appendMessage(result("k2", "tiny", 10_000_004));
 		expect((await r.turnEnd(b2, asst([call("k2")], "toolUse"))).filter((d: Any) => d.type === "compaction")).toHaveLength(1); // the key's summary, at the next decision
@@ -617,7 +771,8 @@ describe("item 5: a run an extension's message starts (sendMessage with triggerT
 		r.sm.appendCustomMessageEntry("owed-drive", "drive the owed work", true);
 		await r.runner.emit({ type: "message_end", message: { role: "custom", customType: "owed-drive", content: "drive the owed work", display: true, timestamp: Date.now() } } as Any);
 		await r.request();
-		await sleep(5);
+		const response = asst([{ type: "text", text: "done" }], "stop", 10_000_001);
+		await r.turnEnd(r.sm.appendMessage(response), response);
 		const notice = (r.sm.getBranch().filter((e: Any) => e.type === "custom" && e.customType === "pi-zip/notice" && !e.data?.kind).at(-1) as Any)?.data;
 		expect(notice?.why).toMatch(/^cache cold/); // old code: a warm plan ("cache warm · ...") or none
 	});
@@ -642,7 +797,8 @@ describe("the notice's why line says the cache was judged cold, as the warm one 
 		const r = await rig(undefined, { tui: true }); // every message is hours old
 		sendPrompt(r.sm, "next request");
 		await r.request();
-		await new Promise((res) => setTimeout(res, 5));
+		const response = asst([{ type: "text", text: "done" }], "stop", 10_000_001);
+		await r.turnEnd(r.sm.appendMessage(response), response);
 		const notice = (r.sm.getBranch().filter((e: Any) => e.type === "custom" && e.customType === "pi-zip/notice" && !e.data?.kind).at(-1) as Any)?.data;
 		expect(notice?.why).toMatch(/^cache cold · away [\d.]+ (s|min|h)$/); // old code: "away 3.0 h"
 	});

@@ -219,8 +219,9 @@ function requestEst(branch: Any[], id: string): number | null {
 	const pre = branch.slice(0, at);
 	const edit = new Map<string, Any>();
 	for (const e of pre) if (e?.type === "context_edit") edit.set(e.targetId, e.replacement);
-	for (let i = at + 1; i < branch.length && !(branch[i]?.type === "message" || branch[i]?.type === "compaction"); i++) {
+	for (let i = at + 1; i < branch.length; i++) {
 		const e = branch[i];
+		if ((e?.type === "message" && e.message?.role !== "toolResult") || (e?.type === "compaction" && e.details?.carried !== false)) break;
 		if (e?.type === "custom" && e.customType === COMMIT_CUSTOM) {
 			if (e.data?.carried) for (let j = at + 1; j < i; j++) if (branch[j]?.type === "context_edit") edit.set(branch[j].targetId, branch[j].replacement);
 			break;
@@ -277,9 +278,9 @@ export function calibrate(entries: Any[], sys?: SysInfo, branch: Any[] = [], mod
 	const Snow = S >= 0 ? S : sys ? sysEst(sys) : 0;
 	const head = entries[0]?.sourceEntry?.type === "compaction" ? entries[0].sourceEntry : null;
 	const headMs = head ? Date.parse(head.timestamp) || 0 : 0;
-	// a pi-zip summary persisted as a turn_end draft was request-local first (a run plan carries it before its entry exists); one that
-	// went in through Pi's compaction before the run (details.via "native") is carried after its entry, exactly like Pi's own
-	const local = !!head && head.details?.by === PRODUCT && head.details?.via !== "native";
+	// Only a request-local summary was carried before its draft. Room and valve summaries (carried=false), and native summaries,
+	// first enter the next request; the preceding response must be calibrated against the original request rebuilt from the branch.
+	const local = !!head && head.details?.by === PRODUCT && head.details?.via !== "native" && head.details?.carried !== false;
 	// Was the request behind this response sent after the head compaction entry was written? The branch's order says (timestamps tie when
 	// a compaction follows a response in the same millisecond); without the branch the timestamps do.
 	const pos = new Map<string, number>();
@@ -568,7 +569,9 @@ export interface RunPlan {
 	persisted: boolean;
 	cutVisibleIdx?: number; // where the kept part starts among the projected non-system messages
 	cutKeptFirstMsg?: Any; // ... and that message itself (a disagreeing request view drops the cut)
-	sent?: boolean; // a request view carrying this plan has gone out
+	sent?: boolean; // a request view carrying this plan's folds has gone out
+	cutSent?: boolean; // separately tracked when a room summary joins folds already sent
+	noticeTs?: number; // the first request carrying the folds (their notice may wait for the boundary)
 	applied?: Set<string>; // entry ids whose fold the latest request view actually carried (what turn_end must persist, no more)
 	cutTs?: number; // timestamp of the request-local summary message: one value per run, so every request of the run is identical
 	untouched?: number; // real tokens before the earliest edited block: what the first request carrying the plan can still read from the cache
