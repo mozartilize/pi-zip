@@ -152,7 +152,7 @@ fn a1_users_quoted_by_the_summary() {
 #[test]
 fn lw_summary_call_is_priced() {
     let t = lines(&["world explicit known ttl=300 true=300 survival=none c=1 sys=30000 window=200000 native interactive", "prompt", "say 25K", "prompt +60s", "say 100", "prompt +60s", "say 100", "prompt +1h", "say 100"]);
-    caught_all("m25", "plan.ts", &[("gate(\"summary\", X, Sr, null, call, Sr, undefined, undefined, isReady)", "gate(\"summary\", X, Sr, null, 0, Sr, undefined, undefined, isReady)", 1)], &["LW"], &t);
+    caught_all("m25", "plan.ts", &[("gate(\"summary\", X, Sr, null, call, Sr, undefined, undefined, isReady, ", "gate(\"summary\", X, Sr, null, 0, Sr, undefined, undefined, isReady, ", 1)], &["LW"], &t);
 }
 
 /// Review P1-3: LW pins the call of a whole-plan step both ways. A plan with a cut that reaches the plan gate with no call (the summary
@@ -194,6 +194,18 @@ fn a3_return_does_not_wait() {
 #[test]
 fn tr_produced_summary_goes_in_once_ready() {
     caught("r4tr", "plan.ts", "const ready = new Set(o.ready ?? []);", "const ready = new Set<string>();", "TR", &trace_file("tr-produced.trace"));
+}
+
+/// TR and theory 1.4 R5 (step 4 review P1): a ready summary is used up to c, or up to cW when there is no c. Here the cold return's c
+/// is a few hundred tokens beyond cW (the shallower cuts' calls did not pay at P = 0 by a hair); at the next turn_end no cut pays with
+/// its call, so the ready summary beyond cW is passed over, as specified, and TR excuses it (it failed before the excuse).
+#[test]
+fn tr_ready_summary_beyond_cw_is_passed_over() {
+    if !available() {
+        return;
+    }
+    let t = Trace::parse(&trace_file("tr-beyond-cw.trace")).unwrap();
+    assert!(holds(&observe(&worktree_src(), &t), "TR"));
 }
 
 /// 0.4.0 step 4, review fix: the turn_end that persists a run plan of folds alone still waits at Pi's compaction room for the room

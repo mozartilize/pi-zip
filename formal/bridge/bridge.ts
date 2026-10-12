@@ -507,7 +507,7 @@ async function runTrace(tr: Any): Promise<Any> {
 			}
 			const c = r ? (r.scale?.c ?? r.k ?? 1) : 1;
 			const after = r ? r.ctxAfterFolds - (r.cutIdx !== null ? c * (r.prefixTokens - r.summaryTokensPlanned) : 0) : null;
-			out.push({ p, actual: p === actual, mode, plan: !!r, folds: r ? r.folds.map((f: Any) => f.entryId) : [], cut: r?.firstKeptEntryId ?? null, prefix: r ? c * r.prefixTokens : 0, sum: r ? c * r.summaryTokensPlanned : 0, before: r?.ctxTokens ?? null, afterFolds: r ? r.ctxAfterFolds : null, after, law: o.trace.map((t: Any) => ({ at: t.where, ok: t.ok, B: t.B, A: t.A, T: t.T, K: t.K, phi: t.phi, eta: t.eta, ...(t.cut !== undefined ? { cut: t.cut } : {}), ...(t.ready ? { ready: true } : {}) })) });
+			out.push({ p, actual: p === actual, mode, plan: !!r, folds: r ? r.folds.map((f: Any) => f.entryId) : [], cut: r?.firstKeptEntryId ?? null, prefix: r ? c * r.prefixTokens : 0, sum: r ? c * r.summaryTokensPlanned : 0, before: r?.ctxTokens ?? null, afterFolds: r ? r.ctxAfterFolds : null, after, law: o.trace.map((t: Any) => ({ at: t.where, ok: t.ok, B: t.B, A: t.A, T: t.T, K: t.K, phi: t.phi, eta: t.eta, ...(t.cut !== undefined ? { cut: t.cut } : {}), ...(t.ready ? { ready: true } : {}), ...(t.key ? { key: t.key } : {}) })) });
 		}
 		// WL's oracle: a warm decision the one-summary-per-warm-stretch flag constrained, planned again at the actual P with the flag lifted
 		// (everything else as captured): the summary the flag kept out, if any, and the law's verdict on it
@@ -516,7 +516,7 @@ async function runTrace(tr: Any): Promise<Any> {
 			const o = { ...cap.o, law: { ...cap.o.law, pWarm: actual }, noSummary: false, regrowAt: undefined, trace: [] };
 			try {
 				const r = plan.planContext(cap.entries, o);
-				free = { plan: !!r, cut: r?.firstKeptEntryId ?? null, folds: r ? r.folds.map((f: Any) => f.entryId) : [], afterFolds: r ? r.ctxAfterFolds : null, law: o.trace.map((t: Any) => ({ at: t.where, ok: t.ok, B: t.B, A: t.A, T: t.T, K: t.K, phi: t.phi, eta: t.eta, ...(t.cut !== undefined ? { cut: t.cut } : {}), ...(t.ready ? { ready: true } : {}) })) };
+				free = { plan: !!r, cut: r?.firstKeptEntryId ?? null, folds: r ? r.folds.map((f: Any) => f.entryId) : [], afterFolds: r ? r.ctxAfterFolds : null, law: o.trace.map((t: Any) => ({ at: t.where, ok: t.ok, B: t.B, A: t.A, T: t.T, K: t.K, phi: t.phi, eta: t.eta, ...(t.cut !== undefined ? { cut: t.cut } : {}), ...(t.ready ? { ready: true } : {}), ...(t.key ? { key: t.key } : {}) })) };
 			} catch (err) {
 				free = { error: String(err) };
 			}

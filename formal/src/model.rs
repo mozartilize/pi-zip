@@ -450,6 +450,8 @@ pub struct LawStep {
     pub cut: Option<bool>,
     /// the step judges a cut whose summary is produced and ready: its call is spent, priced 0 (theory 1.4; 0.4.0 step 4)
     pub ready: Option<bool>,
+    /// a summary step only: its cut (the first kept entry)
+    pub key: Option<String>,
 }
 
 /// One plan the planner would make at this decision point, at one P(warm) (everything else held fixed).

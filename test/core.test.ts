@@ -141,6 +141,19 @@ describe("core: decide", () => {
 		expect(unready({ p: null }, [], () => r)).toEqual({ r: { p: null }, produce: null });
 	});
 	const opts = (l: Learned, p: number, pause: boolean) => (entries: Any[], cutAt?: string, foldsOnly?: boolean, ready?: readonly string[]) => planOpts(entries, [], env(), l, false, p, pause, cutAt, foldsOnly, ready);
+	test("a ready summary never cuts deeper than c, or than cW when no cut pays with its call (theory 1.4 plan)", () => {
+		// 18 turns of prose no fold can touch: cW is u12; at p = 1 no cut from cW on pays with its call
+		const prose = Array.from({ length: 18 }, (_, i) => [U(`u${i + 1}`, `turn ${i + 1}`), AX(`a${i + 1}`, 13_000)]).flat();
+		const cutAt = (p: number, ready: string[]) => planContext(prose, planOpts(prose, [], env(), lam(), false, p, false, undefined, false, ready).o)?.firstKeptEntryId ?? null;
+		expect(cutAt(1, [])).toBeNull();
+		expect(cutAt(0, [])).toBe("u12"); // c at a dead cache: the cut that reaches the view
+		expect(cutAt(1, ["u12"])).toBe("u12"); // a = cW: its call is spent
+		expect(cutAt(1, ["u9", "u12", "u15"])).toBe("u12"); // the deepest ready summary no deeper than cW
+		for (const deep of ["u13", "u15", "u17"]) {
+			expect(cutAt(1, [deep])).toBeNull(); // deeper than cW, no c: not taken however cheap
+			expect(cutAt(0, [deep])).toBe("u12"); // deeper than c: c stands (and is produced)
+		}
+	});
 	test("decideRun: b2b only for a warm return right after an edit without a native summary (its summary is still produced); a cold return plans on the session", () => {
 		const l = lam({ justEdited: true });
 		const b = decideRun({ cold: false, justEdited: true, nat: null, foreign: false, now: big, ready: [], opts: opts(l, 1, false) });

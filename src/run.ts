@@ -48,6 +48,16 @@ interface Bg {
 	estUsd: number; // what the call is billed for its input if it is aborted after the provider took it: the prefix it reads, uncached
 }
 
+/** Resolves with the promise's value, or null as soon as the signal aborts (Esc: Pi cancels the prompt; the call goes on). */
+function waitFor<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T | null> {
+	return new Promise((resolve) => {
+		if (signal?.aborted) return resolve(null);
+		const onAbort = () => resolve(null);
+		signal?.addEventListener("abort", onAbort, { once: true });
+		promise.then(resolve, () => resolve(null)).finally(() => signal?.removeEventListener("abort", onAbort));
+	});
+}
+
 const errText = (err: unknown) => (err instanceof Error ? (err.stack ?? err.message) : String(err));
 /** A compaction another extension supplied (through session_before_compact): not Pi's own summary, not pi-zip's. */
 const foreignCompaction = (e: Any): boolean => e?.type === "compaction" && !!e.fromHook && e.details?.by !== PRODUCT;
@@ -1060,7 +1070,9 @@ export class Zip implements ZipControl {
 	/**
 	 * The one wait (theory 1.4, R9): at a turn_end whose view after the decision's edit is still at Pi's compaction room, the plan's own
 	 * cut is summarised while the turn waits (Pi would stop for its own, lossy compaction otherwise). A call running for that very cut
-	 * is awaited; any other call is ended first, so there is never a second one in flight. null: the call failed or was cancelled.
+	 * is awaited (Esc ends the wait, not the call); any other call is ended first, so there is never a second one in flight. A call
+	 * made here is a pi-zip/summary entry and in the session totals at once, like a background one, so a summary the commit then
+	 * refuses is neither lost nor missing from the totals. null: the call failed or was cancelled.
 	 */
 	private async roomWait(c: PlanResult, ctx: Any): Promise<{ cut: Cut; ms: number } | null> {
 		const head = headOf(this.branch(ctx)), key = c.firstKeptEntryId, b = this.bg, w0 = performance.now();
@@ -1069,11 +1081,14 @@ export class Zip implements ZipControl {
 		let cut: Cut | null = null;
 		try {
 			if (running) {
-				const got = await this.working(ctx, `${PRODUCT}: finishing a summary (the context is close to the window)`, b!.promise);
+				const got = await this.working(ctx, `${PRODUCT}: finishing a summary (the context is close to the window)`, waitFor(b!.promise, ctx?.signal));
 				cut = got ? { ...got, trigger: "valve", prepared: true } : null; // booked when it was produced
 			} else {
 				this.discardBg("replaced");
-				cut = await this.working(ctx, `${PRODUCT}: writing a summary (the context is close to the window)`, buildCut(c, ctx));
+				const got = await this.working(ctx, `${PRODUCT}: writing a summary (the context is close to the window)`, buildCut(c, ctx));
+				this.stats.summaryUsd += got.costUsd;
+				this.record({ head, key: key!, cut: got, usd: got.costUsd });
+				cut = { ...got, prepared: true }; // booked now
 			}
 		} catch (err) {
 			this.ledger({ type: "error", where: "room_wait", error: errText(err) });
