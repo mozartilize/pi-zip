@@ -869,24 +869,24 @@ export class Zip implements ZipControl {
 		this.timer = null;
 	}
 
-	/** The call in flight, if any, ends unused: aborted, and recorded at once (in the session it belongs to, whatever the aborted call
-	 *  does later) as a pi-zip/summary entry without a summary, at the input it is billed for (estimated). */
+	/** End the call unused and book its estimated input at once, including its in-memory artifact.
+	 *  Its asynchronous cancellation persists the record; shutdown flushes it before exit. */
 	private discardBg(why: "replaced" | "shutdown" | "off") {
 		const b = this.bg;
 		this.bg = null;
 		if (!b) return;
 		b.aborted = true;
-		b.controller.abort();
 		this.stats.summaryUsd += b.estUsd;
 		this.ledger({ type: "unused_summary", key: b.key, why });
-		this.record({ head: b.head, key: b.key, usd: b.estUsd, estimated: true, lost: why });
+		this.record({ head: b.head, key: b.key, usd: b.estUsd, estimated: true, lost: why }, true);
+		b.controller.abort();
 	}
 
-	/** A pi-zip/summary record: written now between runs (custom entry, never in the context); inside a run it waits for the run's next
-	 *  turn_end or settle, where it goes with the drafts. Either way this process reads it from `mine` at once. */
-	private record(a: Artifact) {
+	/** A record is readable from `mine` at once. Completed calls append a custom entry between runs; inside a run it waits for drafts.
+	 *  Cancellation queues it for the call's asynchronous flush or shutdown, so a timer never appends an entry itself. */
+	private record(a: Artifact, deferred = false) {
 		this.mine.push(a);
-		if (this.inRun) this.unwritten.push(a);
+		if (this.inRun || deferred) this.unwritten.push(a);
 		else this.write(a);
 	}
 	private write(a: Artifact) {
@@ -1149,10 +1149,9 @@ export class Zip implements ZipControl {
 		const estUsd = (p.scale.c * Math.max(0, p.prefixTokens - prevSum) * (Number(ctx?.model?.cost?.input) || 0)) / 1e6;
 		const bg: Bg = { key, head, aborted: false, promise: Promise.resolve(null), controller, estUsd };
 		const end = () => { if (this.bg === bg) this.bg = null; };
-		bg.promise = buildCut(p, ctx, controller.signal)
+		bg.promise = Promise.race([buildCut(p, ctx, controller.signal), new Promise<null>((resolve) => controller.signal.addEventListener("abort", () => resolve(null), { once: true }))])
 			.then((c) => {
-				end();
-				if (bg.aborted) return null; // recorded as unused when it was ended
+				if (bg.aborted || !c) return null;
 				const learned = record(model, { explicit: false, total: 0, call: { ms: c.ms, tokens: Math.max(1, c.prefixTokens) } });
 				if (this.entKey === model) this.ent = learned;
 				this.stats.summaryUsd += c.costUsd;
@@ -1161,10 +1160,10 @@ export class Zip implements ZipControl {
 				return c;
 			})
 			.catch((err) => {
-				end();
 				if (!bg.aborted) this.ledger({ type: "error", where: "away_summary", error: err instanceof Error ? err.message : String(err) });
 				return null;
-			});
+			})
+			.finally(() => { end(); if (bg.aborted && !this.inRun) this.writeUnwritten(); });
 		this.bg = bg;
 		this.ledger({ type: "away_summary_start", key });
 		return true;
