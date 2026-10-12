@@ -14,7 +14,7 @@ import { branchOutputs, recalledHandlesFromBranch, resolveHandlesInBranch } from
 import { cleanupRecall, commandNamesRecall, fileRecallFor, materialize, parseRecallPath, recallRoot, recallRootShown, rewriteCommand, sidDir, type FileRecall } from "./recallfile.ts";
 import { buildCut } from "./summary.ts";
 import { type Any, COMMIT_CUSTOM, envInt, isKeystroke, PRODUCT, textOf, tok4 } from "./util.ts";
-import { replayGrowth } from "./state.ts";
+import { pendingSummary, replayGrowth } from "./state.ts";
 import { fmtLife, type CardData, type ChartBin, type StateWord } from "./ui.ts";
 
 export const PLAN_CUSTOM = "pi-zip/plan";
@@ -473,6 +473,7 @@ export class Zip implements ZipControl {
 		this.model = ctx?.model;
 		this.ttlNoticed = false;
 		this.restoreState(branch);
+		this.nextEdit = pendingSummary(branch) ? this.scaleOf(ctx).O : null;
 		this.detectConflict(ctx);
 		let recallFilesRemoved = 0;
 		try {
@@ -1116,8 +1117,7 @@ export class Zip implements ZipControl {
 		const byId = new Set(o.blocks.map((b) => b.entryId));
 		if (!got || checkEdits(o.blocks, o.userTurns, applied.filter((t) => byId.has(t.entryId)), got.cut)) return null; // the run plan alone
 		this.discardBg("replaced");
-		const room: RunPlan = { ...plan, cut: got.cut, waitMs: got.ms, ctxAfter: plan.ctxAfter - sc.c * (got.cut.prefixTokens - got.cut.summaryTokens) };
-		if (room.noticed) this.noticeFor(ctx, room, [], got.cut, after, 0); // its folds were announced with its first request
+		const room: RunPlan = { ...plan, cut: got.cut, cutSent: false, untouched: sc.O, waitMs: got.ms, ctxAfter: plan.ctxAfter - sc.c * (got.cut.prefixTokens - got.cut.summaryTokens) };
 		return room;
 	}
 
@@ -1142,7 +1142,8 @@ export class Zip implements ZipControl {
 				if (!this.runPlan.sent) this.nextEdit = this.runPlan.untouched ?? 0;
 				this.runPlan.sent = true;
 				const applied = (this.runPlan.applied = out?.applied ?? this.runPlan.applied ?? new Set<string>());
-				if (!this.runPlan.noticed) { // say it where it happens: at the top of the turn, before the model answers
+				this.runPlan.noticeTs ??= Date.now();
+				if (!this.runPlan.noticed && (this.runPlan.cut || this.runPlan.native)) { // folds alone wait for the boundary: a room summary can join their one notice
 					this.runPlan.noticed = true;
 					const live = this.runPlan.folds.filter((t) => applied.has(t.entryId));
 					this.noticeFor(ctx, this.runPlan, live, this.runPlan.cut ?? this.runPlan.native ?? null, this.runPlan.ctxBefore, 0);
@@ -1555,9 +1556,9 @@ export class Zip implements ZipControl {
 		const ITEMS = 8;
 		const items = live.slice(0, ITEMS).map((t) => ({ label: `${t.tool}${t.args ? " " + t.args : ""}`, tokens: Math.round(c * t.entryTokens), handle: handleFor(t.entryId) }));
 		const why = valve || !this.cold ? "cache warm · worth it at this size" : this.coldWhy;
-		// reqTs: a run plan is announced as its first request goes out, a valve plan at turn_end, before the next request that first carries
-		// it; either way the first assistant message stamped at or after this moment answered the request that carried the plan
-		const data: NoticeData = { v: 2, text: noticeText(notices), before: Math.round(notices[0].tokensBefore), after: Math.round(notices[notices.length - 1].tokensAfter), desc: noticeDesc(notices), why: why || undefined, items, more: Math.max(0, live.length - ITEMS) || undefined, first: !this.noticed && !this.branch(ctx).some((en: Any) => en?.type === "custom" && en.customType === NOTICE_CUSTOM), reqTs: Date.now(), ...(cut && (!valve || plan.native) && this.nativeNote ? { native: this.nativeNote.native, ...(this.nativeNote.ms !== undefined ? { nativeMs: this.nativeNote.ms } : {}), ...(this.nativeNote.askMs !== undefined ? { nativeAskMs: this.nativeNote.askMs } : {}) } : {}) };
+		// reqTs identifies the first request carrying the final view: a folds-only notice keeps its first-request time when announced
+		// at the boundary; a newly joined room summary uses the boundary time, because only the next request can carry it.
+		const data: NoticeData = { v: 2, text: noticeText(notices), before: Math.round(notices[0].tokensBefore), after: Math.round(notices[notices.length - 1].tokensAfter), desc: noticeDesc(notices), why: why || undefined, items, more: Math.max(0, live.length - ITEMS) || undefined, first: !this.noticed && !this.branch(ctx).some((en: Any) => en?.type === "custom" && en.customType === NOTICE_CUSTOM), reqTs: plan.cutSent === false ? Date.now() : (plan.noticeTs ?? Date.now()), ...(cut && (!valve || plan.native) && this.nativeNote ? { native: this.nativeNote.native, ...(this.nativeNote.ms !== undefined ? { nativeMs: this.nativeNote.ms } : {}), ...(this.nativeNote.askMs !== undefined ? { nativeAskMs: this.nativeNote.askMs } : {}) } : {}) };
 		this.noticed = true;
 		this.notify(ctx, data.text, data);
 	}
@@ -1588,14 +1589,14 @@ export class Zip implements ZipControl {
 			plan.persisted = false; // keep the request-local view: never switch the fold set mid-run
 			return undefined;
 		}
-		if (!plan.sent) this.nextEdit = plan.untouched ?? 0; // persisted now, first sent with the next request
-		const sentBefore = !!plan.sent;
+		const sentBefore = !!plan.sent, cutSent = plan.cutSent ?? sentBefore;
+		if (!sentBefore || (cut && !cutSent)) this.nextEdit = plan.untouched ?? 0; // a new room summary is first sent with the next request
 		const ours: Any[] = live.map((t) => ({ type: "context_edit", targetId: t.entryId, replacement: { content: [{ type: "text", text: t.ph }] } }));
 		for (const t of live) if (t.toolCallId) this.foldedCalls.set(t.toolCallId, handleFor(t.entryId));
 		// the compaction draft goes FIRST: Pi writes its tokensBefore from the newest usage only while no edit follows that usage, so a
 		// fold drafted before it would make Pi's "Compacted from N tokens" the chars/4 of a half-applied projection (research pi-tricks §1a)
-		if (cut) ours.unshift({ type: "compaction", summary: cut.text, firstKeptEntryId: cut.firstKeptEntryId, details: { by: PRODUCT, trigger: cut.trigger, carried: sentBefore, regrow }, usage: cut.usage });
-		ours.push({ type: "custom", customType: COMMIT_CUSTOM, data: { carried: sentBefore } }); // says who first carried these edits (state.ts, plan.ts calibrate)
+		if (cut) ours.unshift({ type: "compaction", summary: cut.text, firstKeptEntryId: cut.firstKeptEntryId, details: { by: PRODUCT, trigger: cut.trigger, carried: cutSent, regrow }, usage: cut.usage });
+		ours.push({ type: "custom", customType: COMMIT_CUSTOM, data: { carried: sentBefore, ...(cut && sentBefore && !cutSent ? { next: true } : {}) } }); // says who first carried these edits (state.ts, plan.ts calibrate)
 		const before = Math.round(c * live.reduce((a, t) => a + t.entryTokens, 0));
 		const after = Math.round(c * live.reduce((a, t) => a + t.phTokens, 0));
 		const cutSaved = cut ? Math.round(c * (cut.prefixTokens - cut.summaryTokens)) : 0;
@@ -1625,8 +1626,8 @@ export class Zip implements ZipControl {
 			coldReason: this.coldReason, prepared: plan.source === "settle", ...(stale ? { staleTargets: stale } : {}),
 		});
 		if (cut) this.ledger({ type: "summary", trigger: cut.trigger, source: plan.source, count: cut.count, prefixTokens: Math.round(c * cut.prefixTokens), summaryTokens: Math.round(c * cut.summaryTokens), ms: cut.ms, waitedMs: Math.round(waitMs), llmOk: cut.llmOk, llmError: cut.llmError, costUsd: cut.costUsd, ...this.usageOf(cut) });
-		// a run plan was announced when its first request went out; a valve plan (between turns) is announced now
-		if (!plan.noticed) this.noticeFor(ctx, plan, live, cut, ctxTokens, plan.source === "valve" ? 0 : o.usageTotal);
+		// A summary already sent was announced with its request; folds alone wait here so a room summary joins their one notice.
+		if (!plan.noticed) this.noticeFor(ctx, plan, live, cut, ctxTokens, plan.source === "valve" || plan.cutSent === false ? 0 : o.usageTotal);
 		plan.noticed = true;
 		return { entries: [...e.entries, ...ours] }; // append, never overwrite other extensions' drafts
 	}

@@ -9,7 +9,8 @@ const nativeSummary = (e: Any): boolean => e?.type === "compaction" && e.details
 
 /** For each assistant message of the branch (by branch index): was it the first response to carry a pi-zip edit? A run plan is sent from
  *  the run's first request and persisted after its response (the commit entry says `carried`); a warm-valve plan, or a summary that went
- *  in through Pi's compaction, is first carried by the next request. Errors and aborts count: the request was made. */
+ *  in through Pi's compaction, is first carried by the next request. A mixed room batch marks both requests (`carried` and `next`).
+ *  Errors and aborts count: the request was made. */
 export function carriedEdits(branch: Any[]): Set<number> {
 	const edited = new Set<number>();
 	let next = false, last = -1;
@@ -21,10 +22,20 @@ export function carriedEdits(branch: Any[]): Set<number> {
 		} else if (nativeSummary(e)) next = true;
 		else if (e?.type === "custom" && e.customType === COMMIT_CUSTOM) {
 			if (e.data?.carried && last >= 0) edited.add(last);
-			else if (!e.data?.carried) next = true;
+			if (!e.data?.carried || e.data?.next) next = true;
 		}
 	});
 	return edited;
+}
+
+/** A persisted summary has no response yet: the next request first carries its rewrite, including after a restart. */
+export function pendingSummary(branch: Any[]): boolean {
+	let pending = false;
+	for (const e of branch) {
+		if (e?.type === "message" && e.message?.role === "assistant") pending = false;
+		else if (e?.type === "compaction") pending = nativeSummary(e) || (e.details?.by === PRODUCT && e.details?.carried === false);
+	}
+	return pending;
 }
 
 /** Growth per request, as run.ts `learn` accumulates it: EWMA(0.1) of the growth between consecutive responses of one model that
