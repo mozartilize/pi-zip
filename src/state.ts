@@ -1,6 +1,6 @@
 // Planner state that is a function of the session: rebuilt from the branch at session start (a restart, a resume, a fork), so a fresh
-// process plans exactly like one that never left (formal/TRIAGE.md (a) 1: growth g, "the newest response carried an edit", and
-// "a summary was made in this warm stretch" lived only in memory).
+// process plans exactly like one that never left: growth g and "the newest response carried an edit" are read from the session,
+// while completed summary calls are persisted artifacts.
 import { grow } from "./core.ts";
 import { COMMIT_CUSTOM, PRODUCT, type Any } from "./util.ts";
 

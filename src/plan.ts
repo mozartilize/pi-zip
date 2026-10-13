@@ -602,9 +602,6 @@ export interface PlanOpts {
 	model?: Any;
 	promptPending?: boolean; // true at settle: the upcoming prompt is NOT in `entries` yet but counts as a new user turn
 	inturnAge?: number; // default settings().inturnAge (PI_ZIP_INTURN_AGE, 60); 0 = outputs of the protected turns never fold on age
-	noSummary?: boolean; // a summary was already made while this cache stayed warm: no second one unless the context is at/above the compaction room
-	regrowAt?: number; // with noSummary: the real context (after folds) the last summary started from; once the context has grown back to it (the
-	// growth since that summary is at least what it removed), a second summary gains what the first did and the law alone decides again
 	rereadOnly?: boolean; // zip_recall is not available to the model: fold only outputs that can be re-read (classify "rereadable")
 	fileRecall?: FileRecall; // zip_recall is hidden but read, grep or bash is active: fold as in full mode, placeholders name the recall file
 	cutAt?: string; // cut at this entry or not at all (a summary for that cut is produced or being produced: core.ts adopt)
@@ -752,8 +749,7 @@ export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
 	const target = Math.max(coldCap, floor + SUMMARY_FLOOR);
 	const atRoom = room !== null && real(ctxAfterFolds) >= room;
 	const atRoomUnedited = room !== null && real(ctxEst) >= room;
-	const noSummary = !!o.noSummary && !(o.regrowAt !== undefined && o.regrowAt > 0 && real(ctxAfterFolds) >= o.regrowAt);
-	const sumTrigger: "cold" | "valve" | null = !o.foldsOnly && ctxAfterFolds > target && (!noSummary || atRoom) ? trig : null;
+	const sumTrigger: "cold" | "valve" | null = !o.foldsOnly && ctxAfterFolds > target ? trig : null;
 	let cutIdx: number | null = null;
 	let prefixTokens = 0;
 	let summaryTokensPlanned = 0;

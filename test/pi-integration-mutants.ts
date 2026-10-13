@@ -14,7 +14,7 @@ const mutants = [
 	{
 		name: "room-summary-inherits-sent",
 		check: "request carry metadata must match the actual request view",
-		edit: (source: string) => source.replace("carried: false, regrow", "carried: sentBefore, regrow"),
+		edit: (source: string) => source.replace("carried: false }, usage: cut.usage", "carried: sentBefore }, usage: cut.usage"),
 	},
 	{
 		name: "room-summary-emits-second-notice",

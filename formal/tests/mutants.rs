@@ -376,42 +376,6 @@ fn trace_file(name: &str) -> String {
     std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("traces").join(name)).unwrap()
 }
 
-/// WL (b): the one-summary-per-warm-stretch flag lapses once the context has grown back to the size the stretch's summary started
-/// from. The mutant is the flag of 4795af3, which never lapses: at request 80 the context is back at 100K (the summary started from
-/// 75K) and a summary that pays (Phi 5.3) is withheld. NT holds on the src: the second summary comes after the regrowth.
-#[test]
-fn wl_the_one_summary_flag_lapses() {
-    // Keep the draft entry path this flag mutant targets; native adoption books the summary before the run.
-    let t = trace_file("wl-regrow.trace").replace(" native ", " nonative ");
-    caught_all(
-        "wl1",
-        "plan.ts",
-        &[("const noSummary = !!o.noSummary && !(o.regrowAt !== undefined && o.regrowAt > 0 && real(ctxAfterFolds) >= o.regrowAt);", "const noSummary = !!o.noSummary;", 1)],
-        &["WL"],
-        &t,
-    );
-}
-
-/// WL (b), review P0-1: a summary, a cold wake started by an extension's message, a restart: the resumed process must know the wake
-/// ended the warm stretch. The mutant is 4795af3's restore: it walks only user prompts (summarizedSince) and has no regrowth rule, so
-/// it restores the flag for a stretch the wake had ended and withholds the summary at request 81 (Phi 5.3); 4795af3 itself fails WL
-/// on this trace the same way. (With the regrowth rule alone the flag would lapse at the same request: both edits are needed.)
-#[test]
-fn wl_a_restart_knows_a_driven_cold_wake() {
-    let t = trace_file("wl-drive-restart.trace");
-    caught_all(
-        "wl2",
-        "core.ts",
-        &[
-            ("if (!afterAnswer) continue; // mid-run, or riding with the prompt just before it", "continue;", 1),
-            // lastRegrow is read only by run.ts restoreState: the same as restoring `summaryRegrow = undefined`
-            ("return typeof e.details.regrow === \"number\" && e.details.regrow > 0 ? e.details.regrow : undefined;", "return undefined;", 1),
-        ],
-        &["WL"],
-        &t,
-    );
-}
-
 /// GC over `drive`: a run an extension's message starts after an hour is planned cold. The mutant drops the agent_start handling
 /// (2cda8e1 and earlier): the driven run is planned on the state of the previous prompt.
 #[test]
@@ -490,4 +454,27 @@ fn en_preceding_boundary_edit_invalidates_usage() {
 #[test]
 fn en_boundary_after_size_counts_folds_once() {
     caught("en4", "run.ts", "const ctxAfter = sizeOf(sc,", "const ctxAfter = ctxTokens - (before - after) - cutSaved; const ignored = sizeOf(sc,", "EN", &trace_file("en-after-size.trace"));
+}
+
+/// NT still rejects a summary that writes more than the conversation it replaces after Q2 is dropped.
+#[test]
+fn nt_a_summary_must_remove_more_than_it_writes() {
+    if !available() { return; }
+    let trace = Trace::parse(&trace_file("na-ready-native.trace")).unwrap();
+    let base = observe(&worktree_src(), &trace);
+    assert!(holds(&base, "NT"));
+    let mut obs = base.obs.clone();
+    let mut changed = 0;
+    for tick in &mut obs.ticks {
+        for grid in &mut tick.grids {
+            for point in &mut grid.grid {
+                if point.actual && point.cut.is_some() {
+                    point.sum = 2.0 * point.prefix;
+                    changed += 1;
+                }
+            }
+        }
+    }
+    assert!(changed > 0, "the trace observes a summary decision");
+    assert!(!holds(&Run::new(trace, obs), "NT"));
 }

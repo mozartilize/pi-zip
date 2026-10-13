@@ -368,6 +368,39 @@ describe("boundary decision regressions", () => {
 	});
 });
 
+describe("successive warm summaries", () => {
+	test("a restarted warm session takes a paying summary below its previous compaction size", async () => {
+		const sm = SessionManager.inMemory(CWD);
+		sm.appendMessage(user("old request"));
+		sm.appendMessage(asst([{ type: "text", text: "old work" }]));
+		const kept = sm.appendMessage(user("new work"));
+		const head = sm.appendCompaction("S".repeat(32_000), kept, 100_000, { by: "pi-zip" }, true);
+		sm.appendMessage({ ...asst([{ type: "text", text: "p".repeat(160_000) }]), timestamp: Date.now(), usage: undefined });
+		const key = sm.appendMessage(user("previous request"));
+		sm.appendMessage({ ...asst([{ type: "text", text: "done" }]), timestamp: Date.now(), usage: undefined });
+		sm.appendMessage(user("current request"));
+		const text = "## Decisions\n" + "S".repeat(32_000);
+		sm.appendCustomEntry("pi-zip/summary", { head, key, usd: 0.01, cut: { firstKeptEntryId: key, text, trigger: "valve", count: 1,
+			prefixTokens: 48_000, summaryTokens: text.length / 4, llmOk: true, llmError: null, costUsd: 0.01, ms: 1 } });
+		const r = await rig(undefined, { file: [sm.getHeader() as Any, ...sm.getEntries()], start: false });
+		const originalOpts = r.zip.opts.bind(r.zip);
+		r.zip.opts = (...args: Any[]) => {
+			const o = originalOpts(...args).o;
+			o.scale = UNIT; o.law = { pr: lawPrices("explicit", false), g: 500, pWarm: 1 };
+			return { o, cal: UNIT };
+		};
+		const response = { ...asst([{ type: "text", text: "finished" }]), timestamp: Date.now(), usage: undefined };
+		const id = r.sm.appendMessage(response);
+		const drafts = await r.turnEnd(id, response);
+		expect(drafts[0]).toMatchObject({ type: "compaction", firstKeptEntryId: key, summary: text });
+		const compactions = r.sm.getBranch().filter((e: Any) => e.type === "compaction") as Any[];
+		expect(compactions).toHaveLength(2);
+		expect(compactions[1].tokensBefore).toBeLessThan(compactions[0].tokensBefore);
+		expect(r.narrativeCalls).toHaveLength(0); // the ready call is reused
+		await r.shutdown();
+	});
+});
+
 describe("mixed room boundary", () => {
 	for (const outcome of ["room", "below room", "aborted"] as const) test(`an incoming edit of a carried target preserves the boundary decision (${outcome})`, async () => {
 		delete process.env.PI_ZIP_COLD_CAP;
@@ -580,7 +613,6 @@ describe("real Pi: the request view is identical before and after turn_end persi
 		expect(comp.tokensBefore).toBe(piBefore);
 		const notice = (r.sm.getBranch().find((e: Any) => e.customType === "pi-zip/notice" && !e.data?.kind) as Any).data;
 		expect(notice.before).toBe(piBefore);
-		expect(comp.details.regrow).toBeGreaterThan(0); // the size the summary started from: a restart restores when the warm-stretch flag lapses
 	});
 
 	test("our replayed system message equals pi-ai's getCurrentSystemMessage", async () => {
@@ -826,10 +858,10 @@ describe("real Pi: a summary prepared while the user was away goes in through Pi
 	test("the timer re-plans after a compaction instead of using a cached settle plan", async () => {
 		process.env.PI_ZIP_TTL_SECS = "0.1";
 		const r = await rig(undefined, { file: template(3_600_000), tui: true, native: false, idle: false, start: false });
-		// A prior summary suppresses warm production but leaves the paying pause timer.
+		// Replacing the old history leaves a short prefix whose production pays only after a pause.
 		const branch = r.sm.getBranch() as Any[];
 		const keep = branch.filter((e) => e.type === "message" && e.message.role === "user")[3];
-		r.sm.appendCompaction("short history", keep.id, 12_000, { by: "pi-zip", regrow: 200_000 }, true);
+		r.sm.appendCompaction("short history", keep.id, 12_000, { by: "pi-zip" }, true);
 		await r.runner.emit({ type: "session_start", reason: "resume" } as Any);
 		await r.settle();
 		await sleep(1_250);
@@ -1001,7 +1033,7 @@ describe("round 5 on real Pi: rule A starts the warm summary early, nobody waits
 				}
 				const entries = sm.buildSessionProjection().entries as Any[];
 				const env = { model: MODEL, cwd: CWD, sys: { text: "You are a coding agent.", tools: [] }, reserve: 16_384, recalled: new Set<string>(), steerIds: new Set<string>(), rereadOnly: false };
-				const learned = { model: MODEL, g: 2500, justEdited: false, summarizedWarm: false };
+				const learned = { model: MODEL, g: 2500, justEdited: false };
 				const key = keys[kept];
 				const opts = (ready: string[]) => planOpts(entries, sm.getBranch(), env, learned, true, p, false, undefined, false, ready).o;
 				if (p === 1) expect(planContext(entries, opts([]))?.cutIdx ?? null).toBeNull();
@@ -1044,7 +1076,7 @@ describe("round 5 on real Pi: rule A starts the warm summary early, nobody waits
 		const key = keys[9], text = "## Decisions\n" + "summary ".repeat(500);
 		const entries = sm.buildSessionProjection().entries as Any[];
 		const env = { model: MODEL, cwd: CWD, sys: { text: "You are a coding agent.", tools: [] }, reserve: 16_384, recalled: new Set<string>(), steerIds: new Set<string>(), rereadOnly: false };
-		const o = planOpts(entries, sm.getBranch(), env, { model: MODEL, g: 2500, justEdited: false, summarizedWarm: false }, true, 1, false, key, false, [key]).o;
+		const o = planOpts(entries, sm.getBranch(), env, { model: MODEL, g: 2500, justEdited: false }, true, 1, false, key, false, [key]).o;
 		const prepared = planContext(entries, o)!;
 		expect(prepared.cutIdx).not.toBeNull();
 		expect(prepared.folds.length).toBeGreaterThan(0);
@@ -1167,7 +1199,7 @@ describe("round 5 on real Pi: rule A starts the warm summary early, nobody waits
 // no-UI behaviour moves, and each move is justified in its commit: 0.3.1's (0907ceea..., 0.3.0's decisions with 0.3.1's format, where
 // these scenarios waited for their summaries in line) became this one when 0.4.0 stopped waiting.
 describe("no UI (pi -p, json): the requests and the session of three scenarios hash to a recorded digest", () => {
-	const NOUI_DIGEST = "b473737be61fd0e62b0259d639815cd3"; // R5_PRINT_DIGEST=1 prints it (0.3.1: 0907ceeacca2be4a8b8f684dd6a47a96)
+	const NOUI_DIGEST = "78899647f944078ff9b4033f6c524334"; // R5_PRINT_DIGEST=1 prints it (0.3.1: 0907ceeacca2be4a8b8f684dd6a47a96)
 	const sleep = (ms: number) => new Promise((res) => setTimeout(res, ms));
 	const shifted = (agoMs: number, prose: number) => {
 		const sm = SessionManager.inMemory(CWD);

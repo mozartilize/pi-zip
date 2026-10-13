@@ -223,21 +223,7 @@ fn warm_above_target() -> F<R> {
 fn head_kept() -> F<R> {
     atom("head_kept", |r: &R, i, _| head_breach(r, i).is_none())
 }
-/// The context (after folds) the summary this request carries new started from: the size its decision saw (WL, NT: the
-/// one-summary-per-warm-stretch rule lapses once the context has grown back to it). Unknown: never regrown.
-fn summary_start() -> Term<R> {
-    term("summary_start", |r: &R, i, _| summary_start_at(r, i))
-}
-/// The decision behind this request's new summary saw a context below the size the stretch's previous summary (frozen in s0)
-/// started from: the stretch's one summary has not been paid back by growth yet.
-fn not_regrown() -> F<R> {
-    atom("not_regrown", |r: &R, i, env: &Env| {
-        let s0 = lookup(env, "s0");
-        r.decision_for(i).and_then(|g| g.actual()).and_then(|p| p.after_folds).is_none_or(|a| a < s0 * (1.0 - TOL))
-    })
-}
-/// No warm decision at this request withholds a summary the law says pays by a margin, unless the one-summary-per-warm-stretch rule
-/// allows it; and every warm turn_end asks the valve.
+/// Every warm turn_end decides, and a ready summary is reused instead of produced again.
 fn warm_summary_not_withheld() -> F<R> {
     atom("warm_summary_not_withheld", |r: &R, i, _| withheld(r, i).is_none())
 }
@@ -367,8 +353,8 @@ pub fn derived() -> Vec<Prop> {
             id: "RD",
             name: "restart determinism",
             from: &["A2", "A3"],
-            why: "decisions are functions of the session: a restart must not plan differently (else the law, the b2b rule and the \
-                  one-summary rule are evaluated on state the session does not carry). Produced summaries are pi-zip/summary entries, so \
+            why: "decisions are functions of the session: a restart must not plan differently (else the law and the b2b rule are \
+                  evaluated on state the session does not carry). Produced summaries are pi-zip/summary entries, so \
                   a fresh process takes them too; what a restart may lose is a summary call still in flight (RDr excuses only that).",
             evidence: Evidence::Conformance,
             f: always(run_start() >> fresh_plans_alike()),
@@ -427,12 +413,9 @@ pub fn derived() -> Vec<Prop> {
             id: "NT",
             name: "no thrash",
             from: &["A2", "A3"],
-            why: "at most one summary per warm stretch as pi-zip believes it (a stretch ends at a return planned cold; learning that a cache \
-                  outlives its declared TTL is outside this spec) unless at Pi's compaction room or once the context has grown back to the \
-                  size the stretch's summary started from (then a second one gains what the first did: review round 4, P0-1); and never a \
-                  summary that removes nothing (below the irreducible floor, or a prefix that is mostly the previous summary).",
+            why: "a summary must remove at least what it writes, above the irreducible floor (system prompt, previous summary and protected turns). The law alone prices successive summaries; no warm-stretch budget or regrowth exception remains.",
             evidence: Evidence::Conformance,
-            f: always(zip_summary() >> freeze("s0", summary_start(), !next((!cold_plan()).until(zip_summary() & !cold_plan() & !at_room() & not_regrown())))) & always(zip_summary() >> summary_worth_it()),
+            f: always(zip_summary() >> summary_worth_it()),
         },
         Prop {
             id: "WL",
@@ -440,13 +423,8 @@ pub fn derived() -> Vec<Prop> {
             from: &["A2", "A3"],
             why: "completeness (every other property is safety: a pi-zip that never summarises passes them). (a) Every warm turn_end of a \
                   request that did not fail asks the valve (a decision point), unless the request right before carried a fresh edit (b2b) \
-                  or the run plan is persisted there. (b) A warm decision the one-summary-per-warm-stretch flag constrained, planned again \
-                  with the flag lifted, may withhold a summary whose summary step and whole-plan step (the call priced) the law accepts \
-                  with Phi >= 1 + WL_MARGIN only while the rule allows it: a pi-zip summary (or another extension's compaction) was made \
-                  since the last cold plan and the context has not grown back to the size that summary started from. A flag that never \
-                  lapses, or one a restart restored for a stretch a cold return had ended, withholds summaries that pay. (c) Restated in \
-                  0.4.0: a summary a decision wants is produced at once and applied at the first decision after it is ready, so no \
-                  decision produces again a summary whose call returned while its range is still the session's prefix.",
+                  or the run plan is persisted there. A summary a decision wants is produced at once and applied at the first decision \
+                  after it is ready, so no decision produces again a summary whose call returned while its range is still the session's prefix.",
             evidence: Evidence::Conformance,
             f: always(warm_summary_not_withheld()),
         },
@@ -456,7 +434,7 @@ pub fn derived() -> Vec<Prop> {
             from: &["A2", "A3"],
             why: "completeness at the idle prompt: given ready artifacts in the session, the spec chooses the deepest guarded cut no \
                   deeper than c (or cW without c), using its own law and class prices; if that cut pays with call price zero and \
-                  the native door is open, outside b2b and Q2, it must enter natively before the first request.",
+                  the native door is open, outside b2b, it must enter natively before the first request.",
             evidence: Evidence::Conformance,
             f: always(atom("native_ready_applied", |r: &R, i, _| native_withheld(r, i).is_none())),
         },
@@ -513,7 +491,7 @@ pub fn derived() -> Vec<Prop> {
             id: "RDr",
             name: "restart determinism, residual",
             from: &["RD"],
-            why: "RD with the known cause transplanted (g, justEdited, summarizedWarm together, TRIAGE (a) 1): what is left is a new cause.",
+            why: "RD with the known cause transplanted (g and justEdited together, TRIAGE (a) 1): what is left is a new cause.",
             evidence: Evidence::Conformance,
             f: always(run_start() >> rd_residual()),
         },
@@ -957,25 +935,6 @@ pub fn summary_waste(r: &R, i: usize) -> Option<String> {
     None
 }
 
-/// WL: the summary step and the whole plan's step must beat their cost by this margin before a withheld summary counts (the sizes
-/// are the planner's calibrated estimates).
-pub const WL_MARGIN: f64 = 0.25;
-
-/// The context (after folds) the decision behind request i's summary saw; infinite when unknown (never regrown).
-pub fn summary_start_at(r: &R, i: usize) -> f64 {
-    r.decision_for(i).and_then(|g| g.actual()).and_then(|p| p.after_folds).unwrap_or(f64::INFINITY)
-}
-
-/// The newest request at or before i whose run pi-zip planned cold (the start of the warm stretch i belongs to), if any.
-fn last_cold_plan(r: &R, i: usize) -> Option<usize> {
-    (0..=i).rev().find(|&m| r.tick(m).n == 0 && r.st[m].believed_cold)
-}
-
-/// A recorded law step passes with Phi >= 1 + WL_MARGIN (Phi is infinite, reported as none, when K <= 0).
-fn pays_by_margin(s: &LawStep) -> bool {
-    s.ok && s.phi.is_none_or(|phi| phi >= 1.0 + WL_MARGIN)
-}
-
 /// WL (c), 0.4.0 step 4 (architecture section 8, WL restated: a warm summary that pays is produced at once and applied at the first
 /// decision after it is ready): a decision at request i (its run hook or its turn_end) asks for a summary whose call already returned
 /// (run.ts `away_summary`) and whose range is still the session's prefix (no compaction of any kind, no foreign edit, since that call
@@ -1023,7 +982,7 @@ pub fn ready_produced_again(r: &R, i: usize) -> Option<String> {
 /// Native completeness uses pre-door artifacts and sizes, not a `take`, `native_skip`, or the planner's law verdicts.
 pub fn native_withheld(r: &R, i: usize) -> Option<String> {
     let n = r.tick(i).native_door.as_ref()?;
-    if !r.trace.world.native || !n.open || n.b2b || n.no_summary || n.after_folds <= n.target.max(n.floor) || n.cuts.is_empty() {
+    if !r.trace.world.native || !n.open || n.b2b || n.after_folds <= n.target.max(n.floor) || n.cuts.is_empty() {
         return None;
     }
     let pr = class_prices(if n.known { r.trace.world.cls } else { Class::Explicit }, r.trace.world.tier == Tier::Long);
@@ -1053,43 +1012,6 @@ pub fn withheld(r: &R, i: usize) -> Option<String> {
     let run_plan_persisted = t.n == 0 && t.run_plan.is_some();
     if !asked && t.failed.is_none() && !b2b && !run_plan_persisted {
         return Some("a warm turn_end asked no valve (no decision point, no b2b skip, no run plan to persist)".into());
-    }
-    // (b) the one-summary flag withholds only what the rule allows
-    for g in r.grids(i) {
-        if g.mode != "warm" || !g.no_summary {
-            continue;
-        }
-        let Some(f) = g.free.as_ref().filter(|f| f.error.is_none() && f.cut.is_some()) else { continue };
-        if g.actual().is_some_and(|p| p.cut.is_some()) {
-            continue;
-        }
-        let Some(k) = f.law.iter().rposition(|s| s.at == "plan" && s.cut == Some(true) && s.ok) else { continue };
-        let sum_ok = k > 0 && f.law[k - 1].at == "summary" && pays_by_margin(&f.law[k - 1]);
-        if !sum_ok || !pays_by_margin(&f.law[k]) {
-            continue;
-        }
-        let phi = f.law[k].phi.map(|x| format!("{x:.2}")).unwrap_or_else(|| "inf".into());
-        let now = f.after_folds.unwrap_or(0.0);
-        let m0 = last_cold_plan(r, i).unwrap_or(0);
-        if (m0..=i).any(|m| r.tick(m).env.iter().any(|e| e == "foreign")) {
-            continue; // another extension's compaction is this stretch's summary
-        }
-        let starts: Vec<f64> = (m0..=i).filter(|&m| r.zip_summary_new(m)).map(|m| summary_start_at(r, m)).collect();
-        match starts.last() {
-            None => {
-                return Some(format!(
-                    "{} plan at P={}: the one-summary flag is set, but pi-zip made no summary since the last cold plan (request {m0}); it withholds a summary that pays (Phi {phi}, context {now:.0})",
-                    g.at, g.p
-                ))
-            }
-            Some(&s0) if now >= s0 * (1.0 + TOL) => {
-                return Some(format!(
-                    "{} plan at P={}: the context ({now:.0}) has grown back past the size the stretch's summary started from ({s0:.0}), and the flag still withholds a summary that pays (Phi {phi})",
-                    g.at, g.p
-                ))
-            }
-            _ => {}
-        }
     }
     None
 }
@@ -1368,14 +1290,13 @@ pub fn explain(id: &str, r: &R, i: usize) -> Vec<String> {
                 let z = if i > 0 { r.tick(i - 1).zip.clone() } else { Default::default() };
                 vec![format!(
                     "live process sends {} messages ({} pi-zip edits), a fresh process {} ({} edits); in-memory state a restart loses: \
-                     growth g {:.0} (fresh: 2500), justEdited {}, summarizedWarm {}; fresh plan: {}",
+                     growth g {:.0} (fresh: 2500), justEdited {}; fresh plan: {}",
                     f.live,
                     f.live_mods,
                     f.fresh,
                     f.fresh_mods,
                     z.g.unwrap_or(f64::NAN),
                     z.just_edited,
-                    z.summarized_warm,
                     f.fresh_plan.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(" ")
                 )]
             })
@@ -1523,17 +1444,10 @@ pub fn classify(id: &str, r: &R, v: &Violation) -> String {
             Some(_) => "not explained by the transplanted in-memory state".into(),
             None => "other".into(),
         },
-        "B2B" | "NT" => {
+        "NT" => "a summary that removes (almost) nothing".into(),
+        "B2B" => {
             let j = v.witnesses.iter().copied().max().unwrap_or(v.at);
-            if summary_waste(r, v.at).is_some() {
-                "a summary that removes (almost) nothing".into()
-            } else if restart_between(r, v.at, j) {
-                format!("a restart in between loses {}", if id == "B2B" { "justEdited" } else { "summarizedWarm" })
-            } else if id == "NT" {
-                "two summaries in one warm stretch".into()
-            } else {
-                "two warm rewrites in a row".into()
-            }
+            if restart_between(r, v.at, j) { "a restart in between loses justEdited".into() } else { "two warm rewrites in a row".into() }
         }
         "TR" => {
             let i = v.at;
@@ -1546,11 +1460,7 @@ pub fn classify(id: &str, r: &R, v: &Violation) -> String {
         }
         "WL" => match withheld(r, v.at) {
             Some(w) if w.contains("asked no valve") => "a warm turn_end that asks no valve".into(),
-            Some(w) if w.contains("whose summary was ready") => "a ready summary produced again instead of taken".into(),
-            Some(w) if w.contains("no summary since the last cold plan") => {
-                if (0..=v.at).any(|m| r.tick(m).env.iter().any(|e| e == "restart")) { "the flag outlives the stretch: restored after a restart for a stretch a cold return ended".into() } else { "the flag outlives the stretch".into() }
-            }
-            Some(_) => "the flag never lapses: the context grew back past the size the stretch's summary started from".into(),
+            Some(_) => "a ready summary produced again instead of taken".into(),
             None => "other".into(),
         },
         "PW" => "edit inside the protected turns".into(),

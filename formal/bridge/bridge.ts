@@ -4,7 +4,7 @@
 // stdin: one trace per line   {"id", "world": {...}, "events": [...], "probes": {...}}
 // stdout: one observation per line   {"id", "ok", "blocks": [...], "ticks": [...], "refreshes": [...]}
 //
-// What is REAL here: pi-zip's index.ts wiring, run.ts (cold detection, run plan, valve, b2b skip, summarizedWarm, away timer, native
+// What is REAL here: pi-zip's index.ts wiring, run.ts (cold detection, run plan, valve, b2b skip, producer timer, native
 // compaction gate, persistence at turn_end, learning of g / class / survival, steering marks, the tool_call hook, the payload tier),
 // plan.ts, summary.ts, recall.ts (zip_recall as the model calls it), recallfile.ts, guard.ts (repairPayload on a real Anthropic-shaped
 // payload); Pi's own SessionManager (projection of context_edit and compaction entries), Pi's draft application
@@ -150,9 +150,8 @@ Zip.prototype.opts = function (this: Any, ...a: Any[]) {
 	// planner options a run may set (PZF_PLAN_OPTS, e.g. {"inturnAge":20}): merged into what run.ts passes to planContext
 	if (PLAN_OPTS) Object.assign(r.o, PLAN_OPTS);
 	// the P-grid re-plans in exactly this state: the recalled set is a snapshot (the live one grows when zip_recall runs later). opts is
-	// (ctx, pending, entries, pWarm, pause, cutAt): P enters the law only; `mode` is a label (P < 0.5: "cold"), and the one summary per
-	// warm stretch (summarizedWarm, summaryRegrow: the flag a plan at P >= 0.5 gets) is captured for the grid's higher P
-	if (optsSink && !this.__probe) optsSink.push({ room: /at roomOf \(/.test(new Error().stack ?? ""), pending: a[1], entries: a[2], mode: Number(a[3]) < 0.5 ? "cold" : "warm", sw: !!this.summarizedWarm, regrow: this.summaryRegrow, o: { ...r.o, recalled: new Set(r.o.recalled ?? []) }, live: r.o });
+	// (ctx, pending, entries, pWarm, pause, cutAt): P enters the law only; `mode` is a label (P < 0.5: "cold").
+	if (optsSink && !this.__probe) optsSink.push({ room: /at roomOf \(/.test(new Error().stack ?? ""), pending: a[1], entries: a[2], mode: Number(a[3]) < 0.5 ? "cold" : "warm", o: { ...r.o, recalled: new Set(r.o.recalled ?? []) }, live: r.o });
 	return r;
 };
 
@@ -498,9 +497,8 @@ async function runTrace(tr: Any): Promise<Any> {
 	}
 
 	// ---- probes --------------------------------------------------------------------------------------------------------------
-	// pi-zip's state just before the run's before_agent_start: what a WARM return would have planned with (a cold return resets
-	// summarizedWarm, and the b2b rule applies only to warm returns)
-	let preRun: { sw: boolean; je: boolean } | null = null;
+	// b2b applies only to warm returns: capture the previous request's edit before the run starts.
+	let preRun: { je: boolean } | null = null;
 	/** The decisions of one hook, as run.ts made them. A warm plan whose cut moved away from a summary written in the background is
 	 *  planned once more with `cutAt` (run.ts pinned): when that plan cuts there, it is the decision and the first plan is not; when it does
 	 *  not, the first plan stands and the pinned attempt is dropped. */
@@ -539,19 +537,16 @@ async function runTrace(tr: Any): Promise<Any> {
 		const actual = Number(cap.o.law?.pWarm ?? 0);
 		const ps = [...new Set([...(probes.pgrid as number[]), actual])].sort((a, b) => a - b);
 		const pre = (cap.at === "run" || cap.at === "native") && actual < 0.5 ? preRun : null;
-		// one planner (0.4.0): everything but P is the captured decision's (the pause too); P enters the law, and the two rules that read
-		// P >= 0.5 outside it: b2b and the one summary per warm stretch
-		const sw = pre ? !!pre.sw : !!cap.sw;
+		// one planner (0.4.0): everything but P is the captured decision's (the pause too); P enters the law, with one rule reading
+		// P >= 0.5 outside it: b2b
 		for (const p of ps) {
 			const mode = p < 0.5 ? "cold" : "warm"; // a label (run.ts: cold = P(warm) < 0.5)
-			// a warm plan at an actual cold return: the state a warm return would have seen (summarizedWarm not reset; b2b skip)
+			// a warm plan at an actual cold return still observes b2b
 			if (pre && mode === "warm" && pre.je) {
 				out.push({ p, actual: false, mode, plan: false, b2b: true, folds: [], cut: null, prefix: 0, sum: 0, before: null, afterFolds: null, after: null, law: [] });
 				continue;
 			}
-			const noSummary = mode !== "warm" ? false : actual >= 0.5 ? !!cap.o.noSummary : sw;
-			const regrowAt = noSummary ? (actual >= 0.5 ? cap.o.regrowAt : cap.regrow || undefined) : undefined;
-			const o = { ...cap.o, law: { ...cap.o.law, pWarm: p }, noSummary, regrowAt, trace: [] };
+			const o = { ...cap.o, law: { ...cap.o.law, pWarm: p }, trace: [] };
 			let r: Any = null;
 			try {
 				r = plan.planContext(cap.entries, o);
@@ -563,19 +558,7 @@ async function runTrace(tr: Any): Promise<Any> {
 			const after = r ? r.ctxAfterFolds - (r.cutIdx !== null ? c * (r.prefixTokens - r.summaryTokensPlanned) : 0) : null;
 			out.push({ p, actual: p === actual, mode, plan: !!r, folds: r ? r.folds.map((f: Any) => f.entryId) : [], cut: r?.firstKeptEntryId ?? null, prefix: r ? c * r.prefixTokens : 0, sum: r ? c * r.summaryTokensPlanned : 0, before: r?.ctxTokens ?? null, afterFolds: r ? r.ctxAfterFolds : null, after, law: o.trace.map((t: Any) => ({ at: t.where, ok: t.ok, B: t.B, A: t.A, T: t.T, K: t.K, phi: t.phi, eta: t.eta, ...(t.cut !== undefined ? { cut: t.cut } : {}), ...(t.ready ? { ready: true } : {}), ...(t.key ? { key: t.key } : {}) })) });
 		}
-		// WL's oracle: a warm decision the one-summary-per-warm-stretch flag constrained, planned again at the actual P with the flag lifted
-		// (everything else as captured): the summary the flag kept out, if any, and the law's verdict on it
-		let free: Any = null;
-		if (actual >= 0.5 && cap.o.noSummary) {
-			const o = { ...cap.o, law: { ...cap.o.law, pWarm: actual }, noSummary: false, regrowAt: undefined, trace: [] };
-			try {
-				const r = plan.planContext(cap.entries, o);
-				free = { plan: !!r, cut: r?.firstKeptEntryId ?? null, folds: r ? r.folds.map((f: Any) => f.entryId) : [], afterFolds: r ? r.ctxAfterFolds : null, law: o.trace.map((t: Any) => ({ at: t.where, ok: t.ok, B: t.B, A: t.A, T: t.T, K: t.K, phi: t.phi, eta: t.eta, ...(t.cut !== undefined ? { cut: t.cut } : {}), ...(t.ready ? { ready: true } : {}), ...(t.key ? { key: t.key } : {}) })) };
-			} catch (err) {
-				free = { error: String(err) };
-			}
-		}
-		return { room: !!cap.room, at: cap.at, mode: cap.mode, p: actual, pause: !!cap.o.pause, noSummary: !!cap.o.noSummary, regrowAt: cap.o.regrowAt ?? null, g: cap.o.law?.g ?? null, pr: cap.o.law?.pr ?? null, grid: out, free };
+		return { room: !!cap.room, at: cap.at, mode: cap.mode, p: actual, pause: !!cap.o.pause, g: cap.o.law?.g ?? null, pr: cap.o.law?.pr ?? null, grid: out };
 	}
 
 	// A second pi-zip instance on the live session, never driven: the model's way back to a folded output (its zip_recall, its
@@ -713,10 +696,9 @@ async function runTrace(tr: Any): Promise<Any> {
 	const TRANSPLANT: Record<string, string[]> = {
 		g: ["g", "deltas"],
 		justEdited: ["justEdited"],
-		summarizedWarm: ["summarizedWarm", "summaryRegrow"],
 		clock: ["lastReqMs", "lastModelKey", "prevTotal", "prevKey"],
 	};
-	const KNOWN = ["g", "justEdited", "summarizedWarm"]; // TRIAGE (a) 1: the three fields the session does not carry
+	const KNOWN = ["g", "justEdited"]; // decision state rebuilt from the session
 	async function freshProbe(snapshot: Any[], userMsg: Any, liveDesc: Any[], liveState?: Any) {
 		const base = await freshOnce(snapshot, userMsg, liveDesc, null);
 		if (base.same || !liveState) return base;
@@ -815,7 +797,7 @@ async function runTrace(tr: Any): Promise<Any> {
 		const gapMs = lastResp ? clock - lastResp : null;
 		const t0 = (clock - T0) / 1000;
 		const runStart = reqInRun === 0;
-		const state0 = runStart ? { cold: !!z?.cold, pWarm: z?.pWarm ?? null, pause: !!z?.pause, summarizedWarm: !!z?.summarizedWarm } : null;
+		const state0 = runStart ? { cold: !!z?.cold, pWarm: z?.pWarm ?? null, pause: !!z?.pause } : null;
 		envSince.push(...envNext.splice(0));
 		sink = [];
 		optsSink = [];
@@ -980,7 +962,7 @@ async function runTrace(tr: Any): Promise<Any> {
 			waitRun: narrativeCalls.slice(nc0, nc1).filter((c) => c.phase === "present").length,
 			waitTe: narrativeCalls.slice(nc1).filter((c) => c.phase === "present").length,
 			grids: [...(runStart ? nativeGrids : []), ...planGrids, ...teGrids],
-			zip: { g: z?.g ?? null, justEdited: !!z?.justEdited, summarizedWarm: !!z?.summarizedWarm, summaryRegrow: z?.summaryRegrow ?? null },
+			zip: { g: z?.g ?? null, justEdited: !!z?.justEdited },
 		};
 		ncSeen = nc1;
 		probeAt = T0 + t0 * 1000;
@@ -1077,7 +1059,6 @@ async function runTrace(tr: Any): Promise<Any> {
 			open: live.ctx.isIdle() && !z.nativeOff && !foreign && branch.at(-1)?.type !== "compaction" && !!prepareCompaction(branch, { enabled: true, reserveTokens: 16_384, keepRecentTokens: 20_000 }),
 			p: now.pWarm, g: learned.g, known: !!learned.ent?.cls,
 			b2b: now.pWarm >= 0.5 && learned.justEdited,
-			noSummary: now.pWarm >= 0.5 && learned.summarizedWarm && !(learned.summaryRegrow > 0 && O + c * total >= learned.summaryRegrow) && O + c * total < room,
 			before: O + c * bs.reduce((a: number, b: Any) => a + b.tokens, 0),
 			afterFolds: O + c * total, target: cap, floor: O + c * (floor + 1000), cuts, applied: null,
 		};
@@ -1104,7 +1085,7 @@ async function runTrace(tr: Any): Promise<Any> {
 					const snapshot = [sm.getHeader(), ...sm.getEntries()];
 					statsAtPrompt = existsSync(STATS) ? readFileSync(STATS, "utf8") : "";
 					const z0: Any = live.zip ?? {};
-					preRun = { sw: !!z0.summarizedWarm, je: !!z0.justEdited };
+					preRun = { je: !!z0.justEdited };
 					pendingNative = nativeSnapshot(text);
 					const nativeIds = new Set(sm.getBranch().map((x: Any) => x.id));
 					optsSink = [];
@@ -1139,7 +1120,7 @@ async function runTrace(tr: Any): Promise<Any> {
 					const snapshot = [sm.getHeader(), ...sm.getEntries()];
 					statsAtPrompt = existsSync(STATS) ? readFileSync(STATS, "utf8") : "";
 					const z0: Any = live.zip ?? {};
-					preRun = { sw: !!z0.summarizedWarm, je: !!z0.justEdited };
+					preRun = { je: !!z0.justEdited };
 					await fire(live, "agent_start", { type: "agent_start" });
 					const text = `owed work ${turn}: continue with what was left open`;
 					const cm = { role: "custom", customType: "owed-drive", content: text, display: true, timestamp: clock };
