@@ -1,0 +1,73 @@
+# Publishes pi-zip to npm or moves a dist-tag, using npm trusted publishing (OIDC): no npm token is stored anywhere.
+# Run by hand only:
+#   gh workflow run publish.yml -f action=publish  -f version=0.4.1 -f tag=next
+#   gh workflow run publish.yml -f action=dist-tag -f version=0.4.1 -f tag=latest
+# "publish" publishes the commit at git tag v<version>, which must already be pushed and must carry that version.
+name: publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "publish (the commit at tag v<version>) or dist-tag (point <tag> at <version>)"
+        type: choice
+        options: [publish, dist-tag]
+        required: true
+      version:
+        description: "Package version, e.g. 0.4.1"
+        type: string
+        required: true
+      tag:
+        description: "npm dist-tag, e.g. next or latest"
+        type: string
+        required: true
+        default: next
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: npm-publish
+  cancel-in-progress: false
+
+jobs:
+  npm:
+    runs-on: ubuntu-latest
+    env:
+      ACTION: ${{ inputs.action }}
+      VERSION: ${{ inputs.version }}
+      TAG: ${{ inputs.tag }}
+    steps:
+      - name: Check inputs
+        run: |
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]] || { echo "bad version: $VERSION"; exit 1; }
+          [[ "$TAG" =~ ^[a-z][a-z0-9-]*$ ]] || { echo "bad tag: $TAG"; exit 1; }
+
+      - uses: actions/checkout@v6
+        if: inputs.action == 'publish'
+        with:
+          ref: refs/tags/v${{ inputs.version }}
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+          package-manager-cache: false
+
+      # OIDC dist-tag support needs npm 11.21+ or 12.2+
+      - run: npm install -g npm@latest && npm --version
+
+      - name: Publish
+        if: inputs.action == 'publish'
+        run: |
+          test "$(node -p 'require("./package.json").version')" = "$VERSION" || { echo "package.json version differs from $VERSION"; exit 1; }
+          npm pack --dry-run
+          npm publish --tag "$TAG"
+
+      - name: Move dist-tag
+        if: inputs.action == 'dist-tag'
+        run: npm dist-tag add "pi-zip@$VERSION" "$TAG"
+
+      - name: Show dist-tags
+        run: npm dist-tag ls pi-zip
