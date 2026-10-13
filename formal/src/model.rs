@@ -559,6 +559,8 @@ pub struct NativeCut {
     pub key: String,
     pub prefix: f64,
     pub summary: f64,
+    /// The finished artifact's size when ready (pi-zip/summary `cut.summaryTokens`); the planned size otherwise.
+    pub finished: f64,
     pub read: f64,
     pub written: f64,
     pub ready: bool,

@@ -1009,7 +1009,9 @@ pub fn native_withheld(r: &R, i: usize) -> Option<String> {
         && with_tail(law(n.before, after(c), n.p, Some(r.st[i].room), Some(pr), n.g, call, after(c)), n.before, after(c), Some(r.st[i].room), pr, n.keep).ok;
     let cw = n.cuts.iter().position(|c| after(c) <= n.target).unwrap_or(n.cuts.len() - 1);
     let bound = (cw..n.cuts.len()).find(|&k| pays(&n.cuts[k], summary_call(pr, n.cuts[k].read, n.cuts[k].written))).unwrap_or(cw);
-    let c = n.cuts[..=bound].iter().rev().find(|c| c.ready && c.guard && c.prefix >= 2.0 * c.summary && guard(n.before, after(c), n.p, Some(r.st[i].room), pr, n.g, n.rent, n.keep).ok)?;
+    // Planned sizes bound production (cw, bound); a READY artifact is judged at its finished size (plan.ts `readySize`).
+    let fin = |c: &NativeCut| if c.finished > 0.0 { c.finished } else { c.summary };
+    let c = n.cuts[..=bound].iter().rev().find(|c| c.ready && c.guard && c.prefix >= 2.0 * fin(c) && guard(n.before, n.after_folds - c.prefix + fin(c), n.p, Some(r.st[i].room), pr, n.g, n.rent, n.keep).ok)?;
     // Inspect the compaction actually appended at the idle door, including the artifact's text identity.
     if n.applied.as_ref().is_some_and(|a| a.key == c.key && c.hash.as_deref() == Some(a.hash.as_str())) {
         return None;

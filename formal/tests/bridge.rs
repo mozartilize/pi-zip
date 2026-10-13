@@ -87,6 +87,29 @@ fn native_application_prices_the_spent_call_at_zero() {
 
 /// A large indivisible recent block changes Pi's room price; NA must use the observed tail before applying the guard.
 #[test]
+fn native_completeness_judges_a_ready_artifact_at_its_finished_size() {
+    use pz_formal::model::Obs;
+    use pz_formal::spec::native_withheld;
+    use serde_json::json;
+    // Planned 2,000 tokens fails the guard; the finished 500-token artifact passes it (plan.ts `readySize`). The window keeps
+    // Pi's room above the context, so no room credit decides either verdict.
+    let trace = Trace::parse("world explicit known ttl=300 true=300 survival=none c=1 sys=3000 window=400000 native print\nprompt\nsay 100\n").unwrap();
+    let door = |finished: Option<f64>| {
+        let mut cut = json!({ "key": "kept", "prefix": 20000, "summary": 2000, "read": 20000, "written": 2000, "ready": true, "guard": true, "hash": "artifact" });
+        if let Some(f) = finished { cut["finished"] = json!(f); }
+        let obs: Obs = serde_json::from_value(json!({
+            "ok": true, "ticks": [{ "req": 0, "model": "p/m", "n": 0, "t0": 0, "t1": 5,
+                "nativeDoor": { "open": true, "p": 1, "g": 200, "known": true, "rent": 80000,
+                    "before": 100000, "afterFolds": 100000, "target": 40000, "cuts": [cut] } }]
+        })).unwrap();
+        native_withheld(&Run::new(trace.clone(), obs), 0)
+    };
+    assert!(door(Some(500.0)).is_some(), "the finished artifact passes the guard and was withheld");
+    assert!(door(Some(2000.0)).is_none(), "at the planned size the guard refuses it");
+    assert!(door(None).is_none(), "no finished size: the planned size is used");
+}
+
+#[test]
 fn native_completeness_prices_the_measured_long_tail() {
     use pz_formal::law::{class_prices, guard};
     use pz_formal::model::{Class, Obs};
