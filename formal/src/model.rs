@@ -137,8 +137,9 @@ pub enum Tool {
 /// writes between runs, `Compact` is Pi's own compaction (its threshold, an overflow or /compact; between runs or mid-run), `Edit`
 /// is another extension's context_edit of the oldest output the model still sees (anywhere). The away timer and Pi's cache
 /// warming are not environment events: the clock fires them.
-/// `Drive` starts a run the way an extension's message does (Pi 1.1.0 `sendCustomMessage(..., { triggerTurn: true })` ->
-/// `_runAgentPrompt`: agent_start, the custom message appended, the first request; never before_agent_start): pi-runway's owed-drive,
+/// `Drive` starts a run the way an extension's message does (`sendCustomMessage(..., { triggerTurn: true })`: on Pi 1.2.0 a
+/// before_agent_start with messageType "custom", on 1.1.0 none; agent_start, the custom message appended, the first request; never
+/// Pi's input event): pi-runway's owed-drive,
 /// durable-subagents' attention. It is a new user turn, as a prompt is (README rule 3's protected turns). `NextTurn` is a custom
 /// message Pi stores right after a prompt (a nextTurn message, or a before_agent_start handler's message): part of the prompt's turn.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

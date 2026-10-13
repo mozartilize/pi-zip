@@ -376,12 +376,16 @@ fn trace_file(name: &str) -> String {
     std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("traces").join(name)).unwrap()
 }
 
-/// GC over `drive`: a run an extension's message starts after an hour is planned cold. The mutant drops the agent_start handling
-/// (2cda8e1 and earlier): the driven run is planned on the state of the previous prompt.
+/// GC over `drive`: a run an extension's message starts after an hour is planned cold. The mutant drops the start of a driven run
+/// (2cda8e1 and earlier had no agent_start handling): the driven run is planned on the state of the previous prompt. Since 0.4.1 a
+/// driven run starts at agent_start (Pi 1.1.0) or at a "custom" before_agent_start (Pi 1.2.0, the bridge's default order): both go.
 #[test]
 fn gc_a_driven_run_after_the_ttl_is_cold() {
     let t = trace_file("gc-drive.trace");
-    caught("drv", "index.ts", "pi.on(\"agent_start\", (_e, ctx) => zip.agentStart(ctx));", "", "GC", &t);
+    caught_all("drv", "run.ts", &[
+        ("\t\tif (kind !== \"prompt\") return this.drivenStart(ctx);", "\t\tif (kind !== \"prompt\") return;", 1),
+        ("\t\t\tthis.startKind = \"driven\";\n\t\t\tawait this.drivenStart(ctx);", "\t\t\tthis.startKind = \"driven\";", 1),
+    ], &["GC"], &t);
 }
 
 /// PW over `nextturn`, review P0-2: Pi stores a prompt first and the nextTurn message after it; the mutant (4795af3's buildBlocks)
@@ -415,6 +419,24 @@ fn tr_a_summary_may_keep_from_a_driven_runs_message() {
 #[test]
 fn en_native_number_is_the_before_size() {
     caught("en1", "run.ts", "const before = Math.round(p.ctxTokens);", "const before = Math.round(p.ctxTokens) + 1;", "EN", &trace_file("na-ready-native.trace"));
+}
+
+/// 0.4.1: the typed-prompt door is Pi's input event. The mutant asks at before_agent_start, as 0.4.0 did: in Pi 1.2.0's order (the
+/// bridge's default) Pi is busy there, the door stays shut and the ready summary that pays is withheld (NA); made to ignore that Pi is
+/// busy, it compacts while the run is starting (EN: the native compaction is not at an idle typed prompt).
+#[test]
+fn na_en_the_door_is_the_input_event() {
+    if std::env::var("PZF_PI").as_deref() == Ok("1.1") {
+        return; // Pi 1.1.0 is idle at before_agent_start too: there the old door was open
+    }
+    let late = [
+        ("index.ts", "\t\tawait zip.input(e, ctx);\n", "", 1),
+        ("index.ts", "\t\tawait zip.beforeAgentStart(ctx, e);\n", "\t\tawait zip.input({ text: e.prompt, images: e.images }, ctx);\n\t\tawait zip.beforeAgentStart(ctx, e);\n", 1),
+    ];
+    let t = trace_file("na-ready-native.trace");
+    caught_files("door1", &late, &["NA"], &t);
+    let busy = [late[0], late[1], ("run.ts", "idle = ctx?.isIdle?.() === true;", "idle = true;", 1), ("run.ts", "idle = ctx.isIdle?.() === true;", "idle = true;", 1)];
+    caught_files("door2", &busy, &["EN"], &t);
 }
 
 /// Moving the compaction behind folds invalidates Pi's usage-based meter.
