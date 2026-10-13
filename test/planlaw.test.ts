@@ -12,23 +12,23 @@ const law = (pWarm: number, g: number) => ({ pr: ANTH, g, pWarm });
 
 describe("the whole plan's gate prices the summary call", () => {
 	// 20K tokens of prose, a small turn, then the protected window
-	const ctx = [U("u1", "one"), AX("x1", 80_000), U("u2", "two"), AX("y", 4_000), A("a2"), U("u3", "three"), A("a3"), U("u4", "four")];
+	const ctx = [U("u1", "one"), AX("x1", 80_000), U("u2", "two"), AX("y", 8_000), A("a2"), U("u3", "three"), A("a3"), U("u4", "four")];
 	test("every plan step with a cut carries the call: its K is the summary step's K plus the rewrite of what is left", () => {
 		const trace: Any[] = [];
-		planContext(ctx, { ...base, coldCap: 20_000, law: law(1, 500), trace });
-		const pairs = trace.flatMap((t, i) => (t.where === "plan" && trace[i - 1]?.where === "summary" ? [[trace[i - 1], t]] : []));
+		planContext(ctx, { ...base, coldCap: 20_000, law: law(1, 400), trace });
+		const pairs = trace.flatMap((t, i) => (t.where === "plan" && t.cut && trace[i - 1]?.where === "summary" ? [[trace[i - 1], t]] : []));
 		expect(pairs.length).toBeGreaterThan(0);
 		for (const [sum, plan] of pairs) expect(plan.K).toBeGreaterThan(sum.K); // old code: the plan's K = (w - r) A, a few K against the call's 30K
 	});
 	test("a cut whose call the whole plan cannot pay is not written: the next cut that pays is", () => {
 		const trace: Any[] = [];
-		const p = planContext(ctx, { ...base, coldCap: 20_000, law: law(1, 500), trace })!;
+		const p = planContext(ctx, { ...base, coldCap: 20_000, law: law(1, 420), trace })!;
 		expect(trace.some((t) => t.where === "plan" && !t.ok)).toBe(true);
 		expect(p.cutIdx).not.toBeNull();
 		expect(p.firstKeptEntryId).not.toBe("u2"); // the minimal cut: its summary passed the summary gate, the plan did not
 		const last = trace.filter((t) => t.where === "plan").at(-1);
 		expect(last.ok).toBe(true);
-		expect(last.K).toBe(lawTerms(last.B, last.A, 1, null, ANTH, 500, last.K - lawTerms(last.B, last.A, 1, null, ANTH, 500, 0, last.T).K, last.T).K);
+		expect(last.K).toBe(lawTerms(last.B, last.A, 1, null, ANTH, 420, last.K - lawTerms(last.B, last.A, 1, null, ANTH, 420, 0, last.T).K, last.T).K);
 	});
 });
 
@@ -53,7 +53,7 @@ describe("what a plan says it leaves is what it leaves", () => {
 	// an old 120K output is folded; the prose after it is summarised; the fold lies inside the prefix and is void
 	const ctx = [U("u1", "one"), A("a1", ["c1"]), R("r1", "c1", 120_000), A("a1b"), U("u2", "two"), AX("x1", 80_000), A("a2"), U("u3", "three"), A("a3"), U("u4", "four")];
 	test("folds inside the replaced prefix do not count back: after = kept + summary", () => {
-		const p = planContext(ctx, { ...base, coldCap: 20_000, law: law(1, 500) });
+		const p = planContext(ctx, { ...base, coldCap: 20_000, law: law(1, 400) });
 		expect(p?.cutIdx).not.toBeNull(); // old code: null (the plan believed it left the voided fold's savings more, 30K, and the law refused)
 		const blocks = buildBlocks(ctx);
 		const kept = blocks.slice(p!.cutIdx!).reduce((a, b) => a + b.tokens, 0);

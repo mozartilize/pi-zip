@@ -6,7 +6,6 @@ import { type Any, COMMIT_CUSTOM, PRODUCT, clamp, envInt, piTokensOf, textOf, to
 import { PH_MARK } from "./placeholder.ts";
 import { lawPrices, MIN_EXPECT, type Prices } from "./learn.ts";
 import { commandNamesRecall, parseRecallPath, type FileRecall } from "./recallfile.ts";
-import { previousNarrative } from "./summary.ts"; // a cycle (summary.ts imports this module): both use the other's exports only when called
 
 /** Default age, in assistant requests, from which ANY foldable output (every recoverability class) inside the protected user turns may
  *  still be folded. A sub-agent session is one user turn with hundreds of tool rounds, so without this its candidate set is empty for
@@ -22,12 +21,6 @@ const PROTECT_USER_TURNS = 2; // the latest user turn and the one before it are 
  *  code carries them forward), plus output of at most the narrative budget. */
 /** The narrative's token budget (chars/4), summary.ts buildCut: clamp(planned - skeleton, 300, NARRATIVE_MAX). */
 export const NARRATIVE_MAX = 4000;
-let prevNarrMemo: { text: string; tokens: number } | null = null;
-/** Tokens (chars/4) of the previous summary's narrative the narrative call reads (summary.ts previousNarrative), memoised per text. */
-function prevNarrativeTokens(text: string): number {
-	if (prevNarrMemo?.text !== text) prevNarrMemo = { text, tokens: tok4(previousNarrative(text)?.text ?? "") };
-	return prevNarrMemo.tokens;
-}
 const SUMMARY_FLOOR = 1000;
 const SUMMARY_CAP = 8000;
 const SUMMARY_RATIO = 0.1;
@@ -121,7 +114,7 @@ export const G0 = 2_500; // growth per request before the session's own EWMA has
 /** What the law knows at a decision: prices (the class ratios; the explicit ones while the class is not learned yet), growth per
  *  request g (real tokens), P(the cache is warm). P enters the planner here and nowhere else. */
 export interface Law { pr: Prices; g: number; pWarm: number }
-export interface LawTerms { ok: boolean; B: number; A: number; T: number; P: number; K: number; eta: number; phi: number; Tsuf?: number }
+export interface LawTerms { ok: boolean; B: number; A: number; T: number; P: number; K: number; eta: number; phi: number; Tsuf?: number; rent?: number; keep?: number }
 
 /**
  * The round-5 law (verdict section 8): rewrite the cache only when what the edit saves pays for the rewrite it causes.
@@ -140,11 +133,19 @@ export function lawTerms(B: number, A: number, P: number, room: number | null, p
 	const D = B - A, K = (w - r) * (P * Math.min(T, A) - (1 - P) * D) + call;
 	let eta = 0;
 	if (room !== null && B >= room) {
-		const S = Math.min(8_000, Math.max(1_000, 0.1 * (B - keep))), Api = keep + S;
-		eta = (w * (B - keep) + out * S + (w - r) * Api) / Math.max(B - Api, 1);
+		const X = Math.max(0, B - keep), S = clamp(0.1 * X, 1_000, 8_000);
+		eta = X > S ? (w * X + out * S + (w - r) * (B - X + S)) / (X - S) : 0;
 	}
 	const gain = (r * D * D) / (2 * Math.max(g, 1)) + eta * D;
 	return { ...t, ok: K <= 0 || gain >= K, K, eta, phi: K > 0 ? gain / K : Infinity };
+}
+
+/** G_{1/10}: accumulated rent buys the rewrite, or the plain law buys it once a tenth is paid.
+ * Prices are input units here; rent and D are tokens, so multiplying by r converts their rent to the same units. */
+export function guardTerms(B: number, A: number, P: number, room: number | null, pr: Prices, g: number, rent: number, keep = PI_KEEP_RECENT): LawTerms {
+	const t = lawTerms(B, A, P, room, pr, g, 0, A, keep), D = B - A;
+	const effective = t.K - t.eta * D, paid = pr.r * (rent + D);
+	return { ...t, ok: D > 0 && (effective <= 0 || paid >= effective || (t.ok && paid >= effective / 10)) };
 }
 
 export const editAllowed = (B: number, A: number, P: number, room: number | null, pr: Prices | null, g: number, call = 0, T = A): boolean =>
@@ -587,10 +588,15 @@ export interface RunPlan {
 }
 
 export interface PlanOpts {
+	keep?: number; // real tokens in Pi's kept tail, measured on the unedited view
+	rent?: number; // removable tokens rented since the last applied edit or cold decision
+	justEdited?: boolean; // the immediately preceding request carried a rewrite
+	application?: boolean; // application uses the guard; production keeps the plain law
+	deferSummary?: boolean; // first requests of driven runs take folds only
 	carriedFolds?: readonly FoldTarget[]; // reconciled sent folds: retain their exact placeholders when pricing the boundary edit
 	law?: Law; // prices, g and P(warm): the only input that depends on P; default: the explicit class ratios at P = 0
 	pause?: boolean; // a return after a pause (the absence outlived the requested cache lifetime) or a model switch: the previous user turn's re-readable outputs may fold
-	trace?: (LawTerms & { where: "summary" | "plan"; cut?: boolean; ready?: boolean; key?: string })[]; // every law evaluation is pushed here (ledger)
+	trace?: (LawTerms & { where: "summary" | "plan" | "guard"; cut?: boolean; ready?: boolean; key?: string })[]; // every law evaluation is pushed here (ledger)
 	reserve?: number; // Pi's compaction reserveTokens (default 16384)
 	steerIds?: Set<string>; // user entries that are mid-run steering or follow-up messages, not new user turns
 	scale?: Scale; // real = O + c x content estimate (calibrate); default UNIT = the estimates are taken as real
@@ -606,7 +612,8 @@ export interface PlanOpts {
 	fileRecall?: FileRecall; // zip_recall is hidden but read, grep or bash is active: fold as in full mode, placeholders name the recall file
 	cutAt?: string; // cut at this entry or not at all (a summary for that cut is produced or being produced: core.ts adopt)
 	foldsOnly?: boolean; // no cut: the plan of the folds alone (its summary is not ready: core.ts unready)
-	ready?: readonly string[]; // cuts whose summary is produced and ready: its call is spent, so the law prices it at 0 (theory 1.4)
+	ready?: readonly string[];
+	readySizes?: Readonly<Record<string, number>>; // cuts whose summary is produced and ready: its call is spent, so the law prices it at 0 (theory 1.4)
 }
 
 export interface PlanResult {
@@ -647,7 +654,7 @@ export const contentKeyOf = (content: Any): string => {
  *  old. If the folds cannot reach W, one summary: the first cut from the one reaching W whose summary pays with its call, and with
  *  which the whole plan pays (folds inside the prefix are void). Then the whole plan must pay. P(warm) enters only the law (o.law), so
  *  a lower P never plans less. The target never exceeds Pi's compaction room. null: nothing to plan, or the law refuses. */
-export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
+export function plan(entries: Any[], o: PlanOpts): { f: PlanResult; c: PlanResult | null; a: PlanResult | null } | null {
 	const s = settings();
 	// limits are in real tokens; the plan works in content estimate units (real = O + c x estimate), so they are converted once, here.
 	// The cold cap is on the whole context, but leaves at least half of itself for the conversation above O (coldTarget): a cap the
@@ -661,9 +668,9 @@ export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
 	// `cut`: a whole-plan step records whether the plan it judges has a cut (and so carries its summary call); the formal checker pins the
 	// call to 0 for a folds-only plan and to the summary step's call for a cut; `ready`: the cut's summary is ready (its call is 0);
 	// `key`: a summary step's cut (its first kept entry)
-	const gate = (where: "summary" | "plan", B: number, A: number, r: number | null, call: number, T: number, Tsuf?: number, cut?: boolean, isReady?: boolean, key?: string): boolean => {
-		const t = lawTerms(B, A, law.pWarm, r, law.pr, law.g, call, T);
-		o.trace?.push({ where, ...t, ...(Tsuf !== undefined ? { Tsuf } : {}), ...(cut !== undefined ? { cut } : {}), ...(isReady ? { ready: true } : {}), ...(key !== undefined ? { key } : {}) });
+	const gate = (where: "summary" | "plan" | "guard", B: number, A: number, r: number | null, call: number, T: number, Tsuf?: number, cut?: boolean, isReady?: boolean, key?: string): boolean => {
+		const t = lawTerms(B, A, law.pWarm, r, law.pr, law.g, call, T, o.keep);
+		o.trace?.push({ where, ...t, ...(r !== null ? { keep: o.keep } : {}), ...(Tsuf !== undefined ? { Tsuf } : {}), ...(cut !== undefined ? { cut } : {}), ...(isReady ? { ready: true } : {}), ...(key !== undefined ? { key } : {}) });
 		return t.ok;
 	};
 	const foldMin = o.foldMin ?? s.foldMin;
@@ -675,6 +682,9 @@ export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
 	const calls = toolCallIndex(blocks);
 	const recalled = o.recalled ?? new Set<string>();
 	const ctxEst = blocks.reduce((a, b) => a + b.tokens, 0); // content
+	let tail = 0;
+	for (let i = blocks.length - 1; i >= 0 && tail < PI_KEEP_RECENT; i--) tail += c * blocks[i].tokens;
+	o.keep = tail;
 	if (!(ctxEst > coldCap)) return null; // below the working view nothing is planned (I6)
 	const trig = law.pWarm < 0.5 ? "cold" : "valve"; // a label for the ledger and the summary's trigger only
 	const tokOverride = new Map<number, number>();
@@ -720,7 +730,7 @@ export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
 	const head = law.pr.cls === "automatic" ? (MIN_EXPECT - O) / c : 0; // MIN_EXPECT counts from the first token, O included
 	const start: number[] = [];
 	blocks.reduce((acc, b) => ((start[b.idx] = acc), acc + b.tokens), 0);
-	const foldable = (b: Block) => b.kind === "toolResult" && !b.edited && !!b.entryId && b.tokens > foldMin && !isRecall(b) && start[b.idx] >= head && (!o.rereadOnly || classify(b) === "rereadable");
+	const foldable = (b: Block) => b.kind === "toolResult" && !b.edited && !!b.entryId && tok4(textOf((b.raw ?? b.msg).content)) > foldMin && !isRecall(b) && start[b.idx] >= head && (!o.rereadOnly || classify(b) === "rereadable");
 	const protectedTurn = (b: Block) => b.userTurn >= userTurns - PROTECT_USER_TURNS + 1;
 	const savings = () => folds.reduce((a, t) => a + t.entryTokens - t.phTokens, 0);
 	// the eligible outputs, class by class, each biggest first, until the view is at the working size: inside one rewrite a fold beyond
@@ -744,75 +754,61 @@ export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
 	// what no summary can remove (besides O): the protected turns (after their folds) and the previous summary, which the next one
 	// carries forward; the cap is never chased below it (a context that is mostly this floor would be re-summarised for nothing)
 	const prevSum = blocks[0]?.kind === "summary" ? blocks[0].tokens : 0;
-	const prevNarr = blocks[0]?.kind === "summary" ? prevNarrativeTokens(String(blocks[0].msg?.summary ?? "")) : 0; // what the narrative call reads of it
-	const floor = prevSum + blocks.reduce((a, b) => a + (protectedTurn(b) ? (tokOverride.get(b.idx) ?? b.tokens) : 0), 0);
-	const target = Math.max(coldCap, floor + SUMMARY_FLOOR);
 	const atRoom = room !== null && real(ctxAfterFolds) >= room;
 	const atRoomUnedited = room !== null && real(ctxEst) >= room;
-	const sumTrigger: "cold" | "valve" | null = !o.foldsOnly && ctxAfterFolds > target ? trig : null;
-	let cutIdx: number | null = null;
-	let prefixTokens = 0;
-	let summaryTokensPlanned = 0;
+	const sumTrigger: "cold" | "valve" | null = !o.foldsOnly && ctxAfterFolds > coldCap ? trig : null;
 	const minCut = blocks[0].kind === "summary" ? 2 : 1; // never re-summarise a prefix that is only the previous summary
 	const pre: number[] = [];
-	const S = (x: number) => Math.max(clamp(SUMMARY_RATIO * x, SUMMARY_FLOOR, SUMMARY_CAP), prevSum); // the next summary carries the previous one forward
-	// Block index of every fold: the folds a cut voids are those before it
-	const foldAt = folds.map((t) => blocks.findIndex((b) => b.entryId === t.entryId));
-	/** The whole plan's law (F10): B is the context as it is, A what the plan leaves, `call` the summary call a cut makes; `untouched` is
-	 *  the content before the earliest edit (ledger only). T = A (the whole post-edit context, O included, as tuned: the cheaper A - O
-	 *  fires warm edits earlier and loses items offline). */
-	const planGate = (after: number, untouched: number, call: number, cut: boolean, isReady = false): boolean =>
-		gate("plan", real(ctxEst), real(after), room, call, real(after), c * (after - untouched), cut, isReady);
-	/** The cut for cut points minCut..maxCut: the first that brings the context to the cap, else the deepest; its summary must pay with
-	 *  its call (the summary step's law). When the minimal cut's summary or the whole plan with it is refused, the deeper cuts are tried
-	 *  in turn (the gain grows as D^2, the call only with the prefix read). The whole plan's law prices the summary call too. Applies
-	 *  the first cut both laws accept (folds in the prefix are void) and returns true, or changes nothing. */
-	const pinned = o.cutAt;
-	const ready = new Set(o.ready ?? []);
-	const summarise = (maxCut: number): boolean => {
-		const cuts: number[] = [];
-		for (let i = minCut; i < blocks.length && i <= maxCut; i++) if (isCutBlock(blocks[i]) && (pinned === undefined || blocks[i].entryId === pinned)) cuts.push(i);
-		if (!cuts.length) return false;
-		let acc = 0;
-		for (let i = 0; i < blocks.length; i++) {
-			pre[i] = acc;
-			acc += tokOverride.get(i) ?? blocks[i].tokens;
-		}
-		const total = acc;
-		let first = cuts.length - 1;
-		for (let k = 0; k < cuts.length; k++) if (total - pre[cuts[k]] + S(pre[cuts[k]]) <= coldCap) { first = k; break; }
-		/** `spent`: a ready cut is priced at call 0 (a pinned cut, or a ready summary when no cut pays with its call); c itself is
-		 *  chosen with every call priced (theory 1.4 plan: a ready summary never cuts deeper than c, or than cW without c). */
-		const take = (pick: number, spent: boolean): boolean => {
-			const X = c * pre[pick], Sr = c * S(pre[pick]);
-			// the call is the narrative call summary.ts makes: uncached input of the prefix without the previous summary, plus that
-			// summary's narrative, which it merges (not its lists), + output of at most the narrative budget; 0 for a ready summary
-			const isReady = spent && ready.has(blocks[pick].entryId!);
-			const call = isReady ? 0 : law.pr.input * c * (Math.max(pre[pick] - prevSum, 0) + prevNarr) + law.pr.out * c * Math.min(S(pre[pick]), NARRATIVE_MAX);
-			if (!gate("summary", X, Sr, null, call, Sr, undefined, undefined, isReady, blocks[pick].entryId ?? undefined)) return false; // the summary call must pay for itself
-			if (!(pre[pick] >= 2 * S(pre[pick]))) return false;
-			// what the plan leaves: the context with its folds (those inside the prefix too: the prefix is measured as folded, `pre`) minus
-			// what the summary replaces plus the summary
-			if (!planGate(ctxAfterFolds - (pre[pick] - S(pre[pick])), 0, call, true, isReady)) return false;
-			cutIdx = pick;
-			prefixTokens = pre[pick];
-			summaryTokensPlanned = S(pre[pick]);
-			for (let i = folds.length - 1; i >= 0; i--) if (foldAt[i] < pick && !o.carriedFolds?.some((t) => t.entryId === folds[i].entryId)) { tokOverride.delete(foldAt[i]); folds.splice(i, 1); foldAt.splice(i, 1); } // prefix folds are void, except sent folds retained for request calibration
-			return true;
-		};
-		if (pinned !== undefined) return cuts.some((pick) => take(pick, true)); // adopt's cut a <= c: its call may be spent
-		if (cuts.slice(first).some((pick) => take(pick, false))) return true;
-		// no cut pays with its call: a ready summary no deeper than the cut that reaches the view (theory 1.4 R5: a <= cW), the deepest first
-		return cuts.slice(0, first + 1).reverse().some((pick) => ready.has(blocks[pick].entryId!) && take(pick, true));
+	const S = (x: number) => Math.max(clamp(SUMMARY_RATIO * c * x, SUMMARY_FLOOR, SUMMARY_CAP), c * prevSum) / c; // the next summary carries the previous one forward
+	const result = (pick: number | null, summary = pick === null ? 0 : S(pre[pick])): PlanResult => ({
+		blocks, calls, folds: pick === null ? [...folds] : folds.filter((t) => blocks.findIndex((b) => b.entryId === t.entryId) >= pick || o.carriedFolds?.some((u) => u.entryId === t.entryId)),
+		cutIdx: pick, firstKeptEntryId: pick === null ? null : blocks[pick].entryId, prefixTokens: pick === null ? 0 : pre[pick],
+		summaryTokensPlanned: summary, sumTrigger, scale: o.scale ?? UNIT,
+		ctxTokens: real(ctxEst), ctxAfterFolds: real(ctxAfterFolds), userTurns, ...(o.fileRecall ? { fileRecall: o.fileRecall } : {}),
+		...(atRoom ? { atRoom } : {}), ...(atRoomUnedited ? { atRoomUnedited } : {}),
+	});
+	const f = result(null);
+	if (!sumTrigger) return { f, c: null, a: null };
+	let acc = 0;
+	for (const b of blocks) { pre[b.idx] = acc; acc += tokOverride.get(b.idx) ?? b.tokens; }
+	const limit = blocks.findIndex(protectedTurn), cuts: number[] = [];
+	for (let i = minCut; i < blocks.length && (limit < 0 || i <= limit); i++) if (isCutBlock(blocks[i])) cuts.push(i);
+	if (!cuts.length) return { f, c: null, a: null };
+	const cw = cuts.findIndex((k) => ctxAfterFolds - pre[k] + S(pre[k]) <= coldCap);
+	const first = cw < 0 ? cuts.length - 1 : cw;
+	const paying = cuts.slice(first).find((k) => {
+		const X = c * pre[k], Sr = c * S(pre[k]);
+		if (X < 2 * Sr) return false;
+		const call = law.pr.w * c * Math.max(0, pre[k] - prevSum) + law.pr.out * Math.min(c * S(pre[k]), NARRATIVE_MAX);
+		return gate("summary", X, Sr, null, call, Sr, undefined, undefined, false, blocks[k].entryId ?? undefined)
+			&& gate("plan", real(ctxEst), real(ctxAfterFolds - pre[k] + S(pre[k])), room, call, real(ctxAfterFolds - pre[k] + S(pre[k])), undefined, true);
+	});
+	const bound = paying ?? cuts[first], ready = new Set(o.ready ?? []);
+	const readySize = (k: number) => o.readySizes?.[blocks[k].entryId!] ?? S(pre[k]);
+	const have = cuts.filter((k) => k <= bound && ready.has(blocks[k].entryId!) && pre[k] >= 2 * readySize(k)).pop();
+	return { f, c: paying === undefined ? null : result(paying), a: have === undefined ? null : result(have, readySize(have)) };
+}
+
+/** Select from the planner's tuple: production uses the plain law; application uses G_{1/10} and takes only READY summaries. */
+export function selectPlan(q: ReturnType<typeof plan>, o: PlanOpts): PlanResult | null {
+	if (!q) return null;
+	const law = o.law ?? { pr: lawPrices(undefined, false), g: G0, pWarm: 0 };
+	const test = (p: PlanResult, ready = false) => {
+		const A = p.ctxAfterFolds - p.scale.c * (p.prefixTokens - p.summaryTokensPlanned), room = compactionRoom(o.model, o.reserve);
+		const t = o.application ? guardTerms(p.ctxTokens, A, law.pWarm, room, law.pr, law.g, o.rent ?? 0, o.keep)
+			: lawTerms(p.ctxTokens, A, law.pWarm, room, law.pr, law.g, 0, A, o.keep);
+		o.trace?.push({ ...t, keep: o.keep, Tsuf: A - sizeOf(p.scale, untouchedEst(p.blocks, p.folds, p.cutIdx !== null)), where: o.application ? "guard" : "plan", ...(o.application ? { rent: o.rent ?? 0 } : {}), cut: p.cutIdx !== null, ...(ready ? { ready: true } : {}) });
+		return t.ok && (p.cutIdx !== null || p.folds.length > 0);
 	};
-	if (sumTrigger) {
-		const limit = blocks.findIndex((b) => protectedTurn(b));
-		summarise(limit >= 0 ? limit : blocks.length - 1);
-	}
-	// a plan with a cut passed the whole plan's law with its call inside summarise; folds only (no summary wanted, or none the laws
-	// accepted: the deeper cuts and the cut-free plan both stand) is judged here
-	if (cutIdx === null && (!folds.length || !planGate(ctxAfterFolds, untouchedEst(blocks, folds, false), 0, false))) return null;
-	return { blocks, calls, folds, cutIdx, firstKeptEntryId: cutIdx !== null ? blocks[cutIdx].entryId : null, prefixTokens, summaryTokensPlanned, sumTrigger: cutIdx !== null ? (sumTrigger ?? trig) : sumTrigger, scale: o.scale ?? UNIT, ctxTokens: real(ctxEst), ctxAfterFolds: real(ctxAfterFolds), userTurns, ...(o.fileRecall ? { fileRecall: o.fileRecall } : {}), ...(atRoom ? { atRoom } : {}), ...(atRoomUnedited ? { atRoomUnedited } : {}) };
+	const a = o.cutAt === undefined ? q.a : q.a?.firstKeptEntryId === o.cutAt ? q.a : null;
+	if (a && !o.deferSummary && test(a, true)) return a;
+	if (!o.application && !o.foldsOnly && o.cutAt === undefined && q.c) return q.c;
+	return test(q.f) ? q.f : null;
+}
+
+/** Compatibility projection for planner callers; the decision core also reads the unfiltered tuple for rent and production. */
+export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
+	return selectPlan(plan(entries, o), o);
 }
 
 const isSystem = (m: Any) => String(m?.role ?? "") === "system";

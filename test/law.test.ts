@@ -164,7 +164,7 @@ describe("through the extension: the free signal is learned, persisted and used;
 		expect(late.find((r) => r.type === "prompt")).toMatchObject({ cold: false, survSrc: "learned" });
 		expect(late.find((r) => r.type === "prompt").pWarm).toBeGreaterThanOrEqual(0.5);
 		expect(late.find((r) => r.type === "cold_plan")).toMatchObject({ trigger: "valve", source: "valve", folds: 1 });
-		expect(late.find((r) => r.type === "law").steps.at(-1)).toMatchObject({ at: "plan", ok: true });
+		expect(late.find((r) => r.type === "law").steps.at(-1)).toMatchObject({ at: "guard", ok: true });
 		const early = await run(125); // inside the TTL: a warm return keeps the turn just finished
 		expect(early.find((r) => r.type === "prompt")).toMatchObject({ cold: false });
 		expect(early.find((r) => r.type === "cold_plan")).toBeUndefined();
@@ -181,7 +181,7 @@ describe("through the extension: the free signal is learned, persisted and used;
 		await zip.context({ messages: entries.flatMap((x: Any) => x.messages) }, ctx);
 		const law = readFileSync(process.env.PI_ZIP_LEDGER!, "utf8").trim().split("\n").map((l) => JSON.parse(l)).find((r) => r.type === "law");
 		expect(law).toMatchObject({ where: "run", g: 2500, pWarm: 0, survSrc: "prior", cls: "explicit", wr: 12.5, prSrc: "class" });
-		expect(law.steps.at(-1)).toMatchObject({ at: "plan", ok: true });
+		expect(law.steps.at(-1)).toMatchObject({ at: "guard", ok: true });
 		expect(law.steps.at(-1).K).toBeLessThan(0);
 		expect(Object.keys(law.steps.at(-1))).toEqual(["at", "ok", "B", "A", "T", "Tsuf", "phi", "K", "eta"]);
 		expect(law.steps.at(-1).T).toBe(law.steps.at(-1).A);
@@ -292,7 +292,7 @@ describe("final model (research round 5, final-model.md section 8 tests 1-5)", (
 		expect(te1.entries.filter((e: Any) => e.type === "context_edit").length).toBeGreaterThan(30);
 		reply(5_000); // the request that first carries the edit
 		const s2 = [...project(s1, te1.entries), ...turns(100, 40), U("uM", "more"), A("aM")]; // 40 new foldable outputs: the law would fire again
-		expect(await end(s2)).toBeUndefined();
+		expect((await end(s2)).entries.every((e: Any) => e.customType === "pi-zip/rent")).toBe(true);
 		expect(ledger().filter((r) => r.type === "b2b_skip")).toEqual([expect.objectContaining({ where: "turn_end" })]);
 		reply(5_000); // a plain request in between
 		const te3 = await end(s2);
@@ -329,5 +329,29 @@ describe("final model (research round 5, final-model.md section 8 tests 1-5)", (
 		await zip.context({ messages: flat(entries) }, ctx);
 		expect(ledger().find((r) => r.type === "law")).toMatchObject({ cls: "automatic", wr: 5, prSrc: "class" }); // w/r = 1 / 0.2: kappa = 4
 		expect(zip.status()).toContain("cache q/odd: automatic (from usage), read 0.2 / write 1 / output 4 x input (class ratios)");
+	});
+});
+
+// The guard is a distinct application predicate; production retains the plain law.
+describe("the guarded application law", () => {
+	test("the tenth-rent floor blocks an early plain-law edit; rent can buy the rewrite with any growth estimate", async () => {
+		const { guardTerms, lawTerms } = await import("../src/plan.ts");
+		const pr = { r: 0.1, w: 1.25, out: 5 };
+		expect(lawTerms(100_000, 90_000, 1, null, pr, 40).ok).toBe(true);
+		expect(guardTerms(100_000, 90_000, 1, null, pr, 40, 0).ok).toBe(false);
+		expect(guardTerms(100_000, 90_000, 1, null, pr, 40, 100_000).ok).toBe(true);
+		expect(lawTerms(100_000, 90_000, 1, null, pr, 1e6).ok).toBe(false);
+		expect(guardTerms(100_000, 90_000, 1, null, pr, 1e6, 1.1e6).ok).toBe(true);
+		expect(guardTerms(100_000, 100_000, 1, null, pr, 40, 1e9).ok).toBe(false);
+		expect(guardTerms(100_000, 90_000, 0, null, pr, 1e6, 0).ok).toBe(true);
+	});
+	test("the actual kept tail determines room credit, and X <= S supplies none", async () => {
+		const { guardTerms, lawTerms } = await import("../src/plan.ts");
+		const pr = { r: 0.1, w: 1.25, out: 5 };
+		const room = guardTerms(200_000, 40_000, 1, 100_000, pr, 1e6, 0, 70_000);
+		expect(room.eta).toBeCloseTo((1.25 * 130_000 + 5 * 8000 + 1.15 * 78_000) / 122_000, 10);
+		expect(room.ok).toBe(true);
+		expect(guardTerms(200_000, 40_000, 1, null, pr, 1e6, 0).ok).toBe(false);
+		expect(lawTerms(200_000, 40_000, 1, 100_000, pr, 1e6, 0, 40_000, 199_500).eta).toBe(0);
 	});
 });

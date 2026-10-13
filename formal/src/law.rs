@@ -24,7 +24,7 @@ pub struct Prices {
 /// the previous summary's lists (the code carries them forward verbatim) but with its narrative, which it merges, with cacheRetention
 /// "none", and writes the summary.
 pub fn summary_call(pr: Prices, read: f64, written: f64) -> f64 {
-    read.max(0.0) + pr.out * written.max(0.0)
+    pr.w * read.max(0.0) + pr.out * written.max(0.0)
 }
 
 /// The call term a recorded law step used, backed out of its K (K = (w - r)(P min(T, A) - (1 - P)(B - A)) + call).
@@ -65,13 +65,34 @@ pub fn law(b: f64, a: f64, p: f64, room: Option<f64>, pr: Option<Prices>, g: f64
     let mut eta = 0.0;
     if let Some(room) = room {
         if b >= room {
-            let s = (0.1 * (b - KEEP_RECENT)).clamp(1_000.0, 8_000.0);
-            let api = KEEP_RECENT + s;
-            eta = (pr.w * (b - KEEP_RECENT) + pr.out * s + (pr.w - pr.r) * api) / (b - api).max(1.0);
+            let x = (b - KEEP_RECENT).max(0.0);
+            let s = (0.1 * x).clamp(1_000.0, 8_000.0);
+            eta = if x > s { (pr.w * x + pr.out * s + (pr.w - pr.r) * (b - x + s)) / (x - s) } else { 0.0 };
         }
     }
     let gain = (pr.r * d * d) / (2.0 * g.max(1.0)) + eta * d;
     Terms { ok: k <= 0.0 || gain >= k, k, eta, gain }
+}
+
+pub fn with_tail(mut t: Terms, b: f64, a: f64, room: Option<f64>, pr: Prices, keep: Option<f64>) -> Terms {
+    if let Some(keep) = keep.filter(|_| room.is_some_and(|room| b >= room)) {
+        let x = (b - keep).max(0.0);
+        let s = (0.1 * x).clamp(1_000.0, 8_000.0);
+        let eta = if x > s { (pr.w * x + pr.out * s + (pr.w - pr.r) * (b - x + s)) / (x - s) } else { 0.0 };
+        t.gain += (eta - t.eta) * (b - a);
+        t.eta = eta;
+        t.ok = a < b && (t.k <= 0.0 || t.gain >= t.k);
+    }
+    t
+}
+
+/// The guarded application law, in the same input-price units as law(). Production stays plain.
+pub fn guard(b: f64, a: f64, p: f64, room: Option<f64>, pr: Prices, g: f64, rent: f64) -> Terms {
+    let mut t = law(b, a, p, room, Some(pr), g, 0.0, a);
+    let effective = t.k - t.eta * (b - a);
+    let paid = pr.r * (rent + b - a);
+    t.ok = a < b && (effective <= 0.0 || paid >= effective || (t.ok && paid >= effective / 10.0));
+    t
 }
 
 /// The expected cost difference of an edit under the law's own model (negative: the edit saves).

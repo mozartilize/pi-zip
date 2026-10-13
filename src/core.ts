@@ -4,7 +4,7 @@
 import { detectCold, modelKey, resolveTtl, type ColdInfo } from "./cache.ts";
 import { validateEdits } from "./guard.ts";
 import { GAP_EDGES, lawPrices, pWarm, type Entry } from "./learn.ts";
-import { buildBlocks, calibrate, compactionRoom, planContext, sizeOf, untouchedEst, UNIT, type Block, type Cut, type FoldTarget, type Law, type PlanOpts, type PlanResult, type RunPlan, type Scale, type SysInfo } from "./plan.ts";
+import { buildBlocks, calibrate, compactionRoom, plan, selectPlan, sizeOf, untouchedEst, UNIT, type Block, type Cut, type FoldTarget, type Law, type PlanOpts, type PlanResult, type RunPlan, type Scale, type SysInfo } from "./plan.ts";
 import type { FileRecall } from "./recallfile.ts";
 import { PRODUCT, type Any } from "./util.ts";
 
@@ -139,62 +139,50 @@ export function planOpts(entries: Any[], branch: Any[], env: Env, lam: Learned, 
 	return { cal, o: { pause, scale: cal, cwd: env.cwd, recalled: env.recalled, model: env.model, promptPending: pending, rereadOnly: env.rereadOnly, ...(env.fileRecall ? { fileRecall: env.fileRecall } : {}), reserve: env.reserve, steerIds: env.steerIds, law: lawOf(branch, lam, pWarm), trace: [], ...(cutAt !== undefined ? { cutAt } : {}), ...(foldsOnly ? { foldsOnly } : {}), ...(ready?.length ? { ready } : {}) } };
 }
 
-/** A summary a plan may take: produced and ready (`running` false), or still being written. */
-export interface Avail { key: string; running: boolean }
+/** The branch owns rent; every compaction is a rewrite, including one supplied by Pi or another extension. */
+export function rentOf(branch: Any[]): number {
+	const latest = [...branch].reverse().find((e) => e?.customType === "pi-zip/rent" || e?.type === "compaction");
+	return latest?.type === "custom" ? latest.data?.rent ?? 0 : 0;
+}
 
-/** The plan `first`, or, when a summary produced or being produced (`avail`) cuts no deeper than its cut, the plan cutting at the
- *  deepest such summary (plan.ts cutAt) if the law accepts it: a call already paid for is used instead of a new one, and never for a
- *  cut deeper than the plan asks for. `note`: the adoption, for the ledger (`running`: the summary is not written yet). */
-export function adopt<T extends { p: PlanResult | null }>(first: T, mk: (cutAt: string) => T, avail: readonly Avail[], where: string): { r: T; note?: Note } {
-	const p = first.p;
-	if (!avail.length || !p || p.cutIdx === null) return { r: first };
-	let at = -1, pick: Avail | null = null;
-	for (const a of avail) {
-		const i = p.blocks.findIndex((b) => b.entryId === a.key);
-		if (i >= 0 && i <= p.cutIdx && i > at) [at, pick] = [i, a];
-	}
-	if (!pick || pick.key === p.firstKeptEntryId) return { r: first };
-	const q = mk(pick.key);
-	const ok = !!q.p && q.p.cutIdx !== null && q.p.firstKeptEntryId === pick.key;
-	return { r: ok ? q : first, note: { type: "pin", where, from: p.firstKeptEntryId, to: pick.key, ok, ...(pick.running ? { running: true } : {}) } };
+/** A summary a plan may take: produced and ready (`running` false), or still being written. */
+export interface Avail { key: string; running: boolean; summaryTokens?: number }
+
+/** Production reads the same tuple, including structurally eligible ready/running summaries. No application test suppresses Y. */
+export function candidateOf(entries: Any[], opts: (cutAt?: string, foldsOnly?: boolean, ready?: readonly string[]) => { o: PlanOpts; cal?: Scale }, avail: readonly Avail[], _where: string, foldsOnly = false) {
+	const { o, cal } = opts(undefined, foldsOnly, avail.map((a) => a.key));
+	o.readySizes = Object.fromEntries(avail.filter((a) => a.summaryTokens !== undefined).map((a) => [a.key, a.summaryTokens!]));
+	const q = plan(entries, o);
+	return { r: { o, cal: o.scale ?? cal ?? UNIT, p: q?.a ?? q?.c ?? null } };
 }
 
 // ---- decide -------------------------------------------------------------------------------------------------------------------
-
-/** An unready summary (theory 1.4 decide): a plan whose cut is not ready (no produced summary for it in `ready`) gives way to the plan
- *  of its folds alone, judged by the law with no call (`foldsOnly`: null when the law refuses them), and its cut is produced in the
- *  background (`produce`). Nobody waits for it: the next decision after it is ready takes it. */
-export function unready<T extends { p: PlanResult | null }>(r: T, ready: readonly Avail[], foldsOnly: () => T): { r: T; produce: PlanResult | null } {
-	const p = r.p;
-	if (!p || p.cutIdx === null || ready.some((a) => !a.running && a.key === p.firstKeptEntryId)) return { r, produce: null };
-	return { r: foldsOnly(), produce: p };
-}
-
-/** One candidate search and ready-summary adoption, shared by decisions and production. */
-export function candidateOf(entries: Any[], opts: (cutAt?: string, foldsOnly?: boolean, ready?: readonly string[]) => { o: PlanOpts; cal?: Scale }, avail: readonly Avail[], where: string, foldsOnly = false) {
-	const mk = (cutAt?: string) => {
-		const { o, cal } = opts(cutAt, foldsOnly, avail.map((a) => a.key));
-		return { o, cal: o.scale ?? cal ?? UNIT, p: planContext(entries, o) };
-	};
-	return adopt(mk(), mk, avail, where);
-}
 
 /** The application rules have one implementation for prompts, first requests and boundaries. First requests defer summaries;
  *  native first requests retain the prompt's already priced decision. b2b blocks application only, never production or the room. */
 export function decideEdits(x: { at: "native" | "run" | "turn_end"; justEdited: boolean; pWarm: number; entries: Any[]; ready: readonly Avail[];
 	opts: (cutAt?: string, foldsOnly?: boolean, ready?: readonly string[]) => { o: PlanOpts; cal?: Scale } }) {
-	const { r: first, note } = candidateOf(x.entries, x.opts, x.ready.filter((a) => !a.running), x.at);
-	const p = first.p, has = p && p.cutIdx !== null && x.ready.some((a) => a.key === p.firstKeptEntryId);
-	const produce = p && p.cutIdx !== null && !has ? p : null;
-	if (x.justEdited && x.pWarm >= 0.5) return { kind: "b2b" as const, ...first, p: null, notes: [], produce };
-	const deferred = x.at === "run" && p && p.cutIdx !== null;
-	const u = unready(first, deferred ? [] : x.ready, () => candidateOf(x.entries, x.opts, [], x.at, true).r);
-	return { kind: "plan" as const, ...u.r, notes: [...(note ? [note] : []), ...(deferred && has ? [{ type: "defer", key: p.firstKeptEntryId } as Note] : [])], produce };
+	const r = x.opts(undefined, false, x.ready.filter((a) => !a.running).map((a) => a.key));
+	const { o } = r, cal = o.scale ?? r.cal ?? UNIT;
+	o.readySizes = Object.fromEntries(x.ready.filter((a) => !a.running && a.summaryTokens !== undefined).map((a) => [a.key, a.summaryTokens!]));
+	o.application = true;
+	o.justEdited = x.justEdited;
+	o.deferSummary = x.at === "run";
+	const q = plan(x.entries, o), produce = q?.c && !x.ready.some((a) => a.key === q.c!.firstKeptEntryId) ? q.c : null;
+	const carriedSavings = cal.c * (o.carriedFolds ?? []).reduce((n, t) => n + t.entryTokens - t.phTokens, 0);
+	const saved = q ? q.f.ctxTokens - (q.a ?? q.f).ctxAfterFolds + (q.a ? q.a.scale.c * (q.a.prefixTokens - q.a.summaryTokensPlanned) : 0) : 0;
+	const b2b = x.justEdited && x.pWarm >= 0.5;
+	const p = b2b ? null : selectPlan(q, o);
+	const rentNext = p || x.pWarm < 0.5 ? 0 : (o.rent ?? 0) + Math.max(0, saved - carriedSavings);
+	const notes: Note[] = q?.a && x.at === "run" ? [{ type: "defer", key: q.a.firstKeptEntryId }] : [];
+	if (p?.cutIdx != null && q?.c && p.firstKeptEntryId !== q.c.firstKeptEntryId) notes.push({ type: "pin", where: x.at, from: q.c.firstKeptEntryId, to: p.firstKeptEntryId, ok: true });
+	return { kind: b2b ? "b2b" as const : "plan" as const, o, cal, p, notes, produce: p?.cutIdx != null ? null : produce, rentNext };
+
 }
 
 /** A native prompt carries its jointly priced folds; other first requests defer summaries to turn_end. */
 export function decideRun(x: { cold: boolean; justEdited: boolean; nat: { o: PlanOpts; cal: Scale; p: PlanResult } | null; foreign: boolean; now: Any[]; ready: readonly Avail[]; opts: (entries: Any[], cutAt?: string, foldsOnly?: boolean, ready?: readonly string[]) => { o: PlanOpts; cal: Scale } }) {
-	if (x.nat) return { kind: "plan" as const, ...x.nat, notes: [], produce: null };
+	if (x.nat) return { kind: "plan" as const, ...x.nat, notes: [], produce: null, rentNext: 0 };
 	return decideEdits({ at: "run", justEdited: x.justEdited, pWarm: x.cold ? 0 : 1, entries: x.now, ready: x.ready,
 		opts: (cutAt, foldsOnly, ready) => {
 			const r = x.opts(x.now, cutAt, foldsOnly, ready);
@@ -247,18 +235,18 @@ export function decideTurnEnd(x: { failed: boolean; justEdited: boolean; pWarm: 
 	const before = sizeOf(d.cal, blocks.reduce((n, b) => n + b.tokens, 0));
 	const after = d.p ? d.p.ctxAfterFolds - d.p.scale.c * (d.p.prefixTokens - d.p.summaryTokensPlanned)
 		: before - d.cal.c * (d.o.carriedFolds ?? []).reduce((n, t) => n + t.entryTokens - t.phTokens, 0);
-	const room = roomOf(after, d.o, () => candidateOf(x.entries, opts, [], "room").r.p, d.p?.firstKeptEntryId ?? undefined);
+	const room = roomOf(after, d.o, () => { const r = opts(undefined, false, []); r.o.application = false; r.o.pause = false; return candidateOf(x.entries, () => r, [], "room").r.p; });
 	return { ...d, produce: room ? null : d.produce, room, runPlan: carried };
 }
 
 /** The one wait (theory 1.4 R9): when the view after a turn_end's edit (`after`) is still at Pi's compaction room, the plan at the
  *  in-run p with no pause and no ready summaries (`plan`: every call priced), if it has a cut c′ (which then passed the law with its
- *  call) other than the one the edit takes already (`taken`); else null. `o`: the decision's options (model, reserve). */
-export function roomOf(after: number, o: PlanOpts, plan: () => PlanResult | null, taken?: string): PlanResult | null {
+ *  call); else null. A ready summary of that same cut may still leave the view at the room. `o`: model and reserve. */
+export function roomOf(after: number, o: PlanOpts, plan: () => PlanResult | null): PlanResult | null {
 	const room = compactionRoom(o.model, o.reserve);
 	if (room === null || after < room) return null;
 	const c = plan();
-	return c && c.cutIdx !== null && c.firstKeptEntryId !== taken ? c : null;
+	return c && c.cutIdx !== null ? c : null;
 }
 
 /** The valve plan of a turn_end (persisted at once; `cut`: its summary, ready, or the room wait's; `waitMs`: the room wait). */

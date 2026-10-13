@@ -2,7 +2,7 @@
 // Thinking is never quoted or paraphrased: it is stripped before the model sees the prefix.
 import { randomUUID } from "node:crypto";
 import { blockTime, cdDirOf, clipMid, distinctLines, handleFor, keyTexts, outcomeHint, RECALL_TOOL, shortArgs, strippableCdDirs, whenLabel } from "./placeholder.ts";
-import { type Block, type Cut, type PlanResult, settings, toolCallIndex } from "./plan.ts";
+import { type Block, type Cut, type PlanResult, NARRATIVE_MAX, settings, toolCallIndex } from "./plan.ts";
 import { type FileRecall, fileRecallHow } from "./recallfile.ts";
 import { type Any, clamp, clip, envInt, fmtWhen, textOf, tok4 } from "./util.ts";
 
@@ -570,7 +570,8 @@ export async function narrative(prefix: Block[], ctx: Any, budgetTokens: number,
 			const m = b.raw && !(b.edited && !b.ours) ? b.raw : b.msg; // the summariser reads the unfolded originals
 			return m.role === "assistant" ? { ...m, content: (m.content ?? []).filter((c: Any) => c?.type !== "thinking") } : m;
 		});
-	let lastErr = "";
+	let lastErr = "", costUsd = 0;
+	let usage: Any;
 	try {
 		const conv = await serialize(msgs);
 		const words = narrativeWords(budgetTokens, !!previous);
@@ -605,14 +606,16 @@ export async function narrative(prefix: Block[], ctx: Any, budgetTokens: number,
 				const res: Any = await ctx.modelRegistry.complete(
 					model,
 					{ systemPrompt: NARRATIVE_SYSTEM, messages: [{ role: "user", content: [{ type: "text", text: prompt }], timestamp: Date.now() }] },
-					{ maxTokens: 8192, signal, cacheRetention: "none", sessionId: randomUUID() },
+					{ maxTokens: NARRATIVE_MAX, signal, cacheRetention: "none", sessionId: randomUUID() },
 				);
+				costUsd += Number(res.usage?.cost?.total) || 0;
+				usage = res.usage ?? usage;
 				if (res.stopReason === "error") throw new Error(res.errorMessage || "provider error");
 				if (res.stopReason === "length") throw new Error("narrative hit the token cap");
 				if ((res.content ?? []).some((c: Any) => c.type === "toolCall")) throw new Error("summariser attempted a tool call");
 				const text = textOf(res.content).trim();
 				if (!text) throw new Error("empty narrative");
-				return { text, ok: true, ms: Date.now() - t0, costUsd: Number(res.usage?.cost?.total) || 0, usage: res.usage };
+				return { text, ok: true, ms: Date.now() - t0, costUsd, usage };
 			} catch (err) {
 				lastErr = err instanceof Error ? err.message : String(err);
 				if (POLICY_BLOCK_RE.test(lastErr) || signal.aborted) break; // an identical retry fails the same way
@@ -621,7 +624,7 @@ export async function narrative(prefix: Block[], ctx: Any, budgetTokens: number,
 	} catch (err) {
 		lastErr = err instanceof Error ? err.message : String(err);
 	}
-	return { text: null, ok: false, ms: Date.now() - t0, costUsd: 0, error: lastErr };
+	return { text: null, ok: false, ms: Date.now() - t0, costUsd, usage, error: lastErr };
 }
 
 /** The cold summary (skeleton + narrative + handle table) for a planned cut. */
@@ -664,7 +667,7 @@ export async function buildCut(p: PlanResult, ctx: Any, signal?: AbortSignal): P
 	const file = p.fileRecall; // zip_recall hidden by an allowlist: the summary names the recall files instead
 	const table = handleTable(rows, prev, file);
 	const sk = skeleton(prefix.filter((b) => b.kind !== "summary"), prev, table ?? "", file);
-	const nb = clamp(p.summaryTokensPlanned - tok4(sk.text), 300, 4000);
+	const nb = clamp(p.summaryTokensPlanned - tok4(sk.text), 300, NARRATIVE_MAX);
 	const prevAt = prefix[0]?.kind === "summary" ? Number(prefix[0].msg.timestamp) || 0 : 0;
 	const prevNarr = previousNarrative(prev, prevAt, narrativeWords(nb, true) * PREV_CHARS_PER_WORD);
 	const nar = await narrative(prefix, ctx, nb, signal, prevNarr);

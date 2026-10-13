@@ -128,7 +128,7 @@ export function detectCold(model: Any, lastReqMs: number, branch: Any[], nowMs =
 	const last = Math.max(lastReqMs, lastMessageMs(branch));
 	const prev = lastModel || lastModelInBranch(branch);
 	// a request that went out, even one the provider refused, was made on another model: the new model's cache is not that one
-	if (prev && modelKey(model) && prev !== modelKey(model)) return { cold: true, reason: `model switch ${prev} -> ${modelKey(model)}`, ttl, pWarm: 0, src: "model switch", gapS: null, pause: true };
+	if (prev && modelKey(model) && prev !== modelKey(model)) return { cold: true, reason: `model switch ${prev} -> ${modelKey(model)}`, ttl, pWarm: 0, src: "model switch", gapS: null, pause: last > 0 && nowMs - last >= ttl.ms };
 	if (!last) return { cold: true, reason: "no prior request", ttl, pWarm: 0, src: "no prior request", gapS: null, pause: false };
 	const gapS = (nowMs - last) / 1000;
 	const byTtl = isColdByTtl(last, nowMs, ttl.ms);

@@ -180,7 +180,7 @@ fn k(x: u32) -> String {
     if x >= 1000 && x.is_multiple_of(1000) {
         format!("{}K", x / 1000)
     } else if x >= 1000 {
-        format!("{:.1}K", x as f64 / 1000.0)
+        format!("{}.{:03}K", x / 1000, x % 1000)
     } else {
         format!("{x}")
     }
@@ -224,7 +224,7 @@ impl fmt::Display for Event {
             Event::Drive { gap } => write!(f, "drive +{}", dur(*gap)),
             Event::NextTurn => write!(f, "nextturn"),
             Event::Call { tool, size } => match tool {
-                Tool::Recall => write!(f, "call recall"),
+                Tool::Recall => write!(f, "call recall {}", k(*size)),
                 Tool::Npm => write!(f, "call npm {}", k(*size)),
                 Tool::Cat => write!(f, "call cat {}", k(*size)),
             },
@@ -436,6 +436,8 @@ pub struct Prices {
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct LawStep {
+    pub keep: Option<f64>,
+    pub rent: Option<f64>,
     pub at: String,
     pub ok: bool,
     #[serde(rename = "B")]
@@ -460,6 +462,10 @@ pub struct LawStep {
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct GridPt {
+    pub planned_plan: Option<bool>,
+    pub planned_folds: Vec<String>,
+    pub planned_cut: Option<String>,
+    pub planned_after: Option<f64>,
     pub p: f64,
     pub actual: bool,
     pub mode: String,
@@ -533,6 +539,8 @@ pub struct Fresh {
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct NativeDoor {
+    pub keep: Option<f64>,
+    pub rent: f64,
     pub open: bool,
     pub p: f64,
     pub g: f64,
@@ -861,7 +869,9 @@ impl Run {
     pub fn decision_for(&self, i: usize) -> Option<&Grid> {
         // a valve plan persisted at the previous turn_end is first carried by this request (even the first of a new run)
         if i > 0 && self.tick(i - 1).te_valve {
-            return self.tick(i - 1).grids.iter().find(|g| g.at == "turn_end");
+            let t = self.tick(i - 1);
+            let waited = t.te_ledger.iter().any(|v| v["type"] == "room_wait");
+            return t.grids.iter().find(|g| g.at == "turn_end" && g.room == waited).or_else(|| t.grids.iter().find(|g| g.at == "turn_end"));
         }
         let t = self.tick(i);
         if t.n == 0 {

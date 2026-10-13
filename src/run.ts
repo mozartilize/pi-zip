@@ -6,7 +6,7 @@ import { dirname, join } from "node:path";
 import { lastMessageMs, lastPrompt, modelKey, payloadRetention, refused, ttlFor } from "./cache.ts";
 import { agentDir, curve, describe, lawPrices, loadStats, pWarm, record, sample, statsPath, GAP_EDGES, type Entry } from "./learn.ts";
 import { repairPayload } from "./guard.ts";
-import { candidateOf, decideEdits, checkEdits, clock, decideRun, inRunClock, want, decideTurnEnd, grow, headOf, planOpts, readyOf, runPlanOf, scaleOf, unusedOf, valvePlanOf, SUMMARY_CUSTOM, type Artifact, type Avail, type Env, type Learned } from "./core.ts";
+import { candidateOf, decideEdits, checkEdits, clock, decideRun, inRunClock, want, decideTurnEnd, grow, headOf, planOpts, readyOf, rentOf, runPlanOf, scaleOf, unusedOf, valvePlanOf, SUMMARY_CUSTOM, type Artifact, type Avail, type Env, type Learned } from "./core.ts";
 import { fmtK, Stats, noticeDesc, noticeText, type NoticeAction, type NoticeData, type ZipControl } from "./notice.ts";
 import { applyPlanToMessages, buildBlocks, countUserTurns, G0, keepRecentTokensFor, piCanCompact, piContextTokens, reserveTokensFor, sizeOf, wireTokensOf, UNIT, type Block, type Cut, type FoldTarget, type PlanOpts, type PlanResult, type RunPlan, type Scale, type SysInfo } from "./plan.ts";
 import { handleFor, PH_MARK, RECALL_TOOL } from "./placeholder.ts";
@@ -114,6 +114,8 @@ export class Zip implements ZipControl {
 	private branchLastMs = 0; // the branch clock at run start (a fresh process knows the gap from the session)
 	private nextEdit: number | null = null; // the next request is the first to carry a new edit: its untouched prefix (real tokens)
 	private pending: { gapS: number; expect: number; edited: boolean; key: string } | null = null;
+	private rentHead = "";
+	private rent = 0; // R14: accumulated planned savings, persisted at each boundary
 	private justEdited = false; // the newest response answered a request that first carried an edit: the next request gets no warm edit
 	// pi-zip's own ctx.compact() in flight: the only compaction session_before_compact answers (compaction null = cancel a late ask)
 	private nativeAsk: { compaction: Any | null; answered: boolean; askedAt: number; askedWall: number; until: number } | null = null;
@@ -389,7 +391,11 @@ export class Zip implements ZipControl {
 
 	/** Plan options at P(warm) `pWarm`, after a pause or not, with the token scale read from the branch (core.ts planOpts). */
 	private opts(ctx: Any, pending: boolean, entries: Any[], pWarm: number, pause: boolean, cutAt?: string, foldsOnly = false, ready?: readonly string[]): { o: PlanOpts; cal: Scale } {
-		return planOpts(entries, this.branch(ctx), this.env(ctx), this.lam(ctx), pending, pWarm, pause, cutAt, foldsOnly, ready);
+		const branch = this.branch(ctx);
+		if (this.rentHead !== headOf(branch)) { this.rent = rentOf(branch); this.rentHead = headOf(branch); }
+		const r = planOpts(entries, branch, this.env(ctx), this.lam(ctx), pending, pWarm, pause, cutAt, foldsOnly, ready);
+		r.o.rent = this.rent;
+		return r;
 	}
 
 	private entKey = "";
@@ -472,8 +478,7 @@ export class Zip implements ZipControl {
 
 	/** Opening a session only arms a future producer deadline; browsing old history never starts a call. */
 	armProducer(ctx: Any) {
-		const branch = this.branch(ctx), last = [...branch].reverse().find((en) => en?.type === "message" && en.message)?.message;
-		if (last?.role === "assistant" && last.stopReason !== "toolUse") this.want("timer", ctx, undefined, undefined, true);
+		this.want("timer", ctx, undefined, undefined, true);
 	}
 
 	/** What a process that never left would know: growth g and "the newest response carried an edit" are functions of the session,
@@ -485,6 +490,8 @@ export class Zip implements ZipControl {
 			this.g = r.g;
 			this.deltas = r.deltas;
 			this.justEdited = r.justEdited;
+			this.rent = rentOf(branch);
+			this.rentHead = headOf(branch);
 			const ready = readyOf(branch).length;
 			if (branch.length) this.ledger({ type: "state_restored", g: Math.round(this.g), justEdited: this.justEdited, ...(ready ? { ready } : {}) });
 		} catch (err) {
@@ -626,6 +633,8 @@ export class Zip implements ZipControl {
 		this.detectConflict(ctx);
 		if (!this.active()) return;
 		const branch = this.branch(ctx);
+		this.rent = rentOf(branch);
+		this.rentHead = headOf(branch);
 		const key = modelKey(ctx.model);
 		this.loadEnt(key);
 		this.branchLastMs = lastMessageMs(branch);
@@ -633,7 +642,7 @@ export class Zip implements ZipControl {
 		await this.resolveRetention(ctx);
 		const { cold, reason, ttl, pWarm: p, src, gapS, pause } = clock(branch, { model: ctx.model, ent: this.ent, tier: this.tier(ctx.model) }, Date.now(), { reqMs: this.lastReqMs, modelKey: this.lastModelKey });
 		this.cold = cold;
-		this.pause = pause;
+		this.pause = viaPrompt && pause;
 		this.pWarm = p;
 		this.survSrc = src;
 		this.runChecked = false; // the first request decides (cold: the cold plan; warm: only above the cap, if the law fires)
@@ -827,6 +836,7 @@ export class Zip implements ZipControl {
 		// the summary is in the session from now on, whatever the run does: book it here (commit() does not book it again), the way a
 		// draft of the same kind is booked: a cold return's saves a rewrite, a warm one is a valve edit of the warm cache
 		const cutSaved = Math.round(p.scale.c * (cut.prefixTokens - cut.summaryTokens));
+		this.rent = 0;
 		this.nativeRun = { cut, before, after: Math.round(p.ctxAfterFolds - cutSaved), o, cal, p };
 		const s = this.stats;
 		s.summaries++;
@@ -850,13 +860,13 @@ export class Zip implements ZipControl {
 	 *  Its asynchronous cancellation persists the record; shutdown flushes it before exit. */
 	private discardBg(why: "replaced" | "shutdown" | "off") {
 		const b = this.bg;
-		this.bg = null;
-		if (!b) return;
+		if (!b || b.aborted) return;
 		b.aborted = true;
 		this.stats.summaryUsd += b.estUsd;
 		this.ledger({ type: "unused_summary", key: b.key, why });
 		this.record({ head: b.head, key: b.key, usd: b.estUsd, estimated: true, lost: why }, true);
 		b.controller.abort();
+		void Promise.resolve().then(() => { if (!this.inRun) this.writeUnwritten(); });
 	}
 
 	/** A record is readable from `mine` at once. Completed calls append a custom entry between runs; inside a run it waits for drafts.
@@ -881,15 +891,15 @@ export class Zip implements ZipControl {
 
 	/** The summaries a plan of this branch may take: the ready ones, and the call in flight when it reads this branch's projection. */
 	private avail(branch: Any[]): Avail[] {
-		const out: Avail[] = readyOf(branch, this.mine).map((a) => ({ key: a.key, running: false }));
+		const out: Avail[] = readyOf(branch, this.mine).map((a) => ({ key: a.key, running: false, summaryTokens: a.cut!.summaryTokens }));
 		const b = this.bg;
-		if (b && b.head === headOf(branch) && !out.some((a) => a.key === b.key)) out.push({ key: b.key, running: true });
+		if (b && !b.aborted && b.head === headOf(branch) && !out.some((a) => a.key === b.key)) out.push({ key: b.key, running: true });
 		return out;
 	}
 
 	/** The ready summaries of this branch, as plans take them (a call still running is not ready: nobody waits for it). */
 	private ready(branch: Any[]): Avail[] {
-		return readyOf(branch, this.mine).map((a) => ({ key: a.key, running: false }));
+		return readyOf(branch, this.mine).map((a) => ({ key: a.key, running: false, summaryTokens: a.cut!.summaryTokens }));
 	}
 
 
@@ -901,30 +911,27 @@ export class Zip implements ZipControl {
 	 * refuses is neither lost nor missing from the totals. null: the call failed or was cancelled.
 	 */
 	private async roomWait(c: PlanResult, ctx: Any): Promise<{ cut: Cut; ms: number } | null> {
-		const head = headOf(this.branch(ctx)), key = c.firstKeptEntryId, model = modelKey(ctx.model), b = this.bg, w0 = performance.now();
-		const running = !!b && b.key === key && b.head === head;
+		const head = headOf(this.branch(ctx)), key = c.firstKeptEntryId, b = this.bg, w0 = performance.now();
+		const running = !!b && !b.aborted && b.key === key && b.head === head;
 		this.ledger({ type: "room_wait", key, running });
-		let cut: Cut | null = null;
-		try {
-			if (running) {
-				const got = await this.working(ctx, `${PRODUCT}: finishing a summary (the context is close to the window)`, waitFor(b!.promise, ctx?.signal));
-				cut = got ? { ...got, trigger: "valve", prepared: true } : null; // booked when it was produced
-			} else {
+		const got = await this.working(ctx, `${PRODUCT}: finishing a summary (the context is close to the window)`, (async () => {
+			if (!running) {
 				this.discardBg("replaced");
-				const got = await this.working(ctx, `${PRODUCT}: writing a summary (the context is close to the window)`, buildCut(c, ctx));
-				this.completed(got, model, head, key!);
-				cut = { ...got, prepared: true }; // booked now
+				if (b) await waitFor(b.promise, ctx?.signal); // keep the slot until the provider acknowledges cancellation; Esc ends only the wait
+				if (ctx?.signal?.aborted) return null;
+				this.startBg(c, ctx, true);
 			}
-		} catch (err) {
-			this.ledger({ type: "error", where: "room_wait", error: errText(err) });
-		}
-		return cut ? { cut, ms: performance.now() - w0 } : null;
+			return waitFor(this.bg?.promise ?? Promise.resolve(null), ctx?.signal);
+		})());
+		return got ? { cut: { ...got, trigger: "valve", prepared: true }, ms: performance.now() - w0 } : null;
+
 	}
 
 
 	async context(e: Any, ctx: Any): Promise<Any> {
 		if (!this.active()) return undefined;
 		if (this.starting) await this.starting; // agent_start's start-of-run handling of a driven run
+		if (ctx?.signal?.aborted) return undefined;
 		if (!this.runChecked) {
 			this.runChecked = true;
 			try {
@@ -985,16 +992,16 @@ export class Zip implements ZipControl {
 		// no warm edit on the request right after an edited one (no back-to-back warm rewrites); the summary the plan wants is still
 		// produced. A summary Pi's compaction already put in the session (nativeSummary skips such a return, so only defensively) is
 		// never dropped here: the run plan below carries it
+		this.rent = d.rentNext;
+		if (d.produce) this.want("run", ctx, d.produce);
 		if (d.kind === "b2b") {
 			this.ledger({ type: "b2b_skip", where: "run" });
-			if (d.produce) this.want("run", ctx, d.produce);
 			return;
 		}
 		for (const n of d.notes) this.ledger(n);
 		const { o, cal, p } = d;
 		if (!nat) this.lawLedger("run", o);
-		// a cut with no ready summary: the plan is its folds alone (by the law), and the summary is written in the background
-		if (d.produce) this.want("run", ctx, d.produce);
+		// A cut with no ready summary is produced while the guarded folds ride this run.
 		const native = nat?.cut ?? null;
 		if (!p && !native) return; // the law does not fire (below the working view, or a rewrite that does not pay back)
 		this.runEdits = true;
@@ -1020,7 +1027,7 @@ export class Zip implements ZipControl {
 		return u ? { summaryUsage: { input: u.input, output: u.output, cacheRead: u.cacheRead, cacheWrite: u.cacheWrite } } : {};
 	}
 
-	/** Settle writes pending artifact records; only an interactive session prepares another return. */
+	/** Settle writes pending artifact records and prepares another return in every mode. */
 	async settle(e: Any, ctx: Any): Promise<Any> {
 		this.inRun = false;
 		const recs = this.drafts();
@@ -1031,7 +1038,7 @@ export class Zip implements ZipControl {
 	/** The shell for core.want: one background start and one timer slot, shared by all three triggers. */
 	private want(at: "run" | "turn_end" | "settle" | "timer", ctx: Any, candidate?: PlanResult | null, entries?: Any[], futureOnly = false) {
 		const decision = at === "run" || at === "turn_end";
-		if (!this.active() || !ctx?.model || (!decision && (!ctx.hasUI || this.inRun))) return;
+		if (!this.active() || !ctx?.model || (!decision && this.inRun)) return;
 		try {
 			this.liveCtx = ctx;
 			this.loadEnt(modelKey(ctx.model));
@@ -1043,23 +1050,36 @@ export class Zip implements ZipControl {
 				survival: (g) => process.env.PI_ZIP_TTL_SECS ? (g <= ttlMs / 1000 ? 1 : 0) : pWarm(this.ent, g, ttlMs / 1000).p,
 				plan: (p, pause, have) => {
 					return candidateOf(view, (cutAt, foldsOnly, ready) => this.opts(ctx, true, view, p, pause, cutAt, foldsOnly, ready), have, "want").r.p;
-				}, latency: (p) => this.ent?.call ? this.ent.call.ms * p.prefixTokens / this.ent.call.tokens : 0,
+				}, latency: (p) => this.ent?.call ? this.ent.call.ms * p.scale.c * p.prefixTokens / this.ent.call.tokens : 0,
 			});
 			if (!decision) this.cancelTimer();
 			if (decision && candidate) this.ledger({ type: "produce", where: at, key: candidate.firstKeptEntryId, ...(this.bg ? { running: this.bg.key } : {}) });
 			if (!w) return;
 			const delay = w.start - now;
 			this.ledger({ type: "want", at, key: w.p.firstKeptEntryId, start: w.start, gapS: w.gapS, timerMs: Math.max(0, Math.round(delay)) });
-			if (delay <= 0) {
-				if (!futureOnly && !this.bg) this.startBg(w.p, ctx);
+			if (delay <= 0 && (decision || at === "settle")) {
+				if (!futureOnly && (!this.bg || this.bg.aborted)) this.startBg(w.p, ctx);
 				// After the warm start, ask the same rule for the pause's deadline.
 				if (at === "settle") this.want("timer", ctx, undefined, view);
-			} else if (!decision) {
+			} else if (!decision && (!futureOnly || delay > 0)) {
 				const gen = ++this.timerGen;
-				this.timer = setTimeout(() => {
+				this.timer = setTimeout(async () => {
 					this.timer = null;
-					if (gen === this.timerGen) this.want("timer", ctx);
-				}, delay);
+					if (gen !== this.timerGen || this.inRun || !this.active()) return;
+					const branch = this.branch(ctx);
+					if (this.bg && this.bg.head !== headOf(branch)) this.discardBg("replaced");
+					if (this.bg) {
+						if (!this.bg.aborted) return;
+						await this.bg.promise;
+						if (gen !== this.timerGen || this.inRun || !this.active()) return;
+					}
+					this.loadEnt(modelKey(ctx.model));
+					const current = ctx.sessionManager.buildSessionProjection().entries, gap = w.gapS!;
+					const p = candidateOf(current, (cutAt, foldsOnly, ready) => this.opts(ctx, true, current,
+						process.env.PI_ZIP_TTL_SECS ? (gap <= ttlMs / 1000 ? 1 : 0) : pWarm(this.ent, gap, ttlMs / 1000).p,
+						true, cutAt, foldsOnly, ready), [], "timer").r.p;
+					if (p) this.startBg(p, ctx);
+				}, Math.max(0, delay));
 				this.timer.unref?.();
 			}
 		} catch (err) { this.ledger({ type: "error", where: "want", error: errText(err) }); }
@@ -1069,44 +1089,55 @@ export class Zip implements ZipControl {
 	cacheWarmingDecision(e: Any, ctx: Any): undefined {
 		if (e?.action === "warm") {
 			this.lastReqMs = Date.now();
-			this.want("timer", ctx, undefined, undefined, true);
 		}
+		this.want("timer", ctx);
 		return undefined;
 	}
 
 	/** Each completed call teaches its starting model and books its artifact once, whether it ran at the room or in the background. */
-	private completed(c: Cut, model: string, head: string, key: string) {
-		const learned = record(model, { explicit: false, total: 0, call: { ms: c.ms, tokens: Math.max(1, c.prefixTokens) } });
+	private completed(c: Cut, model: string, head: string, key: string, estimated = 0, prefixReal = c.prefixTokens) {
+		const learned = record(model, { explicit: false, total: 0, call: { ms: c.ms, tokens: Math.max(1, prefixReal) } });
 		if (this.entKey === model) this.ent = learned;
-		this.stats.summaryUsd += c.costUsd;
-		this.record({ head, key, cut: c, usd: c.costUsd });
+		const usd = c.llmOk || c.costUsd > 0 ? c.costUsd : estimated;
+		this.stats.summaryUsd += usd;
+		this.record({ head, key, ...(c.llmOk ? { cut: c } : { lost: "failed", estimated: c.costUsd === 0 }), usd });
 	}
 
 	/** Write the summary for `p` in the background (its own abort signal: nothing is running, so the run's would be stale). Nothing
 	 *  when one for the same cut of the same projection is ready or being written (false); any other call in flight is ended first. */
-	private startBg(p: PlanResult, ctx: Any): boolean {
+	private startBg(p: PlanResult, ctx: Any, room = false): boolean {
 		const branch = this.branch(ctx), head = headOf(branch), key = p.firstKeptEntryId, model = modelKey(ctx.model);
 		if (key === null) return false;
-		if (this.bg && this.bg.key === key && this.bg.head === head) return false;
-		if (readyOf(branch, this.mine).some((a) => a.key === key)) return false;
-		this.discardBg("replaced");
+		if (this.bg) {
+			if (this.bg.aborted) {
+				const gen = this.timerGen;
+				void this.bg.promise.then(() => { if (gen === this.timerGen && this.active() && headOf(this.branch(ctx)) === head) this.startBg(p, ctx, room); });
+			}
+			return false;
+		}
+		if (!room && readyOf(branch, this.mine).some((a) => a.key === key)) return false;
 		const controller = new AbortController();
 		const prevSum = p.blocks[0]?.kind === "summary" ? p.blocks[0].tokens : 0;
 		const estUsd = (p.scale.c * Math.max(0, p.prefixTokens - prevSum) * (Number(ctx?.model?.cost?.input) || 0)) / 1e6;
 		const bg: Bg = { key, head, aborted: false, promise: Promise.resolve(null), controller, estUsd };
 		const end = () => { if (this.bg === bg) this.bg = null; };
-		bg.promise = Promise.race([buildCut(p, ctx, controller.signal), new Promise<null>((resolve) => controller.signal.addEventListener("abort", () => resolve(null), { once: true }))])
+		bg.promise = buildCut(p, ctx, controller.signal)
 			.then((c) => {
 				if (bg.aborted || !c) return null;
-				this.completed(c, model, head, key);
+				this.completed(c, model, head, key, estUsd, p.scale.c * c.prefixTokens);
+				if (!c.llmOk) return null;
 				this.ledger({ type: "away_summary", key, ms: c.ms, llmOk: c.llmOk, costUsd: c.costUsd, ...this.usageOf(c) });
 				return c;
 			})
 			.catch((err) => {
-				if (!bg.aborted) this.ledger({ type: "error", where: "away_summary", error: err instanceof Error ? err.message : String(err) });
+				if (!bg.aborted) {
+					this.stats.summaryUsd += estUsd;
+					this.record({ head, key, usd: estUsd, estimated: true, lost: "failed" });
+					this.ledger({ type: "error", where: "away_summary", error: err instanceof Error ? err.message : String(err) });
+				}
 				return null;
 			})
-			.finally(() => { end(); if (bg.aborted && !this.inRun) this.writeUnwritten(); });
+			.finally(end);
 		this.bg = bg;
 		this.ledger({ type: "away_summary_start", key });
 		return true;
@@ -1118,7 +1149,8 @@ export class Zip implements ZipControl {
 		try {
 			const fresh = this.collectSteer(e); // marked before anything is validated: a steering message is part of its turn
 			const out = await this.onTurnEnd(e, ctx);
-			const recs = this.drafts(); // summaries recorded during the run, after the turn's edits (a compaction goes first)
+			const previousRent = [...this.branch(ctx)].reverse().find((e) => e?.customType === "pi-zip/rent")?.data?.rent ?? 0;
+			const recs = [...this.drafts(), ...(this.rent !== previousRent ? [{ type: "custom", customType: "pi-zip/rent", data: { rent: this.rent } }] : [])]; // summaries recorded during the run, after the turn's edits (a compaction goes first)
 			if (!fresh.length && !recs.length) return out;
 			if (fresh.length) this.ledger({ type: "steer", ids: fresh });
 			return { entries: [...(out?.entries ?? e.entries), ...(fresh.length ? [{ type: "custom", customType: STEER_CUSTOM, data: { ids: fresh } }] : []), ...recs] };
@@ -1174,7 +1206,7 @@ export class Zip implements ZipControl {
 			for (const n of d.notes) this.ledger(n);
 			if (d.o.trace?.length) this.lawLedger("turn_end", d.o);
 		}
-		if (d.produce) this.want("turn_end", ctx, d.produce);
+		this.rent = d.rentNext;
 		let p = d.kind === "plan" ? d.p : null, cut: Cut | null = null, ready = false, waitMs = 0;
 		if (p && p.cutIdx !== null) {
 			const art = readyOf(branch, this.mine).find((a) => a.key === p!.firstKeptEntryId);
@@ -1187,12 +1219,12 @@ export class Zip implements ZipControl {
 			const got = await this.roomWait(d.room, ctx);
 			if (got) [p, cut, waitMs, ready] = [d.room, got.cut, got.ms, false];
 		}
-		if (!p && !runPlan) return undefined;
-		if (cut) this.discardBg("replaced");
+		if (cut) { this.rent = 0; this.discardBg("replaced"); }
 		const plan = p ? { ...valvePlanOf(p, cut, ready, waitMs, performance.now() - t0),
-			...(runPlan ? { source: runPlan.source, sent: runPlan.sent, carriedIds: runPlan.applied, native: runPlan.native, noticed: runPlan.noticed, noticeTs: runPlan.noticeTs } : {}) } : runPlan!;
-		const out = this.commit(e, ctx, plan, o);
-		if (runPlan) runPlan.persisted = plan.persisted;
+			...(runPlan ? { source: runPlan.source, sent: runPlan.sent, carriedIds: runPlan.applied, native: runPlan.native, noticed: runPlan.noticed, noticeTs: runPlan.noticeTs } : {}) } : runPlan;
+		const out = plan ? this.commit(e, ctx, plan, o) : undefined;
+		if (runPlan && plan) runPlan.persisted = plan.persisted;
+		if (!cut && d.produce) this.want("turn_end", ctx, d.produce);
 		return out;
 	}
 
