@@ -912,6 +912,7 @@ export class Zip implements ZipControl {
 	 */
 	private async roomWait(c: PlanResult, ctx: Any): Promise<{ cut: Cut; ms: number } | null> {
 		this.cancelTimer(); // the room owns the slot; invalidate queued ordinary replacements before awaiting cancellation
+		const gen = this.timerGen, owns = () => gen === this.timerGen && this.active() && !ctx?.signal?.aborted;
 		const head = headOf(this.branch(ctx)), key = c.firstKeptEntryId, b = this.bg, w0 = performance.now();
 		const running = !!b && !b.aborted && b.key === key && b.head === head;
 		this.ledger({ type: "room_wait", key, running });
@@ -919,13 +920,13 @@ export class Zip implements ZipControl {
 			if (!running) {
 				this.discardBg("replaced");
 				if (b) await waitFor(b.promise, ctx?.signal); // keep the slot until the provider acknowledges cancellation; Esc ends only the wait
-				if (ctx?.signal?.aborted) return null;
+				if (!owns()) return null;
 				if (!this.startBg(c, ctx, true)) return null;
 			}
 			const call = running ? b : this.bg;
 			return call && !call.aborted && call.head === head && call.key === key ? waitFor(call.promise, ctx?.signal) : null;
 		})());
-		return got?.firstKeptEntryId === key ? { cut: { ...got, trigger: "valve", prepared: true }, ms: performance.now() - w0 } : null;
+		return owns() && got?.firstKeptEntryId === key ? { cut: { ...got, trigger: "valve", prepared: true }, ms: performance.now() - w0 } : null;
 
 	}
 
@@ -1218,7 +1219,9 @@ export class Zip implements ZipControl {
 			}
 		}
 		if (d.room) { // one post-edit judgement, shared by carried folds, b2b and ordinary decisions
-			const got = await this.roomWait(d.room, ctx);
+			const waiting = this.roomWait(d.room, ctx), gen = this.timerGen;
+			const got = await waiting;
+			if (gen !== this.timerGen || !this.active()) return undefined; // deactivation also voids edits selected before the wait
 			if (got) [p, cut, waitMs, ready] = [d.room, got.cut, got.ms, false];
 		}
 		if (cut) { this.rent = 0; this.discardBg("replaced"); }
