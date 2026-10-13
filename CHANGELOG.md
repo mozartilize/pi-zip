@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.4.1
+
+- The typed-prompt door works again on Pi 1.2.0. A summary that is ready when you type a prompt goes in through Pi's own compaction
+  from Pi's `input` event, where Pi 1.1.0 and 1.2.0 are both idle and wait for pi-zip before the run starts. 0.4.0 asked at
+  `before_agent_start`, which Pi 1.2.0 counts as busy, so there the first requests of the run carried the whole old history (a cold
+  return measured in a real TUI: 147,039 tokens instead of 28,278).
+- What the prompt's input decided goes to that prompt's run only. A prompt that starts no run (another extension handles it, the model
+  or its credentials are refused) leaves pi-zip as it was; a summary that already went in stays, with its exact "Compacted from" number.
+- A run an extension's message starts on Pi 1.2.0 (which now fires `before_agent_start` for it) begins once, as a driven run.
+- All three doors (typed prompt, driven run, mid-run) are checked in a real TUI on Pi 1.1.0 and on Pi 1.2.0, each with Pi's exact
+  "Compacted from" number.
+- Correction to the 0.4.0 notes: 0.3.1 does not behave the same on Pi 1.2.0; with the door closed it carries the summary in the
+  run's own requests.
+
 ## 0.4.0
 
 Compared with 0.3.1:
@@ -11,7 +25,7 @@ Compared with 0.3.1:
 - One producer and one production timer replace the separate warm-return path, fixed timer at 80% of the cache lifetime, warming fallback timers and first-key listener. The timer uses learned survival and call time, re-plans on the current branch, and never starts a call merely because an old session was opened.
 - Protection and recall remain: the latest two user turns stay out of summaries; eligible previous-turn re-readable outputs may fold after a pause, and outputs at least 60 requests old may fold during long runs. Recalled originals are never folded again.
 - The README gives the decision, model-qualified theorems, proof sketches and measured limits. Lean 4 + Mathlib checks the stated T2-T5 parts: 22 proved, one original statement refuted and corrected, zero missing. The remaining claims are paper proofs, supported separately by offline implementation checks. Proof files are excluded from the npm package.
-- Known limit on Pi 1.2.0: Pi now counts a starting run as busy during `before_agent_start`, so the typed-prompt door stays closed and a summary ready at a typed prompt enters at the first turn end instead (same summary and exact number; the first requests still carry the old history). 0.3.1 behaves the same on 1.2.0. Pi 1.1.0 keeps both doors.
+- Known limit on Pi 1.2.0: Pi now counts a starting run as busy during `before_agent_start`, so the typed-prompt door stays closed and a summary ready at a typed prompt enters at the first turn end instead (same summary and exact number; the first requests still carry the old history). Pi 1.1.0 keeps both doors. (Fixed in 0.4.1; the claim that 0.3.1 behaves the same was wrong, see 0.4.1.)
 
 ## 0.3.1
 
