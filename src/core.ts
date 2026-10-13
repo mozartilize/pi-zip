@@ -105,12 +105,21 @@ export function readyOf(branch: Any[], extra: readonly Artifact[] = []): Artifac
 }
 
 /** The summary calls of the branch that no compaction used (a summary nobody took, or a call that ended without one), and their cost:
- *  what keeps the session totals honest. */
+ *  what keeps the session totals honest. Each compaction consumes one matching artifact of its incoming head, at the charge it carries.
+ *  Artifacts can follow their compaction because Pi requires the compaction draft first. */
 export function unusedOf(branch: Any[]): { n: number; usd: number } {
-	const used = new Set(branch.filter((e) => e?.type === "compaction" && e.details?.by === PRODUCT).map((e) => `${e.firstKeptEntryId}\u0000${e.summary}`));
-	let n = 0, usd = 0;
-	for (const a of artifactsOf(branch)) {
-		if (a.cut && used.has(`${a.key}\u0000${a.cut.text}`)) continue;
+	const used = new Map<string, number>(), keyOf = (head: string, key: string, text: string, usd: unknown) => JSON.stringify([head, key, text, Number(usd) || 0]);
+	let head = "", n = 0, usd = 0;
+	for (const e of branch) if (e?.type === "compaction") {
+		if (e.details?.by === PRODUCT) {
+			const key = keyOf(head, e.firstKeptEntryId, e.summary, e.usage?.cost?.total);
+			used.set(key, (used.get(key) ?? 0) + 1);
+		}
+		head = String(e.id ?? "");
+	}
+	for (const a of artifactsOf(branch).reverse()) {
+		const key = a.cut ? keyOf(a.head, a.key, a.cut.text, a.usd) : "", remaining = used.get(key) ?? 0;
+		if (remaining) { used.set(key, remaining - 1); continue; }
 		n++;
 		usd += Number(a.usd) || 0;
 	}
