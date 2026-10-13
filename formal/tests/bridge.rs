@@ -84,3 +84,44 @@ fn native_application_prices_the_spent_call_at_zero() {
     assert_eq!(took_ready(&unpaid, 1), None);
     assert!(pays_fully(&unpaid, 1).unwrap_err().contains("with the summary call 87500"), "the same cut with a fresh call does not pay");
 }
+
+/// A large indivisible recent block changes Pi's room price; NA must use the observed tail before applying the guard.
+#[test]
+fn native_completeness_prices_the_measured_long_tail() {
+    use pz_formal::law::{class_prices, guard};
+    use pz_formal::model::{Class, Obs};
+    use pz_formal::spec::native_withheld;
+    use serde_json::json;
+    let pr = class_prices(Class::Explicit, false);
+    let measured = guard(200_000.0, 199_000.0, 1.0, Some(100_000.0), pr, 2_500.0, 0.0, Some(198_000.0));
+    assert!((measured.eta - 236.35).abs() < 1e-9);
+    assert!(measured.ok);
+    assert!(!guard(200_000.0, 199_000.0, 1.0, Some(100_000.0), pr, 2_500.0, 0.0, None).ok);
+    let trace = Trace::parse("world explicit known ttl=300 true=300 survival=none c=1 sys=3000 window=124576 native print\nprompt\nsay 100\n").unwrap();
+    let obs: Obs = serde_json::from_value(json!({
+        "ok": true, "ticks": [{ "req": 0, "model": "p/m", "n": 0, "t0": 0, "t1": 5,
+            "nativeDoor": { "open": true, "p": 1, "g": 2500, "known": true,
+                "before": 200000, "afterFolds": 200000, "target": 40000, "keep": 198000,
+                "cuts": [{ "key": "kept", "prefix": 2000, "summary": 1000, "ready": true, "guard": true, "hash": "artifact" }] }
+        }]
+    })).unwrap();
+    assert!(native_withheld(&Run::new(trace.clone(), obs.clone()), 0).is_some(), "the room credit pays for this withheld ready artifact");
+    let mut default_tail = obs.clone();
+    default_tail.ticks[0].native_door.as_mut().unwrap().keep = None;
+    assert!(native_withheld(&Run::new(trace.clone(), default_tail), 0).is_none(), "the default tail cannot pay for the same edit");
+
+    // The shallow call fails its summary law. Only the measured whole-plan room credit makes the deeper call pay,
+    // so the ready bound must move past the shallow cut. Enough rent makes application pass with either tail.
+    let mut priced = obs;
+    let n = priced.ticks[0].native_door.as_mut().unwrap();
+    n.g = 10.0;
+    n.rent = 3_000_000.0;
+    n.target = 199_000.0;
+    n.cuts = serde_json::from_value(json!([
+        { "key": "shallow", "prefix": 2000, "summary": 1000, "read": 2000, "written": 1000, "guard": true },
+        { "key": "deeper", "prefix": 3000, "summary": 1500, "read": 3000, "written": 1000, "ready": true, "guard": true, "hash": "artifact" }
+    ])).unwrap();
+    assert!(native_withheld(&Run::new(trace.clone(), priced.clone()), 0).unwrap().contains("deeper"));
+    priced.ticks[0].native_door.as_mut().unwrap().keep = None;
+    assert!(native_withheld(&Run::new(trace, priced), 0).is_none(), "without the measured whole-plan credit the ready bound stays shallow");
+}

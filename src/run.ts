@@ -1209,7 +1209,7 @@ export class Zip implements ZipControl {
 			for (const n of d.notes) this.ledger(n);
 			if (d.o.trace?.length) this.lawLedger("turn_end", d.o);
 		}
-		this.rent = d.rentNext;
+		const rentNext = d.p && pIn >= 0.5 ? this.rent : d.rentNext;
 		let p = d.kind === "plan" ? d.p : null, cut: Cut | null = null, ready = false, waitMs = 0;
 		if (p && p.cutIdx !== null) {
 			const art = readyOf(branch, this.mine).find((a) => a.key === p!.firstKeptEntryId);
@@ -1224,10 +1224,11 @@ export class Zip implements ZipControl {
 			if (gen !== this.timerGen || !this.active()) return undefined; // deactivation also voids edits selected before the wait
 			if (got) [p, cut, waitMs, ready] = [d.room, got.cut, got.ms, false];
 		}
-		if (cut) { this.rent = 0; this.discardBg("replaced"); }
+		if (cut) this.discardBg("replaced");
 		const plan = p ? { ...valvePlanOf(p, cut, ready, waitMs, performance.now() - t0),
 			...(runPlan ? { source: runPlan.source, sent: runPlan.sent, carriedIds: runPlan.applied, native: runPlan.native, noticed: runPlan.noticed, noticeTs: runPlan.noticeTs } : {}) } : runPlan;
 		const out = plan ? this.commit(e, ctx, plan, o) : undefined;
+		this.rent = out ? 0 : rentNext; // a selected warm edit resets paid rent only after the commit validates it
 		if (runPlan && plan) runPlan.persisted = plan.persisted;
 		if (!cut && d.produce) this.want("turn_end", ctx, d.produce);
 		return out;

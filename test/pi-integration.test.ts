@@ -294,6 +294,38 @@ const produced = async (r: Any) => {
 };
 
 describe("boundary decision regressions", () => {
+	for (const reject of [false, true]) test(`warm boundary rent resets only after a valid edit (reject=${reject})`, async () => {
+		const sm = SessionManager.inMemory(CWD);
+		sm.appendMessage(user("older"));
+		sm.appendMessage({ ...asst([call("large")], "toolUse"), usage: undefined });
+		sm.appendMessage(result("large", bulk("output", 6000)));
+		sm.appendMessage(user("previous"));
+		sm.appendMessage({ ...asst([{ type: "text", text: "done" }]), usage: undefined });
+		sm.appendMessage(user("current"));
+		sm.appendMessage({ ...asst([call("recent")], "toolUse"), usage: undefined });
+		const recent = sm.appendMessage(result("recent", bulk("recent", 100)));
+		sm.appendCustomEntry("pi-zip/rent", { rent: 10_000 });
+		const r = await rig(undefined, { file: [sm.getHeader() as Any, ...sm.getEntries()], start: false });
+		let restored: Awaited<ReturnType<typeof rig>> | undefined;
+		try {
+			const commit = r.zip.commit.bind(r.zip);
+			r.zip.commit = (e: Any, ctx: Any, plan: Any, o: Any) => {
+				expect(plan.folds.length).toBeGreaterThan(0);
+				if (reject) plan.folds[0] = { ...plan.folds[0], entryId: recent }; // the structural guard refuses a protected target
+				return commit(e, ctx, plan, o);
+			};
+			const response = { ...asst([{ type: "text", text: "finished" }]), timestamp: Date.now(), usage: undefined };
+			const drafts = await r.turnEnd(r.sm.appendMessage(response), response);
+			expect(drafts.some((d) => d.type === "context_edit")).toBe(!reject);
+			expect(drafts.some((d) => d.customType === "pi-zip/rent")).toBe(!reject);
+			const balance = reject ? 10_000 : 0;
+			expect(r.zip.rent).toBe(balance);
+			expect(rentOf(r.sm.getBranch())).toBe(balance);
+			restored = await rig(undefined, { file: [r.sm.getHeader() as Any, ...r.sm.getEntries()], start: false });
+			expect(restored.zip.rent).toBe(balance);
+		} finally { await restored?.shutdown(); await r.shutdown(); }
+	});
+
 	test("rent matching a balance before compaction is persisted and restored", async () => {
 		const sm = SessionManager.inMemory(CWD);
 		sm.appendMessage(user("past"));
@@ -994,7 +1026,11 @@ describe("real Pi: a summary prepared while the user was away goes in through Pi
 		process.env.PI_ZIP_COLD_CAP = "100000";
 		const file = template(240 * 60_000);
 		for (const entry of file) if (entry.message?.role === "assistant") delete entry.message.usage;
-		const r = await rig(undefined, { file, tui: true, start: false, model: { ...MODEL, contextWindow: 100_000 } });
+		file.find((e) => e.message?.role === "toolResult").message.content = [{ type: "text", text: bulk("output", 6000) }];
+		const initial = SessionManager.inMemory(CWD, undefined, file);
+		initial.appendCustomEntry("pi-zip/rent", { rent: 10_000 });
+		const r = await rig(undefined, { file: [initial.getHeader() as Any, ...initial.getEntries()], tui: true, start: false, model: { ...MODEL, contextWindow: 100_000 } });
+		let restored: Awaited<ReturnType<typeof rig>> | undefined;
 		const ctx = r.runner.createContext(), provider = ctx.modelRegistry.complete;
 		const releases: (() => void)[] = [];
 		try {
@@ -1002,13 +1038,16 @@ describe("real Pi: a summary prepared while the user was away goes in through Pi
 			const view = r.sm.buildSessionProjection().entries;
 			const options = r.zip.opts(ctx, true, view, 0, true).o;
 			const shallow = planContext(view, { ...options, coldCap: 200_000 })!;
-			const response = { ...asst([{ type: "text", text: "finished" }]), usage: undefined };
+			const response = { ...asst([{ type: "text", text: "finished" }]), timestamp: Date.now(), usage: undefined };
 			const id = r.sm.appendMessage(response);
 			const entries = r.sm.buildSessionProjection().entries;
-			const d = decideTurnEnd({ failed: false, justEdited: false, pWarm: 0, ready: r.zip.ready(r.sm.getBranch()), entries,
-				opts: (cutAt, foldsOnly, ready) => r.zip.opts(ctx, false, entries, 0, false, cutAt, foldsOnly, ready) });
+			const d = decideTurnEnd({ failed: false, justEdited: false, pWarm: 1, ready: r.zip.ready(r.sm.getBranch()), entries,
+				opts: (cutAt, foldsOnly, ready) => r.zip.opts(ctx, false, entries, 1, false, cutAt, foldsOnly, ready) });
 			expect(d.kind).toBe("plan");
 			expect(d.kind === "plan" && d.p?.folds.length).toBeGreaterThan(0); // newly selected folds must also be rejected after deactivation
+			expect(d.kind !== "none" && d.o.law?.pWarm).toBe(1);
+			expect(d.kind !== "none" && d.rentNext).toBe(0);
+			expect(r.zip.rent).toBe(10_000);
 			expect(d.room?.cutIdx).toBeGreaterThan(0);
 			expect(d.room?.firstKeptEntryId).not.toBe(shallow.firstKeptEntryId);
 			ctx.modelRegistry.complete = async (...args: Any[]) => {
@@ -1034,9 +1073,17 @@ describe("real Pi: a summary prepared while the user was away goes in through Pi
 			expect(drafts.some((d) => d.type === "compaction" || d.type === "context_edit")).toBe(false);
 			expect(r.zip.stats.summaries).toBe(0);
 			expect(r.zip.bg).toBeNull();
+			expect(drafts.some((d) => d.customType === "pi-zip/rent")).toBe(false);
+			expect(r.zip.rent).toBe(10_000);
+			expect(rentOf(r.sm.getBranch())).toBe(10_000);
+			restored = await rig(undefined, { file: [r.sm.getHeader() as Any, ...r.sm.getEntries()], start: false });
+			expect(restored.zip.rent).toBe(10_000);
+			await restored.beforeAgentStart();
+			expect(restored.zip.rent).toBe(10_000);
 		} finally {
 			for (const release of releases) release();
 			ctx.modelRegistry.complete = provider;
+			await restored?.shutdown();
 			await r.shutdown();
 		}
 	});

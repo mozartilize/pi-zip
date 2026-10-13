@@ -87,8 +87,8 @@ pub fn with_tail(mut t: Terms, b: f64, a: f64, room: Option<f64>, pr: Prices, ke
 }
 
 /// The guarded application law, in the same input-price units as law(). Production stays plain.
-pub fn guard(b: f64, a: f64, p: f64, room: Option<f64>, pr: Prices, g: f64, rent: f64) -> Terms {
-    let mut t = law(b, a, p, room, Some(pr), g, 0.0, a);
+pub fn guard(b: f64, a: f64, p: f64, room: Option<f64>, pr: Prices, g: f64, rent: f64, keep: Option<f64>) -> Terms {
+    let mut t = with_tail(law(b, a, p, room, Some(pr), g, 0.0, a), b, a, room, pr, keep);
     let effective = t.k - t.eta * (b - a);
     let paid = pr.r * (rent + b - a);
     t.ok = a < b && (effective <= 0.0 || paid >= effective || (t.ok && paid >= effective / 10.0));

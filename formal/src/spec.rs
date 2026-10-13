@@ -1006,10 +1006,10 @@ pub fn native_withheld(r: &R, i: usize) -> Option<String> {
     let after = |c: &NativeCut| n.after_folds - c.prefix + c.summary;
     let pays = |c: &NativeCut, call: f64| c.prefix >= 2.0 * c.summary
         && law(c.prefix, c.summary, n.p, None, Some(pr), n.g, call, c.summary).ok
-        && law(n.before, after(c), n.p, Some(r.st[i].room), Some(pr), n.g, call, after(c)).ok;
+        && with_tail(law(n.before, after(c), n.p, Some(r.st[i].room), Some(pr), n.g, call, after(c)), n.before, after(c), Some(r.st[i].room), pr, n.keep).ok;
     let cw = n.cuts.iter().position(|c| after(c) <= n.target).unwrap_or(n.cuts.len() - 1);
     let bound = (cw..n.cuts.len()).find(|&k| pays(&n.cuts[k], summary_call(pr, n.cuts[k].read, n.cuts[k].written))).unwrap_or(cw);
-    let c = n.cuts[..=bound].iter().rev().find(|c| c.ready && c.guard && c.prefix >= 2.0 * c.summary && guard(n.before, after(c), n.p, Some(r.st[i].room), pr, n.g, n.rent).ok)?;
+    let c = n.cuts[..=bound].iter().rev().find(|c| c.ready && c.guard && c.prefix >= 2.0 * c.summary && guard(n.before, after(c), n.p, Some(r.st[i].room), pr, n.g, n.rent, n.keep).ok)?;
     // Inspect the compaction actually appended at the idle door, including the artifact's text identity.
     if n.applied.as_ref().is_some_and(|a| a.key == c.key && c.hash.as_deref() == Some(a.hash.as_str())) {
         return None;
