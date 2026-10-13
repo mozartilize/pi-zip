@@ -8,7 +8,7 @@ import { classifyRecoverability, isReadOnlyBash } from "../src/classify.ts";
 import { colorTail, fmtK, noticeText, renderNotice, splitDesc, type NoticeAction, type NoticeData } from "../src/notice.ts";
 import { clipMid, handleFor, makePlaceholder, makePlaceholderFor, outcomeHint, pickKeyLines, shortArgs } from "../src/placeholder.ts";
 import { buildBlocks, toolCallIndex } from "../src/plan.ts";
-import { A, type Any, fakeCtx, fakePi, R, U } from "./helpers.ts";
+import { A, type Any, fakeCtx, fakePi, R, startZip, U } from "./helpers.ts";
 import { branchOutputs, parseRange, recalledHandlesFromBranch, recallSections, resolveHandlesInBranch, searchOutputs, sliceRecall } from "../src/recall.ts";
 import { handleRowsOf, handleTable, INDEX_TOKENS, skeleton, TABLE_ROWS } from "../src/summary.ts";
 import { TOOL_FRAME_CHARS, tokensOf } from "../src/util.ts";
@@ -707,12 +707,12 @@ describe("cache retention from the provider-scoped env and the request payload (
 			const { ctx } = fakeCtx(entries, { model, branch: [last], modelRegistry: registry });
 			zip.sessionStart(ctx);
 			if (payload) {
-				await zip.beforeAgentStart(ctx); // a run that sends one request with this payload ...
+				await startZip(zip, ctx); // a run that sends one request with this payload ...
 				zip.providerRequest({ payload });
 				zip.messageEnd({ role: "assistant", stopReason: "stop", usage: { input: 9000, cacheRead: 0, cacheWrite: 0 } });
 				(zip as Any).lastReqMs = Date.now() - gapS * 1000; // ... gapS ago
 			}
-			await zip.beforeAgentStart(ctx);
+			await startZip(zip, ctx);
 			return readFileSync(ledger, "utf8").trim().split("\n").map((l) => JSON.parse(l)).filter((r) => r.type === "prompt").at(-1);
 		} finally {
 			rmSync(ledger, { force: true });

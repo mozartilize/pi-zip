@@ -102,3 +102,25 @@ export function longTurn(rounds: number, o: { chars?: number; mutating?: number[
 	out.push(A("aEnd"));
 	return out;
 }
+
+/**
+ * A prompt as Pi starts it, seen by the extension: the input event while Pi is idle (Pi waits for it), then before_agent_start and
+ * agent_start. `order` "1.2": Pi 1.2.0 counts the starting run as busy from before_agent_start on (ctx.isIdle() false there); "1.1":
+ * Pi 1.1.0 is idle until the run is active. `fire(name, event)` calls the extension's handler.
+ */
+export async function startPrompt(fire: (name: string, e: Any) => Any, e: Any = {}, o: { ctx?: Any; order?: "1.1" | "1.2" } = {}) {
+	const text = typeof e.prompt === "string" ? e.prompt : "next request";
+	await fire("input", { type: "input", text, images: e.images, source: "interactive" });
+	const idle = o.ctx?.isIdle;
+	if (o.order === "1.2" && o.ctx) o.ctx.isIdle = () => false;
+	try {
+		const r = await fire("before_agent_start", { type: "before_agent_start", messageType: "user", ...e, prompt: text });
+		await fire("agent_start", { type: "agent_start" });
+		return r;
+	} finally {
+		if (o.order === "1.2" && o.ctx) o.ctx.isIdle = idle;
+	}
+}
+/** startPrompt on a Zip instance driven directly. */
+export const startZip = (zip: Any, ctx: Any, e: Any = {}) =>
+	startPrompt((n, ev) => (n === "input" ? zip.input(ev, ctx) : n === "before_agent_start" ? zip.beforeAgentStart(ctx, ev) : zip.agentStart(ctx)), e);

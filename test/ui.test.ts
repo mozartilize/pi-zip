@@ -5,7 +5,7 @@ import { dirname, join } from "node:path";
 import { recallSections, resolveHandlesInBranch } from "../src/recall.ts";
 import { handleFor } from "../src/placeholder.ts";
 import { CHART_W, STACK_CAP, cardText, colW, fmtLife, markFirstLine, recallCallLine, recallResultLines, renderCard, renderState, stackRows, type CardData } from "../src/ui.ts";
-import { fakeCtx, fakePi } from "./helpers.ts";
+import { fakeCtx, fakePi, startPrompt } from "./helpers.ts";
 
 type Any = any;
 const IND_ = 11; // the values column
@@ -359,7 +359,7 @@ describe("transcript wiring", () => {
 	test("a tool allowlist that hides zip_recall, read, grep and bash: one reread-only line per session", async () => {
 		const { f, ctx, render } = await setup([], { getActiveTools: () => ["edit", "write"] });
 		await f.handlers.get("session_start")({}, ctx);
-		await f.handlers.get("before_agent_start")({}, ctx);
+		await startPrompt((n, e) => f.handlers.get(n)(e, ctx));
 		const kept = f.appended.filter((x: Any) => x.customType === "pi-zip/notice");
 		expect(kept).toHaveLength(1);
 		expect(render(kept[0])[0]).toStartWith("ƶ pi-zip  reread-only  a tool allowlist hides zip_recall");
@@ -369,7 +369,7 @@ describe("transcript wiring", () => {
 		ctx.sessionManager.getSessionId = () => "01a120cb-3d40-75a6-aeac-320e71967606";
 		ctx.sessionManager.getSessionFile = () => "/tmp/pi-zip-test-sessions/s.jsonl";
 		await f.handlers.get("session_start")({}, ctx);
-		await f.handlers.get("before_agent_start")({}, ctx);
+		await startPrompt((n, e) => f.handlers.get(n)(e, ctx));
 		const kept = f.appended.filter((x: Any) => x.customType === "pi-zip/notice");
 		expect(kept).toHaveLength(1);
 		const where = join(process.env.XDG_CACHE_HOME!, "pi-zip", "recall"); // where the copies are ($XDG_CACHE_HOME here), not always ~/.cache

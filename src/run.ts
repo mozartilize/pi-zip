@@ -3,7 +3,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { lastMessageMs, lastPrompt, modelKey, payloadRetention, refused, ttlFor } from "./cache.ts";
+import { lastMessageMs, lastPrompt, modelKey, payloadRetention, refused, ttlFor, type ColdInfo } from "./cache.ts";
 import { agentDir, curve, describe, lawPrices, loadStats, pWarm, record, sample, statsPath, GAP_EDGES, type Entry } from "./learn.ts";
 import { repairPayload } from "./guard.ts";
 import { candidateOf, decideEdits, checkEdits, clock, decideRun, inRunClock, want, decideTurnEnd, grow, headOf, planOpts, readyOf, rentOf, runPlanOf, scaleOf, unusedOf, valvePlanOf, SUMMARY_CUSTOM, type Artifact, type Avail, type Env, type Learned } from "./core.ts";
@@ -67,11 +67,24 @@ const NATIVE_SLOW_MS = 250;
  *  cancels every compaction that carries it, so Pi's default summariser never receives it as an instruction. */
 export const NATIVE_MARKER = "[pi-zip native compaction: handlers of session_before_compact return undefined, pi-zip answers this one]";
 
-/** The prompt Pi appends right after before_agent_start, as a projected entry without an id: the plan made before it counts its size. */
+/** The prompt of Pi's input event (its raw text, before a /template or /skill is expanded, and its images), as the projected entry
+ *  without an id Pi appends when the run starts: the plan made before it counts its size. */
 function pendingPrompt(e: Any): Any | null {
-	if (typeof e?.prompt !== "string") return null;
-	const m = { role: "user", content: [{ type: "text", text: e.prompt }, ...(Array.isArray(e.images) ? e.images : [])], timestamp: Date.now() };
+	if (typeof e?.text !== "string") return null;
+	const m = { role: "user", content: [{ type: "text", text: e.text }, ...(Array.isArray(e.images) ? e.images : [])], timestamp: Date.now() };
 	return { sourceEntry: { type: "message", message: m }, messages: [m] };
+}
+
+type NativeRun = { cut: Cut; before: number; after: number; o: PlanOpts; cal: Scale; p: PlanResult };
+/** The start of a run, read once: the return it is (core.ts clock), the settle plan's targets and, for a prompt, what its idle input
+ *  decided (the native summary that went in, or why none did). A prompt's input hands it to that prompt's run at agent_start. */
+interface Start {
+	clk: ColdInfo;
+	settleIds: string[];
+	note: { native: string; ms?: number; askMs?: number } | null;
+	nat: NativeRun | null;
+	foreign: boolean;
+	head: string; // the projection's head once the input is done: another compaction before the run voids the carried decision
 }
 
 export class Zip implements ZipControl {
@@ -128,7 +141,7 @@ export class Zip implements ZipControl {
 	// it (folds only, a summary only at Pi's compaction room), and the summary prepared for the context it replaced is discarded
 	private foreignRun = false;
 	// the native summary already went in; its joint decision supplies the first request's folds and notice sizes
-	private nativeRun: { cut: Cut; before: number; after: number; o: PlanOpts; cal: Scale; p: PlanResult } | null = null;
+	private nativeRun: NativeRun | null = null;
 	// the cache tier (PI_CACHE_RETENTION) of the current model's requests: the payload of its newest request when seen, else the
 	// provider-scoped env resolved once per run (research pi-tricks §3.1); null = nothing known, the process env decides (cache.ts)
 	private retention: { key: string; tier: "short" | "long"; src: "env" | "provider env" | "payload" } | null = null;
@@ -452,6 +465,8 @@ export class Zip implements ZipControl {
 	// ---- events ----------------------------------------------------------------------------------------------
 	sessionStart(ctx: Any) {
 		this.liveCtx = ctx;
+		this.start = null; // a decision carried for a run of the session before is never handed to a run of this one
+		this.startKind = null;
 		const branch = this.branch(ctx);
 		for (let i = branch.length - 1; i >= 0; i--) {
 			const en = branch[i];
@@ -569,29 +584,79 @@ export class Zip implements ZipControl {
 		this.writeUnwritten();
 	}
 
-	/** True from before_agent_start to the agent_start that follows it: that run's start has been handled (Pi's prompt() path). A run started
-	 *  by an extension's message (sendMessage with triggerTurn: pi-runway's owed-drive, durable-subagents' attention) emits agent_start only. */
-	private startHandled = false;
+	/** What the idle input of the newest prompt decided, until that prompt's run takes it at agent_start (start). Every other run start
+	 *  and every later idle input drops it; a prompt that starts no run (another extension handled it, Pi refused the model or its auth)
+	 *  leaves only this, which the next of those drops. */
+	private start: Start | null = null;
+	/** What the newest before_agent_start announced, until its agent_start: the prompt's run, or (Pi 1.2.0) a run an extension's message
+	 *  starts, already begun there. Pi 1.1.0 emits only agent_start for the latter (sendMessage with triggerTurn: pi-runway's owed-drive,
+	 *  durable-subagents' attention). */
+	private startKind: "prompt" | "driven" | null = null;
 	private starting: Promise<void> | null = null;
 
-	async beforeAgentStart(ctx: Any, e?: Any): Promise<void> {
-		this.startHandled = true;
-		await this.beginRun(ctx, e, true);
+	/** Pi's input event of a prompt (typed, or an extension's sendUserMessage). Pi waits for it before it expands the prompt and starts the
+	 *  run, and is idle here on Pi 1.1.0 and 1.2.0 (1.2.0 counts the starting run as busy from before_agent_start on, and compact() would
+	 *  abort it): the one place a summary prepared while the user was away goes in through Pi's compaction. The run is not entered here:
+	 *  the idle timer stays armed (re-armed after a compaction) and nothing of the run is set, so a prompt that starts no run leaves pi-zip
+	 *  as it was, apart from the compaction, which is pi-zip's own summary with its exact size before. A steer or a follow-up (Pi is
+	 *  streaming) belongs to the run in progress. */
+	async input(e: Any, ctx: Any): Promise<void> {
+		if (e?.streamingBehavior) return;
+		this.start = null; // a new prompt: what an earlier one decided (it started no run) is dropped
+		this.startKind = null;
+		let idle = false;
+		try {
+			idle = ctx?.isIdle?.() === true;
+		} catch {}
+		if (!idle || !this.active()) return; // not idle: Pi refuses this prompt, or a Pi that cannot say so; its run (if any) reads its own start
+		this.detectConflict(ctx);
+		if (!this.active()) return;
+		this.liveCtx = ctx;
+		const s = await this.readStart(ctx, true);
+		const ready = readyOf(this.branch(ctx), this.mine).length > 0;
+		if (s.clk.cold && this.bg && !ready) s.note = { native: "summary not finished when the prompt came" };
+		if (ready) {
+			const gen = this.timerGen;
+			try {
+				await this.nativeSummary(ctx, e, s);
+			} catch (err) {
+				const a = this.nativeAsk;
+				if (a && !a.answered) a.compaction = null; // a late ask of pi-zip's compaction is cancelled, never left to Pi's own summary
+				this.ledger({ type: "error", where: "native_summary", error: errText(err) });
+			}
+			if (gen !== this.timerGen) this.armProducer(ctx); // the timer stopped for the compaction: armed again, as if no prompt had come
+		}
+		s.head = headOf(this.branch(ctx));
+		this.start = s;
 	}
 
-	/** agent_start: handled already by before_agent_start (a prompt), else a run an extension's message started: the same start-of-run
-	 *  handling, minus Pi's compaction (ctx.compact() aborts the run that is starting): a prepared summary waits for turn_end. */
-	async agentStart(ctx: Any): Promise<void> {
-		if (this.startHandled) {
-			this.startHandled = false;
-			this.promptStart = true; // its first message says whether it really is the prompt's run (messageEnd)
+	/** before_agent_start: the prompt's run (its input carried the decision), or on Pi 1.2.0 a run an extension's message starts
+	 *  (messageType "custom"), which begins here, once, as a driven run. */
+	async beforeAgentStart(ctx: Any, e?: Any): Promise<void> {
+		if (e?.messageType === "custom") {
+			this.start = null;
+			this.startKind = "driven";
+			await this.drivenStart(ctx);
 			return;
 		}
-		await this.drivenStart(ctx);
+		this.startKind = "prompt";
+	}
+
+	/** agent_start: the run begins (a prompt that fails between before_agent_start and here, in Pi's image normalisation, enters none). The
+	 *  prompt's run takes what its input decided; a run an extension's message started (no before_agent_start on Pi 1.1.0) gets the same
+	 *  start-of-run handling, minus Pi's compaction (ctx.compact() aborts the run that is starting): a prepared summary waits for turn_end. */
+	async agentStart(ctx: Any): Promise<void> {
+		const kind = this.startKind, s = this.start;
+		this.startKind = null;
+		this.start = null;
+		if (kind === "driven") return;
+		if (kind !== "prompt") return this.drivenStart(ctx);
+		this.promptStart = true; // its first message says whether it really is the prompt's run (messageEnd)
+		await this.beginRun(ctx, true, s).catch((err) => this.ledger({ type: "error", where: "agent_start", error: errText(err) })); // Pi awaits it before the first request
 	}
 
 	private drivenStart(ctx: Any): Promise<void> {
-		this.starting = this.beginRun(ctx, undefined, false)
+		this.starting = this.beginRun(ctx, false)
 			.catch((err) => this.ledger({ type: "error", where: "agent_start", error: errText(err) }))
 			.then(() => {
 				this.runUserSeen = 1; // no prompt in this run: a user message that comes later is steering
@@ -601,18 +666,38 @@ export class Zip implements ZipControl {
 	}
 
 	/** Set at an agent_start taken for the prompt's run: before_agent_start fired, but a prompt can still fail before its run starts (Pi's
-	 *  image normalisation), and then the next agent_start belongs to a run an extension's message starts. A prompt's run begins with
-	 *  the user message; a driven run with the custom message: seen at that first message_end, before the run's first request. */
+	 *  image normalisation), and then on Pi 1.1.0 the next agent_start belongs to a run an extension's message starts. A prompt's run
+	 *  begins with the user message; a driven run with the custom message: seen at that first message_end, before the run's first request. */
 	private promptStart = false;
 
 	agentEnd() {
-		this.startHandled = false;
+		this.startKind = null;
 		this.promptStart = false;
 		this.inRun = false;
 		this.writeUnwritten();
 	}
 
-	private async beginRun(ctx: Any, e: Any, viaPrompt: boolean): Promise<void> {
+	/** The start of a run read from the branch now (Start without the native decision): at a prompt's idle input, or at the start of
+	 *  any other run. */
+	private async readStart(ctx: Any, viaPrompt: boolean): Promise<Start> {
+		const branch = this.branch(ctx);
+		this.rent = rentOf(branch);
+		this.rentHead = headOf(branch);
+		this.loadEnt(modelKey(ctx.model));
+		await this.resolveRetention(ctx);
+		const clk = clock(branch, { model: ctx.model, ent: this.ent, tier: this.tier(ctx.model) }, Date.now(), { reqMs: this.lastReqMs, modelKey: this.lastModelKey });
+		for (const h of recalledHandlesFromBranch(branch)) this.recalled.add(h);
+		let settleIds: string[] = [];
+		for (let i = branch.length - 1; i >= 0; i--) {
+			const en = branch[i];
+			if (en?.type !== "custom" || en.customType !== PLAN_CUSTOM) continue;
+			if (en.data?.policy === PRODUCT && clk.cold && Array.isArray(en.data.targets)) settleIds = en.data.targets.map((t: Any) => (typeof t === "string" ? t : t?.entryId)).filter((x: Any) => typeof x === "string");
+			break;
+		}
+		return { clk: { ...clk, pause: viaPrompt && clk.pause }, settleIds, note: null, nat: null, foreign: false, head: headOf(branch) };
+	}
+
+	private async beginRun(ctx: Any, viaPrompt: boolean, carried: Start | null = null): Promise<void> {
 		this.liveCtx = ctx;
 		this.inRun = true;
 		this.cancelTimer(); // the user is back: nothing is started behind their back any more
@@ -632,50 +717,35 @@ export class Zip implements ZipControl {
 		this.detectConflict(ctx);
 		if (!this.active()) return;
 		const branch = this.branch(ctx);
-		this.rent = rentOf(branch);
-		this.rentHead = headOf(branch);
-		const key = modelKey(ctx.model);
-		this.loadEnt(key);
+		// another compaction went in between the prompt's input and its run (Pi's own, say): the decision priced another projection
+		if (carried && carried.head !== headOf(branch)) {
+			this.ledger({ type: "start_dropped", reason: "the projection changed between the prompt and its run", native: !!carried.nat });
+			carried = null;
+		}
+		const s = carried ?? (await this.readStart(ctx, viaPrompt));
 		this.branchLastMs = lastMessageMs(branch);
 		if (!this.prevKey) ({ key: this.prevKey, total: this.prevTotal } = lastPrompt(branch)); // fresh process: the session's newest response
-		await this.resolveRetention(ctx);
-		const { cold, reason, ttl, pWarm: p, src, gapS, pause } = clock(branch, { model: ctx.model, ent: this.ent, tier: this.tier(ctx.model) }, Date.now(), { reqMs: this.lastReqMs, modelKey: this.lastModelKey });
+		const { cold, reason, ttl, pWarm: p, src, gapS, pause } = s.clk;
 		this.cold = cold;
-		this.pause = viaPrompt && pause;
+		this.pause = pause;
 		this.pWarm = p;
 		this.survSrc = src;
 		this.runChecked = false; // the first request decides (cold: the cold plan; warm: only above the cap, if the law fires)
 		this.coldReason = reason;
 		this.coldWhy = src === "model switch" ? "cache cold · model switched" : cold && gapS !== null ? `cache cold · away ${fmtAway(gapS)}` : ""; // the warm form says "cache warm · worth it at this size"
-		for (const h of recalledHandlesFromBranch(branch)) this.recalled.add(h);
-		for (let i = branch.length - 1; i >= 0; i--) {
-			const en = branch[i];
-			if (en?.type !== "custom" || en.customType !== PLAN_CUSTOM) continue;
-			if (en.data?.policy === PRODUCT) {
-				if (cold && Array.isArray(en.data.targets)) this.settleIds = en.data.targets.map((t: Any) => (typeof t === "string" ? t : t?.entryId)).filter((x: Any) => typeof x === "string");
-			}
-			break;
-		}
+		this.settleIds = s.settleIds;
 		this.ledger({ type: "prompt", cold, reason, ttlMs: ttl.ms, ttlSource: ttl.source, settleTargets: this.settleIds.length, gapS: gapS === null ? null : Math.round(gapS), pWarm: Math.round(p * 1000) / 1000, survSrc: src, cls: this.ent?.cls ?? null });
 		if (ttl.note && !this.ttlNoticed) {
 			this.ttlNoticed = true; // once per session
 			if (!this.quiet) this.stateLine(ctx, "cache", ttl.note.replace(`${PRODUCT} · `, ""));
 		}
-		this.nativeNote = null;
+		// a summary written in the background went in through Pi's compaction at the prompt's idle input (input), cold return or warm
+		this.nativeRun = s.nat;
+		this.foreignRun = s.foreign;
+		this.nativeNote = s.note;
 		const ready = readyOf(branch, this.mine).length > 0;
-		if ((ready || this.bg) && !viaPrompt) this.nativeNote = { native: "run started by an extension's message: draft path (compact() would abort it)" };
-		else if (cold && this.bg && !ready) this.nativeNote = { native: "summary not finished when the prompt came" };
-		// a summary written in the background goes in through Pi's compaction, cold return or warm: one place, before the prompt,
-		// with pi-zip's own size before
-		if (ready && viaPrompt) {
-			try {
-				await this.nativeSummary(ctx, e);
-			} catch (err) {
-				const a = this.nativeAsk;
-				if (a && !a.answered) a.compaction = null; // a late ask of pi-zip's compaction is cancelled, never left to Pi's own summary
-				this.ledger({ type: "error", where: "native_summary", error: errText(err) });
-			}
-		}
+		if (!viaPrompt && (ready || this.bg)) this.nativeNote = { native: "run started by an extension's message: draft path (compact() would abort it)" };
+		else if (!carried && ready) this.nativeNote = { native: "no idle input before this prompt's run" };
 	}
 
 	/** session_before_compact: answers ONLY the compaction pi-zip itself asked for a moment ago (nativeAsk): its own summary and its own
@@ -726,7 +796,7 @@ export class Zip implements ZipControl {
 		if (branch.some(foreignCompaction)) return "another extension's compaction is in this branch";
 		let idle = false;
 		try {
-			idle = ctx.isIdle?.() === true; // compact() aborts whatever runs first: only ever called while Pi is idle (it is, here, in 1.1.0)
+			idle = ctx.isIdle?.() === true; // compact() aborts whatever runs first: only ever called while Pi is idle (it is at a prompt's input)
 		} catch {}
 		if (!idle) return "not idle";
 		if (branch[branch.length - 1]?.type === "compaction") return "already compacted";
@@ -739,7 +809,7 @@ export class Zip implements ZipControl {
 	}
 
 	/**
-	 * A summary prepared while the user was away goes into the session through Pi's own compaction, before the run (research pi-tricks
+	 * A summary prepared while the user was away goes into the session through Pi's own compaction, at the prompt's input (research pi-tricks
 	 * §1b, variant 1): ctx.compact() with session_before_compact answering pi-zip's summary and pi-zip's own tokensBefore (the notice's
 	 * "before", provider scale), so Pi's "[compaction] Compacted from N tokens" shows that number. It takes milliseconds: the summary is
 	 * done. The run plan folds the resulting projection; a closed native door defers the summary to turn_end.
@@ -747,17 +817,18 @@ export class Zip implements ZipControl {
 	 * entry is the one that went in, fast, the native path ends for the process (endNative). A compaction not finished by the deadline
 	 * is cancelled first, and a summary prepared for a context another extension's compaction has replaced is never used (its head is gone).
 	 */
-	private async nativeSummary(ctx: Any, e: Any): Promise<void> {
+	private async nativeSummary(ctx: Any, e: Any, s: Start): Promise<void> {
 		const branch = this.branch(ctx);
 		const pre = ((ctx.sessionManager.buildSessionProjection() as Any)?.entries ?? []) as Any[];
 		const skip = (reason: string) => {
-			this.nativeNote = { native: reason };
+			s.note = { native: reason };
 			this.ledger({ type: "native_skip", reason });
 		};
 		// Select once with the prompt Pi is about to append; its jointly priced folds become the first request's plan.
 		const pending = pendingPrompt(e), entries = pending ? [...pre, pending] : pre;
-		const d = decideEdits({ at: "native", justEdited: this.justEdited, pWarm: this.pWarm, entries, ready: this.ready(branch),
-			opts: (cutAt, foldsOnly, ready) => this.opts(ctx, !pending, entries, this.pWarm, this.pause, cutAt, foldsOnly, ready) });
+		const { pWarm, pause, cold } = s.clk;
+		const d = decideEdits({ at: "native", justEdited: this.justEdited, pWarm, entries, ready: this.ready(branch),
+			opts: (cutAt, foldsOnly, ready) => this.opts(ctx, !pending, entries, pWarm, pause, cutAt, foldsOnly, ready) });
 		for (const n of d.notes) this.ledger(n);
 		if (d.kind === "b2b") return skip("a warm return right after an edited request makes no edit (b2b)");
 		const { o, cal, p } = d;
@@ -769,10 +840,11 @@ export class Zip implements ZipControl {
 		const gate = this.nativeGate(ctx, branch, pre);
 		if (gate) return skip(gate);
 		const before = Math.round(p.ctxTokens);
-		const trigger: Cut["trigger"] = this.cold ? "cold" : "valve"; // the return that adopts it labels it (written early for a warm one, say)
+		const trigger: Cut["trigger"] = cold ? "cold" : "valve"; // the return that adopts it labels it (written early for a warm one, say)
 		const compaction = { summary: cut.text, firstKeptEntryId: cut.firstKeptEntryId, tokensBefore: before, details: { by: PRODUCT, via: "native", trigger }, usage: cut.usage };
 		const known = new Set(branch.map((en: Any) => en?.id));
 		const ask = { compaction: compaction as Any | null, answered: false, askedAt: 0, askedWall: 0, until: Infinity };
+		this.cancelTimer(); // no producer call starts while Pi compacts (input arms the timer again)
 		this.nativeAsk = ask;
 		const deadline = nativeDeadlineMs(), t0 = performance.now();
 		const res = await new Promise<{ ok: boolean; err?: string; late?: boolean }>((resolve) => {
@@ -822,13 +894,13 @@ export class Zip implements ZipControl {
 			: res.late ? (ask.answered ? `Pi's compaction was not done ${deadline} ms after pi-zip answered (cancelled)` : `another session_before_compact handler ran before pi-zip's (cancelled after ${deadline} ms)`)
 			: `Pi's compaction failed: ${res.err ?? "no compaction entry"}`;
 		if (off) this.endNative(off);
-		this.nativeNote = { native: entry && !off ? "ok" : (off ?? "failed"), ms, ...(askMs !== null ? { askMs } : {}) };
+		s.note = { native: entry && !off ? "ok" : (off ?? "failed"), ms, ...(askMs !== null ? { askMs } : {}) };
 		if (!entry?.id) {
 			this.ledger({ type: "native_fail", ms, askMs, handlerMs, answered: ask.answered, error: res.late ? "deadline" : (res.err ?? "no compaction entry"), foreign: !!last });
 			if (last) {
 				// Another extension replaced this summary's prefix: discard it and use only folds for the first request.
 				this.discardBg("replaced");
-				this.foreignRun = true;
+				s.foreign = true;
 			}
 			return; // nothing went in: the prepared summary waits for turn_end
 		}
@@ -836,17 +908,17 @@ export class Zip implements ZipControl {
 		// draft of the same kind is booked: a cold return's saves a rewrite, a warm one is a valve edit of the warm cache
 		const cutSaved = Math.round(p.scale.c * (cut.prefixTokens - cut.summaryTokens));
 		this.rent = 0;
-		this.nativeRun = { cut, before, after: Math.round(p.ctxAfterFolds - cutSaved), o, cal, p };
-		const s = this.stats;
-		s.summaries++;
-		s.summarizedTokens += cutSaved;
-		s.activeSaved += cutSaved;
-		if (this.cold) s.writeSavedTokens += cutSaved;
+		s.nat = { cut, before, after: Math.round(p.ctxAfterFolds - cutSaved), o, cal, p };
+		const st = this.stats;
+		st.summaries++;
+		st.summarizedTokens += cutSaved;
+		st.activeSaved += cutSaved;
+		if (cold) st.writeSavedTokens += cutSaved;
 		else {
-			s.pressureEdits++;
-			s.pressureRewriteTokens += before;
+			st.pressureEdits++;
+			st.pressureRewriteTokens += before;
 		}
-		this.ledger({ type: "summary", via: "native", handlerMs, trigger, source: this.cold ? "settle" : "valve", count: cut.count, tokensBefore: before, prefixTokens: Math.round(p.scale.c * cut.prefixTokens), summaryTokens: Math.round(p.scale.c * cut.summaryTokens), ms: cut.ms, compactMs: ms, askMs, waitedMs: 0, llmOk: cut.llmOk, llmError: cut.llmError, costUsd: cut.costUsd, ...this.usageOf(cut) });
+		this.ledger({ type: "summary", via: "native", handlerMs, trigger, source: cold ? "settle" : "valve", count: cut.count, tokensBefore: before, prefixTokens: Math.round(p.scale.c * cut.prefixTokens), summaryTokens: Math.round(p.scale.c * cut.summaryTokens), ms: cut.ms, compactMs: ms, askMs, waitedMs: 0, llmOk: cut.llmOk, llmError: cut.llmError, costUsd: cut.costUsd, ...this.usageOf(cut) });
 	}
 
 	private cancelTimer() {

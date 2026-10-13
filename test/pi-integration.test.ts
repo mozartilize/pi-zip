@@ -56,17 +56,40 @@ const sendPrompt = (sm: SessionManager, text: string) => sm.appendMessage(user(t
 // timestamps are bookkeeping: no provider puts them in a request payload
 const llm = (messages: Any[], mid: boolean) => JSON.stringify(resolveTranscript(normalizeContext({ messages: convertToLlm(messages) }), mid).messages, (k, v) => (k === "timestamp" ? undefined : v));
 
+/** Pi's event order at the start of a run. "1.1": input, before_agent_start (prompts only) and agent_start, all idle until the run is
+ *  active; "1.2": input idle, then busy from before_agent_start on, which also fires (messageType "custom") for a run an extension's
+ *  message starts. */
+type PiOrder = "1.1" | "1.2";
+const PI_ORDER: PiOrder = process.env.PZ_PI_ORDER === "1.2" ? "1.2" : "1.1";
+const ORDERS: PiOrder[] = ["1.1", "1.2"];
+let rigOrder: PiOrder = PI_ORDER; // the order of rigs built without one (a describe run under both orders sets it)
+/** A populated session file whose newest response is `agoMs` old. */
+const shiftedFile = (agoMs: number, prose: number) => {
+	const sm = SessionManager.inMemory(CWD);
+	populate(sm, prose);
+	const file = [sm.getHeader() as Any, ...sm.getEntries()];
+	const newest = Math.max(...file.map((e) => e.message?.timestamp ?? 0));
+	const shift = Date.now() - agoMs - newest;
+	for (const e of file) {
+		if (typeof e.message?.timestamp === "number") e.message.timestamp += shift;
+		if (typeof e.timestamp === "string" && e.type !== undefined && e.type !== "session") e.timestamp = new Date(Date.parse(e.timestamp) + shift).toISOString();
+	}
+	return file;
+};
+
 interface RigOpts {
 	file?: Any[]; // start from these session file entries (same entry ids in every rig built from them)
 	tui?: boolean; // an interactive session (settle prepares, the away timer runs)
 	native?: boolean; // ctx.compact is Pi's compaction path (prepareCompaction, session_before_compact, appendCompaction)
-	idle?: boolean; // ctx.isIdle() (default true)
-	start?: boolean; // emit before_agent_start right away (default true)
+	idle?: boolean; // ctx.isIdle() while no run is active (default true)
+	start?: boolean; // start a prompt right away (default true)
+	pi?: PiOrder; // the event order of Pi's run start (default PI_ORDER)
 	settings?: Any;
 	model?: Any;
 	// another extension's session_before_compact handler (Pi runs every extension's for pi-zip's compaction too), loaded before or after pi-zip
 	boundary?: (e: Any, ctx: Any) => Any; // a preceding extension drafts edits at turn_end
 	foreign?: { at: "before" | "after"; on: (e: Any, ctx: Any) => Any };
+	input?: (e: Any, ctx: Any) => Any; // another extension's input handler, loaded after pi-zip
 	latencyMs?: number; // the summary's model call takes this long
 }
 
@@ -87,6 +110,7 @@ async function rig(setup: (sm: SessionManager) => void = populate, opts: RigOpts
 		const other = await loadExtensionFromFactory((api: Any) => api.on("session_before_compact", async (e: Any, c: Any) => (foreignCalls.push(e.reason), f.on(e, c))), CWD, bus, runtime, "<other-compactor>");
 		extensions = f.at === "before" ? [other, ...extensions] : [...extensions, other];
 	}
+	if (opts.input) extensions = [...extensions, await loadExtensionFromFactory((api: Any) => api.on("input", opts.input), CWD, bus, runtime, "<other-input>")];
 	if (opts.boundary) {
 		const other = await loadExtensionFromFactory((api: Any) => api.on("turn_end", opts.boundary), CWD, bus, runtime, "<other-editor>");
 		extensions = [other, ...extensions];
@@ -131,6 +155,8 @@ async function rig(setup: (sm: SessionManager) => void = populate, opts: RigOpts
 	const compactions: Any[] = [];
 	const compactCalls = { n: 0, ended: 0 };
 	let compacting: AbortController | null = null; // Pi's _compactionAbortController: ctx.abort() reaches it (abort -> abortCompaction)
+	let busy = false; // a run is active (Pi's _isAgentRunActive): from agent_start, on Pi 1.2.0 from before_agent_start, to settle
+	const order: PiOrder = opts.pi ?? rigOrder;
 	/** AgentSession.compact() as Pi 1.1.0 runs it for an extension (minus the abort of an idle session and the UI events): Pi's own
 	 *  prepareCompaction decides "Already compacted" / "Nothing to compact", session_before_compact supplies the result (every extension's
 	 *  handler in load order: the last answer wins, a cancel stops it), the abort signal is checked right before appendCompaction. */
@@ -162,7 +188,7 @@ async function rig(setup: (sm: SessionManager) => void = populate, opts: RigOpts
 	};
 	runner.bindCore(
 		{ sendMessage: noop, sendUserMessage: noop, appendEntry, setSessionName: noop, getSessionName: () => undefined, setLabel: noop, getActiveTools: () => ["read", "bash", "zip_recall"], getAllTools: () => [], getSettings: () => opts.settings ?? {}, setActiveTools: noop, refreshTools: noop, getCommands: () => [], setModel: async () => false, getThinkingLevel: () => "off", setThinkingLevel: noop } as Any,
-		{ getModel: () => opts.model ?? MODEL, getScopedModels: () => [], isIdle: () => opts.idle !== false && !compacting, isProjectTrusted: () => true, getSignal: () => undefined, abort: () => compacting?.abort(), hasPendingMessages: () => false, shutdown: noop, getContextUsage: () => undefined, compact: opts.native ? piCompact : (o: Any) => o?.onError?.(new Error("rig: no compaction")), getSystemPrompt: () => "You are a coding agent." } as Any,
+		{ getModel: () => opts.model ?? MODEL, getScopedModels: () => [], isIdle: () => opts.idle !== false && !compacting && !busy, isProjectTrusted: () => true, getSignal: () => undefined, abort: () => compacting?.abort(), hasPendingMessages: () => false, shutdown: noop, getContextUsage: () => undefined, compact: opts.native ? piCompact : (o: Any) => o?.onError?.(new Error("rig: no compaction")), getSystemPrompt: () => "You are a coding agent." } as Any,
 	);
 	// Pi's TUI hands raw input to the extensions' listeners in order (TuiBase.handleTerminalInput): one may consume it or replace the data
 	const inputListeners = new Set<(data: string) => Any>();
@@ -234,13 +260,40 @@ async function rig(setup: (sm: SessionManager) => void = populate, opts: RigOpts
 	const settle = async () => {
 		const out = await runner.emitBoundary({ type: "agent_before_settle", outcome: "completed" } as Any, build as Any);
 		apply(sm, out.entries as Any[]);
+		busy = false;
 		return out.entries as Any[];
 	};
 	const apply = (manager: SessionManager, drafts: Any[]) => (AgentSession.prototype as Any)._applyBoundaryDrafts.call({}, manager, drafts) as Any[];
-	const beforeAgentStart = async (text = "next request") => {
+	/** A prompt as Pi runs it (AgentSession.prompt): the input handlers while Pi is idle (it waits for them), then before_agent_start and
+	 *  agent_start in the rig's order. `fail`: the prompt throws between before_agent_start and agent_start (Pi's image normalisation). */
+	const prompt = async (text = "next request", o: { fail?: boolean } = {}) => {
 		await new Promise((resolve) => setTimeout(resolve, 5));
+		busy = false; // the previous run is over
 		turn++; ended = false;
-		return runner.emitBeforeAgentStart(text, undefined, { cwd: CWD } as Any);
+		await runner.emitInput(text, undefined, "interactive", undefined);
+		if (order === "1.2") busy = true;
+		const r = order === "1.2"
+			? await runner.emit({ type: "before_agent_start", messageType: "user", prompt: text, systemPromptOptions: { cwd: CWD } } as Any)
+			: await runner.emitBeforeAgentStart(text, undefined, { cwd: CWD } as Any);
+		busy = !o.fail;
+		if (!o.fail) await runner.emit({ type: "agent_start" } as Any);
+		return r;
+	};
+	/** Text typed while the run streams (a steer or a follow-up): Pi hands it to the input handlers with its delivery. */
+	const steer = (text: string, behavior: "steer" | "followUp" = "steer") => runner.emitInput(text, undefined, "interactive", behavior);
+	/** A run an extension's message starts (sendMessage with triggerTurn on an idle session): Pi 1.1.0 emits agent_start only, 1.2.0
+	 *  before_agent_start with messageType "custom" first. The custom message is appended and its message_end fired. */
+	const drive = async (text = "drive the owed work") => {
+		busy = false;
+		const message = { role: "custom", customType: "owed-drive", content: text, display: true, timestamp: Date.now() };
+		if (order === "1.2") {
+			busy = true;
+			await runner.emit({ type: "before_agent_start", messageType: "custom", message, systemPromptOptions: { cwd: CWD } } as Any);
+		}
+		busy = true;
+		await runner.emit({ type: "agent_start" } as Any);
+		sm.appendCustomMessageEntry(message.customType, message.content, message.display);
+		await runner.emit({ type: "message_end", message } as Any);
 	};
 	const start = (Zip.prototype as Any).sessionStart;
 	(Zip.prototype as Any).sessionStart = function (this: Any, ...args: Any[]) { zip = this; return start.apply(this, args); };
@@ -257,9 +310,9 @@ async function rig(setup: (sm: SessionManager) => void = populate, opts: RigOpts
 		if (rec.type === "fold") reports.push({ after: rec.ctxAfter, scale: { O: rec.O, c: rec.c }, kind: "fold ledger" });
 		return ledger(rec);
 	};
-	if (opts.start !== false) await beforeAgentStart();
+	if (opts.start !== false) await prompt();
 	const shutdown = () => runner.emit({ type: "session_shutdown" } as Any);
-	return { sm, runner, request, turnEnd, settle, beforeAgentStart, narrativeCalls, projectionMessages, compactions, compactCalls, foreignCalls, inputListeners, typeKey, editor, shutdown, zip, checks, noticeCounts };
+	return { sm, runner, request, turnEnd, settle, prompt, steer, drive, order, narrativeCalls, projectionMessages, compactions, compactCalls, foreignCalls, inputListeners, typeKey, editor, shutdown, zip, checks, noticeCounts };
 }
 
 // These checks observe Pi's actual request messages and emitted transcript entries, independently of plan flags.
@@ -290,7 +343,7 @@ const produced = async (r: Any) => {
 	expect(first.some((m: Any) => m.role === "compactionSummary")).toBe(false);
 	await new Promise((res) => setTimeout(res, 50));
 	expect(r.narrativeCalls.length).toBe(1);
-	await r.beforeAgentStart();
+	await r.prompt();
 };
 
 describe("boundary decision regressions", () => {
@@ -305,7 +358,7 @@ describe("boundary decision regressions", () => {
 		const r = await rig(undefined, { file: [sm.getHeader() as Any, ...sm.getEntries()], start: false });
 		let restored: Awaited<ReturnType<typeof rig>> | undefined;
 		try {
-			await r.beforeAgentStart("current");
+			await r.prompt("current");
 			r.sm.appendMessage(user("current"));
 			r.zip.cold = pWarm < 0.5; r.zip.pWarm = pWarm; // a selected fold with incoming rent, on a warm or cold request
 			const signal = { aborted: false }, base = r.runner.createContext();
@@ -347,7 +400,7 @@ describe("boundary decision regressions", () => {
 		const r = await rig(undefined, { file: [sm.getHeader() as Any, ...sm.getEntries()], start: false });
 		let restored: Awaited<ReturnType<typeof rig>> | undefined;
 		try {
-			await r.beforeAgentStart("current");
+			await r.prompt("current");
 			r.sm.appendMessage(user("current"));
 			r.zip.cold = pWarm < 0.5; r.zip.pWarm = pWarm;
 			const controller = new AbortController(), base = r.runner.createContext();
@@ -446,7 +499,7 @@ describe("boundary decision regressions", () => {
 			expect(rentOf(r.sm.getBranch())).toBe(balance);
 			restored = await rig(undefined, { file: [r.sm.getHeader() as Any, ...r.sm.getEntries()], start: false });
 			expect(restored.zip.rent).toBe(balance);
-			await restored.beforeAgentStart();
+			await restored.prompt();
 			expect(restored.zip.rent).toBe(balance);
 		} finally { await restored?.shutdown(); await r.shutdown(); }
 	});
@@ -466,7 +519,7 @@ describe("boundary decision regressions", () => {
 		const text = "## Decisions\nsummary";
 		sm.appendCustomEntry("pi-zip/summary", { head: "", key, usd: 0, cut: { firstKeptEntryId: key, text, trigger: "valve", count: 1, prefixTokens: 20_000, summaryTokens: 1000, llmOk: true, llmError: null, costUsd: 0, ms: 0 } });
 		const r = await rig(undefined, { file: [sm.getHeader() as Any, ...sm.getEntries()], start: false });
-		await r.beforeAgentStart();
+		await r.prompt();
 		const pWarm = 0.4923076923;
 		let probability = 0;
 		const originalOpts = r.zip.opts.bind(r.zip);
@@ -505,7 +558,7 @@ describe("boundary decision regressions", () => {
 			const target = e.context.contextEntries.find((e: Any) => e.messages.some((m: Any) => m.role === "toolResult"));
 			return { entries: [...e.entries, { type: "context_edit", targetId: target.sourceEntry.id, replacement: { content: [{ type: "text", text: "short" }] } }] };
 		} });
-		await r.beforeAgentStart();
+		await r.prompt();
 		const originalOpts = r.zip.opts.bind(r.zip);
 		r.zip.opts = (...args: Any[]) => { const o = originalOpts(...args).o; o.scale = UNIT; o.law.pWarm = 0; return { o, cal: UNIT }; };
 		await r.request();
@@ -573,7 +626,7 @@ describe("mixed room boundary", () => {
 		}, { start: false, tui: true, model: { ...MODEL, contextWindow: 200_000 }, boundary: (e) => ({ entries: [...e.entries,
 			{ type: "context_edit", targetId: target, replacement: { content: [{ type: "text", text: "incoming replacement" }] } },
 		] }) });
-		await r.beforeAgentStart();
+		await r.prompt();
 		let probability = 0;
 		const originalOpts = r.zip.opts.bind(r.zip);
 		r.zip.opts = (...args: Any[]) => {
@@ -792,7 +845,9 @@ describe("real Pi: the request view is identical before and after turn_end persi
 	});
 });
 
-describe("real Pi: a summary prepared while the user was away goes in through Pi's own compaction (pi-tricks §1b, variant 1)", () => {
+for (const order of ORDERS) describe(`real Pi: a summary prepared while the user was away goes in through Pi's own compaction (pi-tricks §1b, variant 1) (Pi ${order} order)`, () => {
+	beforeEach(() => { rigOrder = order; });
+	afterEach(() => { rigOrder = PI_ORDER; });
 	const sleep = (ms: number) => new Promise((res) => setTimeout(res, ms));
 	/** The session as a file whose newest response is `agoMs` old (the rig of every other test is hours old: a cold session). */
 	const template = (agoMs = 0) => {
@@ -813,7 +868,7 @@ describe("real Pi: a summary prepared while the user was away goes in through Pi
 		const r = await rig(undefined, { file: template(), tui: true, native: true, idle: true, start: false }); // session_start only: no settle ever ran in this process
 		await sleep(2_300); // the unlearned timer uses the first paying gap, TTL plus one second
 		expect(r.narrativeCalls.length).toBe(1); // old code: 0 (armAway was reached only from settle)
-		await r.beforeAgentStart("next request");
+		await r.prompt("next request");
 		sendPrompt(r.sm, "next request");
 		const req1 = await r.request();
 		expect(r.narrativeCalls.length).toBe(1); // adopted at the return, not written again while the user waits
@@ -842,7 +897,7 @@ describe("real Pi: a summary prepared while the user was away goes in through Pi
 		r.typeKey("h");
 		await sleep(1_000); // typing the prompt takes 1 s of the 2 s call
 		const t0 = performance.now();
-		await r.beforeAgentStart("hello");
+		await r.prompt("hello");
 		sendPrompt(r.sm, "hello");
 		const req1 = await r.request();
 		const waited = performance.now() - t0;
@@ -870,7 +925,7 @@ describe("real Pi: a summary prepared while the user was away goes in through Pi
 		r.typeKey("h");
 		await sleep(50);
 		expect(r.narrativeCalls.length).toBe(0);
-		await r.beforeAgentStart("hello");
+		await r.prompt("hello");
 		sendPrompt(r.sm, "hello");
 		const req1 = await r.request();
 		expect(req1.some((m) => m.role === "compactionSummary")).toBe(false); // still being written: nobody waits for it
@@ -909,14 +964,14 @@ describe("real Pi: a summary prepared while the user was away goes in through Pi
 	test("a fresh room call teaches the producer latency used after restart", async () => {
 		process.env.PI_ZIP_TTL_SECS = "300";
 		process.env.PI_ZIP_COLD_CAP = "100000";
-		const model = { ...MODEL, provider: "latency", id: "room", contextWindow: 100_000 };
+		const model = { ...MODEL, provider: "latency", id: `room-${order}`, contextWindow: 100_000 };
 		const file = template();
 		for (const entry of file) if (entry.message?.role === "assistant") delete entry.message.usage;
 		const r = await rig(undefined, { file, tui: true, start: false, model, latencyMs: 80 });
 		try {
 			await r.runner.emit({ type: "agent_start" } as Any);
 			expect(r.zip.bg).toBeNull();
-			expect(loadStats().models["latency/room"]?.call).toBeUndefined();
+			expect(loadStats().models[`latency/room-${order}`]?.call).toBeUndefined();
 			const response = { ...asst([{ type: "text", text: "done" }]), timestamp: Date.now() };
 			delete response.usage;
 			const id = r.sm.appendMessage(response);
@@ -924,7 +979,7 @@ describe("real Pi: a summary prepared while the user was away goes in through Pi
 			const artifact = drafts.find((e) => e.customType === "pi-zip/summary").data;
 			expect(drafts[0].type).toBe("compaction");
 			expect(r.narrativeCalls).toHaveLength(1);
-			const learned = loadStats().models["latency/room"].call!;
+			const learned = loadStats().models[`latency/room-${order}`].call!;
 			expect(learned.ms).toBeGreaterThanOrEqual(80);
 			expect(learned).toEqual({ ms: artifact.cut.ms, tokens: artifact.cut.prefixTokens * r.zip.scaleOf(r.runner.createContext()).c });
 			expect(r.zip.ent.call).toEqual(learned);
@@ -950,7 +1005,7 @@ describe("real Pi: a summary prepared while the user was away goes in through Pi
 				expect(restarted.zip.ent.call).toEqual(learned);
 				expect(deadlines.get(restarted.zip.timer)).toBeCloseTo(expected, 5);
 				expect(restarted.narrativeCalls).toHaveLength(0);
-				expect(loadStats().models["latency/room"].call).toEqual(learned);
+				expect(loadStats().models[`latency/room-${order}`].call).toEqual(learned);
 			} finally {
 				globalThis.setTimeout = realSet;
 				Date.now = realNow;
@@ -1014,7 +1069,7 @@ describe("real Pi: a summary prepared while the user was away goes in through Pi
 			expect(artifact.data.usd).toBe(0.05);
 			expect(r.zip.totals(ctx).usd).toBe(0.05);
 			if (door === "native") {
-				await r.beforeAgentStart();
+				await r.prompt();
 				expect(r.compactions).toHaveLength(1);
 				expect(r.compactions[0].details.via).toBe("native");
 			} else {
@@ -1216,7 +1271,7 @@ describe("real Pi: a summary prepared while the user was away goes in through Pi
 			expect(rentOf(r.sm.getBranch())).toBe(10_000);
 			restored = await rig(undefined, { file: [r.sm.getHeader() as Any, ...r.sm.getEntries()], start: false });
 			expect(restored.zip.rent).toBe(10_000);
-			await restored.beforeAgentStart();
+			await restored.prompt();
 			expect(restored.zip.rent).toBe(10_000);
 		} finally {
 			for (const release of releases) release();
@@ -1299,25 +1354,16 @@ describe("real Pi: a summary prepared while the user was away goes in through Pi
 		await r.shutdown();
 	});
 });
-describe("item 5: a run an extension's message starts (sendMessage with triggerTurn) never fires before_agent_start; agent_start does", () => {
+// A run an extension's message starts (sendMessage with triggerTurn): Pi 1.1.0 fires agent_start only, Pi 1.2.0 before_agent_start with
+// messageType "custom" first. Either way it begins once, as a driven run, and never compacts.
+for (const order of ORDERS) describe(`item 5: a run an extension's message starts (sendMessage with triggerTurn) begins once as a driven run (Pi ${order} order)`, () => {
 	const sleep = (ms: number) => new Promise((res) => setTimeout(res, ms));
-	const template = (agoMs: number) => {
-		const sm = SessionManager.inMemory(CWD);
-		populate(sm, 9000); // long prose: folds alone cannot reach the cap, so the cold return needs a summary
-		const file = [sm.getHeader() as Any, ...sm.getEntries()];
-		const newest = Math.max(...file.map((e) => e.message?.timestamp ?? 0));
-		const shift = Date.now() - agoMs - newest;
-		for (const e of file) {
-			if (typeof e.message?.timestamp === "number") e.message.timestamp += shift;
-			if (typeof e.timestamp === "string" && e.type !== undefined && e.type !== "session") e.timestamp = new Date(Date.parse(e.timestamp) + shift).toISOString();
-		}
-		return file;
-	};
-	beforeEach(() => { process.env.PI_ZIP_TTL_SECS = "1"; });
-	/** What Pi does for sendCustomMessage({ ..., triggerTurn: true }) on an idle session: agent_start, the message appended, the first request. */
+	const template = (agoMs: number) => shiftedFile(agoMs, 9000); // long prose: folds alone cannot reach the cap, so the cold return needs a summary
+	beforeEach(() => { process.env.PI_ZIP_TTL_SECS = "1"; rigOrder = order; });
+	afterEach(() => { rigOrder = PI_ORDER; });
+	/** What Pi does for sendCustomMessage({ ..., triggerTurn: true }) on an idle session: the run's start, the message appended, the first request. */
 	const drive = async (r: Any, text = "drive the owed work") => {
-		await r.runner.emit({ type: "agent_start" } as Any);
-		r.sm.appendCustomMessageEntry("owed-drive", text, true);
+		await r.drive(text);
 		return r.request();
 	};
 
@@ -1353,28 +1399,47 @@ describe("item 5: a run an extension's message starts (sendMessage with triggerT
 		expect((await r.request()).some((m) => m.role === "compactionSummary")).toBe(true);
 	});
 
-	test("a prompt still goes through before_agent_start once: agent_start after it does not start the run a second time", async () => {
+	// 0.4.0 took a "custom" before_agent_start (Pi 1.2.0) for a prompt and began the run again at its first message_end
+	test("a driven run begins once: one start of run, one driven_run record, no prompt decision", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "pz-driven-once-")), ledger = join(dir, "ledger.jsonl"), saved = process.env.PI_ZIP_LEDGER;
+		process.env.PI_ZIP_LEDGER = ledger;
+		try {
+			const r = await rig(undefined, { file: template(240 * 60_000), tui: true, native: true, idle: true, start: false });
+			let begun = 0;
+			const begin = r.zip.beginRun.bind(r.zip);
+			r.zip.beginRun = (...a: Any[]) => (begun++, begin(...a));
+			await drive(r);
+			const rows = readFileSync(ledger, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+			expect([begun, rows.filter((x) => x.type === "driven_run").length, rows.filter((x) => x.type === "prompt").length]).toEqual([1, 1, 1]);
+			expect(r.compactCalls.n).toBe(0);
+		} finally {
+			if (saved === undefined) delete process.env.PI_ZIP_LEDGER;
+			else process.env.PI_ZIP_LEDGER = saved;
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("a prompt begins its run once: input decides, before_agent_start and agent_start start one run", async () => {
 		const r = await rig(undefined, { file: template(240 * 60_000), tui: true, native: false, idle: false, start: false });
-		await r.beforeAgentStart("next request");
-		await r.runner.emit({ type: "agent_start" } as Any);
+		let begun = 0;
+		const begin = r.zip.beginRun.bind(r.zip);
+		r.zip.beginRun = (...a: Any[]) => (begun++, begin(...a));
+		await r.prompt("next request");
 		sendPrompt(r.sm, "next request");
 		const req = await r.request();
 		await sleep(20);
+		expect(begun).toBe(1);
 		expect(r.narrativeCalls.length).toBe(1); // one start of the run: one summary call
 		expect(req.some(isFolded)).toBe(true);
 	});
 
 	// review P2: before_agent_start fired, then the prompt failed before its run started (Pi's image normalisation throws between the two):
-	// no agent_start, no agent_end. The old code kept startHandled and took the next driven run's agent_start for the prompt's: that run
-	// was planned on the stale start (warm, minutes ago), never as the cold return it is
+	// no agent_start, no agent_end. The next driven run is planned as the cold return it is, not on the failed prompt's start
 	test("a prompt that fails before its run starts does not swallow the next driven run's start", async () => {
 		const r = await rig(undefined, { file: template(0), tui: true, native: false, idle: false, start: false });
-		await r.beforeAgentStart("look at this image"); // warm (the session's last response is 0 s old); then the prompt throws
+		await r.prompt("look at this image", { fail: true }); // warm (the session's last response is 0 s old); then the prompt throws
 		await sleep(1_300); // past the 1 s TTL
-		await r.runner.emit({ type: "agent_start" } as Any);
-		r.sm.appendCustomMessageEntry("owed-drive", "drive the owed work", true);
-		await r.runner.emit({ type: "message_end", message: { role: "custom", customType: "owed-drive", content: "drive the owed work", display: true, timestamp: Date.now() } } as Any);
-		await r.request();
+		await drive(r);
 		const response = asst([{ type: "text", text: "done" }], "stop", 10_000_001);
 		await r.turnEnd(r.sm.appendMessage(response), response);
 		const notice = (r.sm.getBranch().filter((e: Any) => e.type === "custom" && e.customType === "pi-zip/notice" && !e.data?.kind).at(-1) as Any)?.data;
@@ -1386,13 +1451,92 @@ describe("item 5: a run an extension's message starts (sendMessage with triggerT
 		const driven = await rig(undefined, { file: template(2_000), tui: true, native: false, idle: false, start: false });
 		const dReq = await drive(driven);
 		const prompted = await rig(undefined, { file: template(2_000), tui: true, native: false, idle: false, start: false });
-		await prompted.beforeAgentStart("next request");
+		await prompted.prompt("next request");
 		sendPrompt(prompted.sm, "next request");
 		const pReq = await prompted.request();
 		await new Promise((res) => setTimeout(res, 50)); // a summary starts in the background: its call is made off the request path
 		expect(driven.narrativeCalls.length).toBe(prompted.narrativeCalls.length);
 		expect(dReq.some(isFolded)).toBe(pReq.some(isFolded));
 		expect(dReq.some((m) => m.role === "compactionSummary")).toBe(pReq.some((m) => m.role === "compactionSummary"));
+	});
+});
+
+// 0.4.1: the typed-prompt door is Pi's input event, where Pi is idle on 1.1.0 and on 1.2.0 (1.2.0 counts the starting run as busy from
+// before_agent_start on: 0.4.0's door there stayed closed, and the first request carried the whole old history).
+for (const order of ORDERS) describe(`the typed-prompt door opens at Pi's input event (Pi ${order} order)`, () => {
+	const sleep = (ms: number) => new Promise((res) => setTimeout(res, ms));
+	beforeEach(() => { process.env.PI_ZIP_TTL_SECS = "1"; rigOrder = order; });
+	afterEach(() => { rigOrder = PI_ORDER; });
+	/** A cold session whose return summary is ready (the producer wrote it while the user was away). */
+	const readyRig = async (o: Partial<RigOpts> = {}) => {
+		const r = await rig(undefined, { file: shiftedFile(240 * 60_000, 9000), tui: true, native: true, idle: true, start: false, ...o });
+		await r.settle();
+		await sleep(150);
+		expect(r.narrativeCalls.length).toBe(1);
+		return r;
+	};
+
+	for (const text of ["Continue with the task.", "/review the open work"]) test(`a typed prompt takes the ready summary through Pi's compaction, and its own run's first request carries that decision (${text.startsWith("/") ? "a /template, priced unexpanded" : "plain text"})`, async () => {
+		const r = await readyRig();
+		const idleAtCompact: boolean[] = [];
+		const compact = r.zip.nativeSummary.bind(r.zip);
+		r.zip.nativeSummary = (ctx: Any, ...a: Any[]) => (idleAtCompact.push(ctx.isIdle()), compact(ctx, ...a));
+		await r.prompt(text);
+		expect(idleAtCompact).toEqual([true]);
+		expect(r.compactCalls.n).toBe(1);
+		expect(r.compactions[0].details).toMatchObject({ by: "pi-zip", via: "native", trigger: "cold" });
+		const carried = r.zip.nativeRun;
+		expect(carried?.before).toBe(r.compactions[0].tokensBefore);
+		sendPrompt(r.sm, text);
+		const req = await r.request();
+		expect(req.find((m: Any) => m.role === "compactionSummary")?.summary).toBe(r.compactions[0].summary);
+		expect(r.zip.runPlan.native.text).toBe(r.compactions[0].summary);
+		expect(r.zip.runPlan.ctxBefore).toBe(r.compactions[0].tokensBefore);
+		expect(r.zip.runPlan.folds.map((t: Any) => t.entryId)).toEqual(carried.p.folds.map((t: Any) => t.entryId));
+		await sleep(5);
+		const notice = (r.sm.getBranch().filter((e: Any) => e.customType === "pi-zip/notice" && !e.data?.kind).at(-1) as Any).data;
+		expect(notice.before).toBe(r.compactions[0].tokensBefore); // Pi's "Compacted from N" is the notice's before
+		expect(notice.native).toBe("ok");
+	});
+
+	for (const behavior of ["steer", "followUp"] as const) test(`a ${behavior} typed while the run streams does not open the door`, async () => {
+		const r = await readyRig();
+		await r.drive(); // a run is streaming; its ready summary waits for turn_end (never a compaction inside a run)
+		const started = r.zip.start;
+		await r.steer("also look at the logs", behavior);
+		expect(r.compactCalls.n).toBe(0);
+		expect(r.zip.start).toBe(started); // and leaves the start of the run in progress alone
+		expect(r.sm.getBranch().some((e: Any) => e.type === "compaction")).toBe(false);
+	});
+
+	test("an input another extension handles starts no run: the compaction stays, pi-zip is not in a run, the decision reaches no later run", async () => {
+		const r = await readyRig({ input: () => ({ action: "handled" }) });
+		let armed = 0;
+		const arm = r.zip.armProducer.bind(r.zip);
+		r.zip.armProducer = (c: Any) => (armed++, arm(c));
+		const out = await r.runner.emitInput("handled by another extension", undefined, "interactive", undefined);
+		expect(armed).toBe(1); // the timer stopped while Pi compacted is armed again on the compacted session
+		expect(out.action).toBe("handled");
+		expect(r.compactions).toHaveLength(1); // pi-zip's own summary with its exact size before: valid without the run
+		expect(r.zip.inRun).toBe(false);
+		// the producer is as a process that opens the compacted session arms it (0.4.0 on Pi 1.1.0 entered the run: no timer)
+		const fresh = await rig(undefined, { file: [r.sm.getHeader() as Any, ...r.sm.getEntries()], tui: true, native: true, start: false });
+		expect([!!r.zip.timer, r.zip.inRun]).toEqual([!!fresh.zip.timer, fresh.zip.inRun]);
+		await fresh.shutdown();
+		await r.drive(); // the next run is another one: it takes nothing the input decided
+		expect(r.zip.start).toBeNull();
+		await r.request();
+		expect(r.zip.runPlan?.native).toBeUndefined();
+	});
+
+	for (const how of ["handled", "image"] as const) test(`a prompt that starts no run (${how === "handled" ? "another extension handles its input" : "it fails after before_agent_start"}) leaves the producer's timer armed`, async () => {
+		const r = await rig(undefined, { file: shiftedFile(0, 9000), tui: true, native: true, idle: true, start: false, ...(how === "handled" ? { input: () => ({ action: "handled" }) } : {}) });
+		expect(r.zip.timer).not.toBeNull(); // opening the session armed the deadline of the first paying pause
+		if (how === "handled") await r.runner.emitInput("handled elsewhere", undefined, "interactive", undefined);
+		else await r.prompt("look at this image", { fail: true });
+		expect(r.zip.inRun).toBe(false);
+		await sleep(2_300); // 0.4.0 (image): before_agent_start had cancelled the timer and entered the run, so no call ever came
+		expect(r.narrativeCalls.length).toBe(1);
 	});
 });
 
@@ -1410,7 +1554,9 @@ describe("the notice's why line says the cache was judged cold, as the warm one 
 
 // Round 5: the incident (0.3.0, a warm prompt 1 min 48 s after a run that ended at 111.5K; the user waited 39 s for a summary, which went in
 // as a draft whose "Compacted from N" Pi took from the post-summary request). Rule A and the background production against Pi's own session and draft code.
-describe("round 5 on real Pi: rule A starts the warm summary early, nobody waits for it while the cache is warm", () => {
+for (const order of ORDERS) describe(`round 5 on real Pi: rule A starts the warm summary early, nobody waits for it while the cache is warm (Pi ${order} order)`, () => {
+	beforeEach(() => { rigOrder = order; });
+	afterEach(() => { rigOrder = PI_ORDER; });
 	const sleep = (ms: number) => new Promise((res) => setTimeout(res, ms));
 	const template = (agoMs: number) => {
 		const sm = SessionManager.inMemory(CWD);
@@ -1427,7 +1573,7 @@ describe("round 5 on real Pi: rule A starts the warm summary early, nobody waits
 	const noticeOf = (r: Any) => (r.sm.getBranch().filter((e: Any) => e.type === "custom" && e.customType === "pi-zip/notice" && !e.data?.kind).at(-1) as Any)?.data;
 	const prompt = async (r: Any, text = "next request") => {
 		const t0 = performance.now();
-		await r.beforeAgentStart(text);
+		await r.prompt(text);
 		r.sm.appendMessage(user(text, Date.now() - T0));
 		const req = await r.request();
 		return { req, waited: performance.now() - t0 };
@@ -1470,7 +1616,7 @@ describe("round 5 on real Pi: rule A starts the warm summary early, nobody waits
 				const text = "## Decisions\n" + "summary ".repeat(500);
 				sm.appendCustomEntry("pi-zip/summary", { head: "", key, usd: 0, cut: { firstKeptEntryId: key, text, trigger: "valve", count: kept, prefixTokens: readyPlan.prefixTokens, summaryTokens: Math.ceil(text.length / 4), llmOk: true, llmError: null, costUsd: 0, ms: 0, prepared: true } });
 				const r = await rig(undefined, { file: [sm.getHeader() as Any, ...sm.getEntries()], tui: true, native: true, idle: true, start: false });
-				await r.beforeAgentStart();
+				await r.prompt();
 				expect(r.compactCalls.n).toBe(1);
 				expect(r.compactions[0]).toMatchObject({ summary: text, firstKeptEntryId: key, details: { via: "native" } });
 				r.sm.appendMessage(user("next request", Date.now() - T0));
@@ -1509,7 +1655,7 @@ describe("round 5 on real Pi: rule A starts the warm summary early, nobody waits
 		expect(prepared.folds.length).toBeGreaterThan(0);
 		sm.appendCustomEntry("pi-zip/summary", { head: "", key, usd: 0, cut: { firstKeptEntryId: key, text, trigger: "valve", count: 9, prefixTokens: prepared.prefixTokens, summaryTokens: Math.ceil(text.length / 4), llmOk: true, llmError: null, costUsd: 0, ms: 0, prepared: true } });
 		const r = await rig(undefined, { file: [sm.getHeader() as Any, ...sm.getEntries()], tui: true, native: true, idle: true, start: false });
-		await r.beforeAgentStart("next request");
+		await r.prompt("next request");
 		expect(r.compactions).toHaveLength(1);
 		const priced = r.zip.nativeRun.p;
 		expect(priced.folds.length).toBeGreaterThan(0);
@@ -1541,7 +1687,7 @@ describe("round 5 on real Pi: rule A starts the warm summary early, nobody waits
 				await sleep(400);
 				expect(r.narrativeCalls.length).toBe(1); // 0.3.0: 0 here, then a 300 ms wait at the prompt
 				const t0 = performance.now();
-				await r.beforeAgentStart(announced);
+				await r.prompt(announced);
 				r.sm.appendMessage(user("next request", Date.now() - T0));
 				const req = await r.request();
 				expect(performance.now() - t0).toBeLessThan(250);
@@ -1655,7 +1801,7 @@ describe("no UI (pi -p, json): the requests and the session of three scenarios h
 	// a summary call started in the background finishes before the next event (the model answers at once): the transcript does not
 	// depend on how fast this machine runs it
 	const prompt = async (r: Any, log: (x: Any) => void, text: string) => {
-		await r.beforeAgentStart(text);
+		await r.prompt(text);
 		r.sm.appendMessage(user(text, Date.now() - T0));
 		log(await r.request());
 		await sleep(50);
@@ -1679,21 +1825,9 @@ describe("no UI (pi -p, json): the requests and the session of three scenarios h
 		// a warm prompt right after a request that carried an edit (b2b: no warm edit at the prompt; the state a restarted process
 		// restores, set here directly): its summary is still produced, and its first turn_end valve takes it (0.3.1: the turn_end waited)
 		parts.push(await transcript(async (r, log) => {
-			const { Zip } = await import("../src/run.ts");
-			const orig = (Zip.prototype as Any).beginRun;
-			let zip: Any = null;
-			(Zip.prototype as Any).beginRun = async function (this: Any, ...a: Any[]) {
-				(Zip.prototype as Any).beginRun = orig;
-				zip = this;
-				this.justEdited = true;
-				return orig.apply(this, a);
-			};
-			try {
-				await prompt(r, log, "right after an edit");
-			} finally {
-				(Zip.prototype as Any).beginRun = orig;
-			}
-			zip.justEdited = false; // the prompt's response answered a request without a fresh edit (message_end, which this rig does not fire)
+			r.zip.justEdited = true; // from the prompt's input on
+			await prompt(r, log, "right after an edit");
+			r.zip.justEdited = false; // the prompt's response answered a request without a fresh edit (message_end, which this rig does not fire)
 			await step(r, log, 1, 110_000, "small");
 			await step(r, log, 2, 111_000, "small");
 			log(await r.settle());
@@ -1719,7 +1853,7 @@ describe("no UI (pi -p, json): the requests and the session of three scenarios h
 		expect(digest).toBe(NOUI_DIGEST);
 		// the same warm return with a UI and a slow call: no summary in its first request, and no wait
 		const ui = await rig(undefined, { file: shifted(60_000, 6000), tui: true, native: true, idle: true, start: false, latencyMs: 300 });
-		await ui.beforeAgentStart("warm return");
+		await ui.prompt("warm return");
 		ui.sm.appendMessage(user("warm return", Date.now() - T0));
 		const t0 = performance.now();
 		const req = await ui.request();
