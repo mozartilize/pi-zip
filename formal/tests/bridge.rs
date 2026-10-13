@@ -104,7 +104,7 @@ fn native_completeness_judges_a_ready_artifact_at_its_finished_size() {
         })).unwrap();
         native_withheld(&Run::new(trace.clone(), obs), 0)
     };
-    assert!(door(Some(500.0)).is_some(), "the finished artifact passes the guard and was withheld");
+    assert_eq!(door(Some(500.0)).as_deref(), Some("idle native door withheld ready cut kept at P=1 (B=100000, A=80500, call=0)"), "the diagnostic reports the finished size used by the guard");
     assert!(door(Some(2000.0)).is_none(), "at the planned size the guard refuses it");
     assert!(door(None).is_none(), "no finished size: the planned size is used");
 }
