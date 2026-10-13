@@ -1,6 +1,6 @@
 # pz-formal: a specification and a bounded model checker for pi-zip
 
-pi-zip's README states three rules. This crate turns them into a small formal specification, derives the finer properties from
+pi-zip's README states five axioms. This crate turns them into a small formal specification, derives the finer properties from
 them, and checks all of them on the **real** implementation: a bun bridge drives pi-zip's own `index.ts` / `run.ts` / `plan.ts`
 through abstract traces (Pi's real `SessionManager` and draft application, a simulated provider cache, a virtual clock) and reports
 every decision; the Rust checker evaluates the properties over those decisions, exhaustively on small discretised traces and
@@ -41,7 +41,7 @@ always(cold_plan() >> freeze("i0", index(), !quiet_since_i0().until_within(K_REG
 Why embedded rather than parsed: the atoms are computations over the real decisions (the law's terms, protection windows, plan
 dominance, byte hashes of requests). A parsed language would need its own expression language and type checker to say them; Rust
 already is one, the compiler checks the spec, and there is no parser to maintain. What a reader needs is `spec.rs`, which is
-formulas plus words, in the order of the README's rules. `pz-formal spec` prints every property in mathematical notation.
+formulas plus words, in the order of the README's axioms. `pz-formal spec` prints every property in mathematical notation.
 
 **Traces** are data, so they get a **tiny parsed syntax** (one line per event). Counterexamples are printed in it and replay
 with `pz-formal run`:
@@ -93,7 +93,7 @@ say 100
 
 | | axiom | formula |
 |---|---|---|
-| A1 | nothing is lost | □ nothing_lost: the request carries the session's conversation **by position**, one to one and in order from its first kept message to the newest (a summary may stand for a prefix, nothing in between may go missing); every message except a folded output or a summary goes out byte for byte (user text, tool args, system prompt, thinking); pi-zip's request guard does not have to rewrite the payload (an edit that broke a tool_use / tool_result pair); **every folded block names its handle and shows its key lines** (first, last, the error line, as README rule 1 says); every output the model does not see verbatim comes back byte for byte **the way the model gets it back**: `zip_recall(handle)` as the tool executes it, all pages, or a `read` of the recall file the placeholder names (through pi-zip's `tool_call` hook), and in reread-only mode only re-readable outputs fold; a user request pi-zip summarised away is quoted verbatim |
+| A1 | nothing is lost | □ nothing_lost: the request carries the session's conversation **by position**, one to one and in order from its first kept message to the newest (a summary may stand for a prefix, nothing in between may go missing); every message except a folded output or a summary goes out byte for byte (user text, tool args, system prompt, thinking); pi-zip's request guard does not have to rewrite the payload (an edit that broke a tool_use / tool_result pair); **every folded block names its handle and shows its key lines** (first, last, the error line, as the README's Recall section describes); every output the model does not see verbatim comes back byte for byte **the way the model gets it back**: `zip_recall(handle)` as the tool executes it, all pages, or a `read` of the recall file the placeholder names (through pi-zip's `tool_call` hook), and in reread-only mode only re-readable outputs fold; a user request pi-zip summarised away is quoted verbatim |
 | A2 | edit only when the cache is gone or the edit pays | □ (zip_edit → pays): the law's own model, **at the class ratios of the true cache class and tier** (not the planner's prices) and **at the request's real sizes** (B: what the request would have sent without the edit; A: what it sent), with the summary call priced as what it is (uncached read of the conversation the cut replaces, without the carried previous summary, plus the summary written), says the edit costs no more than not editing (10% tolerance: the planner's calibrated estimate). At P < 0.5 folds are free (lemma C), and a summary must also pay its call at its own margin (what the cut removes beyond the folds): no decision is excused for being cold |
 | A3 | never in the way | □ (user_waits → at_room): nobody waits for a summary call except at Pi's compaction room, with a UI or without (sub-agents too). A summary is written in the background (away, at the end of a run, or produced when a decision wants one that is not ready) and taken at the first decision after it is ready; that decision goes with its folds alone meanwhile (0.4.0 step 4: 0.3.1's excuses, a no-UI session and a return a model switch made cold, are gone) |
 
