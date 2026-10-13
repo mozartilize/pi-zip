@@ -935,7 +935,8 @@ export class Zip implements ZipControl {
 		if (!this.active()) return undefined;
 		if (this.starting) await this.starting; // agent_start's start-of-run handling of a driven run
 		if (ctx?.signal?.aborted) return undefined;
-		if (!this.runChecked) {
+		const first = !this.runChecked;
+		if (first) {
 			this.runChecked = true;
 			try {
 				await this.computeRunPlan(ctx);
@@ -947,21 +948,20 @@ export class Zip implements ZipControl {
 			}
 		}
 		if (ctx?.signal?.aborted) return undefined; // Esc (Pi cancelled the prompt): this request never goes out, so nothing is applied or announced
-		if (this.runPlan && !this.runPlan.persisted) {
-			const out = applyPlanToMessages(e.messages, this.runPlan);
-			if (out || this.runPlan.native) { // a native summary is already in the request Pi built: it still goes out with this request
-				this.rent = 0; // the rewrite goes out with this request (R14)
-				if (!this.runPlan.sent) this.nextEdit = this.runPlan.untouched ?? 0;
-				this.runPlan.sent = true;
-				const applied = (this.runPlan.applied = out?.applied ?? this.runPlan.applied ?? new Set<string>());
-				this.runPlan.noticeTs ??= Date.now();
-				if (!this.runPlan.noticed && (this.runPlan.cut || this.runPlan.native)) { // folds alone wait for the boundary: a room summary can join their one notice
-					this.runPlan.noticed = true;
-					const live = this.runPlan.folds.filter((t) => applied.has(t.entryId));
-					this.noticeFor(ctx, this.runPlan, live, this.runPlan.cut ?? this.runPlan.native ?? null, this.runPlan.ctxBefore, sizeOf(this.runPlan.scale, (out?.messages ?? e.messages).filter((m: Any) => m.role !== "system").reduce((n: number, m: Any) => n + wireTokensOf(m), 0)));
-				}
-				return out ? { messages: out.messages } : undefined;
+		const plan = this.runPlan && !this.runPlan.persisted ? this.runPlan : null;
+		const out = plan ? applyPlanToMessages(e.messages, plan) : null;
+		if ((first && this.pWarm < 0.5) || out || plan?.native) this.rent = 0; // R14: an applied rewrite or a cold request ends the rent stretch
+		if (plan && (out || plan.native)) { // a native summary is already in the request Pi built: it still goes out with this request
+			if (!plan.sent) this.nextEdit = plan.untouched ?? 0;
+			plan.sent = true;
+			const applied = (plan.applied = out?.applied ?? plan.applied ?? new Set<string>());
+			plan.noticeTs ??= Date.now();
+			if (!plan.noticed && (plan.cut || plan.native)) { // folds alone wait for the boundary: a room summary can join their one notice
+				plan.noticed = true;
+				const live = plan.folds.filter((t) => applied.has(t.entryId));
+				this.noticeFor(ctx, plan, live, plan.cut ?? plan.native ?? null, plan.ctxBefore, sizeOf(plan.scale, (out?.messages ?? e.messages).filter((m: Any) => m.role !== "system").reduce((n: number, m: Any) => n + wireTokensOf(m), 0)));
 			}
+			return out ? { messages: out.messages } : undefined;
 		}
 		return undefined;
 	}
@@ -996,8 +996,8 @@ export class Zip implements ZipControl {
 		// no warm edit on the request right after an edited one (no back-to-back warm rewrites); the summary the plan wants is still
 		// produced. A summary Pi's compaction already put in the session (nativeSummary skips such a return, so only defensively) is
 		// never dropped here: the run plan below carries it
-		// R14: rent resets only when a rewrite goes out. A selected first-request edit keeps the incoming balance until context()
-		// applies it to a request (Esc before application, or content another handler changed, leaves the paid rent intact).
+		// R14: a selected first-request edit keeps the incoming balance until context() sends a rewrite or a cold request.
+		// Esc before application, or a warm request whose content another handler changed, leaves the paid rent intact.
 		if (!d.p || nat) this.rent = d.rentNext;
 		if (d.produce) this.want("run", ctx, d.produce);
 		if (d.kind === "b2b") {
