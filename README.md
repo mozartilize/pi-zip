@@ -212,7 +212,7 @@ on run start: clear the timer
 on call completion: record pi-zip/summary; failed/aborted calls are not READY
 on shutdown: abort the running call and record one estimated unused charge
 
-doors: idle typed prompt → ctx.compact() with the ready answer and Pi's before-size
+doors: idle typed prompt (Pi's input event) → ctx.compact() with the ready answer and Pi's before-size
        turn_end → compaction draft first, then folds and artifact records
        first request → folds only, persisted at its first turn_end
 ```
@@ -483,11 +483,14 @@ No cell of 4 price/cache regimes × 8 session strata has a cost-ratio confidence
 - **Per-item need rates are not observable.** They enter as classes (the protection window, 60 requests, 500 tokens) and as
   claim 8's ordering assumption.
 - **κ is a class ratio, not your price table.** A factor-2 error costs at most 6 % in the EOQ model.
-- **On Pi 1.2.0 the typed-prompt door is closed.** Pi 1.2.0 counts a starting run as busy during `before_agent_start`, and a
-  native compaction there would abort the run, so pi-zip does not ask for one. A summary ready at a typed prompt then enters
-  as the first draft at that run's first turn end: same summary, same exact "Compacted from" number, but the run's first
-  requests still carry the history it replaces. All doors are checked in a real TUI on Pi 1.1.0; on 1.2.0 the two draft doors
-  are. 0.3.1 behaves the same on 1.2.0.
+- **The typed-prompt door depends on Pi's `input` event.** pi-zip asks for the native compaction in its `input` handler, where
+  Pi 1.1.0 and 1.2.0 are both idle and wait for the handler before they start the run (1.2.0 counts the run as busy from
+  `before_agent_start` on, so 0.4.0's door there stayed closed). A prompt typed while a run streams (a steer or follow-up) never
+  opens it. A prompt that starts with `/` is priced from its raw text before Pi expands the template or skill (so is a prompt
+  another extension rewrites after pi-zip); a much larger expansion makes that one decision slightly optimistic, and later
+  decisions read the real sizes. If no run follows (another extension handles the input, or Pi refuses the model), a summary
+  that went in stays in the session (pi-zip's own, with its exact size before) and nothing else of that prompt is kept. All
+  three doors are checked in a real TUI on Pi 1.1.0 and 1.2.0.
 - **Offline is not live.** The model's behaviour after a fold comes from a calibrated simulator, and the cells to watch live are
   one-hour-cache main sessions.
 
@@ -565,7 +568,7 @@ An extension that only writes Pi's compaction summaries (a `session_before_compa
 
 **If your extension handles every `session_before_compact`, return `undefined` when `event.customInstructions` starts with `[pi-zip native compaction`.** pi-zip answers its own ask; the marker never reaches Pi's default summariser. The 250 ms slow-handler threshold counts only time other handlers occupy, excluding Pi's own work rebuilding the context after the entry is saved. Every summary notice records its door (`native: "ok"`, or the reason it waited for a draft) in session metadata (`native`, `nativeMs`, `nativeAskMs`).
 
-**Runs an extension starts.** A run triggered by `sendMessage` can begin without `before_agent_start`. Its first request gets the same priced fold decision, and a ready summary waits for the first turn_end, where its compaction draft goes first. Calling `ctx.compact()` at that start would abort the starting run, so the idle door is unavailable. A custom message that starts a run after the previous final answer ends the protected tail like a user prompt. Messages that steer an active run stay part of its current turn.
+**Runs an extension starts.** A run triggered by `sendMessage` has no `input` event; it begins at `agent_start` (Pi 1.1.0) or at a `before_agent_start` whose `messageType` is `"custom"` (Pi 1.2.0), once either way. Its first request gets the same priced fold decision, and a ready summary waits for the first turn_end, where its compaction draft goes first. Calling `ctx.compact()` at that start would abort the starting run, so the idle door is unavailable. A custom message that starts a run after the previous final answer ends the protected tail like a user prompt. Messages that steer an active run stay part of its current turn.
 
 The guard has two parts. Before saving a fold or a summary it checks that the edit itself would not leave a tool result without its tool call (failed or aborted assistant turns, which the provider layer drops anyway, are ignored, as is any oddity the session already had). And before a request is sent it repairs a tool result that lost its tool call, instead of letting the provider reject the request and brick the session. The repair understands the request shapes of Pi's Anthropic, OpenAI chat completions (and Mistral), OpenAI Responses (Azure, Codex), Google Gemini/Vertex and Bedrock Converse providers; a request of any other shape is passed through untouched.
 
