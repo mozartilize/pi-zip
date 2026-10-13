@@ -10,7 +10,9 @@
 // payload); Pi's own SessionManager (projection of context_edit and compaction entries), Pi's draft application
 // (AgentSession._applyBoundaryDrafts), Pi's prepareCompaction (pi-zip's ctx.compact and Pi's own compaction), Pi's CacheWarmer (idle
 // cache warming, with its own economics and timers).
-// What is MIRRORED (not callable without a live model): Pi's agent loop event order (before_agent_start, prompt appended, per request
+// What is MIRRORED (not callable without a live model): Pi's agent loop event order (Pi 1.2.0 by default, PZF_PI=1.1 for 1.1.0: a prompt's
+// input while Pi is idle, then before_agent_start, from which 1.2.0 counts the run as busy, agent_start, the prompt appended; a run an
+// extension's message starts: before_agent_start with messageType "custom" on 1.2.0, agent_start only on 1.1.0; per request
 // context_with_system -> before_provider_request -> assistant message_end -> tool_call -> tool results -> turn_end, then
 // agent_before_settle), the provider (a prefix cache with a TTL that produces usage reports), the narrative model call (a fixed text),
 // the clock and timers (virtual), and pi-zip's index.ts is called as is (only the Zip instance is captured to read its state).
@@ -27,6 +29,7 @@ if (!argv[0]) {
 const SRC = resolve(argv[0]);
 const PI = resolve(argv.includes("--pi") ? argv[argv.indexOf("--pi") + 1] : join(SRC, "../node_modules/@earendil-works/pi-coding-agent"));
 const WORK = process.env.PZF_WORK ?? `/tmp/pz-formal-bridge-${process.pid}`;
+const PI12 = process.env.PZF_PI !== "1.1"; // the event order mirrored: Pi 1.2.0 (default) or 1.1.0
 mkdirSync(WORK, { recursive: true });
 const STATS = join(WORK, "cache-survival.json");
 // isolation: nothing the extension writes leaves WORK (stats, welcome flag, recall copies); the ledger is tapped in memory
@@ -269,6 +272,8 @@ async function runTrace(tr: Any): Promise<Any> {
 		}
 	};
 	let nativeAllowed = false;
+	let piBusy = false; // Pi's run is active (isIdle() false): from before_agent_start on 1.2.0, from agent_start on 1.1.0, to the run's end
+	let compactIdle: boolean | null = null; // isIdle() when pi-zip's newest ctx.compact() was called
 	const hijacked: string[] = []; // compactions pi-zip answered without having asked for them
 	const toolOf = new Map<string, string>(); // tool result entry id -> npm | cat | recall
 	const activeTools = w.tools === "full" ? ["read", "bash", "zip_recall"] : w.tools === "file" ? ["read", "bash"] : ["edit", "write"];
@@ -302,7 +307,7 @@ async function runTrace(tr: Any): Promise<Any> {
 			mode: w.interactive ? "tui" : "print", hasUI: w.interactive, cwd: CWD,
 			// pi-zip waits for a call still running (it says so in the working line): in a slow world that call answers now
 			ui: { notify: () => {}, setWorkingMessage: (text?: string) => { if (text) for (const f of [...slowCalls]) f(); }, setStatus: () => {} },
-			getSystemPrompt: () => sysText, sessionManager: manager, isIdle: () => true,
+			getSystemPrompt: () => sysText, sessionManager: manager, isIdle: () => manager !== sm || !piBusy,
 			// Pi provides abort() even while idle; native compaction is instant here, with no foreign handler to cancel.
 			abort: () => {},
 			modelRegistry: {
@@ -337,6 +342,7 @@ async function runTrace(tr: Any): Promise<Any> {
 	 *  "Already compacted" / "Nothing to compact", session_before_compact supplies the result, appendCompaction. */
 	async function piCompact(manager: Any, handlers: Map<string, Any>, options: Any) {
 		if (manager === sm && !nativeAllowed) nativeIssues.push("native compaction outside the typed idle prompt");
+		if (manager === sm) compactIdle = !piBusy;
 		try {
 			const branch = manager.getBranch();
 			const prep = prepareCompaction(branch, { enabled: true, reserveTokens: 16_384, keepRecentTokens: 20_000 });
@@ -367,7 +373,7 @@ async function runTrace(tr: Any): Promise<Any> {
 		const h = inst.handlers.get(name);
 		if (name === "session_start") captured = null;
 		let r: Any;
-		nativeAllowed = !inst.probe && name === "before_agent_start";
+		nativeAllowed = !inst.probe && name === "input" && !e?.streamingBehavior; // the typed-prompt door: Pi's input event while idle
 		try { r = h ? await h(e, inst.ctx) : undefined; }
 		finally { nativeAllowed = false; }
 		if (name === "session_start") {
@@ -691,7 +697,7 @@ async function runTrace(tr: Any): Promise<Any> {
 	}
 
 	// in-memory Zip state a restart loses, transplanted one group at a time into a fresh process to find which one makes the difference
-	// (the learned class and survival and the cache tier are not in this list: beforeAgentStart reloads them from disk and env)
+	// (the learned class and survival and the cache tier are not in this list: a run's start reloads them from disk and env)
 	const TRANSPLANT: Record<string, string[]> = {
 		g: ["g", "deltas"],
 		justEdited: ["justEdited"],
@@ -741,13 +747,15 @@ async function runTrace(tr: Any): Promise<Any> {
 			await fire(inst, "session_start", { type: "session_start", reason: "resume" });
 			if (transplant && inst.zip) Object.assign(inst.zip, structuredClone(transplant));
 			if (userMsg.role === "custom") {
-				// a run an extension's message starts: agent_start only, then the message (Pi 1.1.0 _runAgentPrompt)
+				// a run an extension's message starts: before_agent_start "custom" on 1.2.0 (_startRun), agent_start, then the message
+				if (PI12) await fire(inst, "before_agent_start", { type: "before_agent_start", messageType: "custom", message: userMsg });
 				await fire(inst, "agent_start", { type: "agent_start" });
 				sm2.appendCustomMessageEntry(userMsg.customType, userMsg.content, userMsg.display);
 				await fire(inst, "message_end", { message: userMsg });
 			} else {
-				await fire(inst, "before_agent_start", { type: "before_agent_start", prompt: userMsg.content, images: [] });
-				await fire(inst, "agent_start", { type: "agent_start" }); // Pi emits it right after before_agent_start (a run an extension's message starts emits only this one)
+				await fire(inst, "input", { type: "input", text: userMsg.content, images: [], source: "interactive" });
+				await fire(inst, "before_agent_start", { type: "before_agent_start", messageType: "user", prompt: userMsg.content, images: [] });
+				await fire(inst, "agent_start", { type: "agent_start" });
 				sm2.appendMessage(structuredClone(userMsg));
 				await fire(inst, "message_end", { message: userMsg });
 				for (const c of probeNextTurn) {
@@ -979,6 +987,7 @@ async function runTrace(tr: Any): Promise<Any> {
 		if (!runOpen) return;
 		if (reqInRun === 0) await request({ say: 100 }, ev);
 		runOpen = false;
+		piBusy = false;
 		if (w.interactive) {
 			sink = [];
 			const out = await fire(live, "agent_before_settle", { type: "agent_before_settle", outcome: "completed", context: boundaryCtx(sm), entries: [] });
@@ -1092,13 +1101,18 @@ async function runTrace(tr: Any): Promise<Any> {
 					const nativeIds = new Set(sm.getBranch().map((x: Any) => x.id));
 					optsSink = [];
 					sink = [];
-					await fire(live, "before_agent_start", { type: "before_agent_start", prompt: text, images: [] });
+					// Pi's prompt(): the input handlers while idle (the native door), then the run's start
+					compactIdle = null;
+					await fire(live, "input", { type: "input", text, images: [], source: "interactive" });
 					const applied = sm.getBranch().findLast((x: Any) => x.type === "compaction" && !nativeIds.has(x.id) && x.details?.by === "pi-zip" && x.details?.via === "native");
+					if (PI12) piBusy = true;
+					await fire(live, "before_agent_start", { type: "before_agent_start", messageType: "user", prompt: text, images: [] });
+					piBusy = true;
+					await fire(live, "agent_start", { type: "agent_start" });
 					nativeLedger = sink.map(slim);
 					nativeGrids = applied ? decisions(optsSink ?? []).map((c: Any) => gridFor({ ...c, at: "native" })) : [];
 					optsSink = null;
-					if (pendingNative && applied) pendingNative.applied = { key: applied.firstKeptEntryId, hash: sha(applied.summary), tokensBefore: applied.tokensBefore, idle: live.ctx.isIdle() };
-					await fire(live, "agent_start", { type: "agent_start" });
+					if (pendingNative && applied) pendingNative.applied = { key: applied.firstKeptEntryId, hash: sha(applied.summary), tokensBefore: applied.tokensBefore, idle: compactIdle === true };
 					const userMsg = { role: "user", content: text, timestamp: clock };
 					const uid = sm.appendMessage(userMsg);
 					blocks.push({ id: uid, ev, kind: "user", tok: tokW(userMsg), est: Math.ceil(text.length / 4), turn, tool: null, req: reqNo });
@@ -1111,8 +1125,9 @@ async function runTrace(tr: Any): Promise<Any> {
 				case "drive": {
 					nativeGrids = [];
 					nativeLedger = [];
-					// a run an extension's message starts (Pi 1.1.0 sendCustomMessage(..., { triggerTurn: true }) -> _runAgentPrompt):
-					// agent_start, the custom message appended, its message_end, the first request; never before_agent_start
+					// a run an extension's message starts (sendCustomMessage(..., { triggerTurn: true })): on 1.2.0 before_agent_start with
+					// messageType "custom" (_startRun), on 1.1.0 none (_runAgentPrompt); agent_start, the custom message appended, its
+					// message_end, the first request
 					await closeRun(ev);
 					if (lastResp) await advance((e.gap ?? 60) * 1000);
 					turn++;
@@ -1123,9 +1138,11 @@ async function runTrace(tr: Any): Promise<Any> {
 					statsAtPrompt = existsSync(STATS) ? readFileSync(STATS, "utf8") : "";
 					const z0: Any = live.zip ?? {};
 					preRun = { je: !!z0.justEdited };
-					await fire(live, "agent_start", { type: "agent_start" });
 					const text = `owed work ${turn}: continue with what was left open`;
 					const cm = { role: "custom", customType: "owed-drive", content: text, display: true, timestamp: clock };
+					piBusy = true;
+					if (PI12) await fire(live, "before_agent_start", { type: "before_agent_start", messageType: "custom", message: cm });
+					await fire(live, "agent_start", { type: "agent_start" });
 					const cid = sm.appendCustomMessageEntry(cm.customType, cm.content, cm.display);
 					blocks.push({ id: cid, ev, kind: "custom", starts: true, tok: tokW(cm), est: Math.ceil(text.length / 4), turn, tool: null, req: reqNo });
 					await fire(live, "message_end", { type: "message_end", message: cm });
@@ -1160,6 +1177,7 @@ async function runTrace(tr: Any): Promise<Any> {
 					// a message typed while the agent runs: Pi delivers it after the tool results, before the next request
 					if (!runOpen) throw new Error(`event ${ev} (steer) outside a run`);
 					const text = `steer ${++steerNo}: also look at the logs`;
+					await fire(live, "input", { type: "input", text, images: [], source: "interactive", streamingBehavior: "steer" }); // Pi's prompt() while streaming
 					const m = { role: "user", content: text, timestamp: clock };
 					const id = sm.appendMessage(m);
 					blocks.push({ id, ev, kind: "user", steer: true, tok: tokW(m), est: Math.ceil(text.length / 4), turn, tool: null, req: reqNo });
