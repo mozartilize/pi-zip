@@ -433,11 +433,12 @@ describe("narrative cost survives unsuccessful responses", () => {
 	test("a successful retry retains the charge of its failed attempt", async () => {
 		let calls = 0;
 		const n = await narrative(buildBlocks([U("u", "work"), A("a")]), { model: { id: "m" }, modelRegistry: { complete: async () => ++calls === 1
-			? { stopReason: "error", errorMessage: "transient error", usage: { cost: { total: 0.02 } } }
-			: { stopReason: "stop", content: [{ type: "text", text: "finished" }], usage: { cost: { total: 0.03 } } },
+			? { stopReason: "error", errorMessage: "transient error", usage: { input: 10, output: 2, totalTokens: 12, cost: { input: 0.01, output: 0.01, total: 0.02 } } }
+			: { stopReason: "stop", content: [{ type: "text", text: "finished" }], usage: { input: 20, output: 4, totalTokens: 24, cost: { input: 0.02, output: 0.01, total: 0.03 } } },
 		} } as Any, 1000);
 		expect(n.ok).toBe(true);
 		expect(n.costUsd).toBe(0.05);
+		expect(n.usage).toEqual({ input: 30, output: 6, totalTokens: 36, cost: { input: 0.03, output: 0.02, total: 0.05 } });
 		expect(calls).toBe(2);
 	});
 });

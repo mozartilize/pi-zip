@@ -880,8 +880,50 @@ describe("real Pi: a summary prepared while the user was away goes in through Pi
 		}
 	});
 
-	for (const abortWait of [false, true]) test(`room replacement retains the call slot until delayed cancellation acknowledgment (Esc=${abortWait})`, async () => {
-		const r = await rig(undefined, { file: template(), tui: true, start: false });
+	for (const door of ["native", "draft"] as const) test(`a retried summary retains every attempt's charge before ${door} application, after it and after restart`, async () => {
+		const r = await rig(undefined, { file: template(240 * 60_000), tui: true, native: true, idle: true, start: false });
+		const ctx = r.runner.createContext(), provider = ctx.modelRegistry.complete;
+		let calls = 0, restarted: Awaited<ReturnType<typeof rig>> | undefined;
+		ctx.modelRegistry.complete = async (...args: Any[]) => ++calls === 1
+			? { stopReason: "error", errorMessage: "transient error", usage: { cost: { total: 0.02 } } }
+			: { ...await provider(...args), usage: { cost: { total: 0.03 } } };
+		try {
+			const view = r.sm.buildSessionProjection().entries;
+			const p = planContext(view, r.zip.opts(ctx, true, view, 0, true).o)!;
+			expect(r.zip.startBg(p, ctx)).toBe(true);
+			expect((await r.zip.bg.promise)?.llmOk).toBe(true);
+			expect(calls).toBe(2);
+			const artifact = r.sm.getEntries().find((e: Any) => e.customType === "pi-zip/summary") as Any;
+			expect(artifact.data.usd).toBe(0.05);
+			expect(r.zip.totals(ctx).usd).toBe(0.05);
+			if (door === "native") {
+				await r.beforeAgentStart();
+				expect(r.compactions).toHaveLength(1);
+				expect(r.compactions[0].details.via).toBe("native");
+			} else {
+				await r.runner.emit({ type: "agent_start" } as Any);
+				r.sm.appendCustomMessageEntry("summary-drive", "continue", true);
+				await r.request();
+				const response = asst([{ type: "text", text: "finished" }]);
+				const drafts = await r.turnEnd(r.sm.appendMessage(response), response);
+				expect(drafts[0]).toMatchObject({ type: "compaction", firstKeptEntryId: p.firstKeptEntryId });
+				expect(r.compactCalls.n).toBe(0);
+			}
+			const compaction = r.sm.getBranch().find((e: Any) => e.type === "compaction") as Any;
+			expect(compaction.usage.cost.total).toBe(0.05);
+			expect(r.zip.totals(ctx)).toMatchObject({ summaries: 1, usd: 0.05 });
+			await r.shutdown();
+			restarted = await rig(undefined, { file: [r.sm.getHeader() as Any, ...r.sm.getEntries()], start: false });
+			expect(restarted.zip.totals(restarted.runner.createContext())).toMatchObject({ summaries: 1, usd: 0.05 });
+		} finally {
+			ctx.modelRegistry.complete = provider;
+			await restarted?.shutdown();
+			await r.shutdown();
+		}
+	});
+
+	for (const abortWait of [false, true]) test(`room replacement supersedes a queued ordinary cut until delayed cancellation acknowledgment (Esc=${abortWait})`, async () => {
+		const r = await rig(undefined, { file: template(240 * 60_000), tui: true, start: false });
 		const ctx = r.runner.createContext();
 		const provider = ctx.modelRegistry.complete;
 		let active = 0, peak = 0;
@@ -902,10 +944,14 @@ describe("real Pi: a summary prepared while the user was away goes in through Pi
 			const old = r.zip.bg;
 			expect(active).toBe(1);
 			const controller = new AbortController();
-			const cutIdx = p.blocks.findLastIndex((b: Any, i: number) => i < p.cutIdx && b.kind === "user");
-			expect(cutIdx).toBeGreaterThan(0);
-			const replacement = { ...p, cutIdx, firstKeptEntryId: p.blocks[cutIdx].entryId,
-				prefixTokens: p.blocks.slice(0, cutIdx).reduce((n: number, b: Any) => n + (p.folds.find((t: Any) => t.entryId === b.entryId)?.phTokens ?? b.tokens), 0) };
+			const options = r.zip.opts(ctx, true, view, 0, true).o;
+			const queued = planContext(view, { ...options, coldCap: 60_000 })!;
+			const replacement = planContext(view, { ...options, coldCap: 40_000 })!;
+			expect(replacement.cutIdx).toBeGreaterThan(0);
+			expect(replacement.firstKeptEntryId).not.toBe(p.firstKeptEntryId);
+			r.zip.discardBg("replaced");
+			expect(queued.firstKeptEntryId).not.toBe(replacement.firstKeptEntryId);
+			expect(r.zip.startBg(queued, ctx)).toBe(false); // an ordinary producer queued its replacement before the room takes ownership
 			let finished = false;
 			const waiting = r.zip.roomWait(replacement, { ...ctx, signal: controller.signal }).then((got: Any) => { finished = true; return got; });
 			await sleep(0);
@@ -925,7 +971,7 @@ describe("real Pi: a summary prepared while the user was away goes in through Pi
 				expect(releases).toHaveLength(2);
 				expect(active).toBe(1);
 				releases[1]();
-				expect((await waiting)?.cut.llmOk).toBe(true);
+				expect((await waiting)?.cut).toMatchObject({ llmOk: true, firstKeptEntryId: replacement.firstKeptEntryId });
 			} else {
 				expect(releases).toHaveLength(1);
 				expect(active).toBe(0);

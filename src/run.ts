@@ -911,6 +911,7 @@ export class Zip implements ZipControl {
 	 * refuses is neither lost nor missing from the totals. null: the call failed or was cancelled.
 	 */
 	private async roomWait(c: PlanResult, ctx: Any): Promise<{ cut: Cut; ms: number } | null> {
+		this.cancelTimer(); // the room owns the slot; invalidate queued ordinary replacements before awaiting cancellation
 		const head = headOf(this.branch(ctx)), key = c.firstKeptEntryId, b = this.bg, w0 = performance.now();
 		const running = !!b && !b.aborted && b.key === key && b.head === head;
 		this.ledger({ type: "room_wait", key, running });
@@ -919,11 +920,12 @@ export class Zip implements ZipControl {
 				this.discardBg("replaced");
 				if (b) await waitFor(b.promise, ctx?.signal); // keep the slot until the provider acknowledges cancellation; Esc ends only the wait
 				if (ctx?.signal?.aborted) return null;
-				this.startBg(c, ctx, true);
+				if (!this.startBg(c, ctx, true)) return null;
 			}
-			return waitFor(this.bg?.promise ?? Promise.resolve(null), ctx?.signal);
+			const call = running ? b : this.bg;
+			return call && !call.aborted && call.head === head && call.key === key ? waitFor(call.promise, ctx?.signal) : null;
 		})());
-		return got ? { cut: { ...got, trigger: "valve", prepared: true }, ms: performance.now() - w0 } : null;
+		return got?.firstKeptEntryId === key ? { cut: { ...got, trigger: "valve", prepared: true }, ms: performance.now() - w0 } : null;
 
 	}
 

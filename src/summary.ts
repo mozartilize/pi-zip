@@ -610,7 +610,12 @@ export async function narrative(prefix: Block[], ctx: Any, budgetTokens: number,
 					{ maxTokens: NARRATIVE_MAX, signal, cacheRetention: "none", sessionId: randomUUID() },
 				);
 				costUsd += Number(res.usage?.cost?.total) || 0;
-				usage = res.usage ?? usage;
+				if (res.usage) {
+					const { cost, ...tokens } = res.usage;
+					usage ??= { cost: {} };
+					for (const [k, v] of Object.entries(tokens)) usage[k] = (Number(usage[k]) || 0) + (Number(v) || 0);
+					for (const [k, v] of Object.entries(cost ?? {})) usage.cost[k] = (Number(usage.cost[k]) || 0) + (Number(v) || 0);
+				}
 				if (res.stopReason === "aborted" || signal.aborted) return { text: null, ok: false, ms: Date.now() - t0, costUsd, usage, error: "narrative aborted" };
 				if (res.stopReason === "error") throw new Error(res.errorMessage || "provider error");
 				if (res.stopReason === "length") throw new Error("narrative hit the token cap");
