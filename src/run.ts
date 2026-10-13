@@ -85,6 +85,7 @@ interface Start {
 	nat: NativeRun | null;
 	foreign: boolean;
 	head: string; // the projection's head once the input is done: another compaction before the run voids the carried decision
+	model: string; // the model it was read for: another model chosen before the run (a before_agent_start handler, say) voids it too
 }
 
 export class Zip implements ZipControl {
@@ -593,6 +594,8 @@ export class Zip implements ZipControl {
 	 *  durable-subagents' attention). */
 	private startKind: "prompt" | "driven" | null = null;
 	private starting: Promise<void> | null = null;
+	private inputBusy = false; // an idle input is being handled (its native compaction may be in flight): a second one is not
+	private runStarts = 0; // runs announced so far: an input's decision goes to no run that started while it was being handled
 
 	/** Pi's input event of a prompt (typed, or an extension's sendUserMessage). Pi waits for it before it expands the prompt and starts the
 	 *  run, and is idle here on Pi 1.1.0 and 1.2.0 (1.2.0 counts the starting run as busy from before_agent_start on, and compact() would
@@ -602,6 +605,19 @@ export class Zip implements ZipControl {
 	 *  streaming) belongs to the run in progress. */
 	async input(e: Any, ctx: Any): Promise<void> {
 		if (e?.streamingBehavior) return;
+		// Pi emits the same idle input for steer()/followUp() called while idle (RPC, the TUI's queue after a compaction): no field tells it
+		// from a prompt. Two inputs can overlap (that queue sends a prompt and then its rest without waiting): the second gate check could
+		// pass before the first ctx.compact() sets Pi's controller (compact awaits abort() first). The later one is skipped and changes nothing.
+		if (this.inputBusy) return void this.ledger({ type: "native_skip", reason: "an earlier input is still being handled" });
+		this.inputBusy = true;
+		try {
+			await this.idleInput(e, ctx);
+		} finally {
+			this.inputBusy = false;
+		}
+	}
+
+	private async idleInput(e: Any, ctx: Any): Promise<void> {
 		this.start = null; // a new prompt: what an earlier one decided (it started no run) is dropped
 		this.startKind = null;
 		let idle = false;
@@ -612,6 +628,7 @@ export class Zip implements ZipControl {
 		this.detectConflict(ctx);
 		if (!this.active()) return;
 		this.liveCtx = ctx;
+		const runs = this.runStarts;
 		const s = await this.readStart(ctx, true);
 		const ready = readyOf(this.branch(ctx), this.mine).length > 0;
 		if (s.clk.cold && this.bg && !ready) s.note = { native: "summary not finished when the prompt came" };
@@ -627,12 +644,14 @@ export class Zip implements ZipControl {
 			if (gen !== this.timerGen) this.armProducer(ctx); // the timer stopped for the compaction: armed again, as if no prompt had come
 		}
 		s.head = headOf(this.branch(ctx));
-		this.start = s;
+		if (runs === this.runStarts) this.start = s; // a run that started meanwhile is not this prompt's: it read its own start
+		else this.ledger({ type: "start_dropped", reason: "a run started while the prompt's input was handled", native: !!s.nat });
 	}
 
 	/** before_agent_start: the prompt's run (its input carried the decision), or on Pi 1.2.0 a run an extension's message starts
 	 *  (messageType "custom"), which begins here, once, as a driven run. */
 	async beforeAgentStart(ctx: Any, e?: Any): Promise<void> {
+		this.runStarts++;
 		if (e?.messageType === "custom") {
 			this.start = null;
 			this.startKind = "driven";
@@ -647,6 +666,7 @@ export class Zip implements ZipControl {
 	 *  start-of-run handling, minus Pi's compaction (ctx.compact() aborts the run that is starting): a prepared summary waits for turn_end. */
 	async agentStart(ctx: Any): Promise<void> {
 		const kind = this.startKind, s = this.start;
+		this.runStarts++;
 		this.startKind = null;
 		this.start = null;
 		if (kind === "driven") return;
@@ -694,7 +714,7 @@ export class Zip implements ZipControl {
 			if (en.data?.policy === PRODUCT && clk.cold && Array.isArray(en.data.targets)) settleIds = en.data.targets.map((t: Any) => (typeof t === "string" ? t : t?.entryId)).filter((x: Any) => typeof x === "string");
 			break;
 		}
-		return { clk: { ...clk, pause: viaPrompt && clk.pause }, settleIds, note: null, nat: null, foreign: false, head: headOf(branch) };
+		return { clk: { ...clk, pause: viaPrompt && clk.pause }, settleIds, note: null, nat: null, foreign: false, head: headOf(branch), model: modelKey(ctx.model) };
 	}
 
 	private async beginRun(ctx: Any, viaPrompt: boolean, carried: Start | null = null): Promise<void> {
@@ -718,8 +738,10 @@ export class Zip implements ZipControl {
 		if (!this.active()) return;
 		const branch = this.branch(ctx);
 		// another compaction went in between the prompt's input and its run (Pi's own, say): the decision priced another projection
-		if (carried && carried.head !== headOf(branch)) {
-			this.ledger({ type: "start_dropped", reason: "the projection changed between the prompt and its run", native: !!carried.nat });
+		// or another model was chosen (the clock, the settings and the retention were read for the old one)
+		const changed = !carried ? null : carried.head !== headOf(branch) ? "the projection" : carried.model !== modelKey(ctx.model) ? "the model" : null;
+		if (carried && changed) {
+			this.ledger({ type: "start_dropped", reason: `${changed} changed between the prompt and its run`, native: !!carried.nat });
 			carried = null;
 		}
 		const s = carried ?? (await this.readStart(ctx, viaPrompt));
