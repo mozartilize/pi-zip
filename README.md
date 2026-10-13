@@ -483,6 +483,11 @@ No cell of 4 price/cache regimes × 8 session strata has a cost-ratio confidence
 - **Per-item need rates are not observable.** They enter as classes (the protection window, 60 requests, 500 tokens) and as
   claim 8's ordering assumption.
 - **κ is a class ratio, not your price table.** A factor-2 error costs at most 6 % in the EOQ model.
+- **On Pi 1.2.0 the typed-prompt door is closed.** Pi 1.2.0 counts a starting run as busy during `before_agent_start`, and a
+  native compaction there would abort the run, so pi-zip does not ask for one. A summary ready at a typed prompt then enters
+  as the first draft at that run's first turn end: same summary, same exact "Compacted from" number, but the run's first
+  requests still carry the history it replaces. All doors are checked in a real TUI on Pi 1.1.0; on 1.2.0 the two draft doors
+  are. 0.3.1 behaves the same on 1.2.0.
 - **Offline is not live.** The model's behaviour after a fold comes from a calibrated simulator, and the cells to watch live are
   one-hour-cache main sessions.
 
