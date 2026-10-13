@@ -87,22 +87,18 @@ describe("summary gate", () => {
 		expect(s.prefixTokens).toBe(r.prefixTokens);
 		expect(s.folds).toHaveLength(0);
 	});
-	test("one summary per warm stretch: noSummary blocks a second cut below the compaction room, not at it", () => {
-		const view = [...sumCtx, U("u4", "back")];
-		expect(planContext(view, opts({ coldCap: 6000, promptPending: false, law: at(1, 500) }))!.cutIdx).not.toBeNull();
-		expect(planContext(view, opts({ coldCap: 6000, promptPending: false, law: at(1, 500), noSummary: true }))?.cutIdx ?? null).toBeNull();
-		const tiny = { contextWindow: 60_000 }; // ~83K estimated context is above this room
-		expect(planContext(view, opts({ coldCap: 6000, promptPending: false, law: at(1, 500), noSummary: true, model: tiny }))!.cutIdx).not.toBeNull();
-	});
-	// review P0-1 (design): "one summary per warm stretch" never expired; it now lapses once the context has grown back to the size the
-	// last summary started from (the growth since is at least what it removed: a second summary gains what the first did)
-	test("noSummary lapses at regrowAt: a context grown back to the size the last summary started from may be summarised again", () => {
-		const view = [...sumCtx, U("u4", "back")];
-		const p = planContext(view, opts({ coldCap: 6000, promptPending: false, law: at(1, 500) }))!;
-		const now = p.ctxAfterFolds; // the real context after folds the regrow rule compares
-		expect(planContext(view, opts({ coldCap: 6000, promptPending: false, law: at(1, 500), noSummary: true, regrowAt: now + 1 }))?.cutIdx ?? null).toBeNull();
-		expect(planContext(view, opts({ coldCap: 6000, promptPending: false, law: at(1, 500), noSummary: true, regrowAt: now }))!.cutIdx).toBe(p.cutIdx);
-		expect(planContext(view, opts({ coldCap: 6000, promptPending: false, law: at(1, 500), noSummary: false, regrowAt: now + 1 }))!.cutIdx).toBe(p.cutIdx); // no flag: nothing to lapse
+	test("successive warm summaries pay below the previous starting size without a regrowth budget", () => {
+		const o = opts({ coldCap: 6000, promptPending: false, law: at(1, 500) });
+		const first = planContext([...sumCtx, U("u4", "back")], o)!;
+		const summary = "S".repeat(4 * first.summaryTokensPlanned);
+		const comp = { sourceEntry: { type: "compaction", id: "cmp", details: { by: "pi-zip" } }, messages: [{ role: "compactionSummary", summary }] };
+		const view = [comp, U("u3", "three"), AX("a5", 160_000), U("u4", "four"), A("a6"), U("u5", "five"), A("a7")];
+		const second = planContext(view, o)!;
+		expect(second.ctxAfterFolds).toBeLessThan(first.ctxAfterFolds);
+		expect(second.firstKeptEntryId).toBe("u4");
+		expect(second.prefixTokens).toBeGreaterThanOrEqual(2 * second.summaryTokensPlanned);
+		// The new turn boundary makes fresh prose eligible; the protected turns and the carried summary still stay.
+		expect(second.blocks[second.cutIdx!].userTurn).toBe(second.userTurns - 1);
 	});
 	test("the next summary is planned at least as big as the previous one it carries (no re-summary of a small new prefix)", () => {
 		const SUM = "S".repeat(48_000); // previous summary ~12K tokens, as in a real migrated session

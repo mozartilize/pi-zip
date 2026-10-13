@@ -172,7 +172,7 @@ describe("one producer prepares the return with one timer", () => {
 		if (state.delay) await sleep(state.delay);
 		return { stopReason: "stop", content: [{ type: "text", text: "## Decisions\nnarrative" }], usage: { input: 11, output: 22, cacheRead: 0, cacheWrite: 0, cost: { total: 0.02 } } };
 	};
-	const settle = (r: Any) => r.fire("agent_before_settle", { context: { contextEntries: done }, entries: [] });
+	const settle = (r: Any, entries = done) => r.fire("agent_before_settle", { context: { contextEntries: entries }, entries: [] });
 	const comeBack = async (r: Any, settled: Any, ts: number) => {
 		r.ctx.sessionManager.getBranch = () => [...branchOf(done, ts), ...(settled?.entries?.length ? [settled?.entries.at(-1)] : [])];
 		r.ctx.sessionManager.buildSessionProjection = () => ({ entries: back });
@@ -180,21 +180,14 @@ describe("one producer prepares the return with one timer", () => {
 		return r.fire("context_with_system", { messages: flat(back) });
 	};
 	beforeEach(() => { process.env.PI_ZIP_COLD_CAP = "6000"; process.env.PI_ZIP_TTL_SECS = "0.1"; });
-	/** The away timer's own tests: a summary was already made in this warm stretch (restored from the branch at session_start), so a
-	 *  warm return would not summarise again and settle starts nothing early (rule A); only the cold plan has a cut. */
-	const coldOnly = async <T extends Any>(r: T): Promise<T> => {
-		const sm = (r as Any).ctx.sessionManager, branch = sm.getBranch;
-		sm.getBranch = () => [...branch(), { type: "compaction", id: "prior", details: { by: "pi-zip" } }];
-		await (r as Any).fire("session_start", {});
-		sm.getBranch = branch;
-		return r;
-	};
+	// A short prose prefix pays at a cold pause, but not for a warm return: no immediate rule-A production.
+	const pauseOnly = [U("u1", "one"), AX("a1", 40_000), U("u2", "two"), A("a2"), U("u3", "three"), A("a3")];
 	// the summary loads Pi's serializer lazily; cold, that import alone outlasts the 120 ms these tests leave the away timer
 	beforeAll(async () => { await import("@earendil-works/pi-coding-agent"); });
 
 	test("settle stores no second plan artifact; a paying pause is prepared and adopted without a second call", async () => {
 		const st = { calls: 0 };
-		const r = await coldOnly(await rig(done, COLD_TS(), { modelRegistry: { complete: mkComplete(st) } }));
+		const r = await rig(done, COLD_TS(), { modelRegistry: { complete: mkComplete(st) } });
 		expect(await settle(r)).toBeUndefined();
 		await sleep(100);
 		expect(st.calls).toBe(1);
@@ -208,8 +201,8 @@ describe("one producer prepares the return with one timer", () => {
 	test("a run cancels the future pause timer", async () => {
 		process.env.PI_ZIP_TTL_SECS = "300";
 		const st = { calls: 0 };
-		const r = await coldOnly(await rig(done, WARM_TS(), { modelRegistry: { complete: mkComplete(st) } }));
-		await settle(r);
+		const r = await rig(pauseOnly, WARM_TS(), { modelRegistry: { complete: mkComplete(st) } });
+		await settle(r, pauseOnly);
 		await r.fire("before_agent_start", {});
 		await sleep(50);
 		expect(st.calls).toBe(0);
@@ -220,9 +213,9 @@ describe("one producer prepares the return with one timer", () => {
 		const timers: Any[] = [];
 		(globalThis as Any).setTimeout = (...a: Any[]) => { const h = (realSet as Any)(...a); timers.push(h); return h; };
 		try {
-			const r = await coldOnly(await rig(done, COLD_TS(), { modelRegistry: { complete: mkComplete({ calls: 0 }) } }));
+			const r = await rig(pauseOnly, WARM_TS(), { modelRegistry: { complete: mkComplete({ calls: 0 }) } });
 			process.env.PI_ZIP_TTL_SECS = "3600";
-			await settle(r);
+			await settle(r, pauseOnly);
 			await r.fire("before_agent_start", {}); // cancel before it could fire
 			expect(timers.some((h) => typeof h.hasRef === "function" && h.hasRef() === false)).toBe(true);
 		} finally {
@@ -337,8 +330,8 @@ describe("one producer prepares the return with one timer", () => {
 	test("off cancels the future pause timer and warming decisions never wake it", async () => {
 		process.env.PI_ZIP_TTL_SECS = "300";
 		const st = { calls: 0 };
-		const r = await coldOnly(await rig(done, WARM_TS(), { modelRegistry: { complete: mkComplete(st) } }));
-		await settle(r);
+		const r = await rig(pauseOnly, WARM_TS(), { modelRegistry: { complete: mkComplete(st) } });
+		await settle(r, pauseOnly);
 		expect(await r.fire("cache_warming_decision", { action: "stop" })).toBeUndefined();
 		expect(await r.fire("cache_warming_decision", { action: "warm" })).toBeUndefined();
 		await r.handlers.get("cmd:zip").handler("off", r.ctx);

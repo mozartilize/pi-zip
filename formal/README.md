@@ -111,21 +111,21 @@ otherwise. The round-2 excuses (a turn_end valve mid-run, a return a switch made
 | EN | exact compaction number | I1 | □ exact_number | every summary enters natively at an idle typed prompt or as the first turn_end draft; Pi's appended tokensBefore equals pi-zip's before; every notice and fold ledger after-size is non-negative and matches the resulting Pi projection/request within 10%, counted independently of the reported savings |
 | OC | one call and one timer | A3 | □(active_calls ≤ 1 ∧ production_timers ≤ 1 ∧ direct_timer_writes = 0) | provider calls and producer-owned timer handles are observed independently of ledger wording; a timer only starts production, whose completion records its artifact |
 | I1 | run stability | A2 | □(¬run_start ∧ ¬zip_edit ∧ ¬env → prefix_kept) ∧ □ persisted_as_sent | a byte change no priced edit explains is an unpriced rewrite; persisting something other than what was sent rewrites at the next request |
-| RD | restart determinism | A2, A3 | □(run_start → fresh_plans_alike) | the law, b2b and one-summary rules must be functions of the session, or a restart re-decides on different state; produced summaries are pi-zip/summary entries (0.4.0), so only a call in flight at the restart is the process's own |
+| RD | restart determinism | A2, A3 | □(run_start → fresh_plans_alike) | the law and b2b must be functions of the session, or a restart re-decides on different state; produced summaries are pi-zip/summary entries (0.4.0), so only a call in flight at the restart is the process's own |
 | RC | recall is never refolded | A1, A2 | □ recall_kept | refolding what the model asked for hides it again and invites the same recall: a rewrite each time |
 | PW | protection windows | A1 | □ protection_respected | the latest two user turns stay: their outputs fold only if re-readable in the previous turn after a pause (an absence ≥ the requested TTL τ) or a model switch, whatever P (0.4.0), or ≥ 60 requests old; a summary never cuts into them |
 | B2B | no back-to-back warm rewrites | A2 | □(zip_edit → ¬○(zip_edit ∧ cache_warm ∧ planned_warm ∧ ¬room_wait)) | the second rewrite pays the write twice for one saving; 0.4.0: a rewrite the room wait makes is excused (b2b does not block it, theory 1.3 R6) |
 | MP | monotone in P(warm) | A2 | □ monotone_in_p | an edit is never cheaper at a warm cache than at a cold one: at every decision point, re-planned on a grid of P with everything else fixed, the plan at a lower P covers or beats (smaller context, or the cold target reached) the plan at a higher P; structural since 0.4.0 (one planner: P enters only the law) |
 | NR | time consistency (no regret) | A2, A3 | □(cold_plan → [i0:=i] ¬(quiet U≤10 (i > i0 ∧ zip_edit ∧ planned_warm))) | an edit is free cold and paid warm: a warm edit within 10 requests of a cold plan with no new information means the cold plan was dominated; a later decision taking the summary that cold return produced because it was not ready is excused |
-| NT | no thrash | A2, A3 | □(zip_summary → [s0:=start] ¬○(¬cold_plan U (zip_summary ∧ ¬cold_plan ∧ ¬at_room ∧ start < s0·(1−TOL)))) ∧ □(zip_summary → summary_worth_it) | two summaries in one warm stretch are two uncached calls for one saving, unless the context has grown back to the size the first one started from (then the second gains what the first did); a summary that removes less than it writes, or works within a minimal summary of the floor (system prompt + previous summary + protected turns), is a summary for nothing |
-| WL | a warm summary that pays is not withheld | A2, A3 | □ warm_summary_not_withheld | **completeness** (every other property is safety, and a pi-zip that never summarises passes them): (a) every warm turn_end of a request that did not fail asks the valve, unless b2b or the run plan is persisted there; (b) a warm decision the one-summary flag constrained, re-planned with the flag lifted, withholds a summary whose summary step and whole-plan step (call priced) pass with Φ ≥ 1.25 only while a pi-zip summary (or a foreign compaction) was made since the last cold plan and the context has not grown back past the size it started from (10%); (c) restated in 0.4.0: a summary a decision wants is produced at once and taken at the first decision after it is ready, so no decision produces again a summary whose call returned while its range is still the session's prefix |
-| NA | the open native door takes a ready summary that pays | A2, A3 | □ native_ready_applied | at a typed idle prompt, outside b2b and Q2, the deepest guarded ready artifact no deeper than c (or cW without c) that passes both laws with call price zero must enter through the native door before the first request; readiness comes from session artifacts, prices and law verdicts from the Rust spec, and application from the compaction actually appended, independently of `take` or `native_skip` ledger wording |
+| NT | no thrash | A2, A3 | □(zip_summary → summary_worth_it) | a summary must remove at least what it writes, above the irreducible floor (system prompt, previous summary, protected turns); successive summaries are priced by the law without a warm-stretch budget or regrowth exception (0.4.0 step 7) |
+| WL | a warm summary that pays is not withheld | A2, A3 | □ warm_summary_not_withheld | every warm turn_end decides unless b2b or a run plan is being persisted; a wanted summary is produced at once and taken at the first decision after it is ready, so a returned call whose range is still the prefix is never produced again |
+| NA | the open native door takes a ready summary that pays | A2, A3 | □ native_ready_applied | at a typed idle prompt, outside b2b, the deepest guarded ready artifact no deeper than c (or cW without c) that passes both laws with call price zero must enter through the native door before the first request; readiness comes from session artifacts, prices and law verdicts from the Rust spec, and application from the compaction actually appended, independently of `take` or `native_skip` ledger wording |
 | PC | Pi's own compaction is not left to happen | A1, A3 | □ room_wait_kept | 0.4.0: a request of a run at Pi's own threshold (window − reserve, 8,192 above pi-zip's room) follows a turn_end that waited at the room or wrote a summary, unless that turn_end failed, decided and planned no cut (the room plan's cut must pass the law with its call), or the protected turns fill the room; the run plan's turn_end and a b2b skip are not excused (theory 1.4 R6, R9) |
 | TR | target reachability | A2 | □(cold_plan → target_reached_or_excused) | the cold return is the one free rewrite: it reaches the cold target (±15%) unless the floor fills it, the law refused the summary (or, at P > 0, the plan: then the rewrite is priced, not free), or (0.4.0) it took a summary produced earlier that cuts short of its own cut (never deeper: the paid call is used; the target is reached once the deeper one is ready) |
 | GC | a gone cache gets a cold plan | A2 | □ gone_is_cold | README rule 2, "after the TTL, or after switching model, pi-zip folds": a run after a model switch is planned at P = 0; a run whose cache was last touched (a response that reached the provider, or Pi's refresh) longer ago than the requested TTL τ, or a switch, is marked a pause, and longer ago than both τ and the kept TTL is planned cold |
 | WB | warm does nothing below the target | A2 | □(zip_edit ∧ planned_warm → warm_above_target) | README rule 2, "while the cache is warm it does nothing" except the valve above the target: a new edit planned at P ≥ 0.5 comes from a request (real size) above the cold target (15% tolerance) |
 | MH | an automatic cache keeps its head | A2 | □ head_kept | README: on an automatic prefix cache every edit leaves the first 8K tokens alone, so the response right after a fold still says whether the cache survived (folds only; a cut replaces the prefix, and the first request to a new model is no sample) |
-| RDr, MPr, A2r | residuals | RD, MP, A2 | the property, minus the known root causes | RD after transplanting the three fields TRIAGE (a) 1 names together (g, justEdited, summarizedWarm), or where the live process took a summary call still in flight (0.4.0: a finished one is a pi-zip/summary entry the fresh process reads too); MP outside the mechanisms TRIAGE (a) 3 and 6 name; A2 outside B1 and the plan gate without the call (TRIAGE (a) 2). RD, MP and A2 fail in thousands of traces on 0.2.8 and affine; a new bug of their kind shows up only here (and in the per-trace verdicts) |
+| RDr, MPr, A2r | residuals | RD, MP, A2 | the property, minus the known root causes | RD after transplanting growth and edit state together (g, justEdited), or where the live process took a summary call still in flight (0.4.0: a finished one is a pi-zip/summary entry the fresh process reads too); MP outside the mechanisms TRIAGE (a) 3 and 6 name; A2 outside B1 and the plan gate without the call (TRIAGE (a) 2). RD, MP and A2 fail in thousands of traces on 0.2.8 and affine; a new bug of their kind shows up only here (and in the per-trace verdicts) |
 | LW | the law as specified | A2 | □ law_as_specified | every law evaluation of the real planner equals `law.rs` on the same inputs **at the class ratios** of the true class and tier (learn.ts `CLASS_RATIOS`, which satisfy the lemmas' premise w ≥ r > 0, a unit test); a summary step's call term, backed out of K, is at least half the uncached read of what it summarises; the whole plan's step is pinned both ways by the planner's own cut flag: a cut's step carries exactly the call of the summary step before it, a folds-only plan's step none, and a planned cut ends in an accepted step that carries one; so the lemmas below apply to the code |
 | G, W | harness fidelity | | | the P-grid re-plan at the actual P reproduces the decision run.ts acted on; the bridge's provider keeps the cache exactly as the spec's clock says |
 
@@ -139,11 +139,10 @@ prompt later.
 
 **Monotonicity** is checked at every decision point of every trace by re-planning with the real `planContext` and the captured
 options (entries, scale, prices, g, recalled set, pause), varying only P over {0, .25, .49, .51, .75, 1} plus the actual P (since
-0.4.0 P enters only the law; the one summary per warm stretch and b2b still read P ≥ 0.5). At an actual cold return, a warm probe sees the state a
-warm return would have seen: `summarizedWarm` as it stood before the return (a cold return resets it), and the b2b rule (a warm
-return right after an edited request plans nothing). Property G checks that the probe reproduces the actual decision.
+0.4.0 P enters only the law; b2b still reads P ≥ 0.5). At an actual cold return, a warm probe keeps the b2b rule:
+a warm return right after an edited request plans nothing. Property G checks that the probe reproduces the actual decision.
 
-The NA probe snapshots the session before `before_agent_start`, including ready artifacts, eligible cut sizes, b2b and Q2 state,
+The NA probe snapshots the session before `before_agent_start`, including ready artifacts, eligible cut sizes and b2b state,
 and whether Pi can compact while idle. It shares the source's folding and structural guard mechanics, but supplies no ready keys
 to that folds-only probe and consumes no native planner verdict. Rust computes cW, c, the allowed ready cut and both economic laws
 with its own class prices. The bridge supplies Pi's idle `abort()` capability as well as `compact()` so native worlds exercise that
@@ -215,9 +214,8 @@ in rc030 are other candidate-set effects (TRIAGE.md).
   model answers instantly with as many words as summary.ts asks for (summary *content* quality is not checked, only what A1
   requires of it); Pi's compaction uses `keepRecentTokens` 20,000 and a fixed summary text; another extension's edit always prunes
   the oldest visible output; the cache warmer's refresh is a 1-token request that re-sends the newest prefix.
-* **WL's oracle is the planner.** WL (b) re-plans a warm decision with the one-summary flag lifted: a planner that never proposes a
-  summary has the same oracle. WL (a) sees a valve that is never asked; LW, MP and TR see a broken law or candidate search. A
-  planner-independent oracle (the spec pricing the best cut itself with `law.rs`) is not built.
+* **WL's bounds.** The observer checks decision points and reuse of finished calls; NA separately supplies an independent oracle
+  for taking a ready summary at the native door. An independent oracle for every possible production cut is not built.
 * **Taken from the code, not derived.** A2 reads g (the growth per request in the law's read term) from the planner's own trace:
   how the session's growth should be measured is pi-zip's choice (README "measured in the session"), and RD already shows that g
   is lost on a restart. The protection window (2 user turns, 60 requests) is restated in the spec, not read from the code.
@@ -226,13 +224,13 @@ in rc030 are other candidate-set effects (TRIAGE.md).
   then `agent_before_settle`); the provider and its usage reports; Pi's `AgentSession.compact()` around the real
   `prepareCompaction`; the clock and timers (virtual `Date` and `setTimeout`); the payload pi-ai would build (Anthropic shape
   only: the guard's OpenAI, Responses, Google and Bedrock paths do not run). Called for real: pi-zip's `index.ts` wiring and
-  everything below it (run.ts cold detection, run plan, valve, b2b skip, summarizedWarm, pause, away timer, native
+  everything below it (run.ts cold detection, run plan, valve, b2b skip, pause, producer timer, native
   compaction, persistence at turn_end, learning, steering marks, the `tool_call` hook, the payload tier, `guard.ts`
   `repairPayload`, the `zip_recall` tool's `execute`), Pi's `SessionManager`, `AgentSession._applyBoundaryDrafts`,
   `prepareCompaction`, `convertToLlm` and `CacheWarmer`.
 * **Probes.** MP re-plans with `planContext` and the options run.ts passed (captured by wrapping `Zip.prototype.opts`); RD runs a
   second pi-zip instance on a snapshot of the session and of the learned-survival file, at the instant the live request was sent,
-  and to name the cause transplants the live in-memory fields into it (g, justEdited, summarizedWarm, clock; the learned class
+  and to name the cause transplants the live in-memory fields into it (g, justEdited, clock; the learned class
   and survival are not transplanted: `beforeAgentStart` reloads them from disk). A1's recall round trips run on a third pi-zip
   instance on the live session, so they never touch the live instance's state.
 * **Options.** `--plan-opts '{"inturnAge":20}'` merges planner options into every `planContext` call (an ablation without
@@ -310,8 +308,9 @@ as turns, PW 0 → 1,932; m06 explicit w 1.25 → 0.3, LW 0 → 25,449; m25 summ
 m26 warm below the cap, WB 4 → 692 (new class). m15 (`summarizedWarm` ignored) moves NT 4 → 28 in its existing class: caught
 by the per-trace verdicts only. m03 and m04 are now caught by A1 itself (0 → 5,523 and 0 → 5,218; m04 before only by I1).
 
-`tests/mutants.rs` keeps one mutant per property as a regression test (A1 ×5, A2/LW, A3 ×4, I1, RC ×3, PW ×4, B2B, NT, TR ×3, GC ×4,
-WB, MH, LW ×2, MPr, RDr, WL ×3, PC; round 4 added WL, PW over `nextturn`, GC over `drive` and two TR over `drive`; round 5 two A3 over rule B, see TRIAGE.md) and shows that W, G and LW's arithmetic fail on a tampered observation.
+`tests/mutants.rs` keeps one mutant per property as a regression test (A1 ×5, A2/LW, A3 ×4, I1, RC ×3, PW ×4, B2B, TR ×3, GC ×4,
+WB, MH, LW ×2, MPr, RDr, WL, PC; round 4 added WL, PW over `nextturn`, GC over `drive` and two TR over `drive`; round 5 two A3 over rule B, see TRIAGE.md) and shows that W, G, LW arithmetic and NT summary value fail on a tampered observation. Step 7 removes
+`wl_the_one_summary_flag_lapses` and `wl_a_restart_knows_a_driven_cold_wake` because Q2 and its restore walk are deleted.
 
 ## Checks in real Pi integration
 
@@ -360,3 +359,9 @@ history starts no call, while a completed run prepares its next return in the ba
 Step 6 checks run `bash formal/tui/r7-doors.sh` under the machine lease. The real TUI and local fake provider exercise a typed
 prompt, a driven run and a mid-run boundary. Each checks the displayed “Compacted from” against the appended compaction and
 pi-zip's recorded before size. Histories, settings, cache and captured output stay isolated under `formal/out`.
+
+Step 7 drops Q2 and checks the shipped plain-law policy with `formal/simulator/r7_q2.py`. Run separate `b1` and `b2` processes,
+then `report`, passing `--bench "$BENCH_DIR" --out formal/out/s7/simulator` from the repository root, under the machine lease.
+Each invocation checks the source for the deleted fields and runs the Pi restart regression before evaluating the policy. The
+report requires 0 of 32 failing cells against V3g and prints the edge cells to watch live. This is a simulation of the shipped
+policy; the formal bridge and Pi integration tests cover TypeScript event order, persistence and restart behavior independently.

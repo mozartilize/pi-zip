@@ -411,7 +411,6 @@ pub struct State0 {
     pub cold: bool,
     pub p_warm: Option<f64>,
     pub pause: bool,
-    pub summarized_warm: bool,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -494,26 +493,9 @@ pub struct Grid {
     pub mode: String,
     pub p: f64,
     pub pause: bool,
-    pub no_summary: bool,
-    /// with no_summary: the real context (after folds) at which the flag lapses (the size the stretch's summary started from)
-    pub regrow_at: Option<f64>,
     pub g: Option<f64>,
     pub pr: Option<Prices>,
     pub grid: Vec<GridPt>,
-    /// WL's oracle: a warm decision the one-summary flag constrained, planned again at the actual P with the flag lifted
-    pub free: Option<FreePlan>,
-}
-
-/// The plan a warm decision would have made without the one-summary-per-warm-stretch flag (everything else as captured).
-#[derive(Clone, Debug, Default, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct FreePlan {
-    pub plan: bool,
-    pub cut: Option<String>,
-    pub folds: Vec<String>,
-    pub after_folds: Option<f64>,
-    pub law: Vec<LawStep>,
-    pub error: Option<String>,
 }
 impl Grid {
     pub fn actual(&self) -> Option<&GridPt> {
@@ -529,8 +511,6 @@ impl Grid {
 pub struct ZipState {
     pub g: Option<f64>,
     pub just_edited: bool,
-    pub summarized_warm: bool,
-    pub summary_regrow: Option<f64>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -544,7 +524,7 @@ pub struct Fresh {
     pub fresh_plan: Vec<Value>,
     /// in-memory state groups whose transplant into the fresh process makes it plan like the live one (g, justEdited, ...)
     pub fixed_by: Vec<String>,
-    /// the three fields TRIAGE names (g, justEdited, summarizedWarm) transplanted together make the fresh process plan alike
+    /// growth and edit state transplanted together make the fresh process plan alike
     pub fixed_by_known: bool,
     pub fixed_by_all: bool,
 }
@@ -558,7 +538,6 @@ pub struct NativeDoor {
     pub g: f64,
     pub known: bool,
     pub b2b: bool,
-    pub no_summary: bool,
     pub before: f64,
     pub after_folds: f64,
     pub target: f64,

@@ -6,7 +6,7 @@ import { dirname, join } from "node:path";
 import { lastMessageMs, lastPrompt, modelKey, payloadRetention, refused, ttlFor } from "./cache.ts";
 import { agentDir, curve, describe, lawPrices, loadStats, pWarm, record, sample, statsPath, GAP_EDGES, type Entry } from "./learn.ts";
 import { repairPayload } from "./guard.ts";
-import { candidateOf, decideEdits, checkEdits, clock, decideRun, inRunClock, want, decideTurnEnd, grow, headOf, lastRegrow, planOpts, readyOf, runPlanOf, scaleOf, summarizedSince, unusedOf, valvePlanOf, SUMMARY_CUSTOM, type Artifact, type Avail, type Env, type Learned } from "./core.ts";
+import { candidateOf, decideEdits, checkEdits, clock, decideRun, inRunClock, want, decideTurnEnd, grow, headOf, planOpts, readyOf, runPlanOf, scaleOf, unusedOf, valvePlanOf, SUMMARY_CUSTOM, type Artifact, type Avail, type Env, type Learned } from "./core.ts";
 import { fmtK, Stats, noticeDesc, noticeText, type NoticeAction, type NoticeData, type ZipControl } from "./notice.ts";
 import { applyPlanToMessages, buildBlocks, countUserTurns, G0, keepRecentTokensFor, piCanCompact, piContextTokens, reserveTokensFor, sizeOf, wireTokensOf, UNIT, type Block, type Cut, type FoldTarget, type PlanOpts, type PlanResult, type RunPlan, type Scale, type SysInfo } from "./plan.ts";
 import { handleFor, PH_MARK, RECALL_TOOL } from "./placeholder.ts";
@@ -147,10 +147,6 @@ export class Zip implements ZipControl {
 	entryRenderer = false;
 	private coldWhy = ""; // the expanded notice's "why now" for this run
 	private noticed = false; // a transcript notice was written in this process (the branch may not show it yet)
-	/** A summary was persisted since the last cold run start: later warm plans make none unless at the compaction room, or until the
-	 *  context has grown back to the size that summary started from (`summaryRegrow`, real tokens after folds; plan.ts regrowAt). */
-	summarizedWarm = false;
-	summaryRegrow: number | undefined = undefined;
 	setRecallMode(mode: "tool" | "file" | "reread", tools: { read: boolean; grep: boolean; bash: boolean }, ctx?: Any) {
 		if (mode !== this.recallMode) this.ledger({ type: "recall_available", ok: mode === "tool", mode, ...tools });
 		this.recallMode = mode;
@@ -388,7 +384,7 @@ export class Zip implements ZipControl {
 	/** Λ for the model of `ctx` (core.ts Learned): its learned entry once loaded (loadEnt), its tier, growth and the session facts. */
 	private lam(ctx: Any): Learned {
 		const m = ctx?.model ?? this.model;
-		return { model: m, ent: this.entKey === modelKey(m) ? this.ent : undefined, tier: this.tier(m), g: this.g, justEdited: this.justEdited, summarizedWarm: this.summarizedWarm, summaryRegrow: this.summaryRegrow };
+		return { model: m, ent: this.entKey === modelKey(m) ? this.ent : undefined, tier: this.tier(m), g: this.g, justEdited: this.justEdited };
 	}
 
 	/** Plan options at P(warm) `pWarm`, after a pause or not, with the token scale read from the branch (core.ts planOpts). */
@@ -480,8 +476,8 @@ export class Zip implements ZipControl {
 		if (last?.role === "assistant" && last.stopReason !== "toolUse") this.want("timer", ctx, undefined, undefined, true);
 	}
 
-	/** What a process that never left would know: growth g, "the newest response carried an edit" and "a summary was made in this warm
-	 *  stretch" are functions of the session, rebuilt from the branch (state.ts; a restart, a resume or a fork plans like the live process),
+	/** What a process that never left would know: growth g and "the newest response carried an edit" are functions of the session,
+	 *  rebuilt from the branch (state.ts; a restart, a resume or a fork plans like the live process),
 	 *  and so are the summaries produced in the background (pi-zip/summary entries, read where they are used). */
 	private restoreState(branch: Any[]) {
 		try {
@@ -489,11 +485,8 @@ export class Zip implements ZipControl {
 			this.g = r.g;
 			this.deltas = r.deltas;
 			this.justEdited = r.justEdited;
-			const models = loadStats().models, tierOf = (m: Any) => this.tier(m);
-			this.summarizedWarm = summarizedSince(branch, this.steerIds, models, tierOf);
-			this.summaryRegrow = this.summarizedWarm ? lastRegrow(branch) : undefined;
 			const ready = readyOf(branch).length;
-			if (branch.length) this.ledger({ type: "state_restored", g: Math.round(this.g), justEdited: this.justEdited, summarizedWarm: this.summarizedWarm, ...(ready ? { ready } : {}) });
+			if (branch.length) this.ledger({ type: "state_restored", g: Math.round(this.g), justEdited: this.justEdited, ...(ready ? { ready } : {}) });
 		} catch (err) {
 			this.ledger({ type: "error", where: "restore_state", error: errText(err) });
 		}
@@ -640,10 +633,6 @@ export class Zip implements ZipControl {
 		await this.resolveRetention(ctx);
 		const { cold, reason, ttl, pWarm: p, src, gapS, pause } = clock(branch, { model: ctx.model, ent: this.ent, tier: this.tier(ctx.model) }, Date.now(), { reqMs: this.lastReqMs, modelKey: this.lastModelKey });
 		this.cold = cold;
-		if (cold) {
-			this.summarizedWarm = false; // a cold return may summarise again
-			this.summaryRegrow = undefined;
-		}
 		this.pause = pause;
 		this.pWarm = p;
 		this.survSrc = src;
@@ -772,9 +761,8 @@ export class Zip implements ZipControl {
 		const gate = this.nativeGate(ctx, branch, pre);
 		if (gate) return skip(gate);
 		const before = Math.round(p.ctxTokens);
-		const regrow = Math.round(p.ctxAfterFolds); // the context this summary starts from (folds applied): see summaryRegrow
 		const trigger: Cut["trigger"] = this.cold ? "cold" : "valve"; // the return that adopts it labels it (written early for a warm one, say)
-		const compaction = { summary: cut.text, firstKeptEntryId: cut.firstKeptEntryId, tokensBefore: before, details: { by: PRODUCT, via: "native", trigger, regrow }, usage: cut.usage };
+		const compaction = { summary: cut.text, firstKeptEntryId: cut.firstKeptEntryId, tokensBefore: before, details: { by: PRODUCT, via: "native", trigger }, usage: cut.usage };
 		const known = new Set(branch.map((en: Any) => en?.id));
 		const ask = { compaction: compaction as Any | null, answered: false, askedAt: 0, askedWall: 0, until: Infinity };
 		this.nativeAsk = ask;
@@ -830,17 +818,12 @@ export class Zip implements ZipControl {
 		if (!entry?.id) {
 			this.ledger({ type: "native_fail", ms, askMs, handlerMs, answered: ask.answered, error: res.late ? "deadline" : (res.err ?? "no compaction entry"), foreign: !!last });
 			if (last) {
-				// another extension's compaction replaced the context this summary was written for: adopting it, or writing a new one on
-				// top of it, would summarise twice. It is this stretch's summary (summarizedWarm, as after a pi-zip summary).
+				// Another extension replaced this summary's prefix: discard it and use only folds for the first request.
 				this.discardBg("replaced");
 				this.foreignRun = true;
-				this.summarizedWarm = true;
-				this.summaryRegrow = undefined; // its size is not known: this stretch ends at the next cold return
 			}
 			return; // nothing went in: the prepared summary waits for turn_end
 		}
-		this.summarizedWarm = true; // one summary per warm stretch, as for a draft (commit)
-		this.summaryRegrow = regrow;
 		// the summary is in the session from now on, whatever the run does: book it here (commit() does not book it again), the way a
 		// draft of the same kind is booked: a cold return's saves a rewrite, a warm one is a valve edit of the warm cache
 		const cutSaved = Math.round(p.scale.c * (cut.prefixTokens - cut.summaryTokens));
@@ -1254,13 +1237,6 @@ export class Zip implements ZipControl {
 			return undefined;
 		}
 		const bad = checkEdits(o.blocks, o.userTurns, live, cut);
-		const regrow = cut ? Math.round(plan.ctxAfter + c * (cut.prefixTokens - cut.summaryTokens)) : 0; // the context the summary started from
-		if (!bad && cut) {
-			// one summary per warm stretch (two in a row cost two uncached calls; the second gains little), until the context has grown back
-			// to the size this one started from: a second summary then gains what this one did, and the law alone decides
-			this.summarizedWarm = true;
-			this.summaryRegrow = regrow;
-		}
 		if (bad) {
 			this.ledger({ type: "guard_drop", turnIndex: e.turnIndex, reason: bad, folds: live.length, source: plan.source });
 			plan.persisted = false; // keep the request-local view: never switch the fold set mid-run
@@ -1273,7 +1249,7 @@ export class Zip implements ZipControl {
 		for (const t of live) if (t.toolCallId) this.foldedCalls.set(t.toolCallId, handleFor(t.entryId));
 		// the compaction draft goes FIRST: Pi writes its tokensBefore from the newest usage only while no edit follows that usage, so a
 		// fold drafted before it would make Pi's "Compacted from N tokens" the chars/4 of a half-applied projection (research pi-tricks §1a)
-		if (cut) ours.unshift({ type: "compaction", summary: cut.text, firstKeptEntryId: cut.firstKeptEntryId, details: { by: PRODUCT, trigger: cut.trigger, carried: false, regrow }, usage: cut.usage });
+		if (cut) ours.unshift({ type: "compaction", summary: cut.text, firstKeptEntryId: cut.firstKeptEntryId, details: { by: PRODUCT, trigger: cut.trigger, carried: false }, usage: cut.usage });
 		ours.push({ type: "custom", customType: COMMIT_CUSTOM, data: { carried: sentBefore, ...((cut || mixed) && sentBefore ? { next: true } : {}), ...(mixed ? { carriedIds: [...plan.carriedIds!] } : {}) } }); // says who first carried these edits (state.ts, plan.ts calibrate)
 		const before = Math.round(c * live.reduce((a, t) => a + t.entryTokens, 0));
 		const after = Math.round(c * live.reduce((a, t) => a + t.phTokens, 0));

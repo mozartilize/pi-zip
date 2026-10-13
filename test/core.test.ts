@@ -1,13 +1,13 @@
 // The pure decision core (src/core.ts): view, clock, law, plan and decide as functions of (branch, Λ, now).
 import { describe, expect, test } from "bun:test";
-import { checkEdits, clock, coldReturnAfter, inRunClock, decideRun, want, decideTurnEnd, adopt, artifactsOf, grow, headOf, lastRegrow, lawOf, planOpts, readyOf, unready, unusedOf, runPlanOf, scaleOf, summarizedSince, valvePlanOf, type Env, type Learned } from "../src/core.ts";
+import { checkEdits, clock, inRunClock, decideRun, want, decideTurnEnd, adopt, artifactsOf, grow, headOf, lawOf, planOpts, readyOf, unready, unusedOf, runPlanOf, scaleOf, valvePlanOf, type Env, type Learned } from "../src/core.ts";
 import { planContext, UNIT, type PlanResult } from "../src/plan.ts";
 import { replayGrowth } from "../src/state.ts";
 import { A, AX, R, U, type Any } from "./helpers.ts";
 
 const MODEL = { provider: "p", id: "m", contextWindow: 200_000, promptCache: { short: 300, long: 3600 } };
 const env = (over: Partial<Env> = {}): Env => ({ model: MODEL, cwd: "/tmp", sys: { text: "sys", tools: [] }, reserve: 16_384, recalled: new Set(), steerIds: new Set(), rereadOnly: false, ...over });
-const lam = (over: Partial<Learned> = {}): Learned => ({ model: MODEL, ent: { cls: "explicit", bins: {}, n: 0 }, g: 2_500, justEdited: false, summarizedWarm: false, ...over });
+const lam = (over: Partial<Learned> = {}): Learned => ({ model: MODEL, ent: { cls: "explicit", bins: {}, n: 0 }, g: 2_500, justEdited: false, ...over });
 // ~60K tokens of prose no fold can touch, two tool outputs that fold, and a new prompt: a cold plan folds both and cuts at u2
 const big = [U("u1", "one"), AX("a2", 120_000), AX("a2b", 120_000), U("u2", "two"), A("a3", ["c3"]), R("r3", "c3", 44_000), A("a5"), U("u3", "three"), A("a6", ["c6"]), R("r6", "c6", 44_000), A("a7"), U("u4", "back")];
 const small = [U("u1", "one"), A("a1"), U("u2", "two")];
@@ -52,20 +52,6 @@ describe("core: clock", () => {
 		expect(c.pause).toBe(true);
 		expect(c.cold).toBe(false);
 	});
-	test("coldReturnAfter / summarizedSince: a summary stays this warm stretch's until a return the clock judges cold", () => {
-		const comp = { type: "compaction", id: "s1", details: { by: "pi-zip" } };
-		const warm = [msg("u1", "user", T0), asst("a1", T0 + 1000), comp, msg("u2", "user", T0 + 60_000), asst("a2", T0 + 61_000)];
-		const none = () => undefined;
-		expect(coldReturnAfter(warm, 2, false, new Set(), {}, none)).toBe(-1);
-		expect(summarizedSince(warm, new Set(), {}, none)).toBe(true);
-		const cold = [...warm, msg("u3", "user", T0 + 61_000 + 400_000), asst("a3", T0 + 462_000)];
-		expect(coldReturnAfter(cold, 2, false, new Set(), {}, none)).toBe(5);
-		expect(summarizedSince(cold, new Set(), {}, none)).toBe(false);
-		// a steering message is no return
-		expect(coldReturnAfter(cold, 2, false, new Set(["u3"]), {}, none)).toBe(-1);
-		expect(lastRegrow([{ ...comp, details: { by: "pi-zip", regrow: 1234 } }])).toBe(1234);
-		expect(lastRegrow([comp])).toBeUndefined();
-	});
 	test("grow is the growth step state.ts replays: the same g as replaying the branch", () => {
 		let g = 2_500, deltas: number[] = [];
 		const totals = [1000, 5000, 9000, 8000, 30_000, 31_000];
@@ -89,13 +75,9 @@ describe("core: law", () => {
 });
 
 describe("core: plan", () => {
-	test("planOpts: P goes into the law only, pause as given; noSummary and regrowAt only at P >= 0.5 after a summary; cutAt only when asked", () => {
+	test("planOpts: P goes into the law only, pause as given; cutAt only when asked", () => {
 		expect(planOpts(big, [], env(), lam(), true, 0.3, true).o).toMatchObject({ pause: true, law: { pWarm: 0.3 } });
 		expect(planOpts(big, [], env(), lam(), true, 1, false).o).toMatchObject({ pause: false, law: { pWarm: 1 } });
-		const after = lam({ summarizedWarm: true, summaryRegrow: 9999 });
-		expect(planOpts(big, [], env(), after, false, 0.49, true).o).toMatchObject({ noSummary: false });
-		expect(planOpts(big, [], env(), after, false, 0, true).o.regrowAt).toBeUndefined();
-		expect(planOpts(big, [], env(), after, false, 0.5, false).o).toMatchObject({ noSummary: true, regrowAt: 9999 });
 		expect("cutAt" in planOpts(big, [], env(), lam(), false, 1, false).o).toBe(false);
 		expect(planOpts(big, [], env(), lam(), false, 1, false, "u2").o.cutAt).toBe("u2");
 		expect(planOpts(big, [], env({ rereadOnly: true }), lam(), false, 0, true).o.rereadOnly).toBe(true);
@@ -182,8 +164,9 @@ describe("core: decide", () => {
 	});
 	test("decideRun: another extension's compaction just went in: folds only (no summary)", () => {
 		const d = decideRun({ cold: true, justEdited: false, nat: null, foreign: true, now: big, ready: [], opts: opts(lam(), 0, true) });
-		expect(d.kind === "plan" && d.o.noSummary).toBe(true);
+		expect(d.kind === "plan" && d.o.foldsOnly).toBe(true);
 		expect(d.kind === "plan" && d.p?.cutIdx).toBeNull();
+		expect(d.kind === "plan" && d.produce).toBeNull();
 	});
 	test("decideRun: native application carries the joint prompt decision without a folds-only re-plan", () => {
 		const input = opts(lam(), 0, true)(big), p = planContext(big, input.o)!;
