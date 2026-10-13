@@ -294,7 +294,7 @@ const produced = async (r: Any) => {
 };
 
 describe("boundary decision regressions", () => {
-	for (const how of ["applied", "esc", "mismatch"] as const) test(`first-request rent resets only when the selected edit goes out (${how})`, async () => {
+	for (const pWarm of [1, 0] as const) for (const how of ["applied", "esc", "mismatch"] as const) test(`first-request rent resets on application or a cold request (P=${pWarm}, ${how})`, async () => {
 		const sm = SessionManager.inMemory(CWD);
 		sm.appendMessage(user("older"));
 		sm.appendMessage({ ...asst([call("large")], "toolUse"), usage: undefined });
@@ -307,7 +307,7 @@ describe("boundary decision regressions", () => {
 		try {
 			await r.beforeAgentStart("current");
 			r.sm.appendMessage(user("current"));
-			r.zip.cold = false; r.zip.pWarm = 1; // a warm first request whose fold pays under G_{1/10} with the paid rent
+			r.zip.cold = pWarm < 0.5; r.zip.pWarm = pWarm; // a selected fold with incoming rent, on a warm or cold request
 			const signal = { aborted: false }, base = r.runner.createContext();
 			const ctx = new Proxy(base, { get: (t, k) => (k === "signal" ? signal : Reflect.get(t, k)) });
 			const compute = r.zip.computeRunPlan.bind(r.zip);
@@ -322,11 +322,11 @@ describe("boundary decision regressions", () => {
 			if (how === "applied") expect((await r.request()).filter(isFolded).length).toBeGreaterThan(0); // Pi's request carries it
 			else expect(await r.zip.context({ messages }, ctx)).toBeUndefined();
 			expect(!!r.zip.runPlan?.sent).toBe(how === "applied");
-			const balance = how === "applied" ? 0 : 10_000;
+			const balance = how === "esc" || (how === "mismatch" && pWarm >= 0.5) ? 10_000 : 0;
 			expect(r.zip.rent).toBe(balance);
 			const response = { ...asst([{ type: "text", text: "stopped" }], "aborted"), timestamp: Date.now(), usage: undefined };
 			const drafts = await r.turnEnd(r.sm.appendMessage(response), response); // the failed boundary persists only what went out
-			expect(drafts.some((d) => d.customType === "pi-zip/rent")).toBe(how === "applied");
+			expect(drafts.some((d) => d.customType === "pi-zip/rent")).toBe(balance === 0);
 			expect(rentOf(r.sm.getBranch())).toBe(balance);
 			restored = await rig(undefined, { file: [r.sm.getHeader() as Any, ...r.sm.getEntries()], start: false });
 			expect(restored.zip.rent).toBe(balance);
