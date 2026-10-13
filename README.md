@@ -112,7 +112,7 @@ proved and what it beats; the proof sketches below state the assumptions. Machin
 
 ### The axioms
 
-1. **Nothing is lost.** Original session entries are never deleted or overwritten. Edits and summaries are appended, and anything pi-zip hides comes back word for word when asked.
+1. **Nothing is lost.** Original session entries are never deleted or overwritten. Edits and summaries are appended, and anything pi-zip hides comes back word for word when asked. Only tool outputs are folded: user messages, tool-call arguments and thinking go out unchanged unless a summary replaces older history, and the system prompt and tool definitions are never changed.
 2. **Recent work stays.** Your current and previous prompt, and the model's work on them, are never summarised. Their tool
    outputs stay in full, with two exceptions: outputs 60 or more model requests old and, after a pause, the previous prompt's
    outputs that can simply be re-read (files, read-only commands). Those are folded, and come back word for word when asked.
