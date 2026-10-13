@@ -9,7 +9,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { collapseSystemMessages, getCurrentSystemMessage, normalizeContext, resolveTranscript } from "@earendil-works/pi-ai";
 import { buildBlocks, calibrate, collapseSystem, editAllowed, planContext, UNIT, wireTokensOf } from "../src/plan.ts";
-import { decideRun, decideTurnEnd, planOpts, rentOf } from "../src/core.ts";
+import { decideRun, decideTurnEnd, planOpts, rentOf, unusedOf } from "../src/core.ts";
 import { lawPrices, loadStats, record } from "../src/learn.ts";
 import type { Any } from "./helpers.ts";
 // Pi's own draft application (AgentSession._applyBoundaryDrafts uses no instance state): the order of the drafts and the
@@ -1032,6 +1032,59 @@ describe("real Pi: a summary prepared while the user was away goes in through Pi
 			await r.shutdown();
 			restarted = await rig(undefined, { file: [r.sm.getHeader() as Any, ...r.sm.getEntries()], start: false });
 			expect(restarted.zip.totals(restarted.runner.createContext())).toMatchObject({ summaries: 1, usd: 0.05 });
+		} finally {
+			ctx.modelRegistry.complete = provider;
+			await restarted?.shutdown();
+			await r.shutdown();
+		}
+	});
+
+	test("one room compaction consumes one identical summary call and preserves every charge after restart", async () => {
+		process.env.PI_ZIP_TTL_SECS = "300";
+		process.env.PI_ZIP_COLD_CAP = "100000";
+		const model = { ...MODEL, contextWindow: 100_000 };
+		const r = await rig((sm) => {
+			for (let i = 0; i < 6; i++) {
+				sm.appendMessage(user(`turn ${i + 1}`));
+				sm.appendMessage({ ...asst([{ type: "text", text: "x".repeat(140_000) }]), usage: undefined });
+			}
+		}, { model, start: false });
+		const ctx = r.runner.createContext(), provider = ctx.modelRegistry.complete;
+		let calls = 0, restarted: Awaited<ReturnType<typeof rig>> | undefined;
+		ctx.modelRegistry.complete = async () => ({ stopReason: "stop", content: [{ type: "text", text: "detail ".repeat(5000) }], usage: { cost: { total: ++calls / 10 } } });
+		try {
+			await r.runner.emit({ type: "agent_start" } as Any);
+			const response = { ...asst([{ type: "text", text: "done" }]), timestamp: Date.now(), usage: undefined };
+			const id = r.sm.appendMessage(response), view = r.sm.buildSessionProjection().entries;
+			const decide = () => decideTurnEnd({ failed: false, justEdited: false, pWarm: 1, ready: r.zip.ready(r.sm.getBranch()), entries: view,
+				opts: (cutAt, foldsOnly, ready) => r.zip.opts(ctx, false, view, 1, false, cutAt, foldsOnly, ready) });
+			const initial = decide();
+			expect(initial.room?.cutIdx).toBeGreaterThan(0);
+			expect(r.zip.startBg(initial.room, ctx)).toBe(true);
+			const first = await r.zip.bg.promise;
+			expect(first.llmOk).toBe(true);
+			expect(r.zip.ready(r.sm.getBranch())).toHaveLength(1);
+			const selected = decide();
+			expect(selected.kind).toBe("plan");
+			expect(selected.p?.firstKeptEntryId).toBe(first.firstKeptEntryId);
+			expect(selected.p?.summaryTokensPlanned).toBe(first.summaryTokens);
+			expect(selected.room?.firstKeptEntryId).toBe(first.firstKeptEntryId); // the finished summary still leaves the view at the room
+			const drafts = await r.turnEnd(id, response);
+			expect(calls).toBe(2); // R9 requires a fresh call even with this cut already READY
+			expect(drafts[0]).toMatchObject({ type: "compaction", firstKeptEntryId: first.firstKeptEntryId, summary: first.text });
+			const branch = r.sm.getBranch() as Any[], artifacts = branch.filter((e) => e.customType === "pi-zip/summary");
+			expect(artifacts.map((e) => e.data.usd)).toEqual([0.1, 0.2]);
+			expect(artifacts.map((e) => e.data.cut.text)).toEqual([first.text, first.text]);
+			expect(branch.filter((e) => e.type === "compaction")).toHaveLength(1);
+			expect((branch.find((e) => e.type === "compaction") as Any).usage.cost.total).toBe(0.2);
+			expect(unusedOf(branch)).toEqual({ n: 1, usd: 0.1 });
+			expect(r.zip.stats.summaryUsd).toBeCloseTo(0.3, 10);
+			expect(r.zip.totals(ctx)).toMatchObject({ summaries: 1, usd: expect.closeTo(0.3, 10) });
+			await r.shutdown();
+			restarted = await rig(undefined, { file: [r.sm.getHeader() as Any, ...r.sm.getEntries()], model, start: false });
+			expect(unusedOf(restarted.sm.getBranch())).toEqual({ n: 1, usd: 0.1 });
+			expect(restarted.zip.totals(restarted.runner.createContext())).toMatchObject({ summaries: 1, usd: expect.closeTo(0.3, 10) });
+			expect(restarted.narrativeCalls).toHaveLength(0);
 		} finally {
 			ctx.modelRegistry.complete = provider;
 			await restarted?.shutdown();

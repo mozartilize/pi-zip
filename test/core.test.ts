@@ -92,11 +92,24 @@ describe("core: plan", () => {
 		expect(readyOf(branch).map((a) => a.key)).toEqual(["m1"]); // the lost call has no summary
 		expect(readyOf(branch, [{ head: "", key: "m3", cut: cut("m3", "S3"), usd: 0 }]).map((a) => a.key)).toEqual(["m1", "m3"]);
 		expect(unusedOf(branch)).toEqual({ n: 2, usd: 0.15000000000000002 });
-		const used = [...branch, { type: "compaction", id: "c1", firstKeptEntryId: "m1", summary: "S1", details: { by: "pi-zip" } }];
+		const used = [...branch, { type: "compaction", id: "c1", firstKeptEntryId: "m1", summary: "S1", details: { by: "pi-zip" }, usage: { cost: { total: 0.1 } } }];
 		expect(headOf(used)).toBe("c1");
 		expect(readyOf(used)).toEqual([]); // any compaction moves the head: what was written for the old one is not ready any more
 		expect(unusedOf(used)).toEqual({ n: 1, usd: 0.05 });
 		expect(unusedOf([...branch, { type: "compaction", id: "c2", firstKeptEntryId: "m1", summary: "other", details: { by: "pi-zip" } }]).n).toBe(2);
+	});
+	test("unused calls retain their own charge when identical summaries are produced on successive heads", () => {
+		const artifact = (head: string, usd: number) => ({ type: "custom", customType: "pi-zip/summary", data: { head, key: "m", cut: { text: "same" }, usd } });
+		const compaction = (id: string, usd: number, by = "pi-zip") => ({ type: "compaction", id, firstKeptEntryId: "m", summary: "same", details: { by }, usage: { cost: { total: usd } } });
+		const branch = [artifact("", 0.1), artifact("", 0.2), compaction("c1", 0.3), artifact("", 0.3)]; // the last call's artifact is a boundary draft
+		expect(unusedOf([artifact("", 0.1), artifact("", 0.1), compaction("equal", 0.1)])).toEqual({ n: 1, usd: 0.1 }); // equal charges still represent two calls
+		expect(unusedOf([artifact("", 0.1), compaction("early", 0.1), artifact("", 0.2)])).toEqual({ n: 1, usd: 0.2 }); // a delayed draft can belong to a different call
+		expect(unusedOf(branch).n).toBe(2);
+		expect(unusedOf(branch).usd).toBeCloseTo(0.3, 10); // one compaction takes the newest call, leaving the two older charges
+		const next = [...branch, artifact("c1", 0.4), compaction("c2", 0.4), artifact("c2", 0.5)];
+		expect(unusedOf(next).n).toBe(3);
+		expect(unusedOf(next).usd).toBeCloseTo(0.8, 10); // a later identical artifact cannot be charged to an earlier head
+		expect(unusedOf([artifact("", 0.1), compaction("foreign", 0.1, "other"), artifact("foreign", 0.2), compaction("own", 0.2)])).toEqual({ n: 1, usd: 0.1 });
 	});
 });
 
