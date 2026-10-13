@@ -1,0 +1,33 @@
+== 1. frozen files
+== 2. forbidden constructs
+== 3. every module is imported by PiZip.lean
+== 4. lake build
+Build completed successfully (9048 jobs).
+== 5. audit: proofs against the frozen statements
+STATEMENT                    STATUS    WITNESS     AXIOMS
+T2_i                         PROVED    yes         depends on axioms: [propext, Classical.choice, Quot.sound]
+T2_ii                        PROVED    yes         depends on axioms: [propext, Classical.choice, Quot.sound]
+T2_iii                       PROVED    yes         depends on axioms: [propext, Classical.choice, Quot.sound]
+T2_iv_a                      PROVED    yes         depends on axioms: [propext, Classical.choice, Quot.sound]
+T2_iv_b                      PROVED    yes         depends on axioms: [propext, Classical.choice, Quot.sound]
+T2_iv_c                      PROVED    yes         depends on axioms: [propext, Classical.choice, Quot.sound]
+T2_v                         PROVED    yes         depends on axioms: [propext, Classical.choice, Quot.sound]
+T2_vi                        PROVED    yes         depends on axioms: [propext, Classical.choice, Quot.sound]
+T2_vii                       PROVED    yes         depends on axioms: [propext, Classical.choice, Quot.sound]
+T2_vii_hazard_exact          PROVED    yes         depends on axioms: [propext, Classical.choice, Quot.sound]
+T2_vii_warm_exact            PROVED    yes         depends on axioms: [propext, Classical.choice, Quot.sound]
+T3_i                         PROVED    yes         depends on axioms: [propext, Classical.choice, Quot.sound]
+T3_ii                        PROVED    yes         depends on axioms: [propext, Classical.choice, Quot.sound]
+T3_iii                       PROVED    yes         depends on axioms: [propext, Classical.choice, Quot.sound]
+T3_iv                        PROVED    yes         depends on axioms: [propext, Classical.choice, Quot.sound]
+T4_i                         PROVED    yes         depends on axioms: [propext, Classical.choice, Quot.sound]
+T4_ii                        PROVED    yes         depends on axioms: [propext, Classical.choice, Quot.sound]
+T4_iv                        PROVED    yes         depends on axioms: [propext, Classical.choice, Quot.sound]
+T5_i                         PROVED    yes         depends on axioms: [propext, Classical.choice, Quot.sound]
+T5_ii                        PROVED    yes         depends on axioms: [propext, Classical.choice, Quot.sound]
+T5_iv                        PROVED    yes         depends on axioms: [propext, Classical.choice, Quot.sound]
+T5_v                         REFUTED   yes         depends on axioms: [propext, Classical.choice, Quot.sound]
+T5_v_persistent              PROVED    yes         depends on axioms: [propext, Classical.choice, Quot.sound]
+== 6. kernel re-check (leanchecker) of every PiZip module
+leanchecker: all modules re-checked
+CHECK: statements 23, proved 22, refuted 1, missing 0, gate PASS
