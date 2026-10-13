@@ -199,14 +199,14 @@ decide(at):  # typed prompt, first request of a driven run, or turn_end
     count carried folds once; never count an unproduced cut
   if no summary was applied, c was never produced, and no call is running: produce c
 
-at settle (with a UI):
+at settle (every mode):
   if no call is running: produce now what a return in 30 s would use
   unless the plan after a pause takes a ready or running summary:
     arm THE timer at lastTouch + t* − 1.5·L
     t* = first paying gap among TTL, TTL+1 s, survival edges and +1 s, and 7,200 s
     L = learned call time (0 until measured)
 on timer: re-plan on the current branch at that gap; produce only if no call is running
-on session open: rebuild state; arm only a future timer, with a UI; never start a call
+on session open: rebuild state; arm only a future timer; never start a call
 on Pi's cache-warming decision: observe the touch and re-arm; never answer the decision
 on run start: clear the timer
 on call completion: record pi-zip/summary; failed/aborted calls are not READY
@@ -219,7 +219,7 @@ doors: idle typed prompt → ctx.compact() with the ready answer and Pi's before
 
 Outside the room, an aborted call must finish before its replacement starts; that handover stays in the background. A failed or aborted call may be retried, while a successful artifact is never produced again for the same valid cut.
 
-Eligibility also requires an output larger than 500 chars/4 tokens and a placeholder smaller than 90% of it. Recalled outputs stay unfolded. On automatic prefix caches, folds leave the first 8,192 calibrated tokens alone to preserve a cache-survival sample; summaries replace that prefix and are exempt. Folds inside a summary prefix are absorbed by the summary; folds already carried by a request keep their exact placeholders when saved. Structural guards preserve tool-call/result pairs. A failed turn saves folds its request already carried but makes no new edit. No-UI sessions use the same background production during a run; preparation for a later idle return is omitted because those processes exit at settle.
+Eligibility also requires an output larger than 500 chars/4 tokens and a placeholder smaller than 90% of it. Recalled outputs stay unfolded. On automatic prefix caches, folds leave the first 8,192 calibrated tokens alone to preserve a cache-survival sample; summaries replace that prefix and are exempt. Folds inside a summary prefix are absorbed by the summary; folds already carried by a request keep their exact placeholders when saved. Structural guards preserve tool-call/result pairs. A failed turn saves folds its request already carried but makes no new edit. No-UI sessions use the same background production, at settle and on session open too; in a process that exits right after settle, a call settle started is aborted at exit and counted once as unused at its estimated input charge.
 
 The room credit is zero below room. At or above it, $\eta=[(1+\kappa)X+\text{out}\,S+\kappa(B-X+S)]/(X-S)$ when $X>S$, otherwise zero. Here $X=\max(0,B-\text{keep})$, $S=\min(\max(X/10,1{,}000),8{,}000)$ without the previous-summary floor, and keep is the complete message tail covering Pi's 20K recent tokens. This estimates Pi's own compaction price for the room it would free. A ready summary passed over today stays available while its range is still the prefix; finished summaries are persisted, and each compaction consumes one produced call.
 
@@ -269,7 +269,7 @@ $A = 40$K, $n = 2.4$K and $D = 23.5$K its threshold is $p^* = 0.528$ instead of 
 Firing costs $(1+\kappa)A$ + call whether the cache is alive or not. Holding costs $p(A+D+\kappa n) + (1-p)(1+\kappa)(A+D) +
 \eta D$: alive, the request reads its cached part and writes its $n$ new tokens. The difference is
 $p\kappa (A-n) - D - (1-p)\kappa D - \eta D + \text{call}$, minus the future reads the removal saves. Write the total saved-read value as $V(D)=D+F(D)$, where $F$ covers only future reads. Substituting the
-EOQ cycle surrogate $V(D)=D^2/2g$ (one regrowth from 0 to $D$) gives $\Delta$. This substitution does not assert that $V-D$ is a nonnegative future saving for every $D$. With call and room prices zero, the warm fluid threshold is $D^*=\sqrt{2g\kappa(A-n)}$. It attains a positive-cycle optimum among fluid edit cycles when $n<A$; at $n=A$ the infimum is zero and no positive cycle attains it. Claim 3 treats integer requests separately. $\Delta$ has slope in $p$ is $\kappa (B-n) > 0$. A wrong $p$
+EOQ cycle surrogate $V(D)=D^2/2g$ (one regrowth from 0 to $D$) gives $\Delta$. This substitution does not assert that $V-D$ is a nonnegative future saving for every $D$. With call and room prices zero, the warm fluid threshold is $D^*=\sqrt{2g\kappa(A-n)}$. It attains a positive-cycle optimum among fluid edit cycles when $n<A$; at $n=A$ the infimum is zero and no positive cycle attains it. Claim 3 treats integer requests separately. $\Delta$ has slope $\kappa (B-n) > 0$ in $p$. A wrong $p$
 costs at most $\kappa B\,|\hat p - p|$. $V$ is a surrogate, with no general identification as the true continuation value across
 cache probabilities. In the warm-forever fluid continuation model, the exact relative value on $0<D\le D^*$ is $(D^*D-D^2/2)/g$, at least the surrogate, with equality only at $D=D^*$. With positive end-of-stretch hazard, the discounted relative value is smaller than that warm-forever value on the same continuation region; this does not establish a surrogate upper bound. The decision the surrogate gives is exact, at two corners: $p = 0$ with no call (claim 1), and $p = 1$ with no call and
 $\eta = 0$ (claim 3). ∎
@@ -568,7 +568,7 @@ The guard has two parts. Before saving a fold or a summary it checks that the ed
 
 **Will it save money?** Mostly on cold returns, which is where a long session pays for a full cache rewrite. While the cache is warm an edit must pass the rent guard above (large contexts, near Pi's compaction trigger, outputs 60+ requests old). `/zip` shows what this session has folded (and roughly how many tokens that removed), its summaries with what their model calls cost, and its recalls. The numbers live in the session file, so a restart does not reset them.
 
-**Does it cost extra?** Planning is local. A summary is one extra uncached model call with no tools, shown in `/zip`. The law prices the full call before production, and every unused or failed call stays in the totals. There is no one-unused-call or one-summary budget per warm stretch. Finished summaries are saved as `pi-zip/summary` entries and can be used after a restart while their range is still the prefix. A call running at exit is aborted and counted once as unused at its estimated input charge; an actual charge is retained if available. Recalled content re-enters the context at normal prices.
+**Does it cost extra?** Planning is local. A summary is one extra uncached model call with no tools, shown in `/zip`. The law prices the full call before production, and every unused or failed call stays in the totals. There is no one-unused-call or one-summary budget per warm stretch. Finished summaries are saved as `pi-zip/summary` entries and can be used after a restart while their range is still the prefix. A call running at exit is aborted and counted once as unused at its estimated input charge; a call that fails or ends partially on its own keeps its actual charge when the provider reports one. Recalled content re-enters the context at normal prices.
 
 **Can the model lose information?** Folded outputs are replaced by a placeholder with key lines and a handle, and the placeholder tells the model not to guess. Summaries quote your first and most recent requests verbatim (the ones between are shortened, then counted) and never paraphrase the model's reasoning. If the model ignores the handle and guesses, that is a model failure pi-zip cannot catch; this is why only re-readable outputs of the previous turn are folded after a pause; other outputs of the protected turns wait until they are 60 requests old.
 

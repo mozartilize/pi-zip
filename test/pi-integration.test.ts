@@ -1619,7 +1619,7 @@ describe("round 5 on real Pi: rule A starts the warm summary early, nobody waits
 });
 
 // Without a UI (pi -p, --mode json; rpc binds one on Pi 1.1) pi-zip decides as with one (0.4.0): nobody waits for a summary, it is
-// written in the background and the next decision takes it; only settle's preparation for a return is skipped (the process exits).
+// written in the background and the next decision takes it; settle prepares a return as in every mode (a call the exit aborts is unused).
 // Every request and every session entry of three no-UI scenarios (a warm return that summarises, a warm return right after an edit, a
 // cold return that summarises), normalised only for what differs from run to run (entry ids and the handles made from them,
 // timestamps, measured durations), hash to the digest below, printed by this test with R5_PRINT_DIGEST=1. It moves only when the

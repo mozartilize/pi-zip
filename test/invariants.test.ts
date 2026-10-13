@@ -800,7 +800,7 @@ describe("never wait: rule A starts early; a summary is used once ready; the one
 	test("no UI (print, json) decides as with a UI: the warm return does not wait, the summary is written in the background", async () => {
 		const st = { calls: 0, delay: 200 };
 		const quiet = await rig(done, WARM_TS(), { hasUI: false, mode: "json", modelRegistry: { complete: mkComplete(st) } });
-		expect(await settle(quiet)).toBeUndefined(); // nothing at settle without a UI (the process exits right after it)
+		expect(await settle(quiet)).toBeUndefined(); // settle appends no entry here; its preparation for a return runs in every mode
 		const t0 = Date.now();
 		const req = await prompt(quiet);
 		expect(Date.now() - t0).toBeLessThan(150); // 0.3.1: the whole call, in the request
