@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.4.0
+
+Compared with 0.3.1:
+
+- Five axioms now explain one shared decision: keep originals and recent work, price each edit, prepare slow work in the background, and learn from use. Warm edits use a rent guard: apply when rent pays the rewrite, or when the read savings pay and at least a tenth of the rewrite price has been paid in rent.
+- Summaries run in the background in terminal sessions and sub-agents alike. A missing summary leaves the agent free to continue with eligible folds. Only a turn end at the compaction room can wait, 8,192 tokens below Pi's own threshold.
+- Finished summaries are saved in the session and survive a restart. Every call stays in the totals, including unused calls and a call still running at exit. The one-unused-call budget and one-summary limit per warm stretch are removed; successive summaries must pay their prices.
+- Summaries enter only through Pi's native compaction at a typed idle prompt or as the first draft at a turn end. Driven runs defer them to that boundary. Pi's displayed “Compacted from” number exactly matches the saved before-size at both doors.
+- One producer and one production timer replace the separate warm-return path, fixed timer at 80% of the cache lifetime, warming fallback timers and first-key listener. The timer uses learned survival and call time, re-plans on the current branch, and never starts a call merely because an old session was opened.
+- Protection and recall remain: the latest two user turns stay out of summaries; eligible previous-turn re-readable outputs may fold after a pause, and outputs at least 60 requests old may fold during long runs. Recalled originals are never folded again.
+- The README gives the decision, model-qualified theorems, proof sketches and measured limits. Lean 4 + Mathlib checks the stated T2-T5 parts: 22 proved, one original statement refuted and corrected, zero missing. The remaining claims are paper proofs, supported separately by offline implementation checks. Proof files are excluded from the npm package.
+
 ## 0.3.1
 
 - **A warm return's summary starts when the run ends** (rule A). When even a warm return (your next prompt while the cache is
