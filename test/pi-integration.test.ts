@@ -9,7 +9,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { collapseSystemMessages, getCurrentSystemMessage, normalizeContext, resolveTranscript } from "@earendil-works/pi-ai";
 import { buildBlocks, calibrate, collapseSystem, editAllowed, planContext, UNIT, wireTokensOf } from "../src/plan.ts";
-import { decideTurnEnd, planOpts } from "../src/core.ts";
+import { decideTurnEnd, planOpts, rentOf } from "../src/core.ts";
 import { lawPrices, loadStats, record } from "../src/learn.ts";
 import type { Any } from "./helpers.ts";
 // Pi's own draft application (AgentSession._applyBoundaryDrafts uses no instance state): the order of the drafts and the
@@ -294,6 +294,46 @@ const produced = async (r: Any) => {
 };
 
 describe("boundary decision regressions", () => {
+	test("rent matching a balance before compaction is persisted and restored", async () => {
+		const sm = SessionManager.inMemory(CWD);
+		sm.appendMessage(user("past"));
+		sm.appendMessage({ ...asst([{ type: "text", text: "done" }]), usage: undefined });
+		const kept = sm.appendMessage(user("older"));
+		sm.appendMessage({ ...asst([call("large")], "toolUse"), usage: undefined });
+		sm.appendMessage(result("large", bulk("output", 6000)));
+		sm.appendMessage(user("previous"));
+		sm.appendMessage({ ...asst([{ type: "text", text: "done" }]), usage: undefined });
+		sm.appendMessage(user("current"));
+		const p = planContext(sm.buildSessionProjection().entries, { scale: UNIT, law: { pr: lawPrices("explicit", false), g: 2500, pWarm: 1 }, foldsOnly: true })!;
+		const balance = p.folds.reduce((n, f) => n + f.entryTokens - f.phTokens, 0);
+		expect(balance).toBeGreaterThan(0);
+		sm.appendCustomEntry("pi-zip/rent", { rent: balance });
+		sm.appendCompaction("earlier history", kept, 100_000, { by: "other" }, true);
+		const r = await rig(undefined, { file: [sm.getHeader() as Any, ...sm.getEntries()], start: false });
+		let restored: Awaited<ReturnType<typeof rig>> | undefined;
+		try {
+			expect(rentOf(r.sm.getBranch())).toBe(0);
+			expect(r.zip.rent).toBe(0);
+			const originalOpts = r.zip.opts.bind(r.zip);
+			r.zip.opts = (...args: Any[]) => {
+				const o = originalOpts(...args).o;
+				o.scale = UNIT; o.law = { pr: lawPrices("explicit", false), g: 2500, pWarm: 1 };
+				return { o, cal: UNIT };
+			};
+			r.zip.justEdited = true; // the warm b2b decision accumulates removal without applying it
+			const response = { ...asst([{ type: "text", text: "finished" }]), timestamp: Date.now(), usage: undefined };
+			const id = r.sm.appendMessage(response);
+			const drafts = await r.turnEnd(id, response);
+			expect(r.zip.rent).toBe(balance);
+			expect(drafts).toEqual([{ type: "custom", customType: "pi-zip/rent", data: { rent: balance } }]);
+			expect(rentOf(r.sm.getBranch())).toBe(balance);
+			restored = await rig(undefined, { file: [r.sm.getHeader() as Any, ...r.sm.getEntries()], start: false });
+			expect(restored.zip.rent).toBe(balance);
+			await restored.beforeAgentStart();
+			expect(restored.zip.rent).toBe(balance);
+		} finally { await restored?.shutdown(); await r.shutdown(); }
+	});
+
 	test("an output becoming 60 requests old before the first boundary joins the exact priced summary edit", async () => {
 		delete process.env.PI_ZIP_COLD_CAP;
 		const sm = SessionManager.inMemory(CWD);
@@ -800,6 +840,44 @@ describe("real Pi: a summary prepared while the user was away goes in through Pi
 				await restarted?.shutdown();
 			}
 		} finally { await r.shutdown(); }
+	});
+
+	for (const outcome of ["aborted reply", "expired signal"] as const) test(`partial ${outcome} retains its charge without a ready artifact and a later trigger retries`, async () => {
+		const r = await rig(undefined, { file: template(240 * 60_000), tui: true, start: false });
+		const ctx = r.runner.createContext(), provider = ctx.modelRegistry.complete;
+		const timeout = AbortSignal.timeout, expired = new AbortController();
+		let calls = 0;
+		AbortSignal.timeout = (ms: number) => ms === 240_000 ? expired.signal : timeout(ms);
+		ctx.modelRegistry.complete = async (...args: Any[]) => {
+			if (++calls > 1) return provider(...args);
+			if (outcome === "expired signal") expired.abort();
+			return { stopReason: outcome === "aborted reply" ? "aborted" : "stop", content: [{ type: "text", text: "partial narrative" }], usage: { cost: { total: 0.12 } } };
+		};
+		try {
+			const view = r.sm.buildSessionProjection().entries;
+			const p = planContext(view, r.zip.opts(ctx, true, view, 0, true).o)!;
+			r.zip.want("run", ctx, p);
+			expect(r.zip.bg).toBeTruthy();
+			expect(await r.zip.bg.promise).toBeNull();
+			expect(calls).toBe(1); // abort is terminal, even if the provider did not abort the signal
+			expect(r.zip.bg).toBeNull();
+			expect(r.zip.ready(r.sm.getBranch())).toEqual([]);
+			const lost = r.sm.getEntries().filter((e: Any) => e.customType === "pi-zip/summary") as Any[];
+			expect(lost).toHaveLength(1);
+			expect(lost[0].data).toMatchObject({ key: p.firstKeptEntryId, lost: "failed", usd: 0.12 });
+			expect(lost[0].data.cut).toBeUndefined();
+			expect(r.zip.stats.summaryUsd).toBe(0.12);
+			AbortSignal.timeout = timeout;
+			r.zip.want("run", ctx, p); // the same cut remains eligible at a later production trigger
+			expect((await r.zip.bg.promise)?.llmOk).toBe(true);
+			expect(calls).toBe(2);
+			expect(r.zip.ready(r.sm.getBranch())).toHaveLength(1);
+			expect(r.zip.stats.summaryUsd).toBe(0.12);
+		} finally {
+			AbortSignal.timeout = timeout;
+			ctx.modelRegistry.complete = provider;
+			await r.shutdown();
+		}
 	});
 
 	for (const abortWait of [false, true]) test(`room replacement retains the call slot until delayed cancellation acknowledgment (Esc=${abortWait})`, async () => {
