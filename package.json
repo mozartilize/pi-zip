@@ -1,7 +1,7 @@
 {
   "name": "pi-zip",
-  "version": "0.3.1",
-  "description": "Keeps long Pi sessions cheap without losing anything: folds old tool output only when the prompt cache has already gone cold, and every fold can be recalled byte for byte. Zero config.",
+  "version": "0.4.0",
+  "description": "Keeps long Pi sessions cheap without losing anything: folds older output when the savings pay for the rewrite, prepares summaries in the background, and recalls originals byte for byte. Zero config.",
   "type": "module",
   "license": "MIT",
   "author": "purboo",

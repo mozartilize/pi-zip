@@ -268,7 +268,7 @@ export class Zip implements ZipControl {
 	}
 	private statesShown = new Set<string>();
 
-	/** First pi-zip session on this machine: one line that sets the expectation (nothing visible happens until the cache expires). */
+	/** First pi-zip session on this machine: one line that explains when older context changes. */
 	welcome(ctx: Any) {
 		if (ctx?.mode !== "tui" || !this.entryRenderer || this.off || this.conflict) return;
 		const flag = `${dirname(process.env.PI_ZIP_CACHE_STATS || statsPath())}/welcomed`;
@@ -279,8 +279,7 @@ export class Zip implements ZipControl {
 		} catch {
 			return;
 		}
-		const ttl = ttlFor(ctx.model ?? this.model, [], this.tier(ctx.model ?? this.model));
-		this.stateLine(ctx, "on", `old tool output gets zipped once the prompt cache expires (${fmtLife(ttl / 1000).slice(1)} here) · /zip`);
+		this.stateLine(ctx, "on", "older context gets zipped when the savings pay for the rewrite · /zip");
 	}
 
 	ledger(rec: Record<string, unknown>) {

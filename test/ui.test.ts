@@ -409,7 +409,7 @@ describe("transcript wiring", () => {
 		await a.f.handlers.get("session_start")({}, a.ctx);
 		const w = a.f.appended.filter((x: Any) => x.customType === "pi-zip/notice");
 		expect(w).toHaveLength(1);
-		expect(a.render(w[0])[0]).toBe("ƶ pi-zip  on  old tool output gets zipped once the prompt cache expires (5 min here) · /zip");
+		expect(a.render(w[0])[0]).toBe("ƶ pi-zip  on  older context gets zipped when the savings pay for the rewrite · /zip");
 		expect(existsSync(flag)).toBe(true);
 		const b = await setup();
 		await b.f.handlers.get("session_start")({}, b.ctx);

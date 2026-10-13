@@ -5,12 +5,13 @@ zero missing**, with concrete nonvacuity witnesses for all 23 parts. This covers
 the assigned T2-T5 parts, including corrected T5(v). It does not certify every
 theorem in the paper or the implementation's behavior.
 
-The source of truth is `research/round6/theory.md`, especially sections 2.3-2.4
-and the quoted theorem parts below. `research/round6/readme-math.md` cites those
-results. Round 8 corrected both source texts; the last section of theory.md,
-“Round 8 corrections (machine check),” records those corrections. Its
-pass-one proof-status sentences are historical and need updating after this
-integration. No source text or backup was edited in this integration job.
+The English theorems and their model qualifications are in the main
+[README's math section](../README.md#how-pi-zip-decides-and-why). The
+`theory.md` line numbers quoted below and in the statement doc comments refer
+to the corrected snapshot of unpublished research notes; those notes are not
+part of this repository. The English and Lean statements were reviewed by
+hand for fidelity. A machine check proves the Lean statements as written,
+not their correspondence to the English or to the implementation.
 
 The statement fidelity review and the T2, T3, and T45 proof reviews reported
 PASS. [FROZEN.sha256](FROZEN.sha256) is non-empty: the three models and
@@ -23,13 +24,19 @@ CHECK: statements 23, proved 22, refuted 1, missing 0, gate PASS
 
 ## Statement coverage
 
+T2 uses the one-decision Model C (and its explicitly stated fluid continuation
+comparisons); T3 uses the steady-growth EOQ model and compares all edit
+schedules. T4 and T5 use Model T: one stream, fixed positive rewrite price,
+and a live cache, with the best hindsight edit schedule as comparator.
+Optimality in the table below is restricted to those models and classes.
+
 [PiZip/Statements/R1.lean](PiZip/Statements/R1.lean) contains every exact
 proposition, source quotation, and inventory of added hypotheses. PROVED means
 a theorem named `<statement>_proof` has exactly that proposition; REFUTED means
 `<statement>_false` proves its negation. All results are in namespace PiZip.
 Nonvacuity witnesses in [PiZip/Sanity1.lean](PiZip/Sanity1.lean) show the
 hypotheses can hold; the universal conclusions are established by the proofs.
-Source line numbers refer to this round's corrected snapshot.
+Source line numbers refer to that unpublished snapshot, not the main README.
 
 | Lean statement | English theorem part | Status | Checked content |
 | --- | --- | --- | --- |
@@ -103,8 +110,7 @@ Other pass-one findings were applied to the English before the proof passes:
 - README claims about the T6 grid and T7 planner were restricted to their paper
   evidence. Neither supplies a universal numerical bound or a Lean planner proof.
 
-Detailed applied corrections and the remaining documentation updates are in
-`research/round8/theory-corrections.md`.
+The main [README](../README.md#what-is-proved) incorporates these qualifications.
 
 ## Paper-only and deferred scope
 
@@ -123,14 +129,13 @@ Detailed applied corrections and the remaining documentation updates are in
 | T7(iii) | paper | Weak planner monotonicity and planned-view bound need the planner model. |
 | T7(iv) | paper | Adoption variant and room-wait qualification need the handler/planner model. |
 | T7(v) | paper | b2b behavior needs the synthesis model absent here. |
-| T1 | deferred | Coordinator decision: backs no public claim requiring this round's evidence; WM/AV schedule model absent. |
-| T8 | deferred | Coordinator decision: backs no public claim requiring this round's evidence; fold model F absent. |
-| T9 | deferred | Coordinator decision: backs no public claim requiring this round's evidence; overlaps the separate code-level formal model. |
-| T10 | deferred | Coordinator decision: backs no public claim requiring this round's evidence; overlaps the separate code-level formal model. |
+| T1 | paper | Persistent-edit schedule model absent from the Lean scope. |
+| T8 | paper | Fold model absent from the Lean scope. |
+| T9 | paper | Handler inspection, with separate bounded checks of the implementation. |
+| T10 | paper | Event induction, with separate bounded checks of the implementation. |
 
-The deferrals above are the coordinator's scope decision for this round's
-public proof claims. Paper descriptions still appear in the source README;
-this project supplies no Lean evidence for those deferred theorems.
+T1, T6-T10 and the cited results T4(iii), T5(iii), T5(vi) remain paper proofs.
+This project supplies no separately audited Lean statements for them.
 
 ## Trusted base and additional kernel checks
 
@@ -185,5 +190,4 @@ root list covers this integration snapshot; review it again if declarations
 change. The Nanoda configuration rejects other axioms and enables Nat and
 String kernel extensions. Python screening assists proof design and is never
 verification evidence. Future T6/T7 work needs explicitly scoped models and
-statements; the next documentation dependency is updating the historical
-proof-status sentences in theory.md's last section.
+statements. The main README records the current public proof coverage.
