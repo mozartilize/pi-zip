@@ -11,7 +11,7 @@ import { cleanupRecall, commandRecallHandles, fileRecallFor, fileRecallHow, mate
 import * as recallfile from "../src/recallfile.ts"; // newer exports through the namespace: one missing fails only its own test
 import { handleTable, skeleton } from "../src/summary.ts";
 import { buildBlocks } from "../src/plan.ts";
-import { A, fakeCtx, fakePi, flat, longTurn, R, U, type Any } from "./helpers.ts";
+import { A, fakeCtx, fakePi, flat, longTurn, R, startPrompt, U, type Any } from "./helpers.ts";
 
 const SID = "01a120cb-3d40-75a6-aeac-320e71967606";
 const SESSION_FILE = `/tmp/pi-zip-test-sessions/2026-10-09_${SID}.jsonl`; // a persisted session (never opened: only its name is asked for)
@@ -206,7 +206,8 @@ async function rig(entries: Any[], tools: string[], over: Any = {}, piExtra: Any
 	piZip(f.pi);
 	const branch = over.branch ?? branchOf(entries, Date.now() - 60_000);
 	const { ctx, notes } = fakeCtx(entries, { branch, ...over, sessionManager: { getBranch: () => branch, buildSessionProjection: () => ({ entries: over.projection ?? entries }), getSessionId: () => SID, getSessionFile: () => SESSION_FILE, ...over.sessionManager } });
-	return { ...f, ctx, notes, fire: async (name: string, e: Any) => f.handlers.get(name)(e, ctx) };
+	const fire = async (name: string, e: Any) => f.handlers.get(name)(e, ctx);
+	return { ...f, ctx, notes, fire, prompt: (e: Any = {}) => startPrompt(fire, e) };
 }
 const folded = (msgs: Any[]) => msgs.filter((m) => m.role === "toolResult" && String(m.content[0].text).startsWith("[folded by pi-zip"));
 
@@ -218,11 +219,11 @@ describe("file recall through the extension", () => {
 		process.env.PI_ZIP_COLD_CAP = "8000";
 		const full = await rig(session(), ["read", "bash", "zip_recall"]);
 		await full.fire("session_start", {});
-		await full.fire("before_agent_start", {});
+		await full.prompt({});
 		const want = folded((await full.fire("context_with_system", { messages: flat(session()) })).messages);
 		const file = await rig(session(), ["read", "grep", "find", "ls", "bash"]);
 		await file.fire("session_start", {});
-		await file.fire("before_agent_start", {});
+		await file.prompt({});
 		const got = folded((await file.fire("context_with_system", { messages: flat(session()) })).messages);
 		expect(got.map((m: Any) => m.toolCallId)).toEqual(want.map((m: Any) => m.toolCallId));
 		expect(got.map((m: Any) => m.toolCallId)).toContain("c3"); // an npm test output: not re-readable, folded all the same
@@ -234,7 +235,7 @@ describe("file recall through the extension", () => {
 		// only when none of read, grep and bash is there: re-readable outputs only, pointing at re-reading
 		const none = await rig(session(), ["edit", "write"]);
 		await none.fire("session_start", {});
-		await none.fire("before_agent_start", {});
+		await none.prompt({});
 		const rr = folded((await none.fire("context_with_system", { messages: flat(session()) })).messages);
 		expect(rr.map((m: Any) => m.toolCallId)).not.toContain("c3");
 		for (const m of rr) expect(String(m.content[0].text)).toContain("re-read the file");
@@ -247,7 +248,7 @@ describe("file recall through the extension", () => {
 		rmSync(dir, { recursive: true, force: true });
 		const r = await rig(session(), ["read", "grep", "bash"], { sessionManager: { getSessionFile: () => undefined } });
 		await r.fire("session_start", {});
-		await r.fire("before_agent_start", {});
+		await r.prompt({});
 		const got = folded((await r.fire("context_with_system", { messages: flat(session()) })).messages);
 		expect(got.length).toBeGreaterThan(0);
 		expect(got.map((m: Any) => m.toolCallId)).not.toContain("c3"); // an npm test output: not re-readable, so not folded

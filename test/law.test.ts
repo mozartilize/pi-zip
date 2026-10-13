@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { lawPrices, loadStats, MIN_EXPECT, pWarm, record, sample, type Prices } from "../src/learn.ts";
 import { buildBlocks, compactionRoom, editAllowed, lawTerms, planContext, settings, sizeOf, UNIT, untouchedEst, type Law } from "../src/plan.ts";
 import { Zip } from "../src/run.ts";
-import { A, AX, fakeCtx, fakePi, flat, longTurn, project, R, U, type Any } from "./helpers.ts";
+import { A, AX, fakeCtx, fakePi, flat, longTurn, project, R, startZip, U, type Any } from "./helpers.ts";
 
 const ANTH: Prices = { r: 0.3, w: 3.75, input: 3, out: 15, cls: "explicit", src: "class" };
 const ANTH_1H: Prices = { ...ANTH, w: 6 };
@@ -124,7 +124,7 @@ describe("through the extension: the free signal is learned, persisted and used;
 		const t0 = Date.now() - 365_000;
 		const { ctx } = fakeCtx(entries, { model, branch: back(t0) });
 		zip.sessionStart(ctx);
-		await zip.beforeAgentStart(ctx); // prior: 365 s > 300 s -> cold
+		await startZip(zip, ctx); // prior: 365 s > 300 s -> cold
 		zip.providerRequest({ payload: {} });
 		zip.messageEnd({ role: "assistant", stopReason: "stop", usage: { input: 900, cacheRead: 60_032, cacheWrite: 0, output: 10 } });
 		const e = loadStats().models["zhipu/glm"];
@@ -133,7 +133,7 @@ describe("through the extension: the free signal is learned, persisted and used;
 		const zip2 = new Zip(fakePi().pi as Any); // a fresh process: only the file remembers
 		const { ctx: ctx2 } = fakeCtx(entries, { model, branch: back(Date.now() - 365_000) });
 		zip2.sessionStart(ctx2);
-		await zip2.beforeAgentStart(ctx2);
+		await startZip(zip2, ctx2);
 		const rows = readFileSync(process.env.PI_ZIP_LEDGER!, "utf8").trim().split("\n").map((l) => JSON.parse(l));
 		const prompts = rows.filter((r) => r.type === "prompt");
 		expect(prompts[0]).toMatchObject({ cold: true, survSrc: "prior", pWarm: 0 });
@@ -156,7 +156,7 @@ describe("through the extension: the free signal is learned, persisted and used;
 			const zip = new Zip(fakePi().pi as Any);
 			const { ctx } = fakeCtx(entries, { model, branch: back(Date.now() - gapS * 1000) });
 			zip.sessionStart(ctx);
-			await zip.beforeAgentStart(ctx);
+			await startZip(zip, ctx);
 			await zip.context({ messages: flat(entries) }, ctx);
 			return readFileSync(process.env.PI_ZIP_LEDGER!, "utf8").trim().split("\n").map((l) => JSON.parse(l));
 		};
@@ -177,7 +177,7 @@ describe("through the extension: the free signal is learned, persisted and used;
 		const zip = new Zip(fakePi().pi as Any);
 		const { ctx } = fakeCtx(entries, { branch: [{ type: "message", message: { role: "assistant", provider: "p", model: "m", stopReason: "stop", timestamp: Date.now() - 400_000, content: [] } }] });
 		zip.sessionStart(ctx);
-		await zip.beforeAgentStart(ctx);
+		await startZip(zip, ctx);
 		await zip.context({ messages: entries.flatMap((x: Any) => x.messages) }, ctx);
 		const law = readFileSync(process.env.PI_ZIP_LEDGER!, "utf8").trim().split("\n").map((l) => JSON.parse(l)).find((r) => r.type === "law");
 		expect(law).toMatchObject({ where: "run", g: 2500, pWarm: 0, survSrc: "prior", cls: "explicit", wr: 12.5, prSrc: "class" });
@@ -282,7 +282,7 @@ describe("final model (research round 5, final-model.md section 8 tests 1-5)", (
 		const small = [U("u0", "go")];
 		const { ctx } = fakeCtx(small);
 		zip.sessionStart(ctx);
-		await zip.beforeAgentStart(ctx);
+		await startZip(zip, ctx);
 		await zip.context({ messages: flat(small) }, ctx); // warm, below the cap: no run plan
 		const reply = (total: number) => { zip.providerRequest({ payload: {} }); zip.messageEnd({ role: "assistant", stopReason: "stop", usage: { input: total, cacheRead: 0, cacheWrite: 0, output: 10 } }); };
 		const end = (entries: Any[]) => zip.turnEnd({ message: { role: "assistant", stopReason: "stop", usage: { input: 1_000, cacheRead: 0, cacheWrite: 0 } }, context: { contextEntries: entries }, entries: [], turnIndex: 0 }, ctx);
@@ -307,11 +307,11 @@ describe("final model (research round 5, final-model.md section 8 tests 1-5)", (
 		const { ctx } = fakeCtx(big);
 		zip.sessionStart(ctx);
 		const reply = (total: number) => { zip.providerRequest({ payload: {} }); zip.messageEnd({ role: "assistant", stopReason: "stop", usage: { input: total, cacheRead: 0, cacheWrite: 0, output: 10 } }); };
-		await zip.beforeAgentStart(ctx);
+		await startZip(zip, ctx);
 		const req = await zip.context({ messages: flat(big) }, ctx); // warm run start, far above the threshold: the valve fires
 		expect(req).toBeDefined();
 		reply(5_000); // this request first carried the edit
-		await zip.beforeAgentStart(ctx); // the user answers at once (warm)
+		await startZip(zip, ctx); // the user answers at once (warm)
 		expect(await zip.context({ messages: flat(big) }, ctx)).toBeUndefined();
 		expect(ledger().filter((r) => r.type === "b2b_skip")).toEqual([expect.objectContaining({ where: "run" })]);
 	});
@@ -325,7 +325,7 @@ describe("final model (research round 5, final-model.md section 8 tests 1-5)", (
 		const zip = new Zip(fakePi().pi as Any);
 		const { ctx } = fakeCtx(entries, { model, branch: [{ type: "message", message: { role: "assistant", provider: "q", model: "odd", stopReason: "stop", timestamp: Date.now() - 400_000, content: [] } }] });
 		zip.sessionStart(ctx);
-		await zip.beforeAgentStart(ctx);
+		await startZip(zip, ctx);
 		await zip.context({ messages: flat(entries) }, ctx);
 		expect(ledger().find((r) => r.type === "law")).toMatchObject({ cls: "automatic", wr: 5, prSrc: "class" }); // w/r = 1 / 0.2: kappa = 4
 		expect(zip.status()).toContain("cache q/odd: automatic (from usage), read 0.2 / write 1 / output 4 x input (class ratios)");

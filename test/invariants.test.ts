@@ -8,7 +8,7 @@ import { buildBlocks, planContext, applyPlanToMessages, reserveTokensFor, type B
 import { handleFor } from "../src/placeholder.ts";
 import { skeleton } from "../src/summary.ts";
 import { NATIVE_MARKER, Zip } from "../src/run.ts";
-import { A, AX, fakeCtx, fakePi, flat, longTurn, project, R, U, withK, type Any } from "./helpers.ts";
+import { A, AX, fakeCtx, fakePi, flat, longTurn, project, R, startPrompt, U, withK, type Any } from "./helpers.ts";
 
 const ENV = ["PI_ZIP_TTL_SECS", "PI_ZIP_COLD_CAP", "PI_ZIP_OFF", "PI_ZIP_LEDGER", "PI_ZIP_INTURN_AGE"];
 let saved: Record<string, string | undefined> = {};
@@ -27,7 +27,8 @@ async function rig(entries: Any[], lastTs: number, over: Any = {}, piExtra: Any 
 	const f = fakePi(piExtra);
 	piZip(f.pi);
 	const { ctx, notes } = fakeCtx(entries, { branch: branchOf(entries, lastTs), ...over });
-	return { ...f, ctx, notes, fire: async (name: string, e: Any) => f.handlers.get(name)(e, ctx) };
+	const fire = async (name: string, e: Any) => f.handlers.get(name)(e, ctx);
+	return { ...f, ctx, notes, fire, prompt: (e: Any = {}, order: "1.1" | "1.2" = "1.1") => startPrompt(fire, e, { ctx, order }) };
 }
 /** The Zip instance behind a rig (index.ts keeps it private): only to put it in a state a test needs (justEdited after a warm edit). */
 const zipOf = async (r: Any): Promise<Any> => {
@@ -85,7 +86,7 @@ describe("I1 byte stability: every request of a run sends the same prefix, and i
 
 	async function runCold(entries: Any[]) {
 		const r = await rig(entries, COLD_TS());
-		await r.fire("before_agent_start", {});
+		await r.prompt({});
 		const req1 = await r.fire("context_with_system", { messages: flat(entries) });
 		const req2 = await r.fire("context_with_system", { messages: [...flat(entries), ...flat(tail)] });
 		const all = [...entries, ...tail, A("a6")];
@@ -95,7 +96,7 @@ describe("I1 byte stability: every request of a run sends the same prefix, and i
 	/** Nobody waits for a summary: the first try of a cold return starts the one its plan wants in the background and goes with its
 	 *  folds alone; a later decision takes it once it is ready (here: the prompt tried again). */
 	async function produced(r: Any, entries: Any[]) {
-		await r.fire("before_agent_start", {});
+		await r.prompt({});
 		const first = await r.fire("context_with_system", { messages: flat(entries) });
 		expect(first?.messages?.[0]?.role).not.toBe("compactionSummary");
 		for (let i = 0; i < 300 && !r.ctx.__done; i++) await sleep(10); // the summary loads Pi's serializer lazily: the first call takes a while
@@ -133,7 +134,7 @@ describe("I1 byte stability: every request of a run sends the same prefix, and i
 		const r = await rig(big, COLD_TS());
 		r.ctx.modelRegistry = { complete: async () => ((r.ctx as Any).__done = true, { stopReason: "stop", content: [{ type: "text", text: "## Decisions\nnarrative" }], usage: { cost: { total: 0.01 } } }) };
 		await produced(r, big);
-		await r.fire("before_agent_start", {});
+		await r.prompt({});
 		const req1 = await r.fire("context_with_system", { messages: flat(big) });
 		expect(req1?.messages?.[0]?.role).not.toBe("compactionSummary");
 		const all = [...big, A("a6")];
@@ -154,7 +155,7 @@ describe("I1 byte stability: every request of a run sends the same prefix, and i
 		const r = await rig(big, COLD_TS());
 		r.ctx.modelRegistry = { complete: async () => ((r.ctx as Any).__done = true, { stopReason: "stop", content: [{ type: "text", text: "## Decisions\nnarrative" }], usage: { cost: { total: 0.01 } } }) };
 		await produced(r, big);
-		await r.fire("before_agent_start", {});
+		await r.prompt({});
 		const req1 = await r.fire("context_with_system", { messages: flat(big) });
 		expect(req1?.messages?.[0]?.role).not.toBe("compactionSummary");
 		const all = [...big, A("a6")];
@@ -185,7 +186,7 @@ describe("one producer prepares the return with one timer", () => {
 	const comeBack = async (r: Any, settled: Any, ts: number) => {
 		r.ctx.sessionManager.getBranch = () => [...branchOf(done, ts), ...(settled?.entries?.length ? [settled?.entries.at(-1)] : [])];
 		r.ctx.sessionManager.buildSessionProjection = () => ({ entries: back });
-		await r.fire("before_agent_start", {});
+		await r.prompt({});
 		return r.fire("context_with_system", { messages: flat(back) });
 	};
 	beforeEach(() => { process.env.PI_ZIP_COLD_CAP = "6000"; process.env.PI_ZIP_TTL_SECS = "0.1"; });
@@ -212,7 +213,7 @@ describe("one producer prepares the return with one timer", () => {
 		const st = { calls: 0 };
 		const r = await rig(pauseOnly, WARM_TS(), { modelRegistry: { complete: mkComplete(st) } });
 		await settle(r, pauseOnly);
-		await r.fire("before_agent_start", {});
+		await r.prompt({});
 		await sleep(50);
 		expect(st.calls).toBe(0);
 	});
@@ -225,7 +226,7 @@ describe("one producer prepares the return with one timer", () => {
 			const r = await rig(pauseOnly, WARM_TS(), { modelRegistry: { complete: mkComplete({ calls: 0 }) } });
 			process.env.PI_ZIP_TTL_SECS = "3600";
 			await settle(r, pauseOnly);
-			await r.fire("before_agent_start", {}); // cancel before it could fire
+			await r.prompt({}); // cancel before it could fire
 			expect(timers.some((h) => typeof h.hasRef === "function" && h.hasRef() === false)).toBe(true);
 		} finally {
 			globalThis.setTimeout = realSet;
@@ -309,7 +310,7 @@ describe("one producer prepares the return with one timer", () => {
 		esc.abort();
 		r.ctx.sessionManager.getBranch = () => [...branchOf(done2, COLD_TS()), settled?.entries.at(-1)];
 		r.ctx.sessionManager.buildSessionProjection = () => ({ entries: back2 });
-		await r.fire("before_agent_start", {});
+		await r.prompt({});
 		expect(await r.fire("context_with_system", { messages: flat(back2) })).toBeUndefined(); // the relax fold of r5 stays out
 		expect(r.notes).toEqual([]);
 		expect(await r.fire("turn_end", { ...turnEnd([...back2, A("a6")], "a6"), message: { role: "assistant", stopReason: "aborted", usage: {} } })).toBeUndefined();
@@ -383,9 +384,10 @@ describe("one producer prepares the return with one timer", () => {
 	});
 
 	// ---- the prepared summary goes in through Pi's own compaction (pi-tricks §1b, variant 1) -------------------------------
-	/** The cold return as Pi runs it: before_agent_start sees the session WITHOUT the prompt (Pi appends it after the hook), then the
-	 *  first request. `pi` fakes Pi's side: ctx.compact (asks session_before_compact, appends the entry, projects it), isIdle, settings. */
-	const comeBackNative = async (r: Any, settled: Any, o: { idle?: boolean; compact?: "ok" | "error" | "none"; abort?: boolean; tail?: Any[]; beforeMs?: number; postMs?: number } = {}) => {
+	/** The cold return as Pi runs it: the prompt's input sees the session WITHOUT the prompt (Pi appends it when the run starts), then
+	 *  before_agent_start, agent_start and the first request, in Pi 1.1.0's or 1.2.0's order (`order`). `pi` fakes Pi's side: ctx.compact
+	 *  (asks session_before_compact, appends the entry, projects it), isIdle, settings. */
+	const comeBackNative = async (r: Any, settled: Any, o: { idle?: boolean; compact?: "ok" | "error" | "none"; abort?: boolean; tail?: Any[]; beforeMs?: number; postMs?: number; order?: "1.1" | "1.2" } = {}) => {
 		const st = { compactCalls: 0, answer: undefined as Any, instructions: undefined as Any };
 		let branch: Any[] = [...branchOf(done, COLD_TS()), ...(settled?.entries?.length ? [settled?.entries.at(-1)] : []), ...(o.tail ?? [])];
 		let comp: Any = null;
@@ -410,7 +412,7 @@ describe("one producer prepares the return with one timer", () => {
 				});
 			};
 		}
-		await r.fire("before_agent_start", { prompt: "back" });
+		await r.prompt({ prompt: "back" }, o.order);
 		// Pi appends the prompt, then builds the first request from the session
 		const view = comp ? project(back, [comp]) : back;
 		r.ctx.sessionManager.buildSessionProjection = () => ({ entries: view });
@@ -419,12 +421,12 @@ describe("one producer prepares the return with one timer", () => {
 		return { ...st, req, comp, view };
 	};
 
-	test("a summary prepared while away goes in through Pi's compaction before the run, with pi-zip's own before; the run sends it as Pi projects it", async () => {
+	for (const order of ["1.1", "1.2"] as const) test(`a summary prepared while away goes in through Pi's compaction at the prompt's input, with pi-zip's own before; the run sends it as Pi projects it (Pi ${order} order)`, async () => {
 		const st = { calls: 0 };
 		const r = await rig(done, COLD_TS(), { modelRegistry: { complete: mkComplete(st) } }, { registerEntryRenderer: () => {} });
 		const settled = await settle(r);
 		await sleep(200);
-		const n = await comeBackNative(r, settled);
+		const n = await comeBackNative(r, settled, { order });
 		expect(st.calls).toBe(1); // written once, while away
 		expect(n.compactCalls).toBe(1);
 		expect(n.answer.compaction).toMatchObject({ firstKeptEntryId: "u3", details: { by: "pi-zip", via: "native", trigger: "cold" } });
@@ -458,7 +460,7 @@ describe("one producer prepares the return with one timer", () => {
 		expect(ok.notice).toMatchObject({ native: "ok" });
 		expect(typeof ok.notice.nativeMs).toBe("number");
 		expect(typeof ok.notice.nativeAskMs).toBe("number");
-		expect((await run({ idle: false })).notice.native).toBe("not idle");
+		expect((await run({ idle: false })).notice.native).toBe("no idle input before this prompt's run"); // 0.4.0 (at before_agent_start): "not idle"
 		expect((await run({ compact: "none" })).notice.native).toBe("no ctx.compact");
 		expect((await run({ compact: "error" })).notice.native).toMatch(/^Pi's compaction failed: .*refused/);
 		expect((await run({}, { getSettings: () => ({ compaction: { keepRecentTokens: 10_000_000 } }) })).notice.native).toBe("nothing to compact");
@@ -579,11 +581,11 @@ describe("never wait: rule A starts early; a summary is used once ready; the one
 	beforeAll(async () => { await import("@earendil-works/pi-coding-agent"); });
 	const rows = (type: string): Any[] => (existsSync(ledger) ? readFileSync(ledger, "utf8").trim().split("\n").map((l) => JSON.parse(l)).filter((x) => x.type === type) : []);
 	const settle = (r: Any) => r.fire("agent_before_settle", { context: { contextEntries: done }, entries: [] });
-	/** The user comes back: before_agent_start, then the first request (Pi appended the prompt). */
+	/** The user comes back: the prompt's start (input, before_agent_start, agent_start), then the first request (Pi appended the prompt). */
 	const prompt = async (r: Any, settled?: Any) => {
 		r.ctx.sessionManager.getBranch = () => [...branchOf(done, WARM_TS()), ...(settled?.entries?.length ? [settled?.entries.at(-1)] : [])];
 		r.ctx.sessionManager.buildSessionProjection = () => ({ entries: back });
-		await r.fire("before_agent_start", {});
+		await r.prompt({});
 		return r.fire("context_with_system", { messages: flat(back) });
 	};
 	const noticeOf = (r: Any) => r.appended.filter((x: Any) => x.customType === "pi-zip/notice" && !x.data?.kind).at(-1)?.data;
@@ -707,7 +709,7 @@ describe("never wait: rule A starts early; a summary is used once ready; the one
 		const r = await rig(done, WARM_TS(), { model, modelRegistry: { complete: mkComplete(st) } });
 		r.ctx.sessionManager.getBranch = () => branchOf(done, Date.now() - 600_000);
 		r.ctx.sessionManager.buildSessionProjection = () => ({ entries: back });
-		await r.fire("before_agent_start", {});
+		await r.prompt({});
 		const req = await r.fire("context_with_system", { messages: flat(back) });
 		expect(req?.messages?.[0]?.role).not.toBe("compactionSummary");
 		expect(rows("cold_plan")[0]).toMatchObject({ summary: false });
@@ -954,7 +956,7 @@ describe("never wait: rule A starts early; a summary is used once ready; the one
 		q.ctx.sessionManager.getBranch = () => [...base(), { type: "custom", ...recs[0] }];
 		await q.fire("session_start", {});
 		const t0 = Date.now();
-		const req = await q.fire("before_agent_start", {}).then(() => {
+		const req = await q.prompt({}).then(() => {
 			q.ctx.sessionManager.getBranch = () => [...branchOf(done, WARM_TS()), { type: "custom", ...recs[0] }];
 			q.ctx.sessionManager.buildSessionProjection = () => ({ entries: back });
 			return q.fire("context_with_system", { messages: flat(back) });
@@ -1043,7 +1045,7 @@ describe("I4 off is a strict no-op", () => {
 		await r.handlers.get("cmd:zip").handler("off", r.ctx);
 		r.notes.length = 0; // the command's own confirmation is the only message allowed
 		const msgs = flat(prevRun);
-		expect(await r.fire("before_agent_start", {})).toBeUndefined();
+		expect(await r.prompt({})).toBeUndefined();
 		expect(await r.fire("context_with_system", { messages: msgs })).toBeUndefined();
 		const all = [...prevRun, A("a4")];
 		expect(await r.fire("turn_end", turnEnd(all, "a4"))).toBeUndefined();
@@ -1053,7 +1055,7 @@ describe("I4 off is a strict no-op", () => {
 		// same scenario with zip on does change things (the test would be vacuous otherwise; a working view this small session is above)
 		process.env.PI_ZIP_COLD_CAP = "1000";
 		const on = await rig(prevRun, COLD_TS());
-		await on.fire("before_agent_start", {});
+		await on.prompt({});
 		expect(await on.fire("context_with_system", { messages: msgs })).toBeDefined();
 		expect(await on.fire("before_provider_request", { payload: orphan })).toBeDefined();
 		await r.handlers.get("cmd:zip").handler("on", r.ctx); // and /zip on resumes
@@ -1066,7 +1068,7 @@ describe("I4 off is a strict no-op", () => {
 		expect(r.appended.at(-1)).toMatchObject({ customType: "pi-zip/state", data: { off: true } });
 		const r2 = await rig(prevRun, COLD_TS(), { branch: [...branchOf(prevRun, COLD_TS()), r.appended.at(-1)] });
 		await r2.fire("session_start", { reason: "startup" });
-		await r2.fire("before_agent_start", {});
+		await r2.prompt({});
 		expect(await r2.fire("context_with_system", { messages: flat(prevRun) })).toBeUndefined();
 	});
 
@@ -1215,7 +1217,7 @@ describe("I6 / F10 warm cache: nothing changes unless the context passes the val
 		const entries = session(8);
 		const stale = { type: "custom", customType: "pi-zip/plan", data: { policy: "pi-zip", targets: [], summary: null } };
 		const r = await rig(entries, WARM_TS(), { branch: [...branchOf(entries, WARM_TS()), stale] });
-		await r.fire("before_agent_start", {});
+		await r.prompt({});
 		expect(await r.fire("context_with_system", { messages: flat(entries) })).toBeUndefined();
 		expect(((await r.fire("turn_end", turnEnd([...entries, A("zN")], "zN")))?.entries ?? []).every((e: Any) => e.customType === "pi-zip/rent")).toBe(true);
 		expect(r.notes).toEqual([]);
@@ -1225,7 +1227,7 @@ describe("I6 / F10 warm cache: nothing changes unless the context passes the val
 	test("above V the warm cache is edited with the cold plan: first request carries it, turn_end persists exactly it (one valve, no 0.85 threshold)", async () => {
 		const entries = session(80); // ~180K tokens: above 160K at an unknown window
 		const r = await rig(entries, WARM_TS(), { model: model(undefined) });
-		await r.fire("before_agent_start", {});
+		await r.prompt({});
 		const req1 = await r.fire("context_with_system", { messages: flat(entries) });
 		const foldedIds = req1.messages.filter((m: Any) => m.role === "toolResult" && m.content[0].text.startsWith("[folded by pi-zip")).map((m: Any) => m.toolCallId);
 		expect(foldedIds.length).toBe(76); // the biggest eligible outputs, down to the working view (r79 is the previous turn: protected)
@@ -1246,7 +1248,7 @@ describe("I6 / F10 warm cache: nothing changes unless the context passes the val
 		(big.messages[0] as Any).toolName = "write";
 		entries.splice(entries.length - 1, 0, U("uw", "write it"), call, big, A("zw"));
 		const r = await rig(entries, WARM_TS(), { model: model(undefined) });
-		await r.fire("before_agent_start", {});
+		await r.prompt({});
 		expect(await r.fire("context_with_system", { messages: flat(entries) })).toBeUndefined();
 		expect(((await r.fire("turn_end", turnEnd([...entries, A("zN")], "zN")))?.entries ?? []).every((e: Any) => e.customType === "pi-zip/rent")).toBe(true);
 		expect(r.notes).toEqual([]);
@@ -1258,13 +1260,13 @@ describe("I6 / F10 warm cache: nothing changes unless the context passes the val
 		process.env.PI_ZIP_CACHE_STATS = `${stats}.priced-${process.pid}`;
 		record("p/m", { explicit: true, total: 10_000 }); // the class is known: the law prices the edit with the class ratios
 		const big = await rig(mid, WARM_TS(), { model: model(1_000_000) });
-		await big.fire("before_agent_start", {});
+		await big.prompt({});
 		expect(await big.fire("context_with_system", { messages: flat(mid) })).toBeDefined(); // D ~105K >> the EOQ Delta at this A
 		rmSync(process.env.PI_ZIP_CACHE_STATS, { force: true });
 		process.env.PI_ZIP_CACHE_STATS = stats;
 		const small = session(40); // a larger removal buys the guarded rewrite
 		const tiny = await rig(small, WARM_TS(), { model: model(32_000) }); // cap = room = 7.4K
-		await tiny.fire("before_agent_start", {});
+		await tiny.prompt({});
 		expect(await tiny.fire("context_with_system", { messages: flat(small) })).toBeDefined();
 		// the cold cap never exceeds Pi's compaction room either
 		const prose = [U("u1", "one"), A("a1"), AX("x1", 100_000), U("u2", "two"), A("a2"), AX("x2", 100_000), U("u3", "three"), A("a3"), U("u4", "now")]; // ~30K tokens of prose
@@ -1277,10 +1279,10 @@ describe("I6 / F10 warm cache: nothing changes unless the context passes the val
 	test("a context that grows past V in the middle of a warm run is edited at turn_end, for the next request", async () => {
 		const entries = session(80);
 		const r = await rig(entries, WARM_TS(), { model: model(undefined) });
-		await r.fire("before_agent_start", {});
+		await r.prompt({});
 		// the run started small (first request saw a short session), then grew
 		const first = await rig(session(3), WARM_TS(), { model: model(undefined) });
-		await first.fire("before_agent_start", {});
+		await first.prompt({});
 		expect(await first.fire("context_with_system", { messages: flat(session(3)) })).toBeUndefined();
 		const te = await first.fire("turn_end", turnEnd([...entries, A("zN")], "zN"));
 		expect(te.entries.filter((e: Any) => e.type === "context_edit").length).toBe(76);
@@ -1291,7 +1293,7 @@ describe("I6 / F10 warm cache: nothing changes unless the context passes the val
 		const renderers = new Map<string, Any>();
 		const big = session(80);
 		const r = await rig(session(3), WARM_TS(), { model: model(undefined) }, { registerEntryRenderer: (t: string, fn: Any) => renderers.set(t, fn) });
-		await r.fire("before_agent_start", {});
+		await r.prompt({});
 		expect(await r.fire("context_with_system", { messages: flat(session(3)) })).toBeUndefined();
 		const te = await r.fire("turn_end", turnEnd([...big, A("zN")], "zN")); // the run's last turn: no request of this run carries the plan
 		expect(te.entries.some((e: Any) => e.type === "context_edit")).toBe(true);
@@ -1325,7 +1327,7 @@ describe("run lifecycle: failures, steering", () => {
 	test("an aborted or errored first turn still persists the plan its first request already sent", async () => {
 		for (const stopReason of ["aborted", "error"]) {
 			const r = await rig(cold, COLD_TS());
-			await r.fire("before_agent_start", {});
+			await r.prompt({});
 			const req = await r.fire("context_with_system", { messages: flat(cold) });
 			expect(req.messages.some((m: Any) => m.role === "toolResult" && m.content[0].text.startsWith("[folded"))).toBe(true);
 			const te = await r.fire("turn_end", { ...turnEnd([...cold, A("a5")], "a5"), message: { role: "assistant", stopReason, usage: { input: 0, cacheRead: 0, cacheWrite: 0 } } });
@@ -1335,12 +1337,12 @@ describe("run lifecycle: failures, steering", () => {
 
 	test("a failed turn that never sent a plan persists nothing; when planning threw, the edit run simply ends", async () => {
 		const r = await rig(cold, COLD_TS());
-		await r.fire("before_agent_start", {});
+		await r.prompt({});
 		// the request failed before the context hook ran: no plan was sent
 		expect(await r.fire("turn_end", { ...turnEnd([...cold, A("a5")], "a5"), message: { role: "assistant", stopReason: "error", usage: {} } })).toBeUndefined();
 		const t = await rig(cold, COLD_TS());
 		t.ctx.sessionManager.buildSessionProjection = () => { throw new Error("projection exploded"); };
-		await t.fire("before_agent_start", {});
+		await t.prompt({});
 		expect(await t.fire("context_with_system", { messages: flat(cold) })).toBeUndefined();
 		expect((await t.fire("turn_end", turnEnd([...cold, A("a5")], "a5"))).entries.every((e: Any) => e.customType === "pi-zip/rent")).toBe(true); // nothing was sent, so nothing is persisted
 	});
@@ -1354,7 +1356,7 @@ describe("run lifecycle: failures, steering", () => {
 		(call.messages[0] as Any).content[1].name = "write";
 		process.env.PI_ZIP_COLD_CAP = "1000";
 		const r = await rig(nonRereadable, COLD_TS());
-		await r.fire("before_agent_start", {});
+		await r.prompt({});
 		const req = await r.fire("context_with_system", { messages: flat(nonRereadable) });
 		const foldedIds = req.messages.filter((m: Any) => m.role === "toolResult" && m.content[0].text.startsWith("[folded")).map((m: Any) => m.toolCallId);
 		expect(foldedIds).toEqual(["c1"]); // c2 (write, previous turn) stays: not re-readable
@@ -1366,7 +1368,7 @@ describe("run lifecycle: failures, steering", () => {
 		const steer = withTs(U("u3s", "also do this"), 2000);
 		const entries = [...prevRun, prompt, A("a5", ["c5"]), R("r5", "c5", 300), steer];
 		const r = await rig(entries, COLD_TS());
-		await r.fire("before_agent_start", {});
+		await r.prompt({});
 		await r.fire("message_end", { message: { role: "user", timestamp: 1000, content: "back" } });
 		await r.fire("message_end", { message: { role: "user", timestamp: 2000, content: "also do this" } });
 		const all = [...entries, A("a6")];
@@ -1403,7 +1405,7 @@ describe("coexistence (F14)", () => {
 		const other = { getAllTools: () => [{ name: "compress", sourceInfo: { path: "/opt/ext/node_modules/billion-context-pi/index.ts", source: "npm" } }] };
 		const r = await rig(entries, COLD_TS(), {}, other);
 		await r.fire("session_start", {});
-		await r.fire("before_agent_start", {});
+		await r.prompt({});
 		expect(await r.fire("context_with_system", { messages: flat(entries) })).toBeUndefined();
 		expect(await r.fire("turn_end", turnEnd([...entries, A("a4")], "a4"))).toBeUndefined();
 		expect(await r.fire("before_provider_request", { payload: { messages: [{ role: "tool", tool_call_id: "gone", content: "x" }] } })).toBeDefined();
@@ -1432,10 +1434,10 @@ describe("foreign context editors are logged, never acted on (pi-tricks §3.5)",
 			if (ledger) process.env.PI_ZIP_LEDGER = ledger;
 			else delete process.env.PI_ZIP_LEDGER;
 			const r = await rig(entries, COLD_TS(), { branch });
-			await r.fire("before_agent_start", {});
+			await r.prompt({});
 			const req = await r.fire("context_with_system", { messages: flat(entries) });
 			const te = await r.fire("turn_end", turnEnd([...entries, A("a5")], "a5"));
-			await r.fire("before_agent_start", {}); // a second run: nothing is logged twice
+			await r.prompt({}); // a second run: nothing is logged twice
 			return { req, te };
 		};
 		const ledger = `/tmp/pi-zip-foreign-${process.pid}.jsonl`;
@@ -1464,7 +1466,7 @@ describe("in-turn folds through the real extension: one user message, 60 tool ca
 		process.env.PI_ZIP_COLD_CAP = "8000";
 		const entries = session();
 		const r = await rig(entries, COLD_TS());
-		await r.fire("before_agent_start", {});
+		await r.prompt({});
 		const req1 = await r.fire("context_with_system", { messages: flat(entries) });
 		const req2 = await r.fire("context_with_system", { messages: [...flat(entries), ...flat(tail)] });
 		const all = [...entries, ...tail, A("a63")];
@@ -1493,7 +1495,7 @@ describe("in-turn folds through the real extension: one user message, 60 tool ca
 		const renderers = new Map<string, Any>();
 		const entries = session();
 		const r = await rig(entries, COLD_TS(), {}, { registerEntryRenderer: (t: string, fn: Any) => renderers.set(t, fn) });
-		await r.fire("before_agent_start", {});
+		await r.prompt({});
 		await r.fire("context_with_system", { messages: flat(entries) });
 		await r.fire("turn_end", turnEnd([...entries, ...tail, A("a63")], "a63", 1));
 		await sleep(5);
@@ -1531,7 +1533,7 @@ describe("in-turn folds through the real extension: one user message, 60 tool ca
 		process.env.PI_ZIP_COLD_CAP = "8000";
 		const entries = session();
 		const r = await rig(entries, COLD_TS(), {}, { registerEntryRenderer: () => {} });
-		await r.fire("before_agent_start", {});
+		await r.prompt({});
 		await r.fire("context_with_system", { messages: flat(entries) });
 		await sleep(5);
 		const early = r.appended.filter((x: Any) => x.customType === "pi-zip/notice");
@@ -1550,7 +1552,7 @@ describe("in-turn folds through the real extension: one user message, 60 tool ca
 		const entries = session();
 		const r = await rig(entries, COLD_TS(), {}, { getActiveTools: () => ["edit", "write"] });
 		await r.fire("session_start", {});
-		await r.fire("before_agent_start", {});
+		await r.prompt({});
 		const req1 = await r.fire("context_with_system", { messages: flat(entries) });
 		expect(folded(req1.messages)).toEqual(expected.filter((x) => !["r3", "r10"].includes(x)).sort()); // npm test outputs stay
 		const ph = req1.messages.filter((m: Any) => m.role === "toolResult" && String(m.content[0].text).startsWith("[folded by pi-zip")).map((m: Any) => String(m.content[0].text));
@@ -1584,7 +1586,7 @@ describe("in-turn folds through the real extension: one user message, 60 tool ca
 		const entries = session();
 		process.env.PI_ZIP_COLD_CAP = "8000";
 		const r = await rig(entries, COLD_TS());
-		await r.fire("before_agent_start", {});
+		await r.prompt({});
 		expect(await r.fire("context_with_system", { messages: flat(entries) })).toBeUndefined();
 	});
 

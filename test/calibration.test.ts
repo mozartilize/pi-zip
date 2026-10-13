@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { readFileSync, unlinkSync } from "node:fs";
 import { buildBlocks, C0, C_MAX, C_MIN, calibrate, coldTarget, planContext, R0, sameTokenizer, sizeOf, sysEst, UNIT } from "../src/plan.ts";
 import { lawPrices } from "../src/learn.ts";
-import { A, AX, fakeCtx, fakePi, flat, R, U, type Any } from "./helpers.ts";
+import { A, AX, fakeCtx, fakePi, flat, R, startPrompt, U, type Any } from "./helpers.ts";
 
 const ENV = ["PI_ZIP_TTL_SECS", "PI_ZIP_COLD_CAP", "PI_ZIP_OFF", "PI_ZIP_LEDGER"];
 let saved: Record<string, string | undefined> = {};
@@ -371,7 +371,7 @@ describe("every limit and every number on the right scale", () => {
 			const f = fakePi();
 			piZip(f.pi); // a new Zip each time: nothing from the first one exists in memory
 			const { ctx } = fakeCtx(all, { branch });
-			await f.handlers.get("before_agent_start")({}, ctx);
+			await startPrompt((n, e) => f.handlers.get(n)(e, ctx));
 			await f.handlers.get("context_with_system")({ messages: flat(all) }, ctx);
 		}
 		const plans = readFileSync(ledger, "utf8").trim().split("\n").map((l) => JSON.parse(l)).filter((l: Any) => l.type === "cold_plan");
@@ -391,7 +391,7 @@ describe("every limit and every number on the right scale", () => {
 		const f = fakePi({ registerEntryRenderer: () => {} });
 		piZip(f.pi);
 		const { ctx } = fakeCtx(all, { branch });
-		await f.handlers.get("before_agent_start")({}, ctx);
+		await startPrompt((n, e) => f.handlers.get(n)(e, ctx));
 		const req = await f.handlers.get("context_with_system")({ messages: flat(all) }, ctx);
 		await f.handlers.get("turn_end")({ entries: [], turnIndex: 1, message: { role: "assistant", usage: {} }, context: { contextEntries: all } }, ctx);
 		await new Promise((r) => setTimeout(r, 5));
@@ -425,7 +425,7 @@ describe("regression (fresh process, print mode): the last usage says ~88K real 
 		piZip(f.pi);
 		const branch = [...all.map((x) => ({ type: "message", id: x.sourceEntry.id, message: x.sourceEntry.message })), { type: "message", id: "ts", message: { role: "assistant", timestamp: Date.now() - 60_000, content: [] } }];
 		const { ctx } = fakeCtx(all, { branch });
-		await f.handlers.get("before_agent_start")({}, ctx);
+		await startPrompt((n, e) => f.handlers.get(n)(e, ctx));
 		const req = await f.handlers.get("context_with_system")({ messages: flat(all) }, ctx);
 		const lines = readFileSync(ledger, "utf8").trim().split("\n").map((l) => JSON.parse(l));
 		unlinkSync(ledger);
@@ -476,7 +476,7 @@ describe("stats and notices use the plan's scale", () => {
 		piZip(f.pi);
 		const branch = [...cold.map((x) => ({ type: "message", id: x.sourceEntry.id, message: x.sourceEntry.message })), { type: "message", id: "ts", message: { role: "assistant", timestamp: Date.now() - 60_000, content: [] } }];
 		const { ctx, notes } = fakeCtx(cold, { branch });
-		await f.handlers.get("before_agent_start")({}, ctx);
+		await startPrompt((n, e) => f.handlers.get(n)(e, ctx));
 		await f.handlers.get("context_with_system")({ messages: flat(cold) }, ctx);
 		const all = [...cold, A("a5")];
 		await f.handlers.get("turn_end")({ message: { role: "assistant", stopReason: "stop", usage: { input: 1, cacheRead: 0, cacheWrite: 0 } }, messageEntryId: "a5", context: { contextEntries: all }, entries: [], turnIndex: 0 }, ctx);

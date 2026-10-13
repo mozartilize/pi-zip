@@ -132,13 +132,24 @@ export default function piZip(pi: ExtensionAPI) {
 		zip.armProducer(ctx);
 		return r;
 	});
-	// a run an extension's message starts (sendMessage with triggerTurn) never fires before_agent_start; agent_start always fires
+	// a prompt (typed, or an extension's sendUserMessage): Pi is idle here and waits for the handler before it starts the run, so a
+	// summary prepared while the user was away may go in through Pi's compaction; a steer or follow-up belongs to the running run
+	pi.on("input", async (e, ctx) => {
+		if (!e.streamingBehavior) {
+			checkRecall(ctx);
+			zip.refreshFolded(ctx); // the branch may have changed (/tree, fork)
+		}
+		await zip.input(e, ctx);
+		return undefined;
+	});
+	// the run begins at agent_start, which always fires; before_agent_start says whose run it is (Pi 1.1.0 fires it for prompts only, 1.2.0
+	// also for a run an extension's message starts with sendMessage and triggerTurn, as messageType "custom")
 	pi.on("agent_start", (_e, ctx) => zip.agentStart(ctx));
 	pi.on("agent_end", () => zip.agentEnd());
 	pi.on("before_agent_start", async (e, ctx) => {
 		checkRecall(ctx);
-		zip.refreshFolded(ctx); // the branch may have changed (/tree, fork)
-		await zip.beforeAgentStart(ctx, e); // may persist a summary prepared while the user was away through Pi's compaction (Pi is idle here)
+		zip.refreshFolded(ctx);
+		await zip.beforeAgentStart(ctx, e);
 		return undefined;
 	});
 	// answers only the compaction pi-zip itself just asked for; every other compaction (Pi's, /compact, other extensions') gets undefined
