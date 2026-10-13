@@ -157,11 +157,13 @@ async function rig(setup: (sm: SessionManager) => void = populate, opts: RigOpts
 	let compacting: AbortController | null = null; // Pi's _compactionAbortController: ctx.abort() reaches it (abort -> abortCompaction)
 	let busy = false; // a run is active (Pi's _isAgentRunActive): from agent_start, on Pi 1.2.0 from before_agent_start, to settle
 	const order: PiOrder = opts.pi ?? rigOrder;
+	let model = opts.model ?? MODEL; // Pi's current model (an extension may choose another, at before_agent_start say)
 	/** AgentSession.compact() as Pi 1.1.0 runs it for an extension (minus the abort of an idle session and the UI events): Pi's own
 	 *  prepareCompaction decides "Already compacted" / "Nothing to compact", session_before_compact supplies the result (every extension's
 	 *  handler in load order: the last answer wins, a cancel stops it), the abort signal is checked right before appendCompaction. */
 	const piCompact = (options: Any) => {
 		void (async () => {
+			await Promise.resolve(); // compact() awaits abort() before it sets its controller: Pi is idle until then
 			const controller = new AbortController();
 			compacting = controller;
 			compactCalls.n++;
@@ -188,7 +190,7 @@ async function rig(setup: (sm: SessionManager) => void = populate, opts: RigOpts
 	};
 	runner.bindCore(
 		{ sendMessage: noop, sendUserMessage: noop, appendEntry, setSessionName: noop, getSessionName: () => undefined, setLabel: noop, getActiveTools: () => ["read", "bash", "zip_recall"], getAllTools: () => [], getSettings: () => opts.settings ?? {}, setActiveTools: noop, refreshTools: noop, getCommands: () => [], setModel: async () => false, getThinkingLevel: () => "off", setThinkingLevel: noop } as Any,
-		{ getModel: () => opts.model ?? MODEL, getScopedModels: () => [], isIdle: () => opts.idle !== false && !compacting && !busy, isProjectTrusted: () => true, getSignal: () => undefined, abort: () => compacting?.abort(), hasPendingMessages: () => false, shutdown: noop, getContextUsage: () => undefined, compact: opts.native ? piCompact : (o: Any) => o?.onError?.(new Error("rig: no compaction")), getSystemPrompt: () => "You are a coding agent." } as Any,
+		{ getModel: () => model, getScopedModels: () => [], isIdle: () => opts.idle !== false && !compacting && !busy, isProjectTrusted: () => true, getSignal: () => undefined, abort: () => compacting?.abort(), hasPendingMessages: () => false, shutdown: noop, getContextUsage: () => undefined, compact: opts.native ? piCompact : (o: Any) => o?.onError?.(new Error("rig: no compaction")), getSystemPrompt: () => "You are a coding agent." } as Any,
 	);
 	// Pi's TUI hands raw input to the extensions' listeners in order (TuiBase.handleTerminalInput): one may consume it or replace the data
 	const inputListeners = new Set<(data: string) => Any>();
@@ -265,16 +267,20 @@ async function rig(setup: (sm: SessionManager) => void = populate, opts: RigOpts
 	};
 	const apply = (manager: SessionManager, drafts: Any[]) => (AgentSession.prototype as Any)._applyBoundaryDrafts.call({}, manager, drafts) as Any[];
 	/** A prompt as Pi runs it (AgentSession.prompt): the input handlers while Pi is idle (it waits for them), then before_agent_start and
-	 *  agent_start in the rig's order. `fail`: the prompt throws between before_agent_start and agent_start (Pi's image normalisation). */
-	const prompt = async (text = "next request", o: { fail?: boolean } = {}) => {
+	 *  agent_start in the rig's order. `fail`: the prompt throws between before_agent_start and agent_start (Pi's image normalisation).
+	 *  `afterInput` runs between the input handlers and before_agent_start (Pi's own threshold compaction, say), `afterStart` between
+	 *  before_agent_start and agent_start (a steer typed into the starting run, a handler choosing another model). */
+	const prompt = async (text = "next request", o: { fail?: boolean; afterInput?: () => Any; afterStart?: () => Any } = {}) => {
 		await new Promise((resolve) => setTimeout(resolve, 5));
 		busy = false; // the previous run is over
 		turn++; ended = false;
 		await runner.emitInput(text, undefined, "interactive", undefined);
+		await o.afterInput?.();
 		if (order === "1.2") busy = true;
 		const r = order === "1.2"
 			? await runner.emit({ type: "before_agent_start", messageType: "user", prompt: text, systemPromptOptions: { cwd: CWD } } as Any)
 			: await runner.emitBeforeAgentStart(text, undefined, { cwd: CWD } as Any);
+		await o.afterStart?.();
 		busy = !o.fail;
 		if (!o.fail) await runner.emit({ type: "agent_start" } as Any);
 		return r;
@@ -312,7 +318,8 @@ async function rig(setup: (sm: SessionManager) => void = populate, opts: RigOpts
 	};
 	if (opts.start !== false) await prompt();
 	const shutdown = () => runner.emit({ type: "session_shutdown" } as Any);
-	return { sm, runner, request, turnEnd, settle, prompt, steer, drive, order, narrativeCalls, projectionMessages, compactions, compactCalls, foreignCalls, inputListeners, typeKey, editor, shutdown, zip, checks, noticeCounts };
+	const setModel = (m: Any) => { model = m; };
+	return { sm, runner, request, turnEnd, settle, prompt, steer, drive, order, setModel, narrativeCalls, projectionMessages, compactions, compactCalls, foreignCalls, inputListeners, typeKey, editor, shutdown, zip, checks, noticeCounts };
 }
 
 // These checks observe Pi's actual request messages and emitted transcript entries, independently of plan flags.
@@ -1507,6 +1514,60 @@ for (const order of ORDERS) describe(`the typed-prompt door opens at Pi's input 
 		expect(r.compactCalls.n).toBe(0);
 		expect(r.zip.start).toBe(started); // and leaves the start of the run in progress alone
 		expect(r.sm.getBranch().some((e: Any) => e.type === "compaction")).toBe(false);
+	});
+
+	const ledgerOf = (r: Any) => {
+		const out: Any[] = [];
+		const ledger = r.zip.ledger;
+		r.zip.ledger = (rec: Any) => (out.push(rec), ledger(rec));
+		return out;
+	};
+
+	if (order === "1.2") test("a steer typed into the starting run (busy from before_agent_start on, before agent_start) leaves the prompt's decision to its run", async () => {
+		const r = await readyRig();
+		await r.prompt("Continue with the task.", { afterStart: () => r.steer("also look at the logs") });
+		expect(r.compactCalls.n).toBe(1);
+		expect(r.zip.nativeRun?.before).toBe(r.compactions[0].tokensBefore); // the steer did not take the run's start from it
+		sendPrompt(r.sm, "Continue with the task.");
+		await r.request();
+		expect(r.zip.runPlan.native.text).toBe(r.compactions[0].summary);
+	});
+
+	test("another compaction between the prompt's input and its run (Pi's own, say) voids the carried decision: the run reads its own start", async () => {
+		const r = await readyRig();
+		const led = ledgerOf(r);
+		await r.prompt("Continue with the task.", { afterInput: () => void r.sm.appendCompaction("Pi's own summary.", r.compactions[0].firstKeptEntryId, 50_000, undefined, false) });
+		expect(r.compactCalls.n).toBe(1);
+		expect(led).toContainEqual(expect.objectContaining({ type: "start_dropped", reason: "the projection changed between the prompt and its run", native: true }));
+		expect(r.zip.nativeRun).toBeNull();
+	});
+
+	test("another model chosen before the run (a before_agent_start handler, say) voids the carried decision: the run reads its own start", async () => {
+		const r = await readyRig();
+		const led = ledgerOf(r);
+		await r.prompt("Continue with the task.", { afterStart: () => r.setModel({ ...MODEL, provider: "other", id: `switched-${order}` }) });
+		expect(r.compactCalls.n).toBe(1);
+		expect(led).toContainEqual(expect.objectContaining({ type: "start_dropped", reason: "the model changed between the prompt and its run", native: true }));
+		expect(r.zip.nativeRun).toBeNull();
+		expect(r.zip.model.id).toBe(`switched-${order}`);
+	});
+
+	test("two inputs that overlap (Pi's queue after a compaction sends the rest without waiting) ask for one compaction; the first keeps its decision", async () => {
+		const r = await readyRig();
+		const led = ledgerOf(r);
+		await Promise.all([r.runner.emitInput("Continue with the task.", undefined, "interactive", undefined), r.runner.emitInput("and the tests", undefined, "interactive", undefined)]);
+		expect(r.compactCalls.n).toBe(1);
+		expect(r.compactions).toHaveLength(1);
+		expect(led).toContainEqual(expect.objectContaining({ type: "native_skip", reason: "an earlier input is still being handled" }));
+		expect(r.zip.start?.nat?.before).toBe(r.compactions[0].tokensBefore);
+	});
+
+	test("a run that starts while a prompt's input is handled takes nothing of it, and nothing is left for a later run", async () => {
+		const r = await readyRig();
+		const led = ledgerOf(r);
+		await Promise.all([r.runner.emitInput("Continue with the task.", undefined, "interactive", undefined), r.drive()]);
+		expect(r.zip.start).toBeNull();
+		expect(led).toContainEqual(expect.objectContaining({ type: "start_dropped", reason: "a run started while the prompt's input was handled" }));
 	});
 
 	test("an input another extension handles starts no run: the compaction stays, pi-zip is not in a run, the decision reaches no later run", async () => {

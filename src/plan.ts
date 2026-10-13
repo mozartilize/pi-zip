@@ -493,12 +493,12 @@ export function buildBlocks(contextEntries: Any[], steerIds?: Set<string>): Bloc
 			edited = msg !== raw && msg.content !== raw.content;
 		}
 		// A turn starts at a real user prompt, or at a custom message that starts a run (an extension's `sendMessage(..., { triggerTurn })`:
-		// pi-runway's owed-drive, durable-subagents' attention; Pi starts a run from it without before_agent_start, and nothing else in the
-		// session says "the user is here"). Such a message follows the previous run's final answer; one that arrives mid-run follows a tool
-		// result and belongs to that run. A prompt that directly follows its own starter (a nextTurn message is stored before the prompt it
-		// rides with) is the same turn: one start, however many entries it took. Pi 1.1.0 stores a prompt FIRST and then the nextTurn and
-		// before_agent_start messages that ride with it (agent-session.js prompt): those follow a user message, not an answer, so they never
-		// start a turn of their own (every start clears afterAnswer).
+		// pi-runway's owed-drive, durable-subagents' attention; Pi starts a run from it with no user prompt, before_agent_start only on Pi
+		// 1.2.0, and nothing else in the session says "the user is here"). Such a message follows the previous run's final answer; one that
+		// arrives mid-run follows a tool result and belongs to that run. A prompt that directly follows its own starter (a nextTurn message is
+		// stored before the prompt it rides with) is the same turn: one start, however many entries it took. Pi 1.1.0 stores a prompt FIRST and
+		// then the nextTurn and before_agent_start messages that ride with it (agent-session.js prompt): those follow a user message, not an
+		// answer, so they never start a turn of their own (every start clears afterAnswer).
 		if (kind === "user") {
 			if (!(src.id && steerIds?.has(src.id)) && !starter) userTurn++;
 			starter = false;

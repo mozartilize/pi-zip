@@ -486,11 +486,14 @@ No cell of 4 price/cache regimes × 8 session strata has a cost-ratio confidence
 - **The typed-prompt door depends on Pi's `input` event.** pi-zip asks for the native compaction in its `input` handler, where
   Pi 1.1.0 and 1.2.0 are both idle and wait for the handler before they start the run (1.2.0 counts the run as busy from
   `before_agent_start` on, so 0.4.0's door there stayed closed). A prompt typed while a run streams (a steer or follow-up) never
-  opens it. A prompt that starts with `/` is priced from its raw text before Pi expands the template or skill (so is a prompt
-  another extension rewrites after pi-zip); a much larger expansion makes that one decision slightly optimistic, and later
-  decisions read the real sizes. If no run follows (another extension handles the input, or Pi refuses the model), a summary
-  that went in stays in the session (pi-zip's own, with its exact size before) and nothing else of that prompt is kept. All
-  three doors are checked in a real TUI on Pi 1.1.0 and 1.2.0.
+  opens it, and an input that comes while pi-zip still handles an earlier one is skipped. A steer or follow-up queued while Pi is
+  idle (RPC, Pi's queue after a compaction) reaches extensions exactly like a prompt, so it can open the door too. A prompt that
+  starts with `/` is priced from its raw text before Pi expands the template or skill (so is a prompt another extension rewrites
+  after pi-zip): that decision, and the first request's plan it hands to the run unchanged, are off by the size of the
+  expansion; later decisions read the real sizes. If another compaction goes in or another model is chosen before the run
+  starts, the run reads its own start instead. If no run follows (another extension handles the input, or Pi refuses the
+  model), a summary that went in stays in the session (pi-zip's own, with its exact size before) and nothing else of that
+  prompt is kept. All three doors are checked in a real TUI on Pi 1.1.0 and 1.2.0.
 - **Offline is not live.** The model's behaviour after a fold comes from a calibrated simulator, and the cells to watch live are
   one-hour-cache main sessions.
 

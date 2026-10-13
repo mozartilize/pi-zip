@@ -8,6 +8,8 @@
   return measured in a real TUI: 147,039 tokens instead of 28,278).
 - What the prompt's input decided goes to that prompt's run only. A prompt that starts no run (another extension handles it, the model
   or its credentials are refused) leaves pi-zip as it was; a summary that already went in stays, with its exact "Compacted from" number.
+  If another compaction goes in or another model is chosen between the prompt and its run, the run decides afresh. Two inputs that
+  overlap ask for at most one compaction.
 - A run an extension's message starts on Pi 1.2.0 (which now fires `before_agent_start` for it) begins once, as a driven run.
 - All three doors (typed prompt, driven run, mid-run) are checked in a real TUI on Pi 1.1.0 and on Pi 1.2.0, each with Pi's exact
   "Compacted from" number.
