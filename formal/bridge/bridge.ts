@@ -1052,7 +1052,7 @@ async function runTrace(tr: Any): Promise<Any> {
 				const sum = Math.max(Math.min(Math.max(c * prefix / 10, 1000), 8000), c * prev) / c;
 				const art = artifacts.findLast((a: Any) => a.key === b.entryId && a.cut.firstKeptEntryId === b.entryId);
 				const keptFolds = folds.filter((f: Any) => bs.findIndex((x: Any) => x.entryId === f.entryId) >= i);
-				cuts.push({ key: b.entryId, prefix: c * prefix, summary: c * sum, read: c * Math.max(prefix - prev, 0), written: Math.min(c * sum, 4000), ready: !!art, guard: !core.checkEdits(bs, turns, keptFolds, { firstKeptEntryId: b.entryId }), hash: art ? sha(art.cut.text) : null });
+				cuts.push({ key: b.entryId, prefix: c * prefix, summary: c * sum, finished: art ? c * art.cut.summaryTokens : c * sum, read: c * Math.max(prefix - prev, 0), written: Math.min(c * sum, 4000), ready: !!art, guard: !core.checkEdits(bs, turns, keptFolds, { firstKeptEntryId: b.entryId }), hash: art ? sha(art.cut.text) : null });
 			}
 			prefix += byId.get(b.entryId)?.phTokens ?? b.tokens;
 		}

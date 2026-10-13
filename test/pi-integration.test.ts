@@ -294,6 +294,45 @@ const produced = async (r: Any) => {
 };
 
 describe("boundary decision regressions", () => {
+	for (const how of ["applied", "esc", "mismatch"] as const) test(`first-request rent resets only when the selected edit goes out (${how})`, async () => {
+		const sm = SessionManager.inMemory(CWD);
+		sm.appendMessage(user("older"));
+		sm.appendMessage({ ...asst([call("large")], "toolUse"), usage: undefined });
+		sm.appendMessage(result("large", bulk("output", 6000)));
+		sm.appendMessage(user("previous"));
+		sm.appendMessage({ ...asst([{ type: "text", text: "done" }]), timestamp: Date.now(), usage: undefined });
+		sm.appendCustomEntry("pi-zip/rent", { rent: 10_000 });
+		const r = await rig(undefined, { file: [sm.getHeader() as Any, ...sm.getEntries()], start: false });
+		let restored: Awaited<ReturnType<typeof rig>> | undefined;
+		try {
+			await r.beforeAgentStart("current");
+			r.sm.appendMessage(user("current"));
+			r.zip.cold = false; r.zip.pWarm = 1; // a warm first request whose fold pays under G_{1/10} with the paid rent
+			const signal = { aborted: false }, base = r.runner.createContext();
+			const ctx = new Proxy(base, { get: (t, k) => (k === "signal" ? signal : Reflect.get(t, k)) });
+			const compute = r.zip.computeRunPlan.bind(r.zip);
+			r.zip.computeRunPlan = async (c: Any) => {
+				await compute(c);
+				expect(r.zip.runPlan?.folds.length).toBeGreaterThan(0); // the edit is selected
+				expect(r.zip.rent).toBe(10_000); // and not yet paid for
+				if (how === "esc") signal.aborted = true; // Esc between planning and application
+			};
+			const messages = structuredClone(r.projectionMessages());
+			if (how === "mismatch") for (const m of messages) if (m.role === "toolResult") m.content = [{ type: "text", text: "annotated by a preceding handler" }];
+			if (how === "applied") expect((await r.request()).filter(isFolded).length).toBeGreaterThan(0); // Pi's request carries it
+			else expect(await r.zip.context({ messages }, ctx)).toBeUndefined();
+			expect(!!r.zip.runPlan?.sent).toBe(how === "applied");
+			const balance = how === "applied" ? 0 : 10_000;
+			expect(r.zip.rent).toBe(balance);
+			const response = { ...asst([{ type: "text", text: "stopped" }], "aborted"), timestamp: Date.now(), usage: undefined };
+			const drafts = await r.turnEnd(r.sm.appendMessage(response), response); // the failed boundary persists only what went out
+			expect(drafts.some((d) => d.customType === "pi-zip/rent")).toBe(how === "applied");
+			expect(rentOf(r.sm.getBranch())).toBe(balance);
+			restored = await rig(undefined, { file: [r.sm.getHeader() as Any, ...r.sm.getEntries()], start: false });
+			expect(restored.zip.rent).toBe(balance);
+		} finally { await restored?.shutdown(); await r.shutdown(); }
+	});
+
 	for (const reject of [false, true]) test(`warm boundary rent resets only after a valid edit (reject=${reject})`, async () => {
 		const sm = SessionManager.inMemory(CWD);
 		sm.appendMessage(user("older"));

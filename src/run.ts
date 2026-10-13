@@ -950,6 +950,7 @@ export class Zip implements ZipControl {
 		if (this.runPlan && !this.runPlan.persisted) {
 			const out = applyPlanToMessages(e.messages, this.runPlan);
 			if (out || this.runPlan.native) { // a native summary is already in the request Pi built: it still goes out with this request
+				this.rent = 0; // the rewrite goes out with this request (R14)
 				if (!this.runPlan.sent) this.nextEdit = this.runPlan.untouched ?? 0;
 				this.runPlan.sent = true;
 				const applied = (this.runPlan.applied = out?.applied ?? this.runPlan.applied ?? new Set<string>());
@@ -995,7 +996,9 @@ export class Zip implements ZipControl {
 		// no warm edit on the request right after an edited one (no back-to-back warm rewrites); the summary the plan wants is still
 		// produced. A summary Pi's compaction already put in the session (nativeSummary skips such a return, so only defensively) is
 		// never dropped here: the run plan below carries it
-		this.rent = d.rentNext;
+		// R14: rent resets only when a rewrite goes out. A selected first-request edit keeps the incoming balance until context()
+		// applies it to a request (Esc before application, or content another handler changed, leaves the paid rent intact).
+		if (!d.p || nat) this.rent = d.rentNext;
 		if (d.produce) this.want("run", ctx, d.produce);
 		if (d.kind === "b2b") {
 			this.ledger({ type: "b2b_skip", where: "run" });
