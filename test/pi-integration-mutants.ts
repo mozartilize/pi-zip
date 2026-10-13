@@ -7,6 +7,11 @@ const output = join(root, "formal", "out", "pi-integration-mutants");
 mkdirSync(output, { recursive: true });
 const mutants = [
 	{
+		name: "boundary-double-deducts-folds",
+		check: "reported after-size must be non-negative and match the resulting Pi context within 10%",
+		edit: (source: string) => source.replace("const ctxAfter = sizeOf(sc,", "const ctxAfter = ctxTokens - (before - after) - cutSaved; const ignored = sizeOf(sc,"),
+	},
+	{
 		name: "room-summary-inherits-sent",
 		check: "request carry metadata must match the actual request view",
 		edit: (source: string) => source.replace("carried: false, regrow", "carried: sentBefore, regrow"),

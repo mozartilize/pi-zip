@@ -320,7 +320,7 @@ pub fn axioms() -> Vec<Prop> {
             id: "EN",
             name: "exact compaction number",
             from: &["I1"],
-            why: "every pi-zip summary enters natively at an idle typed prompt or as the first turn_end draft; Pi's actual tokensBefore equals pi-zip's before on both doors",
+            why: "every pi-zip summary enters natively at an idle typed prompt or as the first turn_end draft; Pi's actual tokensBefore equals pi-zip's before on both doors; every notice and fold ledger after-size is non-negative and matches the resulting context within 10%",
             evidence: Evidence::Conformance,
             f: always(atom("exact_number", |r: &R, i, _| {
                 let t = r.tick(i);

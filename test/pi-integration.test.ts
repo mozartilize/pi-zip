@@ -101,7 +101,15 @@ async function rig(setup: (sm: SessionManager) => void = populate, opts: RigOpts
 	};
 	const runner = new ExtensionRunner(extensions, runtime, CWD, sm, registry);
 	const noop = () => {};
-	const checks = { carry: [] as string[], notices: [] as string[] };
+	const checks = { carry: [] as string[], notices: [] as string[], sizes: [] as string[] };
+	const reports: { after: number; scale: { O: number; c: number }; kind: string }[] = [];
+	// Count the resulting Pi messages, independently of the selected edit and its savings arithmetic.
+	const checkSizes = (messages: Any[]) => {
+		for (const report of reports.splice(0)) {
+			const actual = report.scale.O + report.scale.c * messages.filter((m) => m.role !== "system").reduce((n, m) => n + wireTokensOf(m), 0);
+			if (!Number.isFinite(report.after) || report.after < 0 || Math.abs(report.after - actual) > Math.max(2, actual * 0.1)) checks.sizes.push(`${report.kind}: ${report.after} differs from resulting context ${actual}`);
+		}
+	};
 	integrationChecks.push(checks);
 	let zip: Any;
 	let actualRequest: Any[] | null = null;
@@ -196,6 +204,7 @@ async function rig(setup: (sm: SessionManager) => void = populate, opts: RigOpts
 			if (plan.sent && (plan.cut || plan.native) && !containsCut(messages, plan.cut ?? plan.native)) checks.carry.push("sent summary absent from request");
 		}
 		await new Promise((resolve) => setTimeout(resolve, 5));
+		checkSizes(messages);
 		assertIntegrationChecks();
 		return messages;
 	};
@@ -216,6 +225,7 @@ async function rig(setup: (sm: SessionManager) => void = populate, opts: RigOpts
 		}
 		apply(sm, drafts);
 		await new Promise((resolve) => setTimeout(resolve, 5));
+		checkSizes(projectionMessages());
 		assertIntegrationChecks();
 		ended = true;
 		return drafts;
@@ -236,17 +246,29 @@ async function rig(setup: (sm: SessionManager) => void = populate, opts: RigOpts
 	(Zip.prototype as Any).sessionStart = function (this: Any, ...args: Any[]) { zip = this; return start.apply(this, args); };
 	try { await runner.emit({ type: "session_start", reason: "startup" } as Any); }
 	finally { (Zip.prototype as Any).sessionStart = start; }
+	let noticeScale = UNIT;
+	const noticeFor = zip.noticeFor.bind(zip), notify = zip.notify.bind(zip), ledger = zip.ledger.bind(zip);
+	zip.noticeFor = (...args: Any[]) => { noticeScale = args[1].scale; return noticeFor(...args); };
+	zip.notify = (ctx: Any, text: string, data: Any) => {
+		if (data && !data.kind) reports.push({ after: data.after, scale: noticeScale, kind: "notice" });
+		return notify(ctx, text, data);
+	};
+	zip.ledger = (rec: Any) => {
+		if (rec.type === "fold") reports.push({ after: rec.ctxAfter, scale: { O: rec.O, c: rec.c }, kind: "fold ledger" });
+		return ledger(rec);
+	};
 	if (opts.start !== false) await beforeAgentStart();
 	const shutdown = () => runner.emit({ type: "session_shutdown" } as Any);
 	return { sm, runner, request, turnEnd, settle, beforeAgentStart, narrativeCalls, projectionMessages, compactions, compactCalls, foreignCalls, inputListeners, typeKey, editor, shutdown, zip, checks, noticeCounts };
 }
 
 // These checks observe Pi's actual request messages and emitted transcript entries, independently of plan flags.
-const integrationChecks: { carry: string[]; notices: string[] }[] = [];
+const integrationChecks: { carry: string[]; notices: string[]; sizes: string[] }[] = [];
 const assertIntegrationChecks = () => {
 	for (const check of integrationChecks) {
 		expect(check.carry, "request carry metadata must match the actual request view").toEqual([]);
 		expect(check.notices, "one turn emits at most one pi-zip notice").toEqual([]);
+		expect(check.sizes, "reported after-size must be non-negative and match the resulting Pi context within 10%").toEqual([]);
 	}
 };
 const saved: Record<string, string | undefined> = {};
@@ -443,7 +465,9 @@ describe("mixed room boundary", () => {
 		expect(notices[0].data.desc).toContain("zipped");
 		expect(notices[0].data.desc).toContain("summarized");
 		expect(notices[0].data.desc).toContain("waited");
-		expect(notices[0].data.after).toBeLessThan(real / 2);
+		const resulting = scale.O + scale.c * r.projectionMessages().filter((m) => m.role !== "system").reduce((n, m) => n + wireTokensOf(m), 0);
+		expect(notices[0].data.after).toBeGreaterThanOrEqual(0);
+		expect(notices[0].data.after).toBe(Math.round(resulting));
 		const next = await r.request();
 		expect(next.some((m) => m.role === "compactionSummary" && m.summary === compaction.summary)).toBe(true);
 		await r.runner.emitBeforeProviderRequest({});

@@ -121,6 +121,17 @@ Zip.prototype.sessionStart = function (this: Any, ctx: Any) {
 };
 Zip.prototype.ledger = function (rec: Any) {
 	(this.__sink ?? sink).push(rec);
+	if (rec.type === "fold" && !this.__probe) (this.__reports ??= []).push({ kind: "fold ledger", after: rec.ctxAfter, scale: { O: rec.O, c: rec.c } });
+};
+// Capture notice data even without a UI; compare reports with Pi's resulting messages, never their savings arithmetic.
+const origNoticeFor = Zip.prototype.noticeFor, origNotify = Zip.prototype.notify;
+Zip.prototype.noticeFor = function (this: Any, ...a: Any[]) {
+	this.__noticeScale = a[1].scale;
+	return origNoticeFor.apply(this, a);
+};
+Zip.prototype.notify = function (this: Any, ...a: Any[]) {
+	if (a[2] && !a[2].kind && !this.__probe) (this.__reports ??= []).push({ kind: "notice", after: a[2].after, scale: this.__noticeScale });
+	return origNotify.apply(this, a);
 };
 // A summary written in the background (Zip.startBg: the shared producer) is no wait, whenever it runs: its model
 // call is tagged through the async context it was started in (the bridge's narrative model answers at once, so timing cannot tell)
@@ -251,6 +262,13 @@ async function runTrace(tr: Any): Promise<Any> {
 	const foreignDropped = new Set<string>(); // user entries a foreign compaction removed (not pi-zip's to keep)
 	const foreignEdited = new Set<string>(); // tool outputs another extension's context_edit rewrote (not pi-zip's)
 	const nativeIssues: string[] = [];
+	const sizeIssues: string[] = [];
+	const checkSizes = (z: Any, messages: Any[]) => {
+		for (const report of z?.__reports?.splice(0) ?? []) {
+			const actual = report.scale.O + report.scale.c * messages.filter((m) => m.role !== "system").reduce((n, m) => n + plan.wireTokensOf(m), 0);
+			if (!Number.isFinite(report.after) || report.after < 0 || Math.abs(report.after - actual) > Math.max(2, actual * 0.1)) sizeIssues.push(`${report.kind}: ${report.after} differs from resulting context ${actual}`);
+		}
+	};
 	let nativeAllowed = false;
 	const hijacked: string[] = []; // compactions pi-zip answered without having asked for them
 	const toolOf = new Map<string, string>(); // tool result entry id -> npm | cat | recall
@@ -805,6 +823,7 @@ async function runTrace(tr: Any): Promise<Any> {
 		const raw = sm.buildSessionContext().messages;
 		const out = await fire(live, "context_with_system", { type: "context_with_system", messages: raw });
 		const view = out?.messages ?? raw;
+		checkSizes(z, view);
 		const payload = payloadOf(view);
 		const before = JSON.stringify(payload);
 		const sent = await fire(live, "before_provider_request", { type: "before_provider_request", payload });
@@ -910,7 +929,7 @@ async function runTrace(tr: Any): Promise<Any> {
 		const te = await fire(live, "turn_end", { type: "turn_end", turnIndex: reqInRun, message: asst, toolResults, messageEntryId: aid, toolResultEntryIds: [], context: boundaryCtx(staged), entries: incoming });
 		const drafts: Any[] = te?.entries ?? incoming;
 		const ours = drafts.slice(incoming.length);
-		const exactIssues: string[] = nativeIssues.splice(0);
+		const exactIssues: string[] = [...nativeIssues.splice(0), ...sizeIssues.splice(0)];
 		const compaction = drafts.find((d: Any) => d.type === "compaction" && d.details?.by === "pi-zip");
 		const piBefore = estimateProjectedContextTokens(staged.buildSessionProjection(), staged.getBranch()).tokens;
 		if (compaction && drafts[incoming.length] !== compaction) exactIssues.push("the compaction was not the first boundary draft");
@@ -919,6 +938,8 @@ async function runTrace(tr: Any): Promise<Any> {
 		const teLedger = sink.map(slim);
 		optsSink = null;
 		applyDrafts(sm, drafts);
+		checkSizes(z, sm.buildSessionContext().messages);
+		exactIssues.push(...sizeIssues.splice(0));
 		if (compaction) {
 			const written = sm.getBranch().findLast((d: Any) => d.type === "compaction" && d.summary === compaction.summary);
 			const reported = sink.find((x: Any) => x.type === "summary" && x.via !== "native")?.tokensBefore;

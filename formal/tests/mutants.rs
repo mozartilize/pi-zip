@@ -485,3 +485,9 @@ fn en_preceding_boundary_edit_invalidates_usage() {
     }
     caught("en3", "run.ts", "piContextTokens(e.context.contextEntries, this.branch(ctx), e.entries)", "piContextTokens(e.context.contextEntries, this.branch(ctx))", "EN", &text);
 }
+
+/// After-sizes come from the resulting context, so carried folds cannot be deducted twice.
+#[test]
+fn en_boundary_after_size_counts_folds_once() {
+    caught("en4", "run.ts", "const ctxAfter = sizeOf(sc,", "const ctxAfter = ctxTokens - (before - after) - cutSaved; const ignored = sizeOf(sc,", "EN", &trace_file("en-after-size.trace"));
+}
