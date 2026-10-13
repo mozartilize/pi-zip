@@ -936,10 +936,11 @@ export class Zip implements ZipControl {
 		if (this.starting) await this.starting; // agent_start's start-of-run handling of a driven run
 		if (ctx?.signal?.aborted) return undefined;
 		const first = !this.runChecked;
+		let rentNext = this.rent;
 		if (first) {
 			this.runChecked = true;
 			try {
-				await this.computeRunPlan(ctx);
+				rentNext = await this.computeRunPlan(ctx);
 			} catch (err) {
 				// no plan was sent, so none may be persisted: end the edit run here
 				this.runPlan = null;
@@ -948,6 +949,7 @@ export class Zip implements ZipControl {
 			}
 		}
 		if (ctx?.signal?.aborted) return undefined; // Esc (Pi cancelled the prompt): this request never goes out, so nothing is applied or announced
+		this.rent = rentNext; // only a request that passed cancellation earns rent or ends the stretch
 		const plan = this.runPlan && !this.runPlan.persisted ? this.runPlan : null;
 		const out = plan ? applyPlanToMessages(e.messages, plan) : null;
 		if ((first && this.pWarm < 0.5) || out || plan?.native) this.rent = 0; // R14: an applied rewrite or a cold request ends the rent stretch
@@ -996,20 +998,20 @@ export class Zip implements ZipControl {
 		// no warm edit on the request right after an edited one (no back-to-back warm rewrites); the summary the plan wants is still
 		// produced. A summary Pi's compaction already put in the session (nativeSummary skips such a return, so only defensively) is
 		// never dropped here: the run plan below carries it
-		// R14: a selected first-request edit keeps the incoming balance until context() sends a rewrite or a cold request.
-		// Esc before application, or a warm request whose content another handler changed, leaves the paid rent intact.
-		if (!d.p || nat) this.rent = d.rentNext;
+		// R14: context() finalizes this transition after cancellation and actual application are checked.
+		// Selected edits keep paid rent until they go out; no-edit requests earn rent only if they proceed.
+		const rentNext = !d.p || nat ? d.rentNext : this.rent;
 		if (d.produce) this.want("run", ctx, d.produce);
 		if (d.kind === "b2b") {
 			this.ledger({ type: "b2b_skip", where: "run" });
-			return;
+			return rentNext;
 		}
 		for (const n of d.notes) this.ledger(n);
 		const { o, cal, p } = d;
 		if (!nat) this.lawLedger("run", o);
 		// A cut with no ready summary is produced while the guarded folds ride this run.
 		const native = nat?.cut ?? null;
-		if (!p && !native) return; // the law does not fire (below the working view, or a rewrite that does not pay back)
+		if (!p && !native) return rentNext; // the law does not fire (below the working view, or a rewrite that does not pay back)
 		this.runEdits = true;
 		const trigger = this.cold ? "cold" : "valve";
 
@@ -1021,6 +1023,7 @@ export class Zip implements ZipControl {
 		this.runPlan = r.plan;
 		const { source, ctxBefore, ctxAfter } = r.plan;
 		this.ledger({ type: "cold_plan", trigger, source, folds: folds.length, summary: !!native, ...(native ? { via: "native" } : {}), ...this.calOf(cal), ctxBefore: Math.round(ctxBefore), ctxAfter: Math.round(ctxAfter), ms: Math.round(foldMs) });
+		return rentNext;
 	}
 
 	/** Ledger form of a calibration; ctxBefore/ctxAfter next to it are already real (O + c x estimate). */

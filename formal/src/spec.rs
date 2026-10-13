@@ -1011,12 +1011,13 @@ pub fn native_withheld(r: &R, i: usize) -> Option<String> {
     let bound = (cw..n.cuts.len()).find(|&k| pays(&n.cuts[k], summary_call(pr, n.cuts[k].read, n.cuts[k].written))).unwrap_or(cw);
     // Planned sizes bound production (cw, bound); a READY artifact is judged at its finished size (plan.ts `readySize`).
     let fin = |c: &NativeCut| if c.finished > 0.0 { c.finished } else { c.summary };
-    let c = n.cuts[..=bound].iter().rev().find(|c| c.ready && c.guard && c.prefix >= 2.0 * fin(c) && guard(n.before, n.after_folds - c.prefix + fin(c), n.p, Some(r.st[i].room), pr, n.g, n.rent, n.keep).ok)?;
+    let ready_after = |c: &NativeCut| n.after_folds - c.prefix + fin(c);
+    let c = n.cuts[..=bound].iter().rev().find(|c| c.ready && c.guard && c.prefix >= 2.0 * fin(c) && guard(n.before, ready_after(c), n.p, Some(r.st[i].room), pr, n.g, n.rent, n.keep).ok)?;
     // Inspect the compaction actually appended at the idle door, including the artifact's text identity.
     if n.applied.as_ref().is_some_and(|a| a.key == c.key && c.hash.as_deref() == Some(a.hash.as_str())) {
         return None;
     }
-    Some(format!("idle native door withheld ready cut {} at P={} (B={:.0}, A={:.0}, call=0)", c.key, n.p, n.before, after(c)))
+    Some(format!("idle native door withheld ready cut {} at P={} (B={:.0}, A={:.0}, call=0)", c.key, n.p, n.before, ready_after(c)))
 }
 
 /// WL at request i: what is withheld, and why it is not excused.

@@ -9,7 +9,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { collapseSystemMessages, getCurrentSystemMessage, normalizeContext, resolveTranscript } from "@earendil-works/pi-ai";
 import { buildBlocks, calibrate, collapseSystem, editAllowed, planContext, UNIT, wireTokensOf } from "../src/plan.ts";
-import { decideTurnEnd, planOpts, rentOf } from "../src/core.ts";
+import { decideRun, decideTurnEnd, planOpts, rentOf } from "../src/core.ts";
 import { lawPrices, loadStats, record } from "../src/learn.ts";
 import type { Any } from "./helpers.ts";
 // Pi's own draft application (AgentSession._applyBoundaryDrafts uses no instance state): the order of the drafts and the
@@ -312,10 +312,11 @@ describe("boundary decision regressions", () => {
 			const ctx = new Proxy(base, { get: (t, k) => (k === "signal" ? signal : Reflect.get(t, k)) });
 			const compute = r.zip.computeRunPlan.bind(r.zip);
 			r.zip.computeRunPlan = async (c: Any) => {
-				await compute(c);
+				const rentNext = await compute(c);
 				expect(r.zip.runPlan?.folds.length).toBeGreaterThan(0); // the edit is selected
 				expect(r.zip.rent).toBe(10_000); // and not yet paid for
 				if (how === "esc") signal.aborted = true; // Esc between planning and application
+				return rentNext;
 			};
 			const messages = structuredClone(r.projectionMessages());
 			if (how === "mismatch") for (const m of messages) if (m.role === "toolResult") m.content = [{ type: "text", text: "annotated by a preceding handler" }];
@@ -327,6 +328,51 @@ describe("boundary decision regressions", () => {
 			const response = { ...asst([{ type: "text", text: "stopped" }], "aborted"), timestamp: Date.now(), usage: undefined };
 			const drafts = await r.turnEnd(r.sm.appendMessage(response), response); // the failed boundary persists only what went out
 			expect(drafts.some((d) => d.customType === "pi-zip/rent")).toBe(balance === 0);
+			expect(rentOf(r.sm.getBranch())).toBe(balance);
+			restored = await rig(undefined, { file: [r.sm.getHeader() as Any, ...r.sm.getEntries()], start: false });
+			expect(restored.zip.rent).toBe(balance);
+		} finally { await restored?.shutdown(); await r.shutdown(); }
+	});
+
+	for (const pWarm of [0, 1] as const) for (const cancel of [true, false]) test(`no-edit first-request rent changes only after cancellation is checked (P=${pWarm}, cancel=${cancel})`, async () => {
+		const sm = SessionManager.inMemory(CWD);
+		sm.appendMessage(user("older"));
+		if (pWarm) {
+			sm.appendMessage({ ...asst([call("large")], "toolUse"), usage: undefined });
+			sm.appendMessage(result("large", bulk("output", 6000)));
+		}
+		sm.appendMessage(user("previous"));
+		sm.appendMessage({ ...asst([{ type: "text", text: pWarm ? "context ".repeat(45_000) : "done" }]), timestamp: Date.now(), usage: undefined });
+		sm.appendCustomEntry("pi-zip/rent", { rent: 10_000 });
+		const r = await rig(undefined, { file: [sm.getHeader() as Any, ...sm.getEntries()], start: false });
+		let restored: Awaited<ReturnType<typeof rig>> | undefined;
+		try {
+			await r.beforeAgentStart("current");
+			r.sm.appendMessage(user("current"));
+			r.zip.cold = pWarm < 0.5; r.zip.pWarm = pWarm;
+			const controller = new AbortController(), base = r.runner.createContext();
+			const ctx = new Proxy(base, { get: (t, k) => k === "signal" ? controller.signal : Reflect.get(t, k) });
+			const entries = r.sm.buildSessionProjection().entries;
+			const d = decideRun({ cold: r.zip.cold, justEdited: r.zip.justEdited, nat: null, foreign: false, now: entries, ready: [],
+				opts: (view, cutAt, foldsOnly, ready) => r.zip.opts(ctx, false, view, pWarm, r.zip.pause, cutAt, foldsOnly, ready) });
+			expect(d.p).toBeNull();
+			expect(d.o.law.g).toBe(2500);
+			if (pWarm) {
+				expect(d.rentNext).toBeGreaterThan(10_000); // the guard refuses folds with positive removable rent
+				expect(d.o.trace.some((t: Any) => t.where === "guard" && !t.ok && t.phi >= 1)).toBe(true); // the plain law pays, but the rent floor refuses
+			} else expect(d.rentNext).toBe(0);
+			expect(r.zip.rent).toBe(10_000);
+			if (cancel) queueMicrotask(() => controller.abort()); // real Esc at computeRunPlan's await, with unmodified methods
+			expect(await r.zip.context({ messages: r.projectionMessages() }, ctx)).toBeUndefined();
+			expect(controller.signal.aborted).toBe(cancel);
+			expect(r.zip.runChecked).toBe(true); // planning ran before the queued abort
+			expect(r.zip.runPlan).toBeNull();
+			const balance = cancel ? 10_000 : d.rentNext;
+			expect(r.zip.rent).toBe(balance);
+			const response = { ...asst([{ type: "text", text: "stopped" }], "aborted"), timestamp: Date.now(), usage: undefined };
+			const drafts = await r.turnEnd(r.sm.appendMessage(response), response);
+			expect(drafts.filter((d) => d.customType === "pi-zip/rent").map((d) => d.data.rent)).toEqual(cancel ? [] : [balance]);
+			expect(drafts.some((d) => d.type === "compaction" || d.type === "context_edit")).toBe(false);
 			expect(rentOf(r.sm.getBranch())).toBe(balance);
 			restored = await rig(undefined, { file: [r.sm.getHeader() as Any, ...r.sm.getEntries()], start: false });
 			expect(restored.zip.rent).toBe(balance);
