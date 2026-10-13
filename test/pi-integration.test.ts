@@ -922,7 +922,7 @@ describe("real Pi: a summary prepared while the user was away goes in through Pi
 		}
 	});
 
-	for (const abortWait of [false, true]) test(`room replacement supersedes a queued ordinary cut until delayed cancellation acknowledgment (Esc=${abortWait})`, async () => {
+	for (const interrupt of ["none", "Esc", "off", "off/on"] as const) test(`room replacement supersedes a queued ordinary cut until delayed cancellation acknowledgment (${interrupt})`, async () => {
 		const r = await rig(undefined, { file: template(240 * 60_000), tui: true, start: false });
 		const ctx = r.runner.createContext();
 		const provider = ctx.modelRegistry.complete;
@@ -959,24 +959,80 @@ describe("real Pi: a summary prepared while the user was away goes in through Pi
 			expect(r.zip.bg).toBe(old);
 			expect(active).toBe(1);
 			expect(releases).toHaveLength(1);
-			if (abortWait) {
+			if (interrupt === "Esc") {
 				controller.abort();
 				expect(await waiting).toBeNull(); // Esc does not wait for the provider
 				expect(r.zip.bg).toBe(old);
-			} else expect(finished).toBe(false);
+			} else {
+				expect(finished).toBe(false);
+				if (interrupt !== "none") r.zip.setOff(true);
+				if (interrupt === "off/on") r.zip.setOff(false);
+			}
 			releases[0]();
 			expect(await old.promise).toBeNull();
 			await sleep(0);
-			if (!abortWait) {
+			if (interrupt === "none") {
 				expect(releases).toHaveLength(2);
 				expect(active).toBe(1);
 				releases[1]();
 				expect((await waiting)?.cut).toMatchObject({ llmOk: true, firstKeptEntryId: replacement.firstKeptEntryId });
 			} else {
 				expect(releases).toHaveLength(1);
+				expect(await waiting).toBeNull();
 				expect(active).toBe(0);
 			}
 			expect(peak).toBe(1);
+			expect(r.zip.bg).toBeNull();
+		} finally {
+			for (const release of releases) release();
+			ctx.modelRegistry.complete = provider;
+			await r.shutdown();
+		}
+	});
+
+	for (const phase of ["cancellation", "completion"] as const) for (const resume of [false, true]) test(`turn_end discards newly selected edits when disabled during room ${phase} (resume=${resume})`, async () => {
+		process.env.PI_ZIP_COLD_CAP = "100000";
+		const file = template(240 * 60_000);
+		for (const entry of file) if (entry.message?.role === "assistant") delete entry.message.usage;
+		const r = await rig(undefined, { file, tui: true, start: false, model: { ...MODEL, contextWindow: 100_000 } });
+		const ctx = r.runner.createContext(), provider = ctx.modelRegistry.complete;
+		const releases: (() => void)[] = [];
+		try {
+			await r.runner.emit({ type: "agent_start" } as Any);
+			const view = r.sm.buildSessionProjection().entries;
+			const options = r.zip.opts(ctx, true, view, 0, true).o;
+			const shallow = planContext(view, { ...options, coldCap: 200_000 })!;
+			const response = { ...asst([{ type: "text", text: "finished" }]), usage: undefined };
+			const id = r.sm.appendMessage(response);
+			const entries = r.sm.buildSessionProjection().entries;
+			const d = decideTurnEnd({ failed: false, justEdited: false, pWarm: 0, ready: r.zip.ready(r.sm.getBranch()), entries,
+				opts: (cutAt, foldsOnly, ready) => r.zip.opts(ctx, false, entries, 0, false, cutAt, foldsOnly, ready) });
+			expect(d.kind).toBe("plan");
+			expect(d.kind === "plan" && d.p?.folds.length).toBeGreaterThan(0); // newly selected folds must also be rejected after deactivation
+			expect(d.room?.cutIdx).toBeGreaterThan(0);
+			expect(d.room?.firstKeptEntryId).not.toBe(shallow.firstKeptEntryId);
+			ctx.modelRegistry.complete = async (...args: Any[]) => {
+				await new Promise<void>((resolve) => releases.push(resolve));
+				return provider(...args);
+			};
+			expect(r.zip.startBg(phase === "cancellation" ? shallow : d.room, ctx, true)).toBe(true);
+			await sleep(0);
+			const old = r.zip.bg;
+			const waiting = r.turnEnd(id, response);
+			await sleep(0);
+			expect(old.controller.signal.aborted).toBe(phase === "cancellation");
+			expect(releases).toHaveLength(1);
+			r.zip.setOff(true);
+			if (resume) r.zip.setOff(false);
+			releases[0]();
+			expect(await old.promise).toBeNull();
+			await sleep(0);
+			const calls = releases.length;
+			for (const release of releases) release(); // finish a wrongly started replacement before reporting the regression
+			const drafts = await waiting;
+			expect(calls).toBe(1);
+			expect(drafts.some((d) => d.type === "compaction" || d.type === "context_edit")).toBe(false);
+			expect(r.zip.stats.summaries).toBe(0);
 			expect(r.zip.bg).toBeNull();
 		} finally {
 			for (const release of releases) release();
