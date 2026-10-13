@@ -603,6 +603,7 @@ export async function narrative(prefix: Block[], ctx: Any, budgetTokens: number,
 		const signal = AbortSignal.any(signals);
 		for (let attempt = 0; attempt < 2; attempt++) {
 			try {
+				signal.throwIfAborted();
 				const res: Any = await ctx.modelRegistry.complete(
 					model,
 					{ systemPrompt: NARRATIVE_SYSTEM, messages: [{ role: "user", content: [{ type: "text", text: prompt }], timestamp: Date.now() }] },
@@ -610,6 +611,7 @@ export async function narrative(prefix: Block[], ctx: Any, budgetTokens: number,
 				);
 				costUsd += Number(res.usage?.cost?.total) || 0;
 				usage = res.usage ?? usage;
+				if (res.stopReason === "aborted" || signal.aborted) return { text: null, ok: false, ms: Date.now() - t0, costUsd, usage, error: "narrative aborted" };
 				if (res.stopReason === "error") throw new Error(res.errorMessage || "provider error");
 				if (res.stopReason === "length") throw new Error("narrative hit the token cap");
 				if ((res.content ?? []).some((c: Any) => c.type === "toolCall")) throw new Error("summariser attempted a tool call");

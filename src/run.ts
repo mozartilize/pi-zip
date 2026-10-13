@@ -1149,7 +1149,7 @@ export class Zip implements ZipControl {
 		try {
 			const fresh = this.collectSteer(e); // marked before anything is validated: a steering message is part of its turn
 			const out = await this.onTurnEnd(e, ctx);
-			const previousRent = [...this.branch(ctx)].reverse().find((e) => e?.customType === "pi-zip/rent")?.data?.rent ?? 0;
+			const previousRent = rentOf(this.branch(ctx));
 			const recs = [...this.drafts(), ...(this.rent !== previousRent ? [{ type: "custom", customType: "pi-zip/rent", data: { rent: this.rent } }] : [])]; // summaries recorded during the run, after the turn's edits (a compaction goes first)
 			if (!fresh.length && !recs.length) return out;
 			if (fresh.length) this.ledger({ type: "steer", ids: fresh });
