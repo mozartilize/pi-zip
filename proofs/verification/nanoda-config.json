@@ -1,0 +1,12 @@
+{
+  "export_file_path": "audit/pizip-export.ndjson",
+  "permitted_axioms": [
+    "propext",
+    "Classical.choice",
+    "Quot.sound"
+  ],
+  "unpermitted_axiom_hard_error": true,
+  "nat_extension": true,
+  "string_extension": true,
+  "print_success_message": true
+}
