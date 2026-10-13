@@ -139,7 +139,7 @@ fn a1_users_quoted_by_the_summary() {
 #[test]
 fn lw_summary_call_is_priced() {
     let t = lines(&["world explicit known ttl=300 true=300 survival=none c=1 sys=30000 window=200000 native interactive", "prompt", "say 25K", "prompt +60s", "say 100", "prompt +60s", "say 100", "prompt +1h", "say 100"]);
-    caught_all("m25", "plan.ts", &[("gate(\"summary\", X, Sr, null, call, Sr, undefined, undefined, isReady, ", "gate(\"summary\", X, Sr, null, 0, Sr, undefined, undefined, isReady, ", 1)], &["LW"], &t);
+    caught_all("m25", "plan.ts", &[("gate(\"summary\", X, Sr, null, call, Sr, undefined, undefined, false, ", "gate(\"summary\", X, Sr, null, 0, Sr, undefined, undefined, false, ", 1)], &["LW"], &t);
 }
 
 /// Review P1-3: LW pins the call of a whole-plan step both ways. A plan with a cut that reaches the plan gate with no call (the summary
@@ -148,8 +148,8 @@ fn lw_summary_call_is_priced() {
 /// away and the return's production decision prices the call (a summary prepared away is ready: its call is 0 in both steps).
 #[test]
 fn lw_plan_step_call_is_pinned_both_ways() {
-    caught_all("lw1", "plan.ts", &[("if (!planGate(ctxAfterFolds - (pre[pick] - S(pre[pick])), 0, call, true, isReady)) return false;", "if (!planGate(ctxAfterFolds - (pre[pick] - S(pre[pick])), 0, 0, true, isReady)) return false;", 1)], &["LW"], &summary_prepared_away("prompt +1h").replacen(" interactive", " print", 1));
-    caught_all("lw2", "plan.ts", &[("!planGate(ctxAfterFolds, untouchedEst(blocks, folds, false), 0, false)", "!planGate(ctxAfterFolds, untouchedEst(blocks, folds, false), 1000, false)", 1)], &["LW"], &fold_and_recall());
+    caught_all("lw1", "plan.ts", &[("gate(\"plan\", real(ctxEst), real(ctxAfterFolds - pre[k] + S(pre[k])), room, call,", "gate(\"plan\", real(ctxEst), real(ctxAfterFolds - pre[k] + S(pre[k])), room, 0,", 1)], &["LW"], &summary_prepared_away("prompt +1h").replacen(" interactive", " print", 1));
+    caught_all("lw2", "plan.ts", &[("const t = lawTerms(B, A, P, room, pr, g, 0, A, keep), D = B - A;", "const t = lawTerms(B, A, P, room, pr, g, 1000, A, keep), D = B - A;", 1)], &["LW"], &fold_and_recall());
 }
 
 /// Never wait (0.4.0 step 4): a turn_end whose plan wants a summary that is not ready takes its folds alone and produces the summary in
@@ -170,7 +170,7 @@ fn a3_return_does_not_wait() {
 /// The mutant forgets which summaries are ready, so the turn_end prices the spent call again and refuses the summary.
 #[test]
 fn tr_produced_summary_goes_in_once_ready() {
-    caught("r4tr", "plan.ts", "const ready = new Set(o.ready ?? []);", "const ready = new Set<string>();", "TR", &trace_file("tr-produced.trace"));
+    caught("r4tr", "plan.ts", "ready = new Set(o.ready ?? []);", "ready = new Set<string>();", "TR", &trace_file("tr-produced.trace"));
 }
 
 /// TR and theory 1.4 R5 (step 4 review P1): a ready summary is used up to c, or up to cW when there is no c. Here the cold return's c
@@ -197,7 +197,7 @@ fn pc_run_plan_turn_end_waits_at_the_room() {
 #[test]
 fn wl_ready_summary_is_taken_not_produced_again() {
     // Exercise the draft decision: the native door consumes this artifact before that decision can produce it again.
-    caught("r4wl", "run.ts", "return readyOf(branch, this.mine).map((a) => ({ key: a.key, running: false }));", "return [];", "WL", &trace_file("wl-ready-taken.trace").replace(" native ", " nonative "));
+    caught("r4wl", "run.ts", "return readyOf(branch, this.mine).map((a) => ({ key: a.key, running: false, summaryTokens: a.cut!.summaryTokens }));", "return [];", "WL", &trace_file("wl-ready-taken.trace").replace(" native ", " nonative "));
 }
 
 /// Native completeness must catch a ready summary withheld at the idle door, even if the request takes it later.
@@ -216,11 +216,11 @@ fn na_native_door_takes_a_ready_summary() {
 /// Production availability is now an explicit NR excuse. Overlapping calls are a separate safety property.
 #[test]
 fn one_call_and_one_timer() {
-    let trace = lines(&["world explicit known ttl=300 true=300 survival=none c=1 sys=3000 window=200000 nonative interactive slow", "prompt", "say 150K", "prompt +1h", "say 100", "prompt +1h", "call npm 100", "say 100"]);
-    caught("producer-overlap", "run.ts", "if (!futureOnly && !this.bg) this.startBg(w.p, ctx);", "if (!futureOnly && !this.bg) { this.startBg(w.p, ctx); this.bg = null; this.startBg(w.p, ctx); }", "OC", &trace);
+    let trace = lines(&["world explicit known ttl=300 true=300 survival=none c=1 sys=3000 window=200000 nonative interactive slow", "prompt", "say 300K", "prompt +1h", "say 100", "prompt +1h", "call npm 100", "say 100"]);
+    caught("producer-overlap", "run.ts", "if (p) this.startBg(p, ctx);", "if (p) { this.startBg(p, ctx); this.bg = null; this.startBg(p, ctx); }", "OC", &trace);
     let warming = trace.replace("interactive slow", "interactive warming");
     caught("producer-timers", "run.ts", "if (!decision) this.cancelTimer();", "void 0;", "OC", &warming);
-    caught("producer-writes", "run.ts", "this.timer = null;\n\t\t\t\t\tif (gen === this.timerGen)", "this.timer = null; this.pi.appendEntry(\"pi-zip/summary\", {});\n\t\t\t\t\tif (gen === this.timerGen)", "OC", &trace);
+    caught("producer-writes", "run.ts", "this.timer = null;\n\t\t\t\t\tif (gen !== this.timerGen ||", "this.timer = null; this.pi.appendEntry(\"pi-zip/summary\", {});\n\t\t\t\t\tif (gen !== this.timerGen ||", "OC", &trace);
 }
 
 #[test]
@@ -277,7 +277,7 @@ fn b2b_no_back_to_back() {
     // 0.4.0: the folds stop at the working view, so a second rewrite needs new candidates: the window slides at the next prompt.
     // traces/b2b-slide.trace is the shrunk counterexample of `check --suite standard --random 3000 --seed 1 --only B2B` on the mutant
     let t = trace_file("b2b-slide.trace");
-    caught("m10", "core.ts", "if (x.justEdited && x.pWarm >= 0.5)", "if (false)", "B2B", &t);
+    caught("m10", "core.ts", "const b2b = x.justEdited && x.pWarm >= 0.5;", "const b2b = false;", "B2B", &t);
 }
 
 #[test]
@@ -290,7 +290,7 @@ fn rc_recall_is_never_refolded() {
         trace_of(&v)
     };
     caught("m11", "plan.ts", "if (tokOverride.has(b.idx) || recalled.has(handleFor(b.entryId!))) return false;", "if (tokOverride.has(b.idx)) return false;", "RC", &rec(&["prompt +60s", "prompt +330s"]));
-    caught("m12", "plan.ts", "b.tokens > foldMin && !isRecall(b) && start[b.idx] >= head", "b.tokens > foldMin && start[b.idx] >= head", "RC", &rec(&["prompt +60s", "prompt +330s"]));
+    caught("m12", "plan.ts", "tok4(textOf((b.raw ?? b.msg).content)) > foldMin && !isRecall(b) && start[b.idx] >= head", "tok4(textOf((b.raw ?? b.msg).content)) > foldMin && start[b.idx] >= head", "RC", &rec(&["prompt +60s", "prompt +330s"]));
     let restart = trace_of(&[W, "prompt", "call npm 45K", "say 100", "prompt +60s", "call recall", "say 100", "restart", "prompt +330s", "say 100"]);
     caught_all("m23", "run.ts", &[("\t\tfor (const h of recalledHandlesFromBranch(branch)) this.recalled.add(h);\n", "\t\tvoid 0;\n", 3)], &["RC"], &restart);
 }
@@ -352,7 +352,7 @@ fn harness_checks_can_fail() {
     assert!(!holds(
         &tamper(&|o| {
             let mut n = 0;
-            for st in o.ticks.iter_mut().flat_map(|t| t.grids.iter_mut()).flat_map(|g| g.grid.iter_mut()).flat_map(|p| p.law.iter_mut()).filter(|s| s.at == "plan") {
+            for st in o.ticks.iter_mut().flat_map(|t| t.grids.iter_mut()).flat_map(|g| g.grid.iter_mut()).flat_map(|p| p.law.iter_mut()).filter(|s| s.at == "plan" || s.at == "guard") {
                 st.k = st.k.map(|k| k + 1000.0);
                 n += 1;
             }
@@ -425,18 +425,19 @@ fn en_boundary_compaction_is_the_first_draft() {
 
 #[test]
 fn native_joint_folds_are_carried_without_replanning() {
-    use pz_formal::gen::{random_trace, Rng};
-    let mut rng = Rng::new(1);
-    // Both step-6 A2 regressions from the standard suite's random tail (trace indices 34880 and 36356).
-    for index in 0..=2432 {
-        let trace = random_trace(&mut rng);
-        if index != 956 && index != 2432 { continue; }
-        caught_all("native-folds-replanned", "core.ts", &[(
-            "if (x.nat) return { kind: \"plan\" as const, ...x.nat, notes: [], produce: null };",
-            "if (x.nat) { const { o, cal } = x.opts(x.now, undefined, true, []); return { kind: \"plan\", o, cal, p: planContext(x.now, o), notes: [], produce: null }; }",
-            1,
-        )], &["A2"], &trace.to_string());
+    let mut events = vec!["world explicit known ttl=300 true=600 survival=outlives c=1 sys=3000 window=200000 native interactive", "prompt", "say 150K", "prompt +60s", "call cat 3K"];
+    events.extend(std::iter::repeat_n("call npm 100", 20));
+    events.extend(["say 60K", "prompt +330s", "say 100"]);
+    let text = lines(&events);
+    if available() {
+        let base = observe(&worktree_src(), &Trace::parse(&text).unwrap());
+        assert!(base.obs.ticks.iter().any(|t| t.run_plan.as_ref().is_some_and(|p| p.native && !p.folds.is_empty())), "the trace carries a native joint decision");
     }
+    caught_all("native-folds-replanned", "core.ts", &[(
+        "if (x.nat) return { kind: \"plan\" as const, ...x.nat, notes: [], produce: null, rentNext: 0 };",
+        "if (x.nat) { const { o, cal } = x.opts(x.now, undefined, true, []); return { kind: \"plan\", o, cal, p: selectPlan(plan(x.now, o), o), notes: [], produce: null }; }",
+        1,
+    )], &["G"], &text);
 }
 
 /// Incoming drafts invalidate provider usage before pi-zip's first boundary draft is metered.

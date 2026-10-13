@@ -3,7 +3,7 @@
 import { describe, expect, test } from "bun:test";
 import { buildBlocks, toolCallIndex } from "../src/plan.ts";
 import { handleFor } from "../src/placeholder.ts";
-import { BUDGET, buildCut, FIRST_REQUESTS, handleRowsOf, handleTable, parseSummary, PREV_NARRATIVE_CHARS, previousNarrative, skeleton, TABLE_ROWS } from "../src/summary.ts";
+import { BUDGET, buildCut, FIRST_REQUESTS, handleRowsOf, handleTable, parseSummary, PREV_NARRATIVE_CHARS, previousNarrative, narrative, skeleton, TABLE_ROWS } from "../src/summary.ts";
 import { A, R, U, type Any } from "./helpers.ts";
 
 const tcall = (id: string, name: string, args: Any) => {
@@ -40,7 +40,7 @@ async function cutOver(L: number, previous: string | null, prompts: string[] = [
 	const entries = [...(previous ? [summaryEntry(previous)] : []), ...level(L), U(`keep${L}`, "kept"), A(`keepA${L}`)];
 	const blocks = buildBlocks(entries);
 	const cutIdx = blocks.findIndex((b) => b.entryId === `keep${L}`);
-	const complete = async (_m: Any, c: Any) => (prompts.push(c.messages[0].content[0].text), { stopReason: "stop", content: [{ type: "text", text: narrativeFor(L) }], usage: { cost: { total: 0 } } });
+	const complete = async (_m: Any, c: Any, options: Any) => (expect(options.maxTokens).toBeLessThanOrEqual(4000), prompts.push(c.messages[0].content[0].text), { stopReason: "stop", content: [{ type: "text", text: narrativeFor(L) }], usage: { cost: { total: 0 } } });
 	const p: Any = { blocks, calls: toolCallIndex(blocks), cutIdx, prefixTokens: 50_000, summaryTokensPlanned: 7000, sumTrigger: "cold" };
 	return (await buildCut(p, { model: { id: "m" }, modelRegistry: { complete } } as Any)).text;
 }
@@ -141,7 +141,7 @@ describe("sectioned carry-forward: nested summaries, 4 levels deep", () => {
 		const entries = [summaryEntry(first), ...level(2), U("keep2", "kept"), A("keepA2")];
 		const blocks = buildBlocks(entries);
 		const long = "## Decisions and rationale\nHEAD-DECISION\n" + "a sentence of the current state of the work.\n".repeat(2000) + "## Key facts to remember\nTAIL-KEYFACT: 42";
-		const complete = async (_m: Any, c: Any) => (prompts.push(c.messages[0].content[0].text), { stopReason: "stop", content: [{ type: "text", text: long }], usage: { cost: { total: 0 } } });
+		const complete = async (_m: Any, c: Any, options: Any) => (expect(options.maxTokens).toBeLessThanOrEqual(4000), prompts.push(c.messages[0].content[0].text), { stopReason: "stop", content: [{ type: "text", text: long }], usage: { cost: { total: 0 } } });
 		const p: Any = { blocks, calls: toolCallIndex(blocks), cutIdx: blocks.findIndex((b) => b.entryId === "keep2"), prefixTokens: 50_000, summaryTokensPlanned: 40_000, sumTrigger: "cold" };
 		const t = (await buildCut(p, { model: { id: "m" }, modelRegistry: { complete } } as Any)).text;
 		expect(Number(/under about (\d+) words/.exec(prompts[0])![1])).toBe(1500); // no previous narrative: the old budget
@@ -416,5 +416,28 @@ describe("user requests survive carry-forward intact", () => {
 		const old = "## User requests (verbatim, oldest first)\n1. one\n2. two\n## Files touched\n(none)";
 		expect(users(old).items).toEqual(["one", "two"]);
 		expect(users(skeleton(level(["three"]), old).text).items).toEqual(["one", "two", "three"]);
+	});
+});
+
+
+describe("narrative cost survives unsuccessful responses", () => {
+	test("a terminal policy refusal retains its reported charge", async () => {
+		let calls = 0;
+		const n = await narrative(buildBlocks([U("u", "work"), A("a")]), { model: { id: "m" }, modelRegistry: { complete: async () => {
+			calls++; return { stopReason: "error", errorMessage: "content policy refusal", usage: { cost: { total: 0.17 } } };
+		} } } as Any, 1000);
+		expect(n.ok).toBe(false);
+		expect(n.costUsd).toBe(0.17);
+		expect(calls).toBe(1);
+	});
+	test("a successful retry retains the charge of its failed attempt", async () => {
+		let calls = 0;
+		const n = await narrative(buildBlocks([U("u", "work"), A("a")]), { model: { id: "m" }, modelRegistry: { complete: async () => ++calls === 1
+			? { stopReason: "error", errorMessage: "transient error", usage: { cost: { total: 0.02 } } }
+			: { stopReason: "stop", content: [{ type: "text", text: "finished" }], usage: { cost: { total: 0.03 } } },
+		} } as Any, 1000);
+		expect(n.ok).toBe(true);
+		expect(n.costUsd).toBe(0.05);
+		expect(calls).toBe(2);
 	});
 });

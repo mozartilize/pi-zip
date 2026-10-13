@@ -582,8 +582,7 @@ mod tests {
         for _ in 0..200 {
             let t = random_trace(&mut rng);
             let back = Trace::parse(&t.to_string()).unwrap();
-            assert_eq!(back.events.len(), t.events.len());
-            assert_eq!(back.world, t.world);
+            assert_eq!(back, t, "trace syntax must preserve exact sizes");
             assert_eq!(normalize(t.clone()), t, "random traces are normal");
         }
     }

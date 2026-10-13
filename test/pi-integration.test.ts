@@ -457,7 +457,7 @@ describe("mixed room boundary", () => {
 	});
 	test("carried views and one notice follow the real Pi requests across the room boundary", async () => {
 		const r = await rig((sm) => {
-			populate(sm, 3500);
+			populate(sm, 5000);
 			for (const entry of sm.getBranch() as Any[]) if (entry.message?.role === "assistant") delete entry.message.usage;
 		}, { tui: true, model: { ...MODEL, provider: "room", contextWindow: 100_000 }, latencyMs: 20 });
 		sendPrompt(r.sm, "next request");
@@ -519,7 +519,7 @@ describe("mixed room boundary", () => {
 
 	test("an aborted room turn persists only its carried folds and one notice", async () => {
 		const r = await rig((sm) => {
-			populate(sm, 3500);
+			populate(sm, 5000);
 			for (const entry of sm.getBranch() as Any[]) if (entry.message?.role === "assistant") delete entry.message.usage;
 		}, { tui: true, model: { ...MODEL, provider: "room-abort", contextWindow: 100_000 }, latencyMs: 20 });
 		sendPrompt(r.sm, "next request");
@@ -640,7 +640,7 @@ describe("real Pi: a summary prepared while the user was away goes in through Pi
 	/** The session as a file whose newest response is `agoMs` old (the rig of every other test is hours old: a cold session). */
 	const template = (agoMs = 0) => {
 		const sm = SessionManager.inMemory(CWD);
-		populate(sm, 6000); // long prose: folds alone cannot reach the cap, so the cold return needs a summary
+		populate(sm, 9000); // long prose: folds alone cannot reach the cap, so the cold return needs a summary
 		const file = [sm.getHeader() as Any, ...sm.getEntries()];
 		const newest = Math.max(...file.map((e) => e.message?.timestamp ?? 0));
 		const shift = Date.now() - agoMs - newest;
@@ -738,20 +738,20 @@ describe("real Pi: a summary prepared while the user was away goes in through Pi
 		await r.shutdown();
 	});
 
-	test("a process that is not interactive, or a session that ended mid-run, prepares nothing", async () => {
+	test("sessions with and without a UI arm the same future deadline, including after a tool turn", async () => {
 		const quiet = await rig(undefined, { file: template(), tui: false, start: false });
 		await sleep(1_300);
-		expect(quiet.narrativeCalls.length).toBe(0);
+		expect(quiet.narrativeCalls.length).toBe(1);
 		const file = template();
 		file.push({ type: "message", id: "tail", parentId: file.at(-1).id, timestamp: new Date().toISOString(), message: asst([call("zz")], "toolUse", 99) });
 		const cut = await rig(undefined, { file, tui: true, start: false });
 		await sleep(1_300);
-		expect(cut.narrativeCalls.length).toBe(0);
+		expect(cut.narrativeCalls.length).toBe(1);
 	});
 
 	test("a fresh room call teaches the producer latency used after restart", async () => {
 		process.env.PI_ZIP_TTL_SECS = "300";
-		process.env.PI_ZIP_COLD_CAP = "65000";
+		process.env.PI_ZIP_COLD_CAP = "100000";
 		const model = { ...MODEL, provider: "latency", id: "room", contextWindow: 100_000 };
 		const file = template();
 		for (const entry of file) if (entry.message?.role === "assistant") delete entry.message.usage;
@@ -769,7 +769,7 @@ describe("real Pi: a summary prepared while the user was away goes in through Pi
 			expect(r.narrativeCalls).toHaveLength(1);
 			const learned = loadStats().models["latency/room"].call!;
 			expect(learned.ms).toBeGreaterThanOrEqual(80);
-			expect(learned).toEqual({ ms: artifact.cut.ms, tokens: artifact.cut.prefixTokens });
+			expect(learned).toEqual({ ms: artifact.cut.ms, tokens: artifact.cut.prefixTokens * r.zip.scaleOf(r.runner.createContext()).c });
 			expect(r.zip.ent.call).toEqual(learned);
 			await r.shutdown();
 			// Reopen the pre-edit branch: call times are shared by model, even when this branch has no ready artifact.
@@ -789,7 +789,7 @@ describe("real Pi: a summary prepared while the user was away goes in through Pi
 				const view = restarted.sm.buildSessionProjection().entries;
 				const p = planContext(view, restarted.zip.opts(ctx, true, view, 1, true, undefined, false, []).o)!;
 				const touch = Math.max(...file.map((e) => e.message?.timestamp ?? 0));
-				const expected = touch + 300_000 - 1.5 * learned.ms * p.prefixTokens / learned.tokens;
+				const expected = touch + 300_000 - 1.5 * learned.ms * p.scale.c * p.prefixTokens / learned.tokens;
 				expect(restarted.zip.ent.call).toEqual(learned);
 				expect(deadlines.get(restarted.zip.timer)).toBeCloseTo(expected, 5);
 				expect(restarted.narrativeCalls).toHaveLength(0);
@@ -802,12 +802,73 @@ describe("real Pi: a summary prepared while the user was away goes in through Pi
 		} finally { await r.shutdown(); }
 	});
 
+	for (const abortWait of [false, true]) test(`room replacement retains the call slot until delayed cancellation acknowledgment (Esc=${abortWait})`, async () => {
+		const r = await rig(undefined, { file: template(), tui: true, start: false });
+		const ctx = r.runner.createContext();
+		const provider = ctx.modelRegistry.complete;
+		let active = 0, peak = 0;
+		const releases: (() => void)[] = [];
+		ctx.modelRegistry.complete = async (...args: Any[]) => {
+			active++;
+			peak = Math.max(peak, active);
+			try {
+				await new Promise<void>((resolve) => releases.push(resolve)); // provider acknowledges abort only when released
+				return await provider(...args);
+			} finally { active--; }
+		};
+		try {
+			const view = r.sm.buildSessionProjection().entries;
+			const p = planContext(view, r.zip.opts(ctx, true, view, 0, true).o)!;
+			expect(r.zip.startBg(p, ctx)).toBe(true);
+			await sleep(0);
+			const old = r.zip.bg;
+			expect(active).toBe(1);
+			const controller = new AbortController();
+			const cutIdx = p.blocks.findLastIndex((b: Any, i: number) => i < p.cutIdx && b.kind === "user");
+			expect(cutIdx).toBeGreaterThan(0);
+			const replacement = { ...p, cutIdx, firstKeptEntryId: p.blocks[cutIdx].entryId,
+				prefixTokens: p.blocks.slice(0, cutIdx).reduce((n: number, b: Any) => n + (p.folds.find((t: Any) => t.entryId === b.entryId)?.phTokens ?? b.tokens), 0) };
+			let finished = false;
+			const waiting = r.zip.roomWait(replacement, { ...ctx, signal: controller.signal }).then((got: Any) => { finished = true; return got; });
+			await sleep(0);
+			expect(old.controller.signal.aborted).toBe(true);
+			expect(r.zip.bg).toBe(old);
+			expect(active).toBe(1);
+			expect(releases).toHaveLength(1);
+			if (abortWait) {
+				controller.abort();
+				expect(await waiting).toBeNull(); // Esc does not wait for the provider
+				expect(r.zip.bg).toBe(old);
+			} else expect(finished).toBe(false);
+			releases[0]();
+			expect(await old.promise).toBeNull();
+			await sleep(0);
+			if (!abortWait) {
+				expect(releases).toHaveLength(2);
+				expect(active).toBe(1);
+				releases[1]();
+				expect((await waiting)?.cut.llmOk).toBe(true);
+			} else {
+				expect(releases).toHaveLength(1);
+				expect(active).toBe(0);
+			}
+			expect(peak).toBe(1);
+			expect(r.zip.bg).toBeNull();
+		} finally {
+			for (const release of releases) release();
+			ctx.modelRegistry.complete = provider;
+			await r.shutdown();
+		}
+	});
+
 	test("a measured-latency timer invalidating a running cut persists its loss after the callback", async () => {
-		process.env.PI_ZIP_TTL_SECS = "300";
-		process.env.PI_ZIP_COLD_CAP = "65000";
+		delete process.env.PI_ZIP_TTL_SECS;
+		process.env.PI_ZIP_COLD_CAP = "100000";
 		const model = { ...MODEL, provider: "timer", id: "replacement" };
-		record("timer/replacement", { explicit: true, total: 0, call: { ms: 200, tokens: 60_000 } });
+		record("timer/replacement", { explicit: true, total: 0, gapS: 300, alive: false, call: { ms: 200, tokens: 60_000 } });
 		const r = await rig(undefined, { file: template(), tui: true, start: false, model, latencyMs: 500 });
+		const originalOpts = r.zip.opts.bind(r.zip);
+		r.zip.opts = (...args: Any[]) => { const r = originalOpts(...args); r.o.law.g = 5000; return r; };
 		const realSet = globalThis.setTimeout, realNow = Date.now;
 		const callbacks = new Map<Any, { fire: () => void; due: number }>();
 		let inTimer = false, timerWrites = 0;
@@ -841,7 +902,8 @@ describe("real Pi: a summary prepared while the user was away goes in through Pi
 			expect(running.controller.signal.aborted).toBe(true);
 			expect(r.zip.stats.summaryUsd).toBeGreaterThanOrEqual(running.estUsd);
 			expect(r.sm.getEntries().filter((e: Any) => e.customType === "pi-zip/summary")).toHaveLength(0);
-			expect(await running.promise).toBeNull(); // cancellation persists without waiting for a provider that ignores abort
+			expect(r.zip.bg).toBe(running); // cancellation retains the slot while the provider ignores abort
+			expect(await running.promise).toBeNull(); // completion persists the cancellation exactly once
 			const lost = () => r.sm.getEntries().filter((e: Any) => e.customType === "pi-zip/summary" && e.data.lost === "replaced") as Any[];
 			expect(lost()).toHaveLength(1);
 			expect(lost()[0].data).toMatchObject({ key: running.key, head: running.head, usd: running.estUsd, estimated: true });
@@ -876,7 +938,7 @@ describe("item 5: a run an extension's message starts (sendMessage with triggerT
 	const sleep = (ms: number) => new Promise((res) => setTimeout(res, ms));
 	const template = (agoMs: number) => {
 		const sm = SessionManager.inMemory(CWD);
-		populate(sm, 6000); // long prose: folds alone cannot reach the cap, so the cold return needs a summary
+		populate(sm, 9000); // long prose: folds alone cannot reach the cap, so the cold return needs a summary
 		const file = [sm.getHeader() as Any, ...sm.getEntries()];
 		const newest = Math.max(...file.map((e) => e.message?.timestamp ?? 0));
 		const shift = Date.now() - agoMs - newest;
@@ -987,7 +1049,7 @@ describe("round 5 on real Pi: rule A starts the warm summary early, nobody waits
 	const sleep = (ms: number) => new Promise((res) => setTimeout(res, ms));
 	const template = (agoMs: number) => {
 		const sm = SessionManager.inMemory(CWD);
-		populate(sm, 6000); // long prose: folds alone cannot reach the cap, so a warm return would summarise too
+		populate(sm, 9000); // long prose: folds alone cannot reach the cap, so a warm return would summarise too
 		const file = [sm.getHeader() as Any, ...sm.getEntries()];
 		const newest = Math.max(...file.map((e) => e.message?.timestamp ?? 0));
 		const shift = Date.now() - agoMs - newest;
@@ -1199,7 +1261,7 @@ describe("round 5 on real Pi: rule A starts the warm summary early, nobody waits
 // no-UI behaviour moves, and each move is justified in its commit: 0.3.1's (0907ceea..., 0.3.0's decisions with 0.3.1's format, where
 // these scenarios waited for their summaries in line) became this one when 0.4.0 stopped waiting.
 describe("no UI (pi -p, json): the requests and the session of three scenarios hash to a recorded digest", () => {
-	const NOUI_DIGEST = "78899647f944078ff9b4033f6c524334"; // R5_PRINT_DIGEST=1 prints it (0.3.1: 0907ceeacca2be4a8b8f684dd6a47a96)
+	const NOUI_DIGEST = "f6d9629b3c18c8a4101cfd5d92bc94b1"; // R5_PRINT_DIGEST=1 prints it (0.3.1: 0907ceeacca2be4a8b8f684dd6a47a96)
 	const sleep = (ms: number) => new Promise((res) => setTimeout(res, ms));
 	const shifted = (agoMs: number, prose: number) => {
 		const sm = SessionManager.inMemory(CWD);

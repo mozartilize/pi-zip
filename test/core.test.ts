@@ -1,7 +1,8 @@
 // The pure decision core (src/core.ts): view, clock, law, plan and decide as functions of (branch, Λ, now).
 import { describe, expect, test } from "bun:test";
-import { checkEdits, clock, inRunClock, decideRun, want, decideTurnEnd, adopt, artifactsOf, grow, headOf, lawOf, planOpts, readyOf, unready, unusedOf, runPlanOf, scaleOf, valvePlanOf, type Env, type Learned } from "../src/core.ts";
+import { checkEdits, clock, inRunClock, decideRun, decideEdits, want, decideTurnEnd, artifactsOf, grow, headOf, lawOf, planOpts, readyOf, unusedOf, runPlanOf, scaleOf, valvePlanOf, type Env, type Learned } from "../src/core.ts";
 import { planContext, UNIT, type PlanResult } from "../src/plan.ts";
+import { buildCut } from "../src/summary.ts";
 import { replayGrowth } from "../src/state.ts";
 import { A, AX, R, U, type Any } from "./helpers.ts";
 
@@ -28,11 +29,11 @@ describe("core: view", () => {
 });
 
 describe("core: clock", () => {
-	test("no touch: P = 0, no pause; a model switch: P = 0 and a pause; a gap past the TTL: cold and a pause", () => {
+	test("no touch: P = 0, no pause; a model switch: P = 0; a gap past the TTL: cold and a pause", () => {
 		const l = { model: MODEL };
 		expect(clock([], l, T0)).toMatchObject({ cold: true, pWarm: 0, pause: false, src: "no prior request" });
 		const br = [msg("u1", "user", T0), asst("a1", T0 + 1000)];
-		expect(clock(br, l, T0 + 2000, { reqMs: 0, modelKey: "p/other" })).toMatchObject({ cold: true, pWarm: 0, pause: true, src: "model switch" });
+		expect(clock(br, l, T0 + 2000, { reqMs: 0, modelKey: "p/other" })).toMatchObject({ cold: true, pWarm: 0, pause: false, src: "model switch" });
 		expect(clock(br, l, T0 + 60_000)).toMatchObject({ cold: false, pause: false });
 		expect(clock(br, l, T0 + 1000 + 301_000)).toMatchObject({ cold: true, pause: true });
 	});
@@ -82,18 +83,6 @@ describe("core: plan", () => {
 		expect(planOpts(big, [], env(), lam(), false, 1, false, "u2").o.cutAt).toBe("u2");
 		expect(planOpts(big, [], env({ rereadOnly: true }), lam(), false, 0, true).o.rereadOnly).toBe(true);
 	});
-	test("adopt: nothing available, no cut or the same cut keep the first plan; the deepest summary not deeper than the cut is taken if the plan for it cuts there", () => {
-		const blocks = ["s", "a", "b", "c", "d"].map((entryId) => ({ entryId }));
-		const p = (k: string | null) => ({ p: k === null ? null : ({ cutIdx: 3, firstKeptEntryId: k, blocks } as unknown as PlanResult) });
-		const r = (key: string) => ({ key, running: false });
-		expect(adopt(p("c"), () => p("b"), [], "x")).toEqual({ r: p("c") });
-		expect(adopt(p("c"), () => p("b"), [r("c"), r("a")], "x")).toEqual({ r: p("c") });
-		expect(adopt(p("c"), (k) => p(k), [r("a"), r("b")], "x")).toEqual({ r: p("b"), note: { type: "pin", where: "x", from: "c", to: "b", ok: true } });
-		expect(adopt(p("c"), (k) => p(k), [{ key: "b", running: true }], "x")).toEqual({ r: p("b"), note: { type: "pin", where: "x", from: "c", to: "b", ok: true, running: true } });
-		expect(adopt(p("c"), () => p(null), [r("b")], "x")).toEqual({ r: p("c"), note: { type: "pin", where: "x", from: "c", to: "b", ok: false } });
-		// never deeper than the plan's own cut, and never a cut the projection does not have
-		expect(adopt(p("c"), (k) => p(k), [r("d"), r("gone")], "x")).toEqual({ r: p("c") });
-	});
 	test("artifacts: ready while their head is the branch's; unused unless a pi-zip compaction used their text; lost calls count, at their cost", () => {
 		const cut = (k: string, text: string) => ({ firstKeptEntryId: k, text }) as Any;
 		const rec = (data: Any) => ({ type: "custom", customType: "pi-zip/summary", data });
@@ -113,15 +102,6 @@ describe("core: plan", () => {
 
 describe("core: decide", () => {
 	const plan = (o: Any) => ({ atRoom: false, atRoomUnedited: false, firstKeptEntryId: "k", ...o }) as PlanResult;
-	test("unready: a cut with a ready summary stands; one without gives way to its folds alone, and is produced", () => {
-		const r = { p: plan({ cutIdx: 3 }) };
-		const folds = { p: plan({ cutIdx: null, firstKeptEntryId: null }) };
-		expect(unready(r, [{ key: "k", running: false }], () => folds)).toEqual({ r, produce: null });
-		expect(unready(r, [{ key: "k", running: true }], () => folds)).toEqual({ r: folds, produce: r.p }); // running is not ready
-		expect(unready(r, [{ key: "other", running: false }], () => folds)).toEqual({ r: folds, produce: r.p });
-		expect(unready(folds, [], () => r)).toEqual({ r: folds, produce: null }); // no cut: nothing to produce
-		expect(unready({ p: null }, [], () => r)).toEqual({ r: { p: null }, produce: null });
-	});
 	const opts = (l: Learned, p: number, pause: boolean) => (entries: Any[], cutAt?: string, foldsOnly?: boolean, ready?: readonly string[]) => planOpts(entries, [], env(), l, false, p, pause, cutAt, foldsOnly, ready);
 	test("a ready summary never cuts deeper than c, or than cW when no cut pays with its call (theory 1.4 plan)", () => {
 		// 18 turns of prose no fold can touch: cW is u12; at p = 1 no cut from cW on pays with its call
@@ -146,7 +126,7 @@ describe("core: decide", () => {
 		expect(d.o.pause).toBe(true);
 		expect(d.notes).toEqual([]);
 		// no ready summary: the folds alone go now, the cut is produced in the background (nobody waits)
-		expect(d.o.foldsOnly).toBe(true);
+		expect(d.o.deferSummary).toBe(true);
 		expect(d.p?.cutIdx).toBeNull();
 		expect(d.p!.folds.length).toBeGreaterThan(0);
 		expect(d.produce?.cutIdx).not.toBeNull();
@@ -196,6 +176,84 @@ describe("core: decide", () => {
 		expect(r.plan.ctxAfter).toBe(40_000);
 		expect(() => runPlanOf({ ...base, p: joint, native, now, folds: [{ ...joint.folds[0], entryId: "a2" }] })).toThrow("native fold target must be kept after the cut");
 		expect(() => runPlanOf({ ...base, p: joint, native, now: [], folds: joint.folds })).toThrow("native fold target must be kept after the cut");
+	});
+	test("rent counts the ready edit or folds, never an unproduced cut; a dead cache resets it", () => {
+		const at = (pWarm: number, ready: Any[] = [], rent = 123) => decideEdits({
+			at: "turn_end", justEdited: false, pWarm, ready, entries: big,
+			opts: (cutAt, foldsOnly, ready) => {
+				const r = planOpts(big, [], env(), lam({ g: pWarm === 0 ? 2500 : 1e9 }), false, pWarm, false, cutAt, foldsOnly, ready);
+				r.o.rent = rent;
+				return r;
+			},
+		});
+		const cold = at(0);
+		expect(cold.produce?.cutIdx).not.toBeNull();
+		expect(cold.p?.cutIdx ?? null).toBeNull();
+		expect(cold.rentNext).toBe(0);
+		const warm = at(1);
+		expect(warm.p).toBeNull();
+		const folds = warm.o.carriedFolds ?? [];
+		const plain = planContext(big, { ...warm.o, application: false, law: { ...warm.o.law!, pWarm: 0 }, foldsOnly: true })!;
+		expect(folds).toHaveLength(0);
+		expect(warm.rentNext).toBeCloseTo(123 + plain.folds.reduce((n, f) => n + plain.scale.c * (f.entryTokens - f.phTokens), 0), 8);
+		const key = cold.produce!.firstKeptEntryId!;
+		const ready = at(1, [{ key, running: false, summaryTokens: 25 }]);
+		expect(ready.p).toBeNull(); // huge g, low rent: availability alone does not authorize a rewrite
+		expect(ready.rentNext).toBeGreaterThan(warm.rentNext);
+		const bought = at(1, [{ key, running: false, summaryTokens: 25 }], 1e9);
+		expect(bought.p?.firstKeptEntryId).toBe(key);
+		expect(bought.p?.summaryTokensPlanned).toBe(25);
+		expect(bought.rentNext).toBe(0);
+	});
+	test("a boundary adds no rent for folds already sent on the preceding request", () => {
+		const entries = [U("u1", "one"), A("a1", ["c1"]), R("r1", "c1", 160_000), U("u2", "two"), AX("a2", 40_000), U("u3", "three")];
+		const opts = (p: number) => (cutAt?: string, foldsOnly?: boolean, ready?: readonly string[]) => {
+			const r = planOpts(entries, [], env(), lam(), false, p, false, cutAt, foldsOnly, ready);
+			r.o.scale = UNIT;
+			r.o.rent = 0;
+			return r;
+		};
+		const cold = decideEdits({ at: "run", justEdited: false, pWarm: 0, ready: [], entries, opts: opts(0) });
+		expect(cold.p!.folds).toHaveLength(1);
+		expect(cold.p!.ctxAfterFolds).toBeLessThan(40_000);
+		expect(cold.rentNext).toBe(0);
+		const runPlan = runPlanOf({ p: cold.p, cal: cold.cal, cold: true, native: null, nat: null, folds: cold.p!.folds, settleIds: [], ms: 1 }).plan;
+		runPlan.sent = true;
+		runPlan.applied = new Set(runPlan.folds.map((t) => t.entryId));
+		const d = decideTurnEnd({ failed: false, justEdited: true, pWarm: 1, ready: [], entries, opts: opts(1), runPlan });
+		if (d.kind !== "b2b") throw new Error("expected b2b");
+		expect(d.p).toBeNull();
+		expect(d.room).toBeNull();
+		expect(d.rentNext).toBe(0);
+	});
+	test("the room waits for the same cut when its actual finished summary exceeds the planned size", async () => {
+		const outputs = Array.from({ length: 80 }, (_, i) => {
+			const a = A(`a-old-${i}`, [`c-old-${i}`]);
+			(a.messages[0] as Any).content[1].arguments.command = `printf record-${i} ${"x".repeat(70)}`;
+			return [a, R(`r-old-${i}`, `c-old-${i}`, 5000)];
+		}).flat();
+		const entries = [U("u1", "record ".repeat(400)), AX("a1", 320_000), ...outputs, U("u2", "two"), AX("a2", 478_000), U("u3", "three"), A("a3")];
+		const model = { ...MODEL, contextWindow: 144_576 }, e = env({ model }), l = lam({ model });
+		const opts = (cutAt?: string, foldsOnly?: boolean, ready?: readonly string[]) => {
+			const r = planOpts(entries, [], e, l, false, 0, false, cutAt, foldsOnly, ready);
+			r.o.scale = UNIT;
+			return r;
+		};
+		const p = planContext(entries, opts().o)!;
+		const cut = await buildCut(p, { cwd: ".", model, modelRegistry: { complete: async () => ({ stopReason: "stop", content: [{ type: "text", text: "## Decisions\n" + "detail ".repeat(4000) }] }) } });
+		expect(cut.llmOk).toBe(true);
+		expect(cut.summaryTokens).toBeGreaterThan(p.summaryTokensPlanned);
+		const estimatedAfter = p.ctxAfterFolds - p.prefixTokens + p.summaryTokensPlanned;
+		expect(estimatedAfter).toBeLessThan(model.contextWindow - e.reserve);
+		const after = p.ctxAfterFolds - p.prefixTokens + cut.summaryTokens;
+		expect(after).toBeGreaterThan(model.contextWindow - e.reserve);
+		const d = decideTurnEnd({ failed: false, justEdited: false, pWarm: 0, ready: [{ key: cut.firstKeptEntryId, running: false, summaryTokens: cut.summaryTokens }], entries, opts });
+		if (d.kind !== "plan") throw new Error("expected plan");
+		expect(d.p?.firstKeptEntryId).toBe(cut.firstKeptEntryId);
+		expect(d.p?.summaryTokensPlanned).toBe(cut.summaryTokens);
+		expect(d.room?.firstKeptEntryId).toBe(cut.firstKeptEntryId);
+		expect(d.room?.summaryTokensPlanned).toBe(p.summaryTokensPlanned);
+		expect(d.produce).toBeNull();
 	});
 	test("decideTurnEnd: none after a failed turn, b2b after an edited request while warm, a plan only when it changes something", () => {
 		const o = (cutAt?: string, foldsOnly?: boolean, ready?: readonly string[]) => planOpts(small, [], env(), lam(), false, 1, false, cutAt, foldsOnly, ready);

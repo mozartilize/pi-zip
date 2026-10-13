@@ -29,6 +29,15 @@ async function rig(entries: Any[], lastTs: number, over: Any = {}, piExtra: Any 
 	const { ctx, notes } = fakeCtx(entries, { branch: branchOf(entries, lastTs), ...over });
 	return { ...f, ctx, notes, fire: async (name: string, e: Any) => f.handlers.get(name)(e, ctx) };
 }
+/** The Zip instance behind a rig (index.ts keeps it private): only to put it in a state a test needs (justEdited after a warm edit). */
+const zipOf = async (r: Any): Promise<Any> => {
+	const orig = Zip.prototype.sessionStart;
+	let z: Any = null;
+	Zip.prototype.sessionStart = function (this: Any, ...a: Any[]) { z = this; return (orig as Any).apply(this, a); };
+	try { await r.fire("session_start", {}); } finally { Zip.prototype.sessionStart = orig; }
+	return z;
+};
+
 const turnEnd = (all: Any[], lastId: string, turnIndex = 0) => ({
 	message: { role: "assistant", stopReason: "stop", usage: { input: 1000, cacheRead: 0, cacheWrite: 0 }, timestamp: Date.now() }, // the response that ends the turn: the newest touch
 	messageEntryId: lastId, context: { contextEntries: all }, entries: [], turnIndex,
@@ -181,7 +190,7 @@ describe("one producer prepares the return with one timer", () => {
 	};
 	beforeEach(() => { process.env.PI_ZIP_COLD_CAP = "6000"; process.env.PI_ZIP_TTL_SECS = "0.1"; });
 	// A short prose prefix pays at a cold pause, but not for a warm return: no immediate rule-A production.
-	const pauseOnly = [U("u1", "one"), AX("a1", 40_000), U("u2", "two"), A("a2"), U("u3", "three"), A("a3")];
+	const pauseOnly = [U("u1", "one"), AX("a1", 240_000), U("u2", "two"), A("a2"), U("u3", "three"), A("a3")];
 	// the summary loads Pi's serializer lazily; cold, that import alone outlasts the 120 ms these tests leave the away timer
 	beforeAll(async () => { await import("@earendil-works/pi-coding-agent"); });
 
@@ -307,12 +316,12 @@ describe("one producer prepares the return with one timer", () => {
 		expect(st.calls).toBe(1);
 	});
 
-	test("print/json mode (no UI): settle does nothing and starts nothing; a cold return that needs a summary produces it in the background, as with a UI", async () => {
+	test("print/json mode (no UI): settle prepares a summary and the cold return uses it at the boundary", async () => {
 		const st = { calls: 0, delay: 100 };
 		const r = await rig(done, COLD_TS(), { hasUI: false, mode: "print", modelRegistry: { complete: mkComplete(st) } });
 		expect(await settle(r)).toBeUndefined();
 		await sleep(200);
-		expect(st.calls).toBe(0); // no timer, no background work
+		expect(st.calls).toBe(1); // settle prepares the same return as an interactive session
 		const t0 = Date.now();
 		const req = await comeBack(r, undefined, COLD_TS());
 		expect(Date.now() - t0).toBeLessThan(50); // 0.3.1: built at the cold return, awaited
@@ -325,6 +334,40 @@ describe("one producer prepares the return with one timer", () => {
 		const te = await r.fire("turn_end", turnEnd([...back, A("a6")], "a6"));
 		expect(te.entries[0].type).toBe("compaction");
 		expect(st.calls).toBe(1);
+	});
+
+	test("a failed background call retains its cost, makes no ready artifact, and the next trigger retries", async () => {
+		const st = { calls: 0 };
+		const r = await rig(done, WARM_TS(), { modelRegistry: { complete: async () => { st.calls++; throw new Error("content policy refusal"); } } });
+		const zip = await zipOf(r);
+		await settle(r);
+		await sleep(20);
+		expect(st.calls).toBe(1);
+		expect(zip.bg).toBeNull();
+		expect(zip.mine.at(-1)).toMatchObject({ key: "u3", lost: "failed", estimated: true });
+		expect(zip.mine.at(-1).usd).toBeGreaterThan(0);
+		expect(zip.ready(r.ctx.sessionManager.getBranch())).toHaveLength(0);
+		r.ctx.modelRegistry.complete = mkComplete(st);
+		await settle(r);
+		await sleep(20);
+		expect(st.calls).toBe(2);
+		expect(zip.mine.at(-1).cut.llmOk).toBe(true);
+		expect(zip.stats.summaryUsd).toBeCloseTo(zip.mine.reduce((n: number, a: Any) => n + a.usd, 0), 10);
+		expect(zip.ready(r.ctx.sessionManager.getBranch())).toHaveLength(1);
+	});
+	test("rent survives session_start and a later compaction resets the branch's balance", async () => {
+		const r = await rig(done, WARM_TS());
+		const zip = await zipOf(r), rent = (n: number) => ({ type: "custom", customType: "pi-zip/rent", data: { rent: n } });
+		let branch = [...branchOf(done, WARM_TS()), rent(1234)];
+		r.ctx.sessionManager.getBranch = () => branch;
+		await r.fire("session_start", {});
+		expect(zip.rent).toBe(1234);
+		branch = [...branch, { type: "compaction", id: "new-head", summary: "short", firstKeptEntryId: "u3" }];
+		await r.fire("session_start", {});
+		expect(zip.rent).toBe(0);
+		branch = [...branch, rent(5678)];
+		await r.fire("session_start", {});
+		expect(zip.rent).toBe(5678);
 	});
 
 	test("off cancels the future pause timer and warming decisions never wake it", async () => {
@@ -516,7 +559,7 @@ describe("one producer prepares the return with one timer", () => {
 // Round 5 (the 39 s warm wait of 0.3.0): rule A starts a summary a warm return would make when the run ends. 0.4.0: nobody waits for a
 // summary, warm or cold, with a UI or without, except at a turn_end still at Pi's compaction room (Pi would stop for its own there).
 describe("never wait: rule A starts early; a summary is used once ready; the one wait is at Pi's compaction room", () => {
-	const done = [U("u1", "one"), A("a1", ["c1"]), R("r1", "c1", 44_000), AX("a2", 120_000), U("u2", "two"), A("a3", ["c3"]), R("r3", "c3", 44_000), AX("a4", 120_000), U("u3", "three"), A("a5")];
+	const done = [U("u1", "one"), A("a1", ["c1"]), R("r1", "c1", 44_000), AX("a2", 180_000), U("u2", "two"), A("a3", ["c3"]), R("r3", "c3", 44_000), AX("a4", 180_000), U("u3", "three"), A("a5")];
 	const back = [...done, U("u4", "back")];
 	const tail = [A("a6", ["c6"]), R("r6", "c6", 400)];
 	const mkComplete = (state: { calls: number; delay?: number; signals?: Any[] }) => async (_m: Any, _c: Any, o: Any) => {
@@ -544,14 +587,6 @@ describe("never wait: rule A starts early; a summary is used once ready; the one
 		return r.fire("context_with_system", { messages: flat(back) });
 	};
 	const noticeOf = (r: Any) => r.appended.filter((x: Any) => x.customType === "pi-zip/notice" && !x.data?.kind).at(-1)?.data;
-	/** The Zip instance behind a rig (index.ts keeps it private): only to put it in a state a test needs (justEdited after a warm edit). */
-	const zipOf = async (r: Any): Promise<Any> => {
-		const orig = Zip.prototype.sessionStart;
-		let z: Any = null;
-		Zip.prototype.sessionStart = function (this: Any, ...a: Any[]) { z = this; return (orig as Any).apply(this, a); };
-		try { await r.fire("session_start", {}); } finally { Zip.prototype.sessionStart = orig; }
-		return z;
-	};
 	const R5 = { registerEntryRenderer: () => {} }; // notices go to the transcript (r.appended)
 
 	test("A: settle starts the summary a warm return would make at once (not at 0.8 x TTL); the warm return takes it, no second call, no wait", async () => {
@@ -572,16 +607,17 @@ describe("never wait: rule A starts early; a summary is used once ready; the one
 		expect(noticeOf(r).desc).toMatch(/written while you worked$/);
 	});
 
-	test("settle produces despite b2b, which blocks edits only; no UI prepares nothing at settle", async () => {
+	test("settle produces despite b2b in interactive and no-UI sessions", async () => {
 		const st = { calls: 0 };
 		const quiet = await rig(done, WARM_TS(), { hasUI: false, modelRegistry: { complete: mkComplete(st) } });
 		expect(await settle(quiet)).toBeUndefined();
-		expect(st.calls).toBe(0);
+		await sleep(20);
+		expect(st.calls).toBe(1);
 		const r = await rig(done, WARM_TS(), { modelRegistry: { complete: mkComplete(st) } });
 		(await zipOf(r)).justEdited = true;
 		await settle(r);
 		await sleep(20);
-		expect(st.calls).toBe(1);
+		expect(st.calls).toBe(2);
 	});
 
 	test("a warm prompt with no finished summary for its cut: no wait, its folds alone by the law, the summary starts in the background; a later turn_end takes it", async () => {
@@ -640,7 +676,7 @@ describe("never wait: rule A starts early; a summary is used once ready; the one
 		// done: about 123K real before the plan, 91K after its folds (the outputs before the cut). Room between the two: 131,576 - 24,576
 		const run = async (ageMs: number) => {
 			const st = { calls: 0, delay: 200 };
-			const r = await rig(done, WARM_TS(), { model: { provider: "p", id: "m", contextWindow: 131_576, cost: { cacheWrite: 3, cacheRead: 0.3 }, promptCache: { short: 300 } }, modelRegistry: { complete: mkComplete(st) } });
+			const r = await rig(done, WARM_TS(), { model: { provider: "p", id: "m", contextWindow: 176_576, cost: { cacheWrite: 3, cacheRead: 0.3 }, promptCache: { short: 300 } }, modelRegistry: { complete: mkComplete(st) } });
 			const req = await prompt(r);
 			expect(req?.messages?.[0]?.role).not.toBe("compactionSummary"); // 0.3.1: the prompt waited (the request as it was was at the room)
 			const end = turnEnd([...back, ...tail], "r6");
@@ -705,7 +741,9 @@ describe("never wait: rule A starts early; a summary is used once ready; the one
 		const r = await rig(done, WARM_TS(), { model, modelRegistry: { complete: mkComplete(st) } });
 		const zip = await zipOf(r);
 		await prompt(r);
-		zip.discardBg("replaced"); // nothing running at the turn_end: the room wait makes its own call
+		const ended = zip.bg.promise;
+		zip.discardBg("replaced");
+		await ended; // nothing running at the turn_end: the room wait makes its own call
 		const est = zip.stats.summaryUsd;
 		r.ctx.model = { ...model, provider: "room-latency", id: "first" };
 		zip.loadEnt("room-latency/first");
@@ -717,7 +755,7 @@ describe("never wait: rule A starts early; a summary is used once ready; the one
 		expect(rows("room_wait")[0]).toMatchObject({ key: "u3", running: false });
 		const rec = zip.mine.find((a: Any) => a.cut);
 		expect(rec).toMatchObject({ key: "u3", head: "" });
-		expect(loadStats().models["room-latency/first"].call).toEqual({ ms: rec.cut.ms, tokens: rec.cut.prefixTokens });
+		expect(loadStats().models["room-latency/first"].call).toEqual({ ms: rec.cut.ms, tokens: rec.cut.prefixTokens * zip.scaleOf(r.ctx).c });
 		expect(loadStats().models["room-latency/second"]?.call).toBeUndefined();
 		expect(zip.ent).toBeUndefined();
 		expect(rec.usd).toBeGreaterThan(0);
@@ -738,6 +776,7 @@ describe("never wait: rule A starts early; a summary is used once ready; the one
 		expect(te2?.entries?.some((x: Any) => x.type === "compaction")).toBeFalsy();
 		expect(ez.bg?.key).toBe("u3"); // still running
 		expect(st2.calls).toBe(1);
+		await ez.bg.promise; // finish the provider before the next test changes the learning environment
 	});
 	test("awaiting a background call at the room learns and books that completion only once", async () => {
 		const model = { provider: "room-latency", id: "awaited", contextWindow: 100_000, cost: { cacheWrite: 3, cacheRead: 0.3 }, promptCache: { short: 300 } };
@@ -752,7 +791,7 @@ describe("never wait: rule A starts early; a summary is used once ready; the one
 		const artifacts = zip.mine.filter((a: Any) => a.cut);
 		expect(artifacts).toHaveLength(1);
 		const rec = artifacts[0];
-		expect(loadStats().models["room-latency/awaited"].call).toEqual({ ms: 0.9 * prior.ms + 0.1 * rec.cut.ms, tokens: 0.9 * prior.tokens + 0.1 * rec.cut.prefixTokens });
+		expect(loadStats().models["room-latency/awaited"].call).toEqual({ ms: 0.9 * prior.ms + 0.1 * rec.cut.ms, tokens: 0.9 * prior.tokens + 0.1 * rec.cut.prefixTokens * zip.scaleOf(r.ctx).c });
 		expect(zip.stats.summaryUsd).toBe(rec.usd);
 		expect(te.entries[0]).toMatchObject({ type: "compaction", summary: rec.cut.text });
 		expect(st.calls).toBe(1);
@@ -799,9 +838,10 @@ describe("never wait: rule A starts early; a summary is used once ready; the one
 		expect(st.signals[0].aborted).toBe(false);
 	});
 
-	test("a warm cut that moves to another branch: the call for the old one ends, recorded as unused at once; the new cut's starts in the background; nothing waits", async () => {
+	test("a warm cut that moves to another branch: the old call is booked unused at once; its replacement starts only after the provider settles; nothing waits", async () => {
 		const st = { calls: 0, delay: 200, signals: [] as Any[] };
 		const r = await rig(done, WARM_TS(), { modelRegistry: { complete: mkComplete(st) } });
+		const zip = await zipOf(r);
 		expect(await prompt(r)).toBeUndefined(); // no ready summary, and the folds alone do not pay warm: the summary for u3 is being written
 		await sleep(20);
 		expect(st.calls).toBe(1);
@@ -810,12 +850,15 @@ describe("never wait: rule A starts early; a summary is used once ready; the one
 		const t0 = Date.now();
 		const te = await r.fire("turn_end", turnEnd([...other, A("xa6")], "xa6"));
 		expect(Date.now() - t0).toBeLessThan(150);
-		expect(te.entries.map((e: Any) => e.customType ?? e.type)).toEqual(["pi-zip/summary"]); // nothing applied; only the record of the ended call
+		expect(te.entries.map((e: Any) => e.customType ?? e.type)).toEqual(["pi-zip/summary", "pi-zip/rent"]); // nothing applied; only the record of the ended call
 		expect(te.entries[0].data).toMatchObject({ key: "u3", estimated: true, lost: "replaced" });
 		expect(st.signals[0].aborted).toBe(true);
 		expect(rows("produce").at(-1)).toMatchObject({ where: "turn_end", key: "xu3" });
+		expect(st.calls).toBe(1); // cancellation cannot release a still-running provider
+		await zip.bg.promise;
 		await sleep(20);
-		expect(st.calls).toBe(2); // one call in flight at a time
+		expect(st.calls).toBe(2); // the replacement starts after actual completion clears the sole slot
+		await zip.bg.promise;
 	});
 
 	test("idle cache warming does not drop the early summary: Pi's warm and stop decisions leave it alone, the warm return takes it", async () => {
@@ -839,29 +882,36 @@ describe("never wait: rule A starts early; a summary is used once ready; the one
 		expect(rows("unused_summary")).toEqual([]);
 	});
 
-	test("a call ended before it finishes books its input at once and persists on asynchronous cancellation, before the provider settles", async () => {
-		const st = { calls: 0, delay: 5_000 }; // the call ignores the abort and settles 5 s later
-		const r = await rig(done, WARM_TS(), { modelRegistry: { complete: mkComplete(st) } });
+	test("a cancelled call books and persists its loss before the provider settles, retaining the slot until completion", async () => {
+		const st = { calls: 0 };
+		const completion = Promise.withResolvers<void>();
+		const r = await rig(done, WARM_TS(), { modelRegistry: { complete: async (...a: [Any, Any, Any]) => { await completion.promise; return mkComplete(st)(...a); } } });
 		const zip = await zipOf(r);
 		await settle(r);
 		await sleep(10);
 		expect(zip.bg?.key).toBe("u3");
 		const cancelled = zip.bg.promise;
 		zip.discardBg("replaced");
-		expect(zip.bg).toBeNull();
+		expect(zip.bg?.aborted).toBe(true);
 		expect(zip.mine.at(-1)).toMatchObject({ key: "u3", lost: "replaced", usd: zip.stats.summaryUsd });
 		expect(r.appended.filter((x: Any) => x.customType === "pi-zip/summary")).toHaveLength(0);
-		expect(await cancelled).toBeNull();
+		await sleep(0);
+		expect(zip.bg?.aborted).toBe(true); // persistence does not free the provider slot
 		const recs = r.appended.filter((x: Any) => x.customType === "pi-zip/summary").map((x: Any) => x.data);
 		expect(recs).toHaveLength(1);
 		expect(recs[0]).toMatchObject({ key: "u3", head: "", estimated: true, lost: "replaced" });
 		expect(recs[0].usd).toBeCloseTo(zip.stats.summaryUsd, 9);
 		expect(recs[0].usd).toBeGreaterThan(0);
+		completion.resolve();
+		expect(await cancelled).toBeNull();
+		expect(zip.bg).toBeNull();
+		expect(r.appended.filter((x: Any) => x.customType === "pi-zip/summary")).toHaveLength(1);
 	});
 
 	test("a call still running when the process ends is one unused call: recorded at the input it was billed for, kept in the session totals", async () => {
-		const st = { calls: 0, delay: 5_000 };
-		const r = await rig(done, WARM_TS(), { modelRegistry: { complete: mkComplete(st) } });
+		const st = { calls: 0 };
+		const completion = Promise.withResolvers<void>();
+		const r = await rig(done, WARM_TS(), { modelRegistry: { complete: async (...a: [Any, Any, Any]) => { await completion.promise; return mkComplete(st)(...a); } } });
 		const zip = await zipOf(r);
 		await settle(r);
 		await sleep(10);
@@ -872,6 +922,8 @@ describe("never wait: rule A starts early; a summary is used once ready; the one
 		expect(recs[0]).toMatchObject({ key: "u3", lost: "shutdown", estimated: true });
 		expect(recs[0].cut).toBeUndefined();
 		expect(recs[0].usd).toBeGreaterThan(0);
+		expect(zip.bg?.aborted).toBe(true);
+		completion.resolve();
 		expect(await cancelled).toBeNull();
 		expect(r.appended.filter((x: Any) => x.customType === "pi-zip/summary")).toHaveLength(1);
 		// the restarted process: the lost call is in the totals, and it decides as with no summary at all (its own call in the background, no wait)
@@ -1165,7 +1217,7 @@ describe("I6 / F10 warm cache: nothing changes unless the context passes the val
 		const r = await rig(entries, WARM_TS(), { branch: [...branchOf(entries, WARM_TS()), stale] });
 		await r.fire("before_agent_start", {});
 		expect(await r.fire("context_with_system", { messages: flat(entries) })).toBeUndefined();
-		expect(await r.fire("turn_end", turnEnd([...entries, A("zN")], "zN"))).toBeUndefined();
+		expect(((await r.fire("turn_end", turnEnd([...entries, A("zN")], "zN")))?.entries ?? []).every((e: Any) => e.customType === "pi-zip/rent")).toBe(true);
 		expect(r.notes).toEqual([]);
 		expect(planContext(entries, { law: { pr: lawPrices("explicit", false), g: 2_500, pWarm: 1 }, cwd: ".", model: r.ctx.model })).toBeNull();
 	});
@@ -1196,7 +1248,7 @@ describe("I6 / F10 warm cache: nothing changes unless the context passes the val
 		const r = await rig(entries, WARM_TS(), { model: model(undefined) });
 		await r.fire("before_agent_start", {});
 		expect(await r.fire("context_with_system", { messages: flat(entries) })).toBeUndefined();
-		expect(await r.fire("turn_end", turnEnd([...entries, A("zN")], "zN"))).toBeUndefined();
+		expect(((await r.fire("turn_end", turnEnd([...entries, A("zN")], "zN")))?.entries ?? []).every((e: Any) => e.customType === "pi-zip/rent")).toBe(true);
 		expect(r.notes).toEqual([]);
 	});
 
@@ -1210,13 +1262,13 @@ describe("I6 / F10 warm cache: nothing changes unless the context passes the val
 		expect(await big.fire("context_with_system", { messages: flat(mid) })).toBeDefined(); // D ~105K >> the EOQ Delta at this A
 		rmSync(process.env.PI_ZIP_CACHE_STATS, { force: true });
 		process.env.PI_ZIP_CACHE_STATS = stats;
-		const small = session(6); // ~14K tokens
+		const small = session(40); // a larger removal buys the guarded rewrite
 		const tiny = await rig(small, WARM_TS(), { model: model(32_000) }); // cap = room = 7.4K
 		await tiny.fire("before_agent_start", {});
 		expect(await tiny.fire("context_with_system", { messages: flat(small) })).toBeDefined();
 		// the cold cap never exceeds Pi's compaction room either
-		const prose = [U("u1", "one"), A("a1"), AX("x1", 60_000), U("u2", "two"), A("a2"), AX("x2", 60_000), U("u3", "three"), A("a3"), U("u4", "now")]; // ~30K tokens of prose
-		const clamped = planContext(prose, { pause: true, cwd: ".", model: model(32_000), coldCap: 60_000, promptPending: false });
+		const prose = [U("u1", "one"), A("a1"), AX("x1", 100_000), U("u2", "two"), A("a2"), AX("x2", 100_000), U("u3", "three"), A("a3"), U("u4", "now")]; // ~30K tokens of prose
+		const clamped = planContext(prose, { pause: true, cwd: ".", model: model(32_000), coldCap: 60_000, promptPending: false, law: { pr: lawPrices("automatic", false), g: 2500, pWarm: 0 } });
 		expect(clamped!.sumTrigger).not.toBeNull(); // 30K > the compaction room (7.4K): the 60K default cap is clamped
 		const roomy = planContext(prose, { pause: true, cwd: ".", model: model(1_000_000), coldCap: 60_000, promptPending: false });
 		expect(roomy).toBeNull(); // the same context at a 1M window is under the cap: nothing is planned
@@ -1290,7 +1342,7 @@ describe("run lifecycle: failures, steering", () => {
 		t.ctx.sessionManager.buildSessionProjection = () => { throw new Error("projection exploded"); };
 		await t.fire("before_agent_start", {});
 		expect(await t.fire("context_with_system", { messages: flat(cold) })).toBeUndefined();
-		expect(await t.fire("turn_end", turnEnd([...cold, A("a5")], "a5"))).toBeUndefined(); // nothing was sent, so nothing is persisted
+		expect((await t.fire("turn_end", turnEnd([...cold, A("a5")], "a5"))).entries.every((e: Any) => e.customType === "pi-zip/rent")).toBe(true); // nothing was sent, so nothing is persisted
 	});
 
 	test("only re-readable previous-turn outputs are folded (planner and guard agree)", async () => {

@@ -2,7 +2,7 @@
 world explicit known ttl=300 true=300 survival=none c=1 sys=3000 window=128000 nonative print
 prompt
 call npm 1K
-say 90K
+say 110K
 prompt +60s
 call npm 100
 call npm 100

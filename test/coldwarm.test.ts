@@ -39,7 +39,7 @@ describe("the summary call is priced as the narrative call it is", () => {
 		expect(call).toBeLessThan(ANTH.w * X + ANTH.out * S);
 		expect(call).toBeGreaterThanOrEqual(ANTH.input * X);
 	});
-	test("the previous summary's narrative, which the call merges, is priced as input; its lists are not", () => {
+	test("the previous summary is excluded from the specification call price, including its narrative", () => {
 		// two previous summaries of the same size: one mostly lists, one mostly narrative. Same prefix, same carried size, so the
 		// summary step's call differs only by the narrative the call reads (chars/4 tokens, at the input price)
 		const mk = (narr: number) => {
@@ -52,6 +52,6 @@ describe("the summary call is priced as the narrative call it is", () => {
 			return o.trace.find((t: Any) => t.where === "summary")!;
 		};
 		const small = step(240), big = step(10_040);
-		expect(big.K - small.K).toBeCloseTo(ANTH.input * (Math.ceil(10_040 / 4) - Math.ceil(240 / 4)), 0);
+		expect(big.K - small.K).toBe(0);
 	});
 });

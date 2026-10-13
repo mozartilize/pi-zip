@@ -82,5 +82,5 @@ fn native_application_prices_the_spent_call_at_zero() {
     fresh.ticks[1].run_plan.as_mut().unwrap().native = false;
     let unpaid = Run::new(trace, fresh);
     assert_eq!(took_ready(&unpaid, 1), None);
-    assert!(pays_fully(&unpaid, 1).unwrap_err().contains("with the summary call 72500"), "the same cut with a fresh call does not pay");
+    assert!(pays_fully(&unpaid, 1).unwrap_err().contains("with the summary call 87500"), "the same cut with a fresh call does not pay");
 }

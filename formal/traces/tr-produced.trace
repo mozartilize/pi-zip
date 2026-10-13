@@ -3,7 +3,7 @@
 # priced as ready (its call spent). TR's restated clause; the mutant prices it again and leaves the context at 155K.
 world explicit known ttl=300 true=300 survival=none c=1 sys=3000 window=200000 native print
 prompt
-say 150K
+say 300K
 prompt +1h
 call npm 100
 call npm 100

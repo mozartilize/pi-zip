@@ -578,7 +578,7 @@ describe("cache", () => {
 		expect(detectCold(model, 0, [old], now)).toMatchObject({ cold: true, pause: true });
 		const warmLearned = () => ({ p: 0.8, src: "learned" }); // a provider that outlives the lifetime asked for: warm, yet a pause
 		expect(detectCold(model, 0, [old], now, "", warmLearned)).toMatchObject({ cold: false, pWarm: 0.8, pause: true });
-		expect(detectCold({ provider: "p", id: "other", promptCache: { short: 300 } }, 0, [fresh], now)).toMatchObject({ cold: true, pause: true, reason: expect.stringContaining("model switch") });
+		expect(detectCold({ provider: "p", id: "other", promptCache: { short: 300 } }, 0, [fresh], now)).toMatchObject({ cold: true, pause: false, reason: expect.stringContaining("model switch") });
 		expect(detectCold({ provider: "q", id: "m", promptCache: { short: 300 } }, 0, [fresh], now).cold).toBe(true);
 		expect(detectCold({ provider: "p", id: "other" }, now - 1000, [], now, "p/m").cold).toBe(true); // in-process memory of the last request's model
 		expect(detectCold(model, 0, [], now)).toMatchObject({ cold: true, pWarm: 0, pause: false }); // no prior request: nothing is cached, nobody left

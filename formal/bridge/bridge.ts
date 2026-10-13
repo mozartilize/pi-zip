@@ -138,7 +138,7 @@ Zip.prototype.notify = function (this: Any, ...a: Any[]) {
 const bgCall = new AsyncLocalStorage<boolean>();
 const origStartBg = (Zip.prototype as Any).startBg;
 (Zip.prototype as Any).startBg = function (this: Any, ...a: Any[]) {
-	return bgCall.run(true, () => origStartBg.apply(this, a));
+	return bgCall.run(!a[2], () => origStartBg.apply(this, a));
 };
 const origWant = (Zip.prototype as Any).want;
 if (origWant) (Zip.prototype as Any).want = function (this: Any, ...a: Any[]) {
@@ -311,7 +311,6 @@ async function runTrace(tr: Any): Promise<Any> {
 					if (!probe) {
 						activeCalls.add(call);
 						producer.calls = Math.max(producer.calls, activeCalls.size);
-						options?.signal?.addEventListener("abort", end, { once: true });
 					}
 					try {
 					const r = narrativeOf(req);
@@ -326,7 +325,7 @@ async function runTrace(tr: Any): Promise<Any> {
 						});
 					}
 					return r;
-					} finally { end(); options?.signal?.removeEventListener("abort", end); }
+					} finally { end(); }
 				},
 			},
 		};
@@ -499,14 +498,12 @@ async function runTrace(tr: Any): Promise<Any> {
 	// ---- probes --------------------------------------------------------------------------------------------------------------
 	// b2b applies only to warm returns: capture the previous request's edit before the run starts.
 	let preRun: { je: boolean } | null = null;
-	/** The decisions of one hook, as run.ts made them. A warm plan whose cut moved away from a summary written in the background is
-	 *  planned once more with `cutAt` (run.ts pinned): when that plan cuts there, it is the decision and the first plan is not; when it does
-	 *  not, the first plan stands and the pinned attempt is dropped. */
+	/** The decisions of one hook, with the finalized tuple options. Explicit compatibility probes retain their pinned projection. */
 	function decisions(caps: Any[], room = false): Any[] {
 		const out: Any[] = [];
 		for (const captured of caps) {
-			const c = { ...captured, o: { ...captured.o, scale: captured.live.scale, carriedFolds: captured.live.carriedFolds } };
-			// a cut with no ready summary gives way to its folds alone (core.ts unready): that plan is the decision, except at the room
+			const c = { ...captured, o: { ...captured.o, scale: captured.live.scale, carriedFolds: captured.live.carriedFolds, application: captured.live.application, justEdited: captured.live.justEdited, deferSummary: captured.live.deferSummary, rent: captured.live.rent, keep: captured.live.keep, readySizes: captured.live.readySizes } };
+			// A folds-only compatibility projection is the application decision, except at the room
 			// wait (a turn_end still at Pi's compaction room), whose decision is the plan with its own cut
 			if (c.o.foldsOnly && room) continue;
 			if (c.o.foldsOnly) {
@@ -549,14 +546,16 @@ async function runTrace(tr: Any): Promise<Any> {
 			const o = { ...cap.o, law: { ...cap.o.law, pWarm: p }, trace: [] };
 			let r: Any = null;
 			try {
-				r = plan.planContext(cap.entries, o);
+				r = o.application ? core.decideEdits({ at: o.deferSummary ? "run" : "native", entries: cap.entries, pWarm: p, justEdited: !!o.justEdited,
+                    ready: (o.ready ?? []).map((key: string) => ({ key, running: false, summaryTokens: o.readySizes?.[key] })), opts: () => ({ o, cal: o.scale }) }).p : plan.planContext(cap.entries, o);
 			} catch (err) {
 				out.push({ p, mode, error: String(err) });
 				continue;
 			}
+			const planned = plan.planContext(cap.entries, { ...o, application: false, ready: [], trace: [] });
 			const c = r ? (r.scale?.c ?? r.k ?? 1) : 1;
 			const after = r ? r.ctxAfterFolds - (r.cutIdx !== null ? c * (r.prefixTokens - r.summaryTokensPlanned) : 0) : null;
-			out.push({ p, actual: p === actual, mode, plan: !!r, folds: r ? r.folds.map((f: Any) => f.entryId) : [], cut: r?.firstKeptEntryId ?? null, prefix: r ? c * r.prefixTokens : 0, sum: r ? c * r.summaryTokensPlanned : 0, before: r?.ctxTokens ?? null, afterFolds: r ? r.ctxAfterFolds : null, after, law: o.trace.map((t: Any) => ({ at: t.where, ok: t.ok, B: t.B, A: t.A, T: t.T, K: t.K, phi: t.phi, eta: t.eta, ...(t.cut !== undefined ? { cut: t.cut } : {}), ...(t.ready ? { ready: true } : {}), ...(t.key ? { key: t.key } : {}) })) });
+			out.push({ plannedPlan: !!planned, plannedFolds: planned?.folds.map((f: Any) => f.entryId) ?? [], plannedCut: planned?.firstKeptEntryId ?? null, b2b: !!o.application && !!o.justEdited && p >= 0.5, plannedAfter: planned ? planned.ctxAfterFolds - planned.scale.c * (planned.prefixTokens - planned.summaryTokensPlanned) : null, p, actual: p === actual, mode, plan: !!r, folds: r ? r.folds.map((f: Any) => f.entryId) : [], cut: r?.firstKeptEntryId ?? null, prefix: r ? c * r.prefixTokens : 0, sum: r ? c * r.summaryTokensPlanned : 0, before: r?.ctxTokens ?? null, afterFolds: r ? r.ctxAfterFolds : null, after, law: o.trace.map((t: Any) => ({ at: t.where, ok: t.ok, B: t.B, A: t.A, T: t.T, K: t.K, phi: t.phi, eta: t.eta, keep: t.keep, ...(t.rent !== undefined ? { rent: t.rent } : {}), ...(t.cut !== undefined ? { cut: t.cut } : {}), ...(t.ready ? { ready: true } : {}), ...(t.key ? { key: t.key } : {}) })) });
 		}
 		return { room: !!cap.room, at: cap.at, mode: cap.mode, p: actual, pause: !!cap.o.pause, g: cap.o.law?.g ?? null, pr: cap.o.law?.pr ?? null, grid: out };
 	}
@@ -696,9 +695,10 @@ async function runTrace(tr: Any): Promise<Any> {
 	const TRANSPLANT: Record<string, string[]> = {
 		g: ["g", "deltas"],
 		justEdited: ["justEdited"],
+		rent: ["rent"],
 		clock: ["lastReqMs", "lastModelKey", "prevTotal", "prevKey"],
 	};
-	const KNOWN = ["g", "justEdited"]; // decision state rebuilt from the session
+	const KNOWN = ["g", "justEdited", "rent"]; // decision state rebuilt from the session
 	async function freshProbe(snapshot: Any[], userMsg: Any, liveDesc: Any[], liveState?: Any) {
 		const base = await freshOnce(snapshot, userMsg, liveDesc, null);
 		if (base.same || !liveState) return base;
@@ -1039,6 +1039,8 @@ async function runTrace(tr: Any): Promise<Any> {
 		const cap = plan.coldTarget(40_000, O, room), total = bs.reduce((a: number, b: Any) => a + (byId.get(b.entryId)?.phTokens ?? b.tokens), 0);
 		const prev = bs[0]?.kind === "summary" ? bs[0].tokens : 0;
 		const turns = plan.countUserTurns(bs), protectedAt = bs.findIndex((b: Any) => b.userTurn >= turns - 1);
+		let keep = 0;
+		for (let i = bs.length - 1; i >= 0 && keep < 20000; i--) keep += c * bs[i].tokens;
 		const floor = prev + bs.reduce((a: number, b: Any) => a + (b.userTurn >= turns - 1 ? byId.get(b.entryId)?.phTokens ?? b.tokens : 0), 0);
 		const head = branch.filter((e: Any) => e.type === "compaction").at(-1)?.id ?? "";
 		const artifacts = branch.filter((e: Any) => e.type === "custom" && e.customType === "pi-zip/summary" && e.data?.cut && e.data.head === head).map((e: Any) => e.data);
@@ -1047,20 +1049,20 @@ async function runTrace(tr: Any): Promise<Any> {
 		for (let i = 0; i < bs.length; i++) {
 			const b = bs[i];
 			if (i >= (prev ? 2 : 1) && (protectedAt < 0 || i <= protectedAt) && plan.isCutBlock(b)) {
-				const sum = Math.max(Math.min(Math.max(prefix / 10, 1000), 8000), prev);
+				const sum = Math.max(Math.min(Math.max(c * prefix / 10, 1000), 8000), c * prev) / c;
 				const art = artifacts.findLast((a: Any) => a.key === b.entryId && a.cut.firstKeptEntryId === b.entryId);
 				const keptFolds = folds.filter((f: Any) => bs.findIndex((x: Any) => x.entryId === f.entryId) >= i);
-				cuts.push({ key: b.entryId, prefix: c * prefix, summary: c * sum, read: c * (Math.max(prefix - prev, 0) + (prev ? Math.ceil((previousNarrative(String(bs[0].msg?.summary ?? ""))?.text ?? "").length / 4) : 0)), written: c * Math.min(sum, 4000), ready: !!art, guard: !core.checkEdits(bs, turns, keptFolds, { firstKeptEntryId: b.entryId }), hash: art ? sha(art.cut.text) : null });
+				cuts.push({ key: b.entryId, prefix: c * prefix, summary: c * sum, read: c * Math.max(prefix - prev, 0), written: Math.min(c * sum, 4000), ready: !!art, guard: !core.checkEdits(bs, turns, keptFolds, { firstKeptEntryId: b.entryId }), hash: art ? sha(art.cut.text) : null });
 			}
 			prefix += byId.get(b.entryId)?.phTokens ?? b.tokens;
 		}
 		const foreign = branch.some((e: Any) => e.type === "compaction" && e.details?.by !== "pi-zip");
 		return {
 			open: live.ctx.isIdle() && !z.nativeOff && !foreign && branch.at(-1)?.type !== "compaction" && !!prepareCompaction(branch, { enabled: true, reserveTokens: 16_384, keepRecentTokens: 20_000 }),
-			p: now.pWarm, g: learned.g, known: !!learned.ent?.cls,
+			p: now.pWarm, g: learned.g, keep, rent: z.rent, known: !!learned.ent?.cls,
 			b2b: now.pWarm >= 0.5 && learned.justEdited,
 			before: O + c * bs.reduce((a: number, b: Any) => a + b.tokens, 0),
-			afterFolds: O + c * total, target: cap, floor: O + c * (floor + 1000), cuts, applied: null,
+			afterFolds: O + c * total, target: cap, floor: 0, cuts, applied: null,
 		};
 	}
 

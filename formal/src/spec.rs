@@ -7,7 +7,7 @@
 //!
 //! The three axioms come first. Every other property is derived from them: it names the axiom(s) it refines and says why.
 //! Constants: K_REGRET requests and DELTA tokens bound "soon" and "no new information".
-use crate::law::{call_of, class_prices, law, summary_call, Prices};
+use crate::law::{call_of, class_prices, law, guard, with_tail, summary_call, Prices};
 use crate::logic::*;
 use crate::model::*;
 use std::collections::{BTreeMap, BTreeSet};
@@ -648,7 +648,11 @@ pub fn dominates(r: &R, i: usize, p: &GridPt, q: &GridPt) -> bool {
 pub fn mp_breaches(r: &R, i: usize) -> Vec<(String, String)> {
     let mut bad = Vec::new();
     for g in r.grids(i) {
-        let pts: Vec<&GridPt> = g.grid.iter().filter(|x| x.error.is_none()).collect();
+        let planned: Vec<GridPt> = g.grid.iter().filter(|x| x.error.is_none()).cloned().map(|mut p| {
+            if let Some(has) = p.planned_plan { p.plan = has; p.folds = p.planned_folds.clone(); p.cut = p.planned_cut.clone(); p.after = p.planned_after; }
+            p
+        }).collect();
+        let pts: Vec<&GridPt> = planned.iter().collect();
         for (a, q) in pts.iter().enumerate() {
             if !q.edits() {
                 continue;
@@ -761,14 +765,26 @@ pub fn pays_fully(r: &R, i: usize) -> Result<(), String> {
     let call = if e.sum > 0.0 && took_ready(r, i).is_none() { summary_call(pr, e.read, e.written) } else { 0.0 };
     // pays: K <= 0 or gain >= K, up to the estimate's error: the planner decides on chars/4 estimates it calibrates, the spec judges
     // on the request's real size, so the verdict may differ by TOL of the gross terms of K (the rewrite, the reads saved, the call)
+    let guarded = g.actual().and_then(|p| p.law.iter().rev().find(|s| s.at == "guard"));
     let pays = |b: f64, a: f64, t: &crate::law::Terms| {
         let gross = (pr.w - pr.r) * (g.p * a + (1.0 - g.p) * (b - a)).abs() + call;
-        t.ok || t.k - t.gain <= TOL * gross
+        t.ok || if let Some(step) = guarded {
+            let effective = t.k - t.eta * (b - a);
+            let paid = pr.r * (step.rent.unwrap_or(0.0) + b - a);
+            effective <= TOL * gross || effective - paid <= TOL * gross
+                || (t.k - t.gain <= TOL * gross && effective / 10.0 - paid <= TOL * gross)
+        } else { t.k - t.gain <= TOL * gross }
     };
     if e.a >= e.b {
         return Err(format!("{} plan at P={}: B={:.0} A={:.0} (real){}: the edit makes the request larger", g.at, g.p, e.b, e.a, if e.sum > 0.0 { format!(", a summary of {:.0}", e.sum) } else { String::new() }));
     }
-    let t = law(e.b, e.a, g.p, room, Some(pr), gg, call, e.a);
+    let t = if let Some(step) = guarded {
+        let mut t = with_tail(law(e.b, e.a, g.p, room, Some(pr), gg, 0.0, e.a), e.b, e.a, room, pr, step.keep);
+        let effective = t.k - t.eta * (e.b - e.a);
+        let paid = pr.r * (step.rent.unwrap_or(0.0) + e.b - e.a);
+        t.ok = e.a < e.b && (effective <= 0.0 || paid >= effective || (t.ok && paid >= effective / 10.0));
+        t
+    } else { law(e.b, e.a, g.p, room, Some(pr), gg, call, e.a) };
     let mut sum_txt = if e.sum > 0.0 { format!(", a summary of {:.0} (its call read {:.0} and wrote {:.0})", e.sum, e.read, e.written) } else { String::new() };
     // what the planner itself evaluated (its estimates), for the diagnosis
     if let Some(p) = g.actual() {
@@ -789,7 +805,7 @@ pub fn pays_fully(r: &R, i: usize) -> Result<(), String> {
             t.k - t.gain
         ));
     }
-    if e.sum > 0.0 && g.p < 0.5 {
+    if e.sum > 0.0 && g.p < 0.5 && guarded.is_none() {
         let d = (e.b - e.a - e.d_folds).max(0.0);
         let m = law(e.a + d, e.a, g.p, room, Some(pr), gg, call, e.a);
         if !pays(e.a + d, e.a, &m) {
@@ -856,10 +872,11 @@ pub fn gone_but_warm(r: &R, i: usize) -> Option<String> {
     let s = &r.st[i];
     let w = &r.trace.world;
     if s.switched {
-        return (!s.believed_cold || s.p > 0.0 || !s.pause).then(|| format!("the model switched ({} -> {}) and the return was planned with P(warm) {:.2}{}", r.tick(i - 1).model, t.model, s.p, if s.pause { "" } else { ", not as a pause" }));
+        return (!s.believed_cold || s.p > 0.0).then(|| format!("the model switched ({} -> {}) and the return was planned with P(warm) {:.2}{}", r.tick(i - 1).model, t.model, s.p, if s.pause { "" } else { ", not as a pause" }));
     }
     let gap = s.touch_gap?;
-    if gap > w.ttl_decl() + 1.0 && !s.pause {
+    let driven = r.trace.events.iter().take(t.ev as usize + 1).rev().find(|e| e.starts_run()).is_some_and(|e| matches!(e, Event::Drive { .. }));
+    if !driven && gap > w.ttl_decl() + 1.0 && !s.pause {
         return Some(format!("{gap:.0} s since the cache was last touched, past the requested lifetime {:.0} s, and the return is not marked a pause", w.ttl_decl()));
     }
     if gap > w.ttl_decl() + 1.0 && gap > w.ttl_kept() + 1.0 && !s.believed_cold {
@@ -955,7 +972,7 @@ pub fn ready_produced_again(r: &R, i: usize) -> Option<String> {
                 let (ty, key) = (s(x, "type").unwrap_or_default(), s(x, "key"));
                 let Some(k) = key else { continue };
                 match ty.as_str() {
-                    "away_summary_start" | "produce" if m == i && ready.contains(&k) && (ty == "away_summary_start" || x.get("running").is_none()) => {
+                    "away_summary_start" | "produce" if m == i && ready.contains(&k) && (ty == "away_summary_start" || x.get("running").is_none()) && !led.iter().any(|w| w["type"] == "room_wait" && w["key"] == k) => {
                         return Some(format!("the {at} decision at req {i} produced {k} again ({ty}), whose summary was ready"));
                     }
                     "away_summary_start" => {
@@ -992,7 +1009,7 @@ pub fn native_withheld(r: &R, i: usize) -> Option<String> {
         && law(n.before, after(c), n.p, Some(r.st[i].room), Some(pr), n.g, call, after(c)).ok;
     let cw = n.cuts.iter().position(|c| after(c) <= n.target).unwrap_or(n.cuts.len() - 1);
     let bound = (cw..n.cuts.len()).find(|&k| pays(&n.cuts[k], summary_call(pr, n.cuts[k].read, n.cuts[k].written))).unwrap_or(cw);
-    let c = n.cuts[..=bound].iter().rev().find(|c| c.ready && c.guard && pays(c, 0.0))?;
+    let c = n.cuts[..=bound].iter().rev().find(|c| c.ready && c.guard && c.prefix >= 2.0 * c.summary && guard(n.before, after(c), n.p, Some(r.st[i].room), pr, n.g, n.rent).ok)?;
     // Inspect the compaction actually appended at the idle door, including the artifact's text identity.
     if n.applied.as_ref().is_some_and(|a| a.key == c.key && c.hash.as_deref() == Some(a.hash.as_str())) {
         return None;
@@ -1037,9 +1054,11 @@ pub fn target_miss(r: &R, i: usize) -> Option<String> {
     let refused = g.actual().is_some_and(|p| p.law.iter().any(|l| !l.ok && (l.at == "summary" || p.p > 0.0)));
     // 0.4.0 (architecture section 8, TR restated): the return took a summary produced earlier whose cut is not deeper than its own
     // plan's (core.ts adopt): the call is already paid; the target is reached at a decision after the deeper one is ready
-    if adopted_produced(r, i) {
-        return None;
-    }
+    let shallower_ready = took_ready(r, i).is_some_and(|key| g.actual().is_some_and(|p| {
+        let bound = p.planned_cut.as_deref().or_else(|| p.law.iter().find(|s| s.at == "summary").and_then(|s| s.key.as_deref()));
+        bound.is_some_and(|bound| bound != key)
+    }));
+    if shallower_ready { return None; }
     if refused {
         return None;
     }
@@ -1130,23 +1149,31 @@ fn produced_target_miss(r: &R, i: usize, k: &str) -> Option<String> {
 pub fn probe_mismatch(r: &R, i: usize) -> Option<String> {
     let t = r.tick(i);
     let set = |v: &[String]| v.iter().cloned().collect::<BTreeSet<_>>();
-    if let (Some(rp), Some(g)) = (&t.run_plan, t.grids.iter().find(|g| g.at == "run")) {
-        if !rp.native && r.ledger(i, "guard_drop").is_empty() {
-            let pt = g.actual()?;
-            let (f, c) = if pt.plan { (set(&pt.folds), pt.cut.clone()) } else { (BTreeSet::new(), None) };
-            if f != set(&rp.folds) || c != rp.cut {
-                return Some(format!("run plan: real folds {:?} cut {:?}, probe folds {:?} cut {:?}", rp.folds, rp.cut, f, c));
+    if let Some(rp) = &t.run_plan {
+        if rp.native {
+            if let Some(p) = t.grids.iter().find(|g| g.at == "native").and_then(|g| g.actual()) {
+                let kept: BTreeSet<_> = p.folds.iter().filter(|f| match (r.order(f), rp.cut.as_deref().and_then(|k| r.order(k))) { (Some(f), Some(k)) => f >= k, _ => false }).cloned().collect();
+                if kept != set(&rp.folds) { return Some(format!("native joint folds: decision {kept:?}, carried {:?}", rp.folds)); }
+            }
+        } else if let Some(g) = t.grids.iter().find(|g| g.at == "run") {
+            if r.ledger(i, "guard_drop").is_empty() {
+                let pt = g.actual()?;
+                let (f, c) = if pt.plan { (set(&pt.folds), pt.cut.clone()) } else { (BTreeSet::new(), None) };
+                if f != set(&rp.folds) || c != rp.cut {
+                    return Some(format!("run plan: real folds {:?} cut {:?}, probe folds {:?} cut {:?}", rp.folds, rp.cut, f, c));
+                }
             }
         }
     }
     if t.te_valve {
-        let g = t.grids.iter().find(|g| g.at == "turn_end")?;
+        let waited = t.te_ledger.iter().any(|v| v["type"] == "room_wait");
+        let g = t.grids.iter().find(|g| g.at == "turn_end" && g.room == waited).or_else(|| t.grids.iter().find(|g| g.at == "turn_end"))?;
         let pt = g.actual()?;
         let real_f: BTreeSet<String> = t.drafts.iter().filter(|d| d["type"] == "context_edit").filter_map(|d| d["target"].as_str().map(String::from)).collect();
         let real_c = t.drafts.iter().find(|d| d["type"] == "compaction").and_then(|d| d["firstKept"].as_str().map(String::from));
         // a room wait at the turn_end that persists the run plan: the cut is the room plan's, the folds the run plan's (as sent)
         let folds_differ = if t.run_room { t.run_plan.as_ref().is_some_and(|rp| real_f != set(&rp.folds)) } else { real_f != set(&pt.folds) };
-        if folds_differ || real_c != pt.cut {
+        if (folds_differ && !(pt.b2b && real_c.is_none() && t.run_plan.as_ref().is_some_and(|rp| real_f == set(&rp.folds)))) || real_c != pt.cut {
             return Some(format!("valve: real folds {real_f:?} cut {real_c:?}, probe folds {:?} cut {:?}", pt.folds, pt.cut));
         }
     }
@@ -1189,8 +1216,8 @@ pub fn law_mismatch(r: &R, i: usize) -> Option<String> {
         for pt in &g.grid {
             // a plan with a cut ends in an accepted whole-plan step that carries its cut (and so the summary call); a plan without one
             // has no such accepted step (it would have applied the cut). Only for a source that reports the flag.
-            if reports_cut && !pt.law.is_empty() {
-                let last = pt.law.iter().rev().find(|x| x.at == "plan");
+            if reports_cut && !pt.law.is_empty() && !pt.b2b {
+                let last = pt.law.iter().rev().find(|x| x.at == "plan" || x.at == "guard");
                 let cut_ok = last.map(|x| x.ok && x.cut == Some(true)).unwrap_or(false);
                 if pt.cut.is_some() && !cut_ok {
                     return Some(format!("{} plan at P={}: a cut is planned, but the law has no accepted whole-plan step for a cut (the summary call was never priced into the plan)", g.at, pt.p));
@@ -1242,7 +1269,12 @@ pub fn law_mismatch(r: &R, i: usize) -> Option<String> {
                     }
                 }
                 let room = if s.at == "summary" { None } else { Some(r.st[i].room) };
-                let m = law(s.b, s.a, pt.p, room, Some(pr), gg, call, t);
+                let mut m = with_tail(law(s.b, s.a, pt.p, room, Some(pr), gg, call, t), s.b, s.a, room, pr, s.keep);
+                if s.at == "guard" {
+                    let effective = m.k - m.eta * (s.b - s.a);
+                    let paid = pr.r * (s.rent.unwrap_or(0.0) + s.b - s.a);
+                    m.ok = s.a < s.b && (effective <= 0.0 || paid >= effective || (m.ok && paid >= effective / 10.0));
+                }
                 let k_ok = match s.k {
                     Some(k) => m.k.is_finite() && (k - m.k).abs() <= 1e-6 * k.abs().max(1.0),
                     None => !m.k.is_finite(),

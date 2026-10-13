@@ -2,7 +2,7 @@
 # Withholding that ready summary at the idle door sends it through the request-local fallback.
 world explicit known ttl=300 true=300 survival=none c=1 sys=3000 window=200000 native interactive long
 prompt +0s
-say 60K
+say 150K
 prompt +60s
 say 100
 prompt +2h
