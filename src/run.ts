@@ -8,12 +8,12 @@ import { agentDir, curve, describe, lawPrices, loadStats, pWarm, record, sample,
 import { repairPayload } from "./guard.ts";
 import { candidateOf, decideEdits, checkEdits, clock, decideRun, inRunClock, want, decideTurnEnd, grow, headOf, lastRegrow, planOpts, readyOf, runPlanOf, scaleOf, summarizedSince, unusedOf, valvePlanOf, SUMMARY_CUSTOM, type Artifact, type Avail, type Env, type Learned } from "./core.ts";
 import { fmtK, Stats, noticeDesc, noticeText, type NoticeAction, type NoticeData, type ZipControl } from "./notice.ts";
-import { applyPlanToMessages, buildBlocks, countUserTurns, G0, keepRecentTokensFor, piCanCompact, piContextTokens, reserveTokensFor, sizeOf, UNIT, type Block, type Cut, type FoldTarget, type PlanOpts, type PlanResult, type RunPlan, type Scale, type SysInfo } from "./plan.ts";
+import { applyPlanToMessages, buildBlocks, countUserTurns, G0, keepRecentTokensFor, piCanCompact, piContextTokens, reserveTokensFor, sizeOf, wireTokensOf, UNIT, type Block, type Cut, type FoldTarget, type PlanOpts, type PlanResult, type RunPlan, type Scale, type SysInfo } from "./plan.ts";
 import { handleFor, PH_MARK, RECALL_TOOL } from "./placeholder.ts";
 import { branchOutputs, recalledHandlesFromBranch, resolveHandlesInBranch } from "./recall.ts";
 import { cleanupRecall, commandNamesRecall, fileRecallFor, materialize, parseRecallPath, recallRoot, recallRootShown, rewriteCommand, sidDir, type FileRecall } from "./recallfile.ts";
 import { buildCut } from "./summary.ts";
-import { type Any, COMMIT_CUSTOM, envInt, PRODUCT, textOf, tok4 } from "./util.ts";
+import { type Any, COMMIT_CUSTOM, envInt, PRODUCT, textOf, tok4, tokensOf } from "./util.ts";
 import { pendingSummary, replayGrowth } from "./state.ts";
 import { fmtLife, type CardData, type ChartBin, type StateWord } from "./ui.ts";
 
@@ -964,7 +964,7 @@ export class Zip implements ZipControl {
 				if (!this.runPlan.noticed && (this.runPlan.cut || this.runPlan.native)) { // folds alone wait for the boundary: a room summary can join their one notice
 					this.runPlan.noticed = true;
 					const live = this.runPlan.folds.filter((t) => applied.has(t.entryId));
-					this.noticeFor(ctx, this.runPlan, live, this.runPlan.cut ?? this.runPlan.native ?? null, this.runPlan.ctxBefore, 0);
+					this.noticeFor(ctx, this.runPlan, live, this.runPlan.cut ?? this.runPlan.native ?? null, this.runPlan.ctxBefore, sizeOf(this.runPlan.scale, (out?.messages ?? e.messages).filter((m: Any) => m.role !== "system").reduce((n: number, m: Any) => n + wireTokensOf(m), 0)));
 				}
 				return out ? { messages: out.messages } : undefined;
 			}
@@ -1216,26 +1216,23 @@ export class Zip implements ZipControl {
 	/**
 	 * The transcript notice for one plan. Facts only, no claims: what changed (sizes), how long it took, and, expanded, why now
 	 * ("cache cold · away 47 min") and what was folded. Whether the cache really was cold is learned from the response, silently (/zip shows it).
-	 * `realAfter` > 0: the size the provider reported for the request that carried the plan (shown instead of the estimate).
+	 * `realAfter`: the resulting request or persisted projection, counted with the plan's token scale.
 	 */
 	private noticeFor(ctx: Any, plan: RunPlan, live: FoldTarget[], cut: Cut | null, ctxTokens: number, realAfter: number) {
 		if (this.quiet || (!live.length && !cut)) return;
-		const { c } = plan.scale, valve = plan.source === "valve"; // amounts scale by c; sizes are O + c x content (plan.ts)
-		const before = c * live.reduce((a, t) => a + t.entryTokens, 0), after = c * live.reduce((a, t) => a + t.phTokens, 0);
-		const cutSaved = cut ? c * (cut.prefixTokens - cut.summaryTokens) : 0;
-		const estAfter = ctxTokens - (before - after) - cutSaved;
+		const valve = plan.source === "valve";
 		const waitMs = cut ? (plan.waitMs ?? 0) : 0;
 		const notices: NoticeAction[] = [];
-		if (live.length) notices.push({ kind: "fold", count: live.length, tokensBefore: ctxTokens, tokensAfter: cut || !realAfter ? ctxTokens - (before - after) : realAfter, ms: plan.ms, pressure: valve });
+		if (live.length) notices.push({ kind: "fold", count: live.length, tokensBefore: ctxTokens, tokensAfter: realAfter, ms: plan.ms, pressure: valve });
 		if (cut) {
 			// finished while the user was away (or while the run went on): report the real production time, not the zero wait
 			const prepared = (plan.source === "settle" || plan.ready === "away") && waitMs < 500;
 			const background = !prepared && plan.ready === "background" && waitMs < 500;
-			notices.push({ kind: "summary", count: cut.count, tokensBefore: ctxTokens - (before - after), tokensAfter: realAfter || estAfter, ms: Math.max(cut.ms, waitMs), waitMs, prepared, ...(background ? { background } : {}), pressure: valve });
+			notices.push({ kind: "summary", count: cut.count, tokensBefore: ctxTokens, tokensAfter: realAfter, ms: Math.max(cut.ms, waitMs), waitMs, prepared, ...(background ? { background } : {}), pressure: valve });
 		}
 		for (const t of live) this.labels.set(handleFor(t.entryId), `${t.tool}${t.args ? " " + t.args : ""}`);
 		const ITEMS = 8;
-		const items = live.slice(0, ITEMS).map((t) => ({ label: `${t.tool}${t.args ? " " + t.args : ""}`, tokens: Math.round(c * t.entryTokens), handle: handleFor(t.entryId) }));
+		const items = live.slice(0, ITEMS).map((t) => ({ label: `${t.tool}${t.args ? " " + t.args : ""}`, tokens: Math.round(plan.scale.c * t.entryTokens), handle: handleFor(t.entryId) }));
 		const why = valve || !this.cold ? "cache warm · worth it at this size" : this.coldWhy;
 		// reqTs identifies the first request carrying the final view: a folds-only notice keeps its first-request time when announced
 		// at the boundary; a newly joined room summary uses the boundary time, because only the next request can carry it.
@@ -1281,6 +1278,9 @@ export class Zip implements ZipControl {
 		const before = Math.round(c * live.reduce((a, t) => a + t.entryTokens, 0));
 		const after = Math.round(c * live.reduce((a, t) => a + t.phTokens, 0));
 		const cutSaved = cut ? Math.round(c * (cut.prefixTokens - cut.summaryTokens)) : 0;
+		const kept = cut ? o.blocks.slice(o.blocks.findIndex((b) => b.entryId === cut.firstKeptEntryId)) : o.blocks;
+		const folds = new Map(live.map((t) => [t.entryId, t]));
+		const ctxAfter = sizeOf(sc, (cut ? tokensOf({ role: "compactionSummary", summary: cut.text }) : 0) + kept.reduce((n, b) => n + (folds.get(b.entryId!)?.phTokens ?? b.tokens), 0));
 		const waitMs = cut ? (plan.waitMs ?? 0) : 0;
 		const s = this.stats;
 		s.folds += live.length;
@@ -1303,12 +1303,12 @@ export class Zip implements ZipControl {
 		if (live.length) this.ledger({
 			type: "fold", trigger: plan.source, turnIndex: e.turnIndex, count: live.length, entries: live.map((t) => t.entryId), tools: live.map((t) => t.tool),
 			recoverability: live.map((t) => t.recover ?? "?"), trigs: live.map((t) => t.trig), handles: live.map((t) => handleFor(t.entryId)),
-			entryTokensBefore: before, entryTokensAfter: after, ctxBefore: Math.round(ctxTokens), ctxAfter: Math.round(ctxTokens - (before - after) - cutSaved), O: Math.round(sc.O), c: Math.round(sc.c * 1000) / 1000, usageTotal: o.usageTotal,
+			entryTokensBefore: before, entryTokensAfter: after, ctxBefore: Math.round(ctxTokens), ctxAfter: Math.round(ctxAfter), O: Math.round(sc.O), c: Math.round(sc.c * 1000) / 1000, usageTotal: o.usageTotal,
 			coldReason: this.coldReason, prepared: plan.source === "settle", ...(stale ? { staleTargets: stale } : {}),
 		});
 		if (cut) this.ledger({ type: "summary", trigger: cut.trigger, source: plan.source, tokensBefore: ctxTokens, count: cut.count, prefixTokens: Math.round(c * cut.prefixTokens), summaryTokens: Math.round(c * cut.summaryTokens), ms: cut.ms, waitedMs: Math.round(waitMs), llmOk: cut.llmOk, llmError: cut.llmError, costUsd: cut.costUsd, ...this.usageOf(cut) });
 		// Native summaries were announced with their request; boundary summaries join the folds in one notice.
-		if (!plan.noticed) this.noticeFor(ctx, plan, live, cut, ctxTokens, plan.source === "valve" || plan.cut ? 0 : o.usageTotal);
+		if (!plan.noticed) this.noticeFor(ctx, plan, live, cut, ctxTokens, ctxAfter);
 		plan.noticed = true;
 		return { entries: [...e.entries, ...ours] }; // append, never overwrite other extensions' drafts
 	}

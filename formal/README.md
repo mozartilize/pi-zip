@@ -108,7 +108,7 @@ otherwise. The round-2 excuses (a turn_end valve mid-run, a return a switch made
 
 | | property | from | formula (abridged) | why it follows |
 |---|---|---|---|---|
-| EN | exact compaction number | I1 | □ exact_number | every summary enters natively at an idle typed prompt or as the first turn_end draft; Pi's appended tokensBefore equals pi-zip's before, observed through Pi's draft application and the native entry independently of planner verdicts |
+| EN | exact compaction number | I1 | □ exact_number | every summary enters natively at an idle typed prompt or as the first turn_end draft; Pi's appended tokensBefore equals pi-zip's before; every notice and fold ledger after-size is non-negative and matches the resulting Pi projection/request within 10%, counted independently of the reported savings |
 | OC | one call and one timer | A3 | □(active_calls ≤ 1 ∧ production_timers ≤ 1 ∧ direct_timer_writes = 0) | provider calls and producer-owned timer handles are observed independently of ledger wording; a timer only starts production, whose completion records its artifact |
 | I1 | run stability | A2 | □(¬run_start ∧ ¬zip_edit ∧ ¬env → prefix_kept) ∧ □ persisted_as_sent | a byte change no priced edit explains is an unpriced rewrite; persisting something other than what was sent rewrites at the next request |
 | RD | restart determinism | A2, A3 | □(run_start → fresh_plans_alike) | the law, b2b and one-summary rules must be functions of the session, or a restart re-decides on different state; produced summaries are pi-zip/summary entries (0.4.0), so only a call in flight at the restart is the process's own |
