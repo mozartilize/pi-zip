@@ -618,13 +618,15 @@ export class Zip implements ZipControl {
 	}
 
 	private async idleInput(e: Any, ctx: Any): Promise<void> {
-		this.start = null; // a new prompt: what an earlier one decided (it started no run) is dropped
-		this.startKind = null;
 		let idle = false;
 		try {
 			idle = ctx?.isIdle?.() === true;
 		} catch {}
-		if (!idle || !this.active()) return; // not idle: Pi refuses this prompt, or a Pi that cannot say so; its run (if any) reads its own start
+		// not idle: Pi refuses this prompt (a run is starting or in progress: what it announced stays as it is), or a Pi that cannot say so
+		if (!idle) return;
+		this.start = null; // a new prompt: what an earlier one decided (it started no run) is dropped
+		this.startKind = null;
+		if (!this.active()) return; // its run (if any) reads its own start
 		this.detectConflict(ctx);
 		if (!this.active()) return;
 		this.liveCtx = ctx;

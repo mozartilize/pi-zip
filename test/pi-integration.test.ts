@@ -1533,6 +1533,26 @@ for (const order of ORDERS) describe(`the typed-prompt door opens at Pi's input 
 		expect(r.zip.runPlan.native.text).toBe(r.compactions[0].summary);
 	});
 
+	// an input without streamingBehavior while Pi is busy (prompt() called during a run's start, as RPC can: Pi throws only after the
+	// input handlers ran) changes nothing of the run already announced
+	if (order === "1.2") test("a prompt sent into the starting run (no streamingBehavior, Pi busy) leaves the prompt's decision to its run", async () => {
+		const r = await readyRig();
+		await r.prompt("Continue with the task.", { afterStart: () => r.runner.emitInput("again", undefined, "rpc", undefined) });
+		expect(r.compactCalls.n).toBe(1);
+		expect(r.zip.nativeRun?.before).toBe(r.compactions[0].tokensBefore);
+	});
+	if (order === "1.2") test("a custom run begins once when a prompt (no streamingBehavior, Pi busy) lands in its before_agent_start", async () => {
+		const r = await readyRig();
+		const led = ledgerOf(r);
+		const bas = r.zip.beforeAgentStart.bind(r.zip);
+		r.zip.beforeAgentStart = async (ctx: Any, e: Any) => {
+			await bas(ctx, e);
+			await r.runner.emitInput("again", undefined, "rpc", undefined);
+		};
+		await r.drive();
+		expect(led.filter((x: Any) => x.type === "driven_run").length).toBe(1);
+	});
+
 	test("another compaction between the prompt's input and its run (Pi's own, say) voids the carried decision: the run reads its own start", async () => {
 		const r = await readyRig();
 		const led = ledgerOf(r);
