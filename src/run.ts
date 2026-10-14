@@ -325,7 +325,12 @@ export class Zip implements ZipControl {
 		}
 	}
 
+	/** Inside one core want() call, which prices up to ~30 plans of one view synchronously: the branch and each view's token scale are
+	 *  read once (each read walks the whole branch: ~5 ms per plan on a 30K-entry session). Nothing is appended in between. */
+	private frozen: { branch: Any[]; scales: Map<Any[], Scale> } | null = null;
+
 	private branch(ctx: Any): Any[] {
+		if (this.frozen) return this.frozen.branch;
 		try {
 			return ctx.sessionManager.getBranch() as Any[];
 		} catch {
@@ -406,7 +411,13 @@ export class Zip implements ZipControl {
 	private opts(ctx: Any, pending: boolean, entries: Any[], pWarm: number, pause: boolean, cutAt?: string, foldsOnly = false, ready?: readonly string[]): { o: PlanOpts; cal: Scale } {
 		const branch = this.branch(ctx);
 		if (this.rentHead !== headOf(branch)) { this.rent = rentOf(branch); this.rentHead = headOf(branch); }
-		const r = planOpts(entries, branch, this.env(ctx), this.lam(ctx), pending, pWarm, pause, cutAt, foldsOnly, ready);
+		const env = this.env(ctx), f = this.frozen;
+		if (f) {
+			let s = f.scales.get(entries);
+			if (!s) f.scales.set(entries, (s = scaleOf(entries, branch, env.sys, env.model ? modelKey(env.model) : undefined)));
+			env.scale = s;
+		}
+		const r = planOpts(entries, branch, env, this.lam(ctx), pending, pWarm, pause, cutAt, foldsOnly, ready);
 		r.o.rent = this.rent;
 		return r;
 	}
@@ -1151,12 +1162,19 @@ export class Zip implements ZipControl {
 			const now = Date.now(), ttlMs = ttlFor(ctx.model, branch, this.tier(ctx.model));
 			// Only a call whose range left the current prefix may be replaced outside the room.
 			if (this.bg && (this.bg.head !== headOf(branch) || !(candidate ? candidate.blocks.some((b) => b.entryId === this.bg!.key) : view.some((e: Any) => e.sourceEntry?.id === this.bg!.key)))) this.discardBg("replaced");
-			const w = want({ at: decision ? "decision" : at, now, lastTouch: Math.max(this.lastReqMs, lastMessageMs(branch)), ttlMs, avail: this.avail(branch), candidate,
-				survival: (g) => process.env.PI_ZIP_TTL_SECS ? (g <= ttlMs / 1000 ? 1 : 0) : pWarm(this.ent, g, ttlMs / 1000).p,
-				plan: (p, pause, have) => {
-					return candidateOf(view, (cutAt, foldsOnly, ready) => this.opts(ctx, true, view, p, pause, cutAt, foldsOnly, ready), have, "want").r.p;
-				}, latency: (p) => this.ent?.call ? this.ent.call.ms * p.scale.c * p.prefixTokens / this.ent.call.tokens : 0,
-			});
+			const outer = this.frozen;
+			this.frozen = { branch: this.branch(ctx), scales: new Map() }; // read after a discard above, which may have appended its record
+			let w: ReturnType<typeof want>;
+			try {
+				w = want({ at: decision ? "decision" : at, now, lastTouch: Math.max(this.lastReqMs, lastMessageMs(branch)), ttlMs, avail: this.avail(branch), candidate,
+					survival: (g) => process.env.PI_ZIP_TTL_SECS ? (g <= ttlMs / 1000 ? 1 : 0) : pWarm(this.ent, g, ttlMs / 1000).p,
+					plan: (p, pause, have) => {
+						return candidateOf(view, (cutAt, foldsOnly, ready) => this.opts(ctx, true, view, p, pause, cutAt, foldsOnly, ready), have, "want").r.p;
+					}, latency: (p) => this.ent?.call ? this.ent.call.ms * p.scale.c * p.prefixTokens / this.ent.call.tokens : 0,
+				});
+			} finally {
+				this.frozen = outer;
+			}
 			if (!decision) this.cancelTimer();
 			if (decision && candidate) this.ledger({ type: "produce", where: at, key: candidate.firstKeptEntryId, ...(this.bg ? { running: this.bg.key } : {}) });
 			if (!w) return;

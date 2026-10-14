@@ -45,6 +45,7 @@ export interface Env {
 	reserve: number;
 	recalled: Set<string>;
 	steerIds: Set<string>;
+	scale?: Scale; // the token scale of these entries, already read by the shell (one want() prices ~30 plans of one view)
 	rereadOnly: boolean;
 	fileRecall?: FileRecall;
 }
@@ -148,7 +149,7 @@ export const lawOf = (branch: Any[], lam: Learned, pWarm: number): Law => ({ pr:
 /** Plan options for `entries` (`pending`: the next prompt is not in them yet) at P(warm) `pWarm`, after a pause or not, with the token
  *  scale read from the branch. P goes into the law only. */
 export function planOpts(entries: Any[], branch: Any[], env: Env, lam: Learned, pending: boolean, pWarm: number, pause: boolean, cutAt?: string, foldsOnly = false, ready?: readonly string[]): { o: PlanOpts; cal: Scale } {
-	const cal = scaleOf(entries, branch, env.sys, env.model ? modelKey(env.model) : undefined);
+	const cal = env.scale ?? scaleOf(entries, branch, env.sys, env.model ? modelKey(env.model) : undefined);
 	return { cal, o: { pause, scale: cal, cwd: env.cwd, recalled: env.recalled, model: env.model, promptPending: pending, rereadOnly: env.rereadOnly, ...(env.fileRecall ? { fileRecall: env.fileRecall } : {}), reserve: env.reserve, steerIds: env.steerIds, law: lawOf(branch, lam, pWarm), trace: [], ...(cutAt !== undefined ? { cutAt } : {}), ...(foldsOnly ? { foldsOnly } : {}), ...(ready?.length ? { ready } : {}) } };
 }
 

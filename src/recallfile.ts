@@ -65,9 +65,12 @@ export function parseRecallPath(p: unknown): { handle?: string } | null {
  *  The path starts after any quote, operator, `=` (`X=<path>`, `--file=<path>`), `,`, `{` or `}` (brace expansion); `${HOME}` and the
  *  like are part of it. */
 const CMD_RE = new RegExp(`(?:\\$\\{[A-Za-z_][A-Za-z0-9_]*\\}|[^\\s'"\`<>|;&(){},=])*pi-zip/recall/${SID}(/[0-9a-z]{10}\\.txt\\b)?`, "g");
-export const commandNamesRecall = (cmd: unknown): boolean => typeof cmd === "string" && new RegExp(CMD_RE.source).test(cmd);
+/** CMD_RE needs this literal, and the unanchored regex costs ~40 us per command (it retries every start in a word). Checking the
+ *  literal first gives the same answers and keeps a scan of a long branch's commands, at every turn_end, in milliseconds. */
+const CMD_LIT = "pi-zip/recall/";
+export const commandNamesRecall = (cmd: unknown): boolean => typeof cmd === "string" && cmd.includes(CMD_LIT) && new RegExp(CMD_RE.source).test(cmd);
 /** The handles of the recall files a shell command names. */
-export const commandRecallHandles = (cmd: unknown): string[] => (typeof cmd === "string" ? [...cmd.matchAll(CMD_RE)].filter((m) => m[1]).map((m) => m[1].slice(1, 11)) : []);
+export const commandRecallHandles = (cmd: unknown): string[] => (typeof cmd === "string" && cmd.includes(CMD_LIT) ? [...cmd.matchAll(CMD_RE)].filter((m) => m[1]).map((m) => m[1].slice(1, 11)) : []);
 
 /** The command with every recall path pointed at `localDir`, the handles it names, and whether it names the directory itself.
  *  A local directory that would need shell quoting is not written in (the shell then reads ~/.cache, where the copies are when

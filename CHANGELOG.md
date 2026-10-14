@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.4.4
+
+- No more UI stalls on long sessions. Every turn_end and every run start passed each bash command of the whole branch through an
+  unanchored regex that looks for recall-file paths (about 40 us a command, quadratic in a long word). On a 32,000-entry session that
+  was 0.3 s per turn_end, 0.6 s on a loaded machine, at every tool round. The literal is now checked first: same answers, 15 ms.
+- The end of a run (settle) priced up to ~30 plans and read the whole branch and its token scale again for each: 0.16 s, 0.85 s on a
+  loaded machine. They are now read once per settle: 13 ms. Session start went from 0.5 s to 0.06 s.
+- Decisions are unchanged: same tests, same formal verdicts, and the same ledger on a recorded 32,000-entry session. Two new
+  integration checks bound these costs, each with a mutant that re-introduces the old code.
+
 ## 0.4.3
 
 - Documentation only; the code is the same as 0.4.2. The README is a quarter of its former length and has no formulas, which
