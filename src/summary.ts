@@ -556,6 +556,12 @@ export interface Narrative {
 	error?: string;
 }
 
+/** A reasoning model whose provider refuses a request without reasoning (pi-ai sends effort "none" when none is asked for; sota
+ *  gpt-6.1-sol answers "'none' is not supported ... Supported values are: 'low', ..."). Pi's own compaction passes the session's
+ *  thinking level and never meets it. */
+export const EFFORT_REFUSED_RE = /(?:'none'|"none"|reasoning|effort)[^\n]{0,80}not supported|unsupported[^\n]{0,60}(?:reasoning|effort)/i;
+const lowEffort = new Set<string>(); // provider/model keys that need an explicit effort: the next narrative asks for "low" at once
+
 /**
  * Narrative sections written by the current model in a separate, uncached call. Never throws. `previous` = the previous summary's
  * narrative: the call merges it with what the prefix adds into ONE narrative (newer values replace older ones, finished todos go,
@@ -603,13 +609,15 @@ export async function narrative(prefix: Block[], ctx: Any, budgetTokens: number,
 		const outer = ownSignal ?? ctx.signal;
 		if (outer) signals.push(outer);
 		const signal = AbortSignal.any(signals);
+		const key = `${model.provider ?? ""}/${model.id ?? ""}`;
 		for (let attempt = 0; attempt < 2; attempt++) {
+			const low = lowEffort.has(key);
 			try {
 				signal.throwIfAborted();
 				const res: Any = await ctx.modelRegistry.complete(
 					model,
 					{ systemPrompt: NARRATIVE_SYSTEM, messages: [{ role: "user", content: [{ type: "text", text: prompt }], timestamp: Date.now() }] },
-					{ maxTokens: cap, signal, cacheRetention: "none", sessionId: randomUUID() },
+					{ maxTokens: cap, signal, cacheRetention: "none", sessionId: randomUUID(), ...(low ? { reasoningEffort: "low" } : {}) },
 				);
 				costUsd += Number(res.usage?.cost?.total) || 0;
 				if (res.usage) {
@@ -627,6 +635,11 @@ export async function narrative(prefix: Block[], ctx: Any, budgetTokens: number,
 				return { text, ok: true, ms: Date.now() - t0, costUsd, usage };
 			} catch (err) {
 				lastErr = err instanceof Error ? err.message : String(err);
+				if (!low && model.reasoning && EFFORT_REFUSED_RE.test(lastErr) && !signal.aborted) {
+					lowEffort.add(key); // the request itself was refused: ask again with the lowest common effort, without using up the retry
+					attempt--;
+					continue;
+				}
 				if (POLICY_BLOCK_RE.test(lastErr) || lastErr === CAP_ERR || signal.aborted) break; // an identical retry fails the same way
 			}
 		}

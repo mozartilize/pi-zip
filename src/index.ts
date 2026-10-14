@@ -157,7 +157,8 @@ export default function piZip(pi: ExtensionAPI) {
 	pi.on("context_with_system", (e, ctx) => zip.context(e, ctx)); // the complete transcript: system messages stay where Pi put them
 	pi.on("turn_end", (e, ctx) => zip.turnEnd(e, ctx));
 	pi.on("agent_before_settle", (e, ctx) => zip.settle(e, ctx));
-	pi.on("before_provider_request", (e) => zip.providerRequest(e));
+	pi.on("before_provider_request", (e, ctx) => zip.providerRequest(e, ctx));
+	pi.on("model_select", (e) => zip.modelSelect(e.model)); // a mid-run /model has no run start
 	pi.on("tool_call", (e, ctx) => zip.toolCall(e, ctx)); // a recall file named by a built-in tool: this machine's copy, written on demand
 	// Pi's idle cache warming: observed only (the return value is undefined, so Pi's own decision stands); an older Pi never fires it
 	pi.on("cache_warming_decision", (e, ctx) => zip.cacheWarmingDecision(e, ctx));

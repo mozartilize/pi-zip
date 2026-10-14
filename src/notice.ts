@@ -57,7 +57,8 @@ export function noticeDesc(actions: NoticeAction[]): string {
 		.map((a) => {
 			if (a.kind === "fold") return `zipped ${plural(a.count, "old output")} in ${dur(a.ms)}`;
 			const wait = a.prepared ? 0 : (a.waitMs ?? a.ms);
-			const took = `summarized ${plural(a.count, "request")}`;
+			// count = the user's requests in the summarized stretch; a stretch driven by an extension (custom prompts) has none
+			const took = a.count > 0 ? `summarized ${plural(a.count, "request")}` : "summarized earlier turns";
 			if (a.prepared) return `${took} in ${dur(a.ms)} · ready while you were away`;
 			if (a.background) return `${took} in ${dur(a.ms)} · written while you worked`;
 			if (wait >= a.ms - 500) return `${took} · waited ${secs(wait)}`; // the user waited for all of it

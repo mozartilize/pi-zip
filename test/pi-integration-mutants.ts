@@ -73,6 +73,28 @@ const mutants = [
 		check: "one settle reads the branch at most 6 times",
 		edit: (source: string) => rep(source, "if (this.frozen) return this.frozen.branch;", ""),
 	},
+	// 0.4.5 (P1): a mid-run /model booked its requests under the run's first model (every turn_end a "model switch", P = 0), and a
+	// reasoning model refusing effort "none" failed every narrative
+	{
+		name: "request-booked-under-run-model",
+		pattern: "a mid-run /model",
+		check: "a mid-run /model: the request it made is booked under the new model",
+		edit: (source: string) => rep(source, "if (ctx?.model) this.model = ctx.model;\n", ""),
+	},
+	{
+		name: "model-select-ignored",
+		file: "index.ts",
+		pattern: "a mid-run /model",
+		check: "a mid-run /model: /zip shows the selected model",
+		edit: (source: string) => rep(source, 'pi.on("model_select", (e) => zip.modelSelect(e.model));', ""),
+	},
+	{
+		name: "narrative-effort-refusal-not-retried",
+		file: "summary.ts",
+		pattern: "refuses effort none",
+		check: "a narrative refused for its reasoning effort is retried with low effort",
+		edit: (source: string) => rep(source, "if (!low && model.reasoning && EFFORT_REFUSED_RE.test(lastErr) && !signal.aborted) {", "if (false) {"),
+	},
 ];
 const only = process.env.PZ_MUTANTS?.split(","); // run some by name
 for (const mutant of mutants.filter((m) => !only || only.includes(m.name))) {
