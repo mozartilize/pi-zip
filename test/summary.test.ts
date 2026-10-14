@@ -1,7 +1,7 @@
 // Sectioned carry-forward of the previous summary (synthetic sessions only): merge, dedupe, oldest dropped first with a count,
 // old formats and Pi's own free-text compaction summaries.
 import { describe, expect, test } from "bun:test";
-import { buildBlocks, toolCallIndex } from "../src/plan.ts";
+import { buildBlocks, NARRATIVE_CALL_MAX, NARRATIVE_MAX, toolCallIndex } from "../src/plan.ts";
 import { handleFor } from "../src/placeholder.ts";
 import { BUDGET, buildCut, FIRST_REQUESTS, handleRowsOf, handleTable, parseSummary, PREV_NARRATIVE_CHARS, previousNarrative, narrative, skeleton, TABLE_ROWS } from "../src/summary.ts";
 import { A, R, U, type Any } from "./helpers.ts";
@@ -40,7 +40,7 @@ async function cutOver(L: number, previous: string | null, prompts: string[] = [
 	const entries = [...(previous ? [summaryEntry(previous)] : []), ...level(L), U(`keep${L}`, "kept"), A(`keepA${L}`)];
 	const blocks = buildBlocks(entries);
 	const cutIdx = blocks.findIndex((b) => b.entryId === `keep${L}`);
-	const complete = async (_m: Any, c: Any, options: Any) => (expect(options.maxTokens).toBeLessThanOrEqual(4000), prompts.push(c.messages[0].content[0].text), { stopReason: "stop", content: [{ type: "text", text: narrativeFor(L) }], usage: { cost: { total: 0 } } });
+	const complete = async (_m: Any, c: Any, options: Any) => (expect(options.maxTokens).toBe(NARRATIVE_CALL_MAX), prompts.push(c.messages[0].content[0].text), { stopReason: "stop", content: [{ type: "text", text: narrativeFor(L) }], usage: { cost: { total: 0 } } });
 	const p: Any = { blocks, calls: toolCallIndex(blocks), cutIdx, prefixTokens: 50_000, summaryTokensPlanned: 7000, sumTrigger: "cold" };
 	return (await buildCut(p, { model: { id: "m" }, modelRegistry: { complete } } as Any)).text;
 }
@@ -141,7 +141,7 @@ describe("sectioned carry-forward: nested summaries, 4 levels deep", () => {
 		const entries = [summaryEntry(first), ...level(2), U("keep2", "kept"), A("keepA2")];
 		const blocks = buildBlocks(entries);
 		const long = "## Decisions and rationale\nHEAD-DECISION\n" + "a sentence of the current state of the work.\n".repeat(2000) + "## Key facts to remember\nTAIL-KEYFACT: 42";
-		const complete = async (_m: Any, c: Any, options: Any) => (expect(options.maxTokens).toBeLessThanOrEqual(4000), prompts.push(c.messages[0].content[0].text), { stopReason: "stop", content: [{ type: "text", text: long }], usage: { cost: { total: 0 } } });
+		const complete = async (_m: Any, c: Any, options: Any) => (expect(options.maxTokens).toBe(NARRATIVE_CALL_MAX), prompts.push(c.messages[0].content[0].text), { stopReason: "stop", content: [{ type: "text", text: long }], usage: { cost: { total: 0 } } });
 		const p: Any = { blocks, calls: toolCallIndex(blocks), cutIdx: blocks.findIndex((b) => b.entryId === "keep2"), prefixTokens: 50_000, summaryTokensPlanned: 40_000, sumTrigger: "cold" };
 		const t = (await buildCut(p, { model: { id: "m" }, modelRegistry: { complete } } as Any)).text;
 		expect(Number(/under about (\d+) words/.exec(prompts[0])![1])).toBe(1500); // no previous narrative: the old budget
@@ -194,6 +194,41 @@ describe("sectioned carry-forward: nested summaries, 4 levels deep", () => {
 		expect(line).toMatch(/^\(unavailable: .*; rely on the sections above and zip_recall an output by its handle rather than re-running or re-reading\)$/);
 		expect(cut.text).not.toContain("re-read files as needed");
 		expect(parseSummary(cut.text).narrative).toEqual([]); // still not taken for content when carried forward
+	});
+
+	// 0.4.0/0.4.1 capped the call at the budget: a real CJK merge (5,331 tokens out, 589 of them reasoning) hit the cap on every call
+	test("the call's cap is not the narrative budget: a reply past the budget is taken, the cap stays within the model's own limit", async () => {
+		const entries = [...level(1), U("keep1", "kept"), A("keepA1")];
+		const blocks = buildBlocks(entries);
+		const p: Any = { blocks, calls: toolCallIndex(blocks), cutIdx: blocks.findIndex((b) => b.entryId === "keep1"), prefixTokens: 50_000, summaryTokensPlanned: 40_000, sumTrigger: "cold" };
+		const caps: number[] = [];
+		// the reply needs 5,400 tokens: cut at any cap below that, like a provider does
+		const complete = async (_m: Any, _c: Any, options: Any) => (caps.push(options.maxTokens), options.maxTokens < 5400
+			? { stopReason: "length", content: [{ type: "text", text: "## Decisions and rationale\ncut" }], usage: { output: options.maxTokens, cost: { total: 0.01 } } }
+			: { stopReason: "stop", content: [{ type: "text", text: "## Decisions and rationale\nWHOLE-REPLY" }], usage: { output: 5400, cost: { total: 0.01 } } });
+		for (const [maxTokens, cap] of [[undefined, NARRATIVE_CALL_MAX], [8192, 8192], [128_000, NARRATIVE_CALL_MAX]] as const) {
+			caps.length = 0;
+			const cut = await buildCut(p, { model: { id: "m", ...(maxTokens ? { maxTokens } : {}) }, modelRegistry: { complete } } as Any);
+			expect(cut.llmOk).toBe(true);
+			expect(cut.text).toContain("WHOLE-REPLY");
+			expect(caps).toEqual([cap]);
+		}
+		expect(NARRATIVE_CALL_MAX).toBeGreaterThanOrEqual(4 * NARRATIVE_MAX);
+	});
+
+	test("a reply cut at the cap is not retried identically: one call, and the summary carries the previous narrative", async () => {
+		const t1 = await cutOver(1, null);
+		const entries = [{ sourceEntry: { id: "comp", type: "compaction" }, messages: [{ role: "compactionSummary", summary: t1, tokensBefore: 0, timestamp: Date.now() }] }, ...level(2), U("keep2", "kept"), A("keepA2")];
+		const blocks = buildBlocks(entries);
+		const p: Any = { blocks, calls: toolCallIndex(blocks), cutIdx: blocks.findIndex((b) => b.entryId === "keep2"), prefixTokens: 50_000, summaryTokensPlanned: 7000, sumTrigger: "cold" };
+		let calls = 0;
+		const complete = async () => (calls++, { stopReason: "length", content: [{ type: "text", text: "runaway" }], usage: { cost: { total: 0.2 } } });
+		const cut = await buildCut(p, { model: { id: "m" }, modelRegistry: { complete } } as Any);
+		expect(calls).toBe(1);
+		expect(cut.llmOk).toBe(false);
+		expect(cut.llmError).toBe("narrative hit the token cap");
+		expect(cut.costUsd).toBe(0.2);
+		expect(cut.text).toContain("KEYFACT-1: value-1");
 	});
 
 	test("size stays flat from level 2 on (it does not grow with depth)", async () => {

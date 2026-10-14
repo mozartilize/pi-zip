@@ -1021,7 +1021,7 @@ for (const order of ORDERS) describe(`real Pi: a summary prepared while the user
 		} finally { await r.shutdown(); }
 	});
 
-	for (const outcome of ["aborted reply", "expired signal"] as const) test(`partial ${outcome} retains its charge without a ready artifact and a later trigger retries`, async () => {
+	for (const outcome of ["aborted reply", "expired signal"] as const) test(`partial ${outcome} retains its charge and still makes the fallback summary, ready at once`, async () => {
 		const r = await rig(undefined, { file: template(240 * 60_000), tui: true, start: false });
 		const ctx = r.runner.createContext(), provider = ctx.modelRegistry.complete;
 		const timeout = AbortSignal.timeout, expired = new AbortController();
@@ -1037,23 +1037,58 @@ for (const order of ORDERS) describe(`real Pi: a summary prepared while the user
 			const p = planContext(view, r.zip.opts(ctx, true, view, 0, true).o)!;
 			r.zip.want("run", ctx, p);
 			expect(r.zip.bg).toBeTruthy();
-			expect(await r.zip.bg.promise).toBeNull();
+			expect(await r.zip.bg.promise).toMatchObject({ llmOk: false, llmError: "narrative aborted", firstKeptEntryId: p.firstKeptEntryId });
 			expect(calls).toBe(1); // abort is terminal, even if the provider did not abort the signal
 			expect(r.zip.bg).toBeNull();
-			expect(r.zip.ready(r.sm.getBranch())).toEqual([]);
-			const lost = r.sm.getEntries().filter((e: Any) => e.customType === "pi-zip/summary") as Any[];
-			expect(lost).toHaveLength(1);
-			expect(lost[0].data).toMatchObject({ key: p.firstKeptEntryId, lost: "failed", usd: 0.12 });
-			expect(lost[0].data.cut).toBeUndefined();
+			expect(r.zip.ready(r.sm.getBranch())).toHaveLength(1);
+			const arts = r.sm.getEntries().filter((e: Any) => e.customType === "pi-zip/summary") as Any[];
+			expect(arts).toHaveLength(1);
+			expect(arts[0].data).toMatchObject({ key: p.firstKeptEntryId, usd: 0.12, cut: { llmOk: false, llmError: "narrative aborted" } });
+			expect(arts[0].data.lost).toBeUndefined();
 			expect(r.zip.stats.summaryUsd).toBe(0.12);
 			AbortSignal.timeout = timeout;
-			r.zip.want("run", ctx, p); // the same cut remains eligible at a later production trigger
-			expect((await r.zip.bg.promise)?.llmOk).toBe(true);
-			expect(calls).toBe(2);
+			r.zip.want("run", ctx, p); // the cut has its summary: no second call for it
+			expect(r.zip.bg).toBeNull();
+			expect(calls).toBe(1);
 			expect(r.zip.ready(r.sm.getBranch())).toHaveLength(1);
 			expect(r.zip.stats.summaryUsd).toBe(0.12);
 		} finally {
 			AbortSignal.timeout = timeout;
+			ctx.modelRegistry.complete = provider;
+			await r.shutdown();
+		}
+	});
+
+	// 0.4.0/0.4.1 capped the narrative call at its 4,000-token budget: on a real CJK session every call hit the cap (5,331 tokens out)
+	// and no summary was ever applied while the context grew from 161K to 437K
+	for (const fails of [false, true]) test(`a narrative ${fails ? "that fails" : "longer than its budget"} still becomes the summary Pi compacts with`, async () => {
+		const r = await rig(undefined, { file: template(240 * 60_000), tui: true, native: true, idle: true, start: false });
+		const ctx = r.runner.createContext(), provider = ctx.modelRegistry.complete;
+		const caps: number[] = [];
+		// the reply needs 5,400 tokens: a provider cuts it at any cap below that
+		ctx.modelRegistry.complete = async (m: Any, req: Any, options: Any) => {
+			caps.push(options?.maxTokens);
+			const res = await provider(m, req, options);
+			return fails || options?.maxTokens < 5400 ? { ...res, stopReason: "length" } : res;
+		};
+		try {
+			const view = r.sm.buildSessionProjection().entries;
+			const p = planContext(view, r.zip.opts(ctx, true, view, 0, true).o)!;
+			expect(r.zip.startBg(p, ctx)).toBe(true);
+			expect((await r.zip.bg.promise)?.llmOk).toBe(!fails);
+			expect(caps).toEqual([MODEL.maxTokens]);
+			expect(r.zip.ready(r.sm.getBranch())).toHaveLength(1);
+			await r.prompt();
+			expect(r.compactions).toHaveLength(1);
+			expect(r.compactions[0].details.via).toBe("native");
+			const compaction = r.sm.getBranch().find((e: Any) => e.type === "compaction") as Any;
+			expect(compaction.firstKeptEntryId).toBe(p.firstKeptEntryId);
+			expect(compaction.summary.includes("## Narrative (model-written)")).toBe(!fails);
+			expect(caps).toHaveLength(1);
+			// /zip says so: how many narrative calls failed, and why the newest did
+			expect(r.zip.card(ctx).failed).toBe(fails ? 1 : undefined);
+			if (fails) expect(r.zip.card(ctx).failedWhy).toContain("narrative hit the token cap");
+		} finally {
 			ctx.modelRegistry.complete = provider;
 			await r.shutdown();
 		}

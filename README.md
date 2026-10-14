@@ -162,7 +162,7 @@ The guard applies an edit when accumulated rent pays its expected rewrite price,
 
 ### The algorithm
 
-This pseudo-code describes the shipped defaults; sizes are calibrated tokens, prices are read units, and $g$ is bounded below by 1 in the law. A summary's planned size is $S(X)=\max(\min(\max(X/10,1{,}000),8{,}000),\text{previous summary size})$. The planner estimates its call price as $(1+\kappa)\max(X-\text{previous summary size},0)+\text{out}\min(S(X),4{,}000)$: an uncached read excluding the carried previous summary, plus at most 4,000 narrative output tokens. Lists from the previous summary are carried by code; the narrative call merges the previous narrative with the new conversation.
+This pseudo-code describes the shipped defaults; sizes are calibrated tokens, prices are read units, and $g$ is bounded below by 1 in the law. A summary's planned size is $S(X)=\max(\min(\max(X/10,1{,}000),8{,}000),\text{previous summary size})$. The planner estimates its call price as $(1+\kappa)\max(X-\text{previous summary size},0)+\text{out}\min(S(X),4{,}000)$: an uncached read excluding the carried previous summary, plus the narrative's output at its 4,000-token budget. The budget is what the call is asked for and priced at, not the call's cap: real replies overshoot it (a merge on a long CJK session wrote 5,716-7,399 tokens, reasoning included), so the call may write up to 16,000 tokens or the model's own output limit, whichever is lower. Lists from the previous summary are carried by code; the narrative call merges the previous narrative with the new conversation.
 
 ```
 law(B → A | p, call, η): D = B − A > 0
@@ -209,7 +209,7 @@ on timer: re-plan on the current branch at that gap; produce only if no call is 
 on session open: rebuild state; arm only a future timer; never start a call
 on Pi's cache-warming decision: observe the touch and re-arm; never answer the decision
 on run start: clear the timer
-on call completion: record pi-zip/summary; failed/aborted calls are not READY
+on call completion: record pi-zip/summary; a failed narrative still makes a READY summary (the fallback); aborted calls are not READY
 on shutdown: abort the running call and record one estimated unused charge
 
 doors: idle typed prompt (Pi's input event) → ctx.compact() with the ready answer and Pi's before-size
@@ -217,7 +217,7 @@ doors: idle typed prompt (Pi's input event) → ctx.compact() with the ready ans
        first request → folds only, persisted at its first turn_end
 ```
 
-Outside the room, an aborted call must finish before its replacement starts; that handover stays in the background. A failed or aborted call may be retried, while a successful artifact is never produced again for the same valid cut.
+Outside the room, an aborted call must finish before its replacement starts; that handover stays in the background. An aborted call, or one that threw, may be retried. A call whose narrative failed has produced its summary (the fallback), and a summary is never produced again for the same valid cut.
 
 Eligibility also requires an output larger than 500 chars/4 tokens and a placeholder smaller than 90% of it. Recalled outputs stay unfolded. On automatic prefix caches, folds leave the first 8,192 calibrated tokens alone to preserve a cache-survival sample; summaries replace that prefix and are exempt. Folds inside a summary prefix are absorbed by the summary; folds already carried by a request keep their exact placeholders when saved. Structural guards preserve tool-call/result pairs. A failed turn saves folds its request already carried but makes no new edit. No-UI sessions use the same background production, at settle and on session open too; in a process that exits right after settle, a call settle started is aborted at exit and counted once as unused at its estimated input charge.
 
@@ -511,7 +511,7 @@ The working view is capped at pi-zip's room when the window is known. A protecte
 
 | Command | Effect |
 |---|---|
-| `/zip` | the card above: state, how long the cache survives you being away (a dot chart of your own returns), this session's folds, summaries and recalls (counted from the session, so a restart does not reset them) |
+| `/zip` | the card above: state, how long the cache survives you being away (a dot chart of your own returns), this session's folds, summaries and recalls (counted from the session, so a restart does not reset them), and, if any narrative call failed, how many and why the newest did |
 | `/zip off` | strict no-op: no folds, no summaries, requests left untouched (earlier folds stay recallable) |
 | `/zip on` | resume |
 | `/zip quiet` | toggle the per-turn notice (folding continues) |
@@ -531,7 +531,7 @@ key lines kept (original line numbers; up to 8):
 Original kept byte for byte, recallable even after summaries or compaction: zip_recall("k3f9a0x1qz") (optional grep/range) is instant, free, no side effects; prefer it to re-running or re-reading (output may differ). Do not guess its content.
 ```
 
-Placeholders are written once, when the fold is saved: sessions folded by an earlier version keep their old placeholder text unchanged. Summaries list each folded output with its handle, time (`MM-DD HH:MM`, local; a turn count would restart at every compaction) and outcome in the same way, and say at the top that the 10-character code next to a command, file or call is its handle and that what an output said is to be recalled rather than re-run or re-read. Rows that would read alike show the first line of their output that differs, and when every command runs after the same `cd <dir> &&`, that prefix is named once in the heading instead of on every row (with commands in several directories, every row keeps its own). A summary of an earlier summary merges it section by section (requests, files, commands, other calls, errors, handle table, handle index) instead of clipping its text: items are deduplicated, the oldest are dropped first under a per-section budget with a count of what was left out (zip_recall's grep without a handle searches every earlier output, so the lists are kept short: a summary is about a third smaller than in 0.3.0), user requests keep the session's first ones (they define the task) and the newest verbatim, shorten the ones between to their start (marked `≈`) and count the rest, and there is one narrative: the summary call reads the previous summary's narrative (not its lists) next to the new conversation and writes one updated narrative, newer values replacing older ones, finished todos dropped, durable facts kept (bounded: a longer previous narrative is sent as its head and tail). If that call fails, the previous narrative is carried as it was, marked as possibly stale with the time it was written. Pi's own free-text compaction summaries are merged the same way.
+Placeholders are written once, when the fold is saved: sessions folded by an earlier version keep their old placeholder text unchanged. Summaries list each folded output with its handle, time (`MM-DD HH:MM`, local; a turn count would restart at every compaction) and outcome in the same way, and say at the top that the 10-character code next to a command, file or call is its handle and that what an output said is to be recalled rather than re-run or re-read. Rows that would read alike show the first line of their output that differs, and when every command runs after the same `cd <dir> &&`, that prefix is named once in the heading instead of on every row (with commands in several directories, every row keeps its own). A summary of an earlier summary merges it section by section (requests, files, commands, other calls, errors, handle table, handle index) instead of clipping its text: items are deduplicated, the oldest are dropped first under a per-section budget with a count of what was left out (zip_recall's grep without a handle searches every earlier output, so the lists are kept short: a summary is about a third smaller than in 0.3.0), user requests keep the session's first ones (they define the task) and the newest verbatim, shorten the ones between to their start (marked `≈`) and count the rest, and there is one narrative: the summary call reads the previous summary's narrative (not its lists) next to the new conversation and writes one updated narrative, newer values replacing older ones, finished todos dropped, durable facts kept (bounded: a longer previous narrative is sent as its head and tail). If that call fails, the previous narrative is carried as it was, marked as possibly stale with the time it was written, and the summary still goes in: a session whose narrative calls keep failing still compacts (0.4.0 and 0.4.1 dropped such a summary and called again at every trigger). A reply cut at the call's cap is not retried, since the same call stops the same way. Pi's own free-text compaction summaries are merged the same way.
 
 The model recalls by itself when it needs the content:
 
@@ -598,11 +598,13 @@ Some relays reject `PI_CACHE_RETENTION=long` with 400 `a ttl='1h' cache_control 
 ```bash
 bun test                                                                   # unit + invariant tests + integration with Pi itself
 bun run build-check                                                        # bundles src/index.ts with Pi's packages external
+bun run mutants                                                            # each mutant of a past bug must be caught by the integration checks
+formal/live/narrative.sh <session.jsonl> [provider/model]                  # release check with a real model (costs tokens)
 ```
 
 `test/pi-integration.test.ts` runs the extension through Pi's real session manager, extension loader and `emitContext`, with a mid-conversation system update and an aborted tool-call turn in the session, and checks that the request is byte-identical before and after turn_end persists the edits.
 
-The tests use isolated settings, learned-cache files and local fake providers; they make no LLM API calls. Type checking uses `bunx -p typescript@5 tsc --noEmit -p .`. The Rust checker in [formal/README.md](formal/README.md) runs the real extension against bounded synthetic traces and compares it with independent economic and event-order properties. It checks one call, one production timer, the room-only wait and both exact compaction doors. Its remaining findings concern calibrated sizes at the room credit, the automatic-cache head, protection-window slides, growth and target reachability; it is not a proof that every possible session is correct.
+The tests use isolated settings, learned-cache files and local fake providers; they make no LLM API calls. Fake providers never write long replies, which is how 0.4.0 shipped a narrative call capped below what a real model writes: `formal/live/narrative.sh` replays this tree's narrative call on a real session with a real model and passes only if every call comes back. Type checking uses `bunx -p typescript@5 tsc --noEmit -p .`. The Rust checker in [formal/README.md](formal/README.md) runs the real extension against bounded synthetic traces and compares it with independent economic and event-order properties. It checks one call, one production timer, the room-only wait and both exact compaction doors. Its remaining findings concern calibrated sizes at the room credit, the automatic-cache head, protection-window slides, growth and target reachability; it is not a proof that every possible session is correct.
 
 The cost-model proofs have a separate gate described in [proofs/README.md](proofs/README.md). Test environment overrides are internal harness controls, not product parameters.
 
