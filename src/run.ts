@@ -20,6 +20,7 @@ import { fmtLife, type CardData, type ChartBin, type StateWord } from "./ui.ts";
 export const PLAN_CUSTOM = "pi-zip/plan";
 export const STATE_CUSTOM = "pi-zip/state";
 export const STEER_CUSTOM = "pi-zip/steer";
+const WARM_WHY = "cache warm · worth it at this size";
 const fmtAway = (s: number) => (s < 90 ? `${Math.round(s)} s` : s < 5400 ? `${Math.round(s / 60)} min` : `${(Math.round(s / 360) / 10).toFixed(1)} h`);
 export const NOTICE_CUSTOM = "pi-zip/notice"; // a fold/summary notice kept in the transcript (rendered by index.ts, never sent to the model)
 export { checkEdits, SUMMARY_CUSTOM };
@@ -162,6 +163,7 @@ export class Zip implements ZipControl {
 	/** index.ts registered the transcript renderer for NOTICE_CUSTOM (Pi versions without registerEntryRenderer fall back to a status line). */
 	entryRenderer = false;
 	private coldWhy = ""; // the expanded notice's "why now" for this run
+	private turnWhy = ""; // the same for an edit chosen at turn_end: what that decision assumed about the cache
 	private noticed = false; // a transcript notice was written in this process (the branch may not show it yet)
 	setRecallMode(mode: "tool" | "file" | "reread", tools: { read: boolean; grep: boolean; bash: boolean }, ctx?: Any) {
 		if (mode !== this.recallMode) this.ledger({ type: "recall_available", ok: mode === "tool", mode, ...tools });
@@ -736,6 +738,7 @@ export class Zip implements ZipControl {
 		this.cancelTimer(); // the user is back: nothing is started behind their back any more
 		this.model = ctx?.model;
 		this.cold = false;
+		this.turnWhy = ""; // a turn_end's judgement belongs to its run
 		this.pause = false;
 		this.runChecked = true;
 		this.runEdits = false;
@@ -1316,7 +1319,10 @@ export class Zip implements ZipControl {
 		// marks its handles at once, a read, grep or bash of a recall file would otherwise be folded again at this turn_end, by its
 		// decision or its room wait (RC)
 		for (const h of recalledHandlesFromBranch(branch)) this.recalled.add(h);
-		const pIn = inRunClock(branch, { model: m, ent: this.entKey === modelKey(m) ? this.ent : undefined, tier: this.tier(m) }, Date.now(), { reqMs: touch, modelKey: this.lastModelKey }).pWarm;
+		const clk = inRunClock(branch, { model: m, ent: this.entKey === modelKey(m) ? this.ent : undefined, tier: this.tier(m) }, Date.now(), { reqMs: touch, modelKey: this.lastModelKey });
+		const pIn = clk.pWarm;
+		// the notice's "why now" says what this decision assumed (P(warm) at this turn_end), not the run's start
+		this.turnWhy = pIn >= 0.5 ? WARM_WHY : clk.src === "model switch" ? "cache cold · model switched" : `cache likely cold · ${clk.gapS !== null ? `${fmtAway(clk.gapS)} since the last response` : clk.src}`;
 		const carried = this.runEdits ? this.runPlan : null;
 		this.runEdits = false;
 		if (carried && !carried.sent) this.runPlan = null;
@@ -1376,7 +1382,7 @@ export class Zip implements ZipControl {
 		for (const t of live) this.labels.set(handleFor(t.entryId), `${t.tool}${t.args ? " " + t.args : ""}`);
 		const ITEMS = 8;
 		const items = live.slice(0, ITEMS).map((t) => ({ label: `${t.tool}${t.args ? " " + t.args : ""}`, tokens: Math.round(plan.scale.c * t.entryTokens), handle: handleFor(t.entryId) }));
-		const why = valve || !this.cold ? "cache warm · worth it at this size" : this.coldWhy;
+		const why = valve ? this.turnWhy || WARM_WHY : !this.cold ? WARM_WHY : this.coldWhy;
 		// reqTs identifies the first request carrying the final view: a folds-only notice keeps its first-request time when announced
 		// at the boundary; a newly joined room summary uses the boundary time, because only the next request can carry it.
 		const data: NoticeData = { v: 2, text: noticeText(notices), before: Math.round(notices[0].tokensBefore), after: Math.round(notices[notices.length - 1].tokensAfter), desc: noticeDesc(notices), why: why || undefined, items, more: Math.max(0, live.length - ITEMS) || undefined, first: !this.noticed && !this.branch(ctx).some((en: Any) => en?.type === "custom" && en.customType === NOTICE_CUSTOM), reqTs: plan.cut ? Date.now() : (plan.noticeTs ?? Date.now()), ...(cut && this.nativeNote ? { native: this.nativeNote.native, ...(this.nativeNote.ms !== undefined ? { nativeMs: this.nativeNote.ms } : {}), ...(this.nativeNote.askMs !== undefined ? { nativeAskMs: this.nativeNote.askMs } : {}) } : {}) };
@@ -1449,7 +1455,15 @@ export class Zip implements ZipControl {
 		return { entries: [...e.entries, ...ours] }; // append, never overwrite other extensions' drafts
 	}
 
-	providerRequest(e: Any): Any {
+	/** Pi's model_select (/model, cycling, restore): a switch in the middle of a run is not seen by any run start. */
+	modelSelect(model: Any) {
+		if (model) this.model = model;
+	}
+
+	providerRequest(e: Any, ctx?: Any): Any {
+		// the request goes to the session's current model: a /model in the middle of a run switches it without a run start, and a
+		// request booked under the run's first model would make every later turn_end see a "model switch" (P(warm) = 0: any edit is free)
+		if (ctx?.model) this.model = ctx.model;
 		const now = Date.now(), key = modelKey(this.model), last = Math.max(this.lastReqMs, this.branchLastMs);
 		const edited = this.nextEdit !== null;
 		// the free cache signal: this response's cacheRead against what this request re-sent unchanged, after this gap (same model only)

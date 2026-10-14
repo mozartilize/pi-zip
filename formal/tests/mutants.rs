@@ -369,7 +369,7 @@ fn harness_checks_can_fail() {
 #[test]
 fn rc_file_recall_inside_a_run() {
     let t = trace_file("rc-file-recall-in-run.trace");
-    caught("rcf", "run.ts", "\t\tfor (const h of recalledHandlesFromBranch(branch)) this.recalled.add(h);\n\t\tconst pIn", "\t\tconst pIn", "RC", &t);
+    caught("rcf", "run.ts", "\t\tfor (const h of recalledHandlesFromBranch(branch)) this.recalled.add(h);\n\t\tconst clk", "\t\tconst clk", "RC", &t);
 }
 
 fn trace_file(name: &str) -> String {

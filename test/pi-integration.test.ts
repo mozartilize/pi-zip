@@ -1094,6 +1094,31 @@ for (const order of ORDERS) describe(`real Pi: a summary prepared while the user
 		}
 	});
 
+	// 0.4.1-0.4.4 (P1): gateway gpt-6.1-sol refuses a request without reasoning (pi-ai sends effort "none" when none is asked for), so
+	// every narrative on it failed (84 calls in 56 minutes on one session with 0.4.1; a skeleton-only summary with 0.4.4)
+	test("a narrative on a reasoning model that refuses effort none is asked again with low effort", async () => {
+		const model = { ...MODEL, provider: "gateway", id: `refuses-none-${order}`, reasoning: true };
+		const r = await rig(undefined, { file: template(240 * 60_000), tui: true, start: false, model });
+		const ctx = r.runner.createContext(), provider = ctx.modelRegistry.complete;
+		const efforts: (string | undefined)[] = [];
+		ctx.modelRegistry.complete = async (m: Any, req: Any, options: Any) => {
+			efforts.push(options?.reasoningEffort);
+			if (!options?.reasoningEffort) return { stopReason: "error", content: [], usage: { cost: { total: 0 } },
+				errorMessage: "unsupported_value: Unsupported value: 'none' is not supported with the 'gpt-6.1-sol' model. Supported values are: 'low', 'medium', 'high', 'xhigh', and 'max'." };
+			return provider(m, req, options);
+		};
+		try {
+			const view = r.sm.buildSessionProjection().entries;
+			const p = planContext(view, r.zip.opts(ctx, true, view, 0, true).o)!;
+			expect(r.zip.startBg(p, ctx)).toBe(true);
+			expect((await r.zip.bg.promise)?.llmOk, "a narrative refused for its reasoning effort is retried with low effort").toBe(true);
+			expect(efforts).toEqual([undefined, "low"]); // the refused call does not use up the retry
+		} finally {
+			ctx.modelRegistry.complete = provider;
+			await r.shutdown();
+		}
+	});
+
 	for (const door of ["native", "draft"] as const) test(`a retried summary retains every attempt's charge before ${door} application, after it and after restart`, async () => {
 		const r = await rig(undefined, { file: template(240 * 60_000), tui: true, native: true, idle: true, start: false });
 		const ctx = r.runner.createContext(), provider = ctx.modelRegistry.complete;
@@ -1918,6 +1943,46 @@ describe("a long branch: the per-turn handlers stay bounded", () => {
 		(r.sm as Any).getBranch = (...a: Any[]) => (reads++, get(...a));
 		await r.settle();
 		expect(reads, "one settle reads the branch at most 6 times").toBeLessThanOrEqual(6);
+		await r.shutdown();
+	});
+});
+
+// 0.4.1-0.4.4 (P1): a /model in the middle of a run has no run start. Requests were booked under the run's first model, so every later
+// turn_end saw a "model switch" (P(warm) = 0: any edit is free) and folded one output per turn, each a full rewrite of the new model's
+// cache (~130K tokens for 1-15K saved, 23 times in 25 minutes on one session), under a notice that said "cache warm".
+describe("a mid-run /model: the new model's requests are its own", () => {
+	const m2 = { ...MODEL, id: "m2" };
+	const switched = async (select: boolean, request: boolean) => {
+		const r = await rig(undefined, { start: false });
+		await r.prompt("current");
+		r.sm.appendMessage(user("current", Date.now() - T0));
+		await r.request();
+		await r.runner.emitBeforeProviderRequest({});
+		const first = { ...asst([call("s1")], "toolUse"), timestamp: Date.now() };
+		const firstId = r.sm.appendMessage(first);
+		r.sm.appendMessage(result("s1", "ok"));
+		await r.turnEnd(firstId, first);
+		r.setModel(m2);
+		if (select) await r.runner.emit({ type: "model_select", model: m2, previousModel: MODEL, source: "set" } as Any);
+		if (!request) return r;
+		await r.request();
+		await r.runner.emitBeforeProviderRequest({});
+		const second = { ...asst([call("s2")], "toolUse"), model: "m2", timestamp: Date.now() };
+		const secondId = r.sm.appendMessage(second);
+		r.sm.appendMessage(result("s2", "ok"));
+		await r.turnEnd(secondId, second);
+		return r;
+	};
+
+	test("a mid-run /model: turn_end judges the new model's cache by the request it just made", async () => {
+		const r = await switched(false, true);
+		expect(r.zip.turnWhy, "a mid-run /model: the request it made is booked under the new model").toBe("cache warm \u00b7 worth it at this size");
+		await r.shutdown();
+	});
+
+	test("a mid-run /model: model_select makes it the current model before any request", async () => {
+		const r = await switched(true, false);
+		expect(r.zip.status(r.runner.createContext()), "a mid-run /model: /zip shows the selected model").toContain("cache p/m2:");
 		await r.shutdown();
 	});
 });

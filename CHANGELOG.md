@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.4.5
+
+- A `/model` in the middle of a run no longer makes every later turn look like a model switch. Requests were booked under the model
+  the run started with, so after a mid-run switch each turn_end judged the new model's cache cold (P(warm) = 0, where any edit is
+  free) and folded one old output per turn, each a full rewrite of the warm cache: on one session 23 rewrites of ~130K tokens in 25
+  minutes for 1-15K saved each, under a notice that said "cache warm". Requests now carry the session's current model, and pi-zip
+  follows Pi's `model_select`. Replayed on that session, the fixed code makes none of those edits.
+- Narratives work on reasoning models that refuse a request without reasoning. pi-ai sends effort "none" when none is asked for;
+  gateway's gpt-6.1-sol answers "'none' is not supported", so every narrative on it failed (84 calls in 56 minutes with 0.4.1, a
+  skeleton-only summary with 0.4.4). Such a refusal is now asked again once with low effort, and that model gets low effort from
+  then on. Checked live on that model.
+- The notice's "why" line of a turn_end edit says what that decision assumed: "cache cold · model switched" or "cache likely cold ·
+  N min since the last response" when it judged the cache cold, instead of always "cache warm".
+- A summary of a stretch with no user request of its own (a run driven by an extension) says "summarized earlier turns", not
+  "summarized 0 requests".
+- `bench/replay-seq.ts` replays a stretch of a recorded session through this tree, turn by turn, and prints where it would edit
+  next to what the live process did.
+
 ## 0.4.4
 
 - No more UI stalls on long sessions. Every turn_end and every run start passed each bash command of the whole branch through an

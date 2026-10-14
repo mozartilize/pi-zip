@@ -3,7 +3,7 @@
 import { describe, expect, test } from "bun:test";
 import { buildBlocks, NARRATIVE_CALL_MAX, NARRATIVE_MAX, toolCallIndex } from "../src/plan.ts";
 import { handleFor } from "../src/placeholder.ts";
-import { BUDGET, buildCut, FIRST_REQUESTS, handleRowsOf, handleTable, parseSummary, PREV_NARRATIVE_CHARS, previousNarrative, narrative, skeleton, TABLE_ROWS } from "../src/summary.ts";
+import { BUDGET, buildCut, FIRST_REQUESTS, handleRowsOf, handleTable, parseSummary, PREV_NARRATIVE_CHARS, previousNarrative, narrative, skeleton, TABLE_ROWS, EFFORT_REFUSED_RE } from "../src/summary.ts";
 import { A, R, U, type Any } from "./helpers.ts";
 
 const tcall = (id: string, name: string, args: Any) => {
@@ -454,6 +454,29 @@ describe("user requests survive carry-forward intact", () => {
 	});
 });
 
+
+describe("a reasoning model whose provider refuses effort none (gateway gpt-6.1-sol)", () => {
+	const REFUSED = "unsupported_value: Unsupported value: 'none' is not supported with the 'gpt-6.1-sol' model. Supported values are: 'low', 'medium', 'high', 'xhigh', and 'max'.";
+	const refusing = (efforts: (string | undefined)[]) => async (_m: Any, _c: Any, o: Any) => (efforts.push(o?.reasoningEffort), o?.reasoningEffort
+		? { stopReason: "stop", content: [{ type: "text", text: "narrative" }], usage: { cost: { total: 0.01 } } }
+		: { stopReason: "error", errorMessage: REFUSED, usage: { cost: { total: 0 } } });
+	test("asked again with low effort without using up the retry, then low at once for that model", async () => {
+		const efforts: (string | undefined)[] = [];
+		const ctx = { model: { provider: "gateway", id: "unit-refuses-none", reasoning: true }, modelRegistry: { complete: refusing(efforts) } } as Any;
+		expect((await narrative(buildBlocks([U("u", "work"), A("a")]), ctx, 1000)).ok).toBe(true);
+		expect(efforts).toEqual([undefined, "low"]);
+		expect((await narrative(buildBlocks([U("u", "work"), A("a")]), ctx, 1000)).ok).toBe(true);
+		expect(efforts).toEqual([undefined, "low", "low"]);
+	});
+	test("a model without reasoning is not asked for an effort; other errors are not read as a refused effort", async () => {
+		const efforts: (string | undefined)[] = [];
+		const plain = { model: { provider: "x", id: "unit-plain", reasoning: false }, modelRegistry: { complete: refusing(efforts) } } as Any;
+		expect((await narrative(buildBlocks([U("u", "work"), A("a")]), plain, 1000)).ok).toBe(false);
+		expect(efforts).toEqual([undefined, undefined]);
+		expect(EFFORT_REFUSED_RE.test(REFUSED)).toBe(true);
+		for (const other of ["rate limit exceeded", "context length exceeded", "content policy refusal", "Unsupported value: 'image_url'"]) expect(EFFORT_REFUSED_RE.test(other)).toBe(false);
+	});
+});
 
 describe("narrative cost survives unsuccessful responses", () => {
 	test("a terminal policy refusal retains its reported charge", async () => {
