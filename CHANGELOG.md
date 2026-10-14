@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.3
+
+- Documentation only; the code is the same as 0.4.2. The README is a quarter of its former length and has no formulas, which
+  package pages do not render. The theory (rules, algorithm, claims and proofs, limits) moved to `docs/design.md`, the full
+  reference (notices, cache learning, token calibration, recall, coexistence, session entries) to `docs/details.md`.
+
 ## 0.4.2
 
 - Summaries work again on long sessions. 0.4.0 and 0.4.1 capped the narrative call at its 4,000-token budget. A real model writes
