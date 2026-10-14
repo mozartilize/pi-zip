@@ -59,6 +59,20 @@ const mutants = [
 		check: "expect(received).toBe(expected)",
 		edit: (source: string) => rep(source, "this.completed(c, model, head, key, estUsd, p.scale.c * c.prefixTokens);", "this.completed(c, model, head, key, estUsd, p.scale.c * c.prefixTokens);\n\t\t\t\tif (!c.llmOk) return null;"),
 	},
+	// 0.4.4 (P1 on long sessions): a scan of every command of the branch at every turn_end, and a settle re-reading the branch per plan
+	{
+		name: "recall-scan-regex-on-every-command",
+		file: "recallfile.ts",
+		pattern: "a long branch: turn_end",
+		check: "turn_end on a branch of 80 long commands stays under 400 ms",
+		edit: (source: string) => rep(source, '(typeof cmd === "string" && cmd.includes(CMD_LIT) ? [...cmd.matchAll(CMD_RE)]', '(typeof cmd === "string" ? [...cmd.matchAll(CMD_RE)]'),
+	},
+	{
+		name: "settle-rereads-branch-per-plan",
+		pattern: "a long branch: one settle",
+		check: "one settle reads the branch at most 6 times",
+		edit: (source: string) => rep(source, "if (this.frozen) return this.frozen.branch;", ""),
+	},
 ];
 const only = process.env.PZ_MUTANTS?.split(","); // run some by name
 for (const mutant of mutants.filter((m) => !only || only.includes(m.name))) {

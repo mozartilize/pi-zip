@@ -1880,6 +1880,48 @@ for (const order of ORDERS) describe(`round 5 on real Pi: rule A starts the warm
 	});
 });
 
+// 0.4.4 (P1 on long sessions): every turn_end and run start passed every bash command of the branch through an unanchored regex
+// (quadratic in a long word; 0.3 s locally and 0.6 s on a loaded machine per turn_end on a 32K-entry session), and one settle read
+// the whole branch and its token scale again for each of the ~30 plans it priced (0.16 s / 0.85 s). Both stall Pi's UI.
+describe("a long branch: the per-turn handlers stay bounded", () => {
+	/** populate, then 80 tool rounds whose commands carry one 3,000-char word each (old code: ~1.6 s per turn_end here). */
+	const longCommands = (sm: SessionManager) => {
+		populate(sm);
+		const word = "x".repeat(3000);
+		for (let i = 0; i < 80; i++) {
+			sm.appendMessage(user(`long ${i}`, 100 + 4 * i));
+			sm.appendMessage(asst([call(`L${i}`, `echo ${word}${i} | wc -c`)], "toolUse", 101 + 4 * i));
+			sm.appendMessage(result(`L${i}`, "3001", 102 + 4 * i));
+			sm.appendMessage(asst([{ type: "text", text: `counted ${i}` }], "stop", 103 + 4 * i));
+		}
+	};
+
+	test("a long branch: turn_end reads the branch's commands in bounded time", async () => {
+		const r = await rig(longCommands);
+		await r.request();
+		const response = asst([call("t1")], "toolUse");
+		const id = r.sm.appendMessage(response);
+		const t0 = performance.now();
+		await r.turnEnd(id, response);
+		expect(performance.now() - t0, "turn_end on a branch of 80 long commands stays under 400 ms").toBeLessThan(400);
+		await r.shutdown();
+	}, 60_000); // the old scan must reach the assertion, not the test timeout
+
+	test("a long branch: one settle reads the branch a bounded number of times", async () => {
+		const r = await rig(undefined, { tui: true });
+		await r.request();
+		const response = asst([{ type: "text", text: "done" }], "stop");
+		const id = r.sm.appendMessage(response);
+		await r.turnEnd(id, response);
+		const get = r.sm.getBranch.bind(r.sm);
+		let reads = 0;
+		(r.sm as Any).getBranch = (...a: Any[]) => (reads++, get(...a));
+		await r.settle();
+		expect(reads, "one settle reads the branch at most 6 times").toBeLessThanOrEqual(6);
+		await r.shutdown();
+	});
+});
+
 // Without a UI (pi -p, --mode json; rpc binds one on Pi 1.1) pi-zip decides as with one (0.4.0): nobody waits for a summary, it is
 // written in the background and the next decision takes it; settle prepares a return as in every mode (a call the exit aborts is unused).
 // Every request and every session entry of three no-UI scenarios (a warm return that summarises, a warm return right after an edit, a
