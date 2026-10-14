@@ -108,7 +108,9 @@ export function readyOf(branch: Any[], extra: readonly Artifact[] = []): Artifac
 
 /** The summary calls of the branch that no compaction used (a summary nobody took, or a call that ended without one), and their cost:
  *  what keeps the session totals honest. Each compaction consumes one matching artifact of its incoming head, at the charge it carries.
- *  Artifacts can follow their compaction because Pi requires the compaction draft first. */
+ *  Artifacts can follow their compaction because Pi requires the compaction draft first. A fallback whose provider reported no cost is
+ *  booked at its estimate (`estimated`) and its compaction carries cost 0: the two do not pair, so it stays here, which is what keeps
+ *  its estimated charge in the totals. */
 export function unusedOf(branch: Any[]): { n: number; usd: number } {
 	const used = new Map<string, number>(), keyOf = (head: string, key: string, text: string, usd: unknown) => JSON.stringify([head, key, text, Number(usd) || 0]);
 	let head = "", n = 0, usd = 0;

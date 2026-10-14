@@ -184,7 +184,7 @@ export function cardText(c: CardData): string[] {
 	const n = (x: number, one: string, many = one + "s") => `${x} ${x === 1 ? one : many}`;
 	rows.push(["session", `${c.folds} zipped ~${c.foldedTokens}  ·  ${n(c.summaries, "summary", "summaries")}${c.summaryUsd > 0 ? ` $${c.summaryUsd.toFixed(2)}` : ""}  ·  ${n(c.recalls, "unzip")}`]);
 	if (c.last) rows.push(["last", c.last]);
-	if (c.failed) rows.push(["errors", `${n(c.failed, "narrative call")} failed${c.failedWhy ? ` · last ${c.failedWhy}` : ""}`]);
+	if (c.failed) rows.push(["errors", `${n(c.failed, "narrative call")} failed${c.failedWhy ? ` · last ${clean(c.failedWhy).replace(/\s+/g, " ").trim()}` : ""}`]); // a provider's message: one line
 	if (c.unzip) rows.push(["unzip", c.unzip]);
 	if (c.quiet) rows.push(["notices", "off  (/zip quiet turns them back on)"]); // the default says nothing, so it is not shown
 	return rows.map(([k, v]) => `${k.padEnd(LABEL_W)}${v}`);
