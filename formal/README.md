@@ -1,6 +1,6 @@
 # pz-formal: a specification and a bounded model checker for pi-zip
 
-pi-zip's README states five axioms. This crate turns them into a small formal specification, derives the finer properties from
+pi-zip's [design document](../docs/design.md) states five axioms. This crate turns them into a small formal specification, derives the finer properties from
 them, and checks all of them on the **real** implementation: a bun bridge drives pi-zip's own `index.ts` / `run.ts` / `plan.ts`
 through abstract traces (Pi's real `SessionManager` and draft application, a simulated provider cache, a virtual clock) and reports
 every decision; the Rust checker evaluates the properties over those decisions, exhaustively on small discretised traces and

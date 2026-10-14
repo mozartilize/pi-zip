@@ -5,8 +5,8 @@ zero missing**, with concrete nonvacuity witnesses for all 23 parts. This covers
 the assigned T2-T5 parts, including corrected T5(v). It does not certify every
 theorem in the paper or the implementation's behavior.
 
-The English theorems and their model qualifications are in the main
-[README's math section](../README.md#how-pi-zip-decides-and-why). The
+The English theorems and their model qualifications are in the
+[design document](../docs/design.md). The
 `theory.md` line numbers quoted below and in the statement doc comments refer
 to the corrected snapshot of unpublished research notes; those notes are not
 part of this repository. The English and Lean statements were reviewed by
@@ -110,7 +110,7 @@ Other pass-one findings were applied to the English before the proof passes:
 - README claims about the T6 grid and T7 planner were restricted to their paper
   evidence. Neither supplies a universal numerical bound or a Lean planner proof.
 
-The main [README](../README.md#what-is-proved) incorporates these qualifications.
+The [design document](../docs/design.md#what-is-proved) incorporates these qualifications.
 
 ## Paper-only and deferred scope
 
