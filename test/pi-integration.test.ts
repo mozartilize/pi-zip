@@ -105,6 +105,7 @@ async function rig(setup: (sm: SessionManager) => void = populate, opts: RigOpts
 	const runtime = loaded.runtime;
 	let extensions = loaded.extensions;
 	const foreignCalls: string[] = [];
+	const abortsInRun = { n: 0 }; // ctx.abort() while a run is starting or running: it would abort that run
 	if (opts.foreign) {
 		const f = opts.foreign;
 		const other = await loadExtensionFromFactory((api: Any) => api.on("session_before_compact", async (e: Any, c: Any) => (foreignCalls.push(e.reason), f.on(e, c))), CWD, bus, runtime, "<other-compactor>");
@@ -190,7 +191,7 @@ async function rig(setup: (sm: SessionManager) => void = populate, opts: RigOpts
 	};
 	runner.bindCore(
 		{ sendMessage: noop, sendUserMessage: noop, appendEntry, setSessionName: noop, getSessionName: () => undefined, setLabel: noop, getActiveTools: () => ["read", "bash", "zip_recall"], getAllTools: () => [], getSettings: () => opts.settings ?? {}, setActiveTools: noop, refreshTools: noop, getCommands: () => [], setModel: async () => false, getThinkingLevel: () => "off", setThinkingLevel: noop } as Any,
-		{ getModel: () => model, getScopedModels: () => [], isIdle: () => opts.idle !== false && !compacting && !busy, isProjectTrusted: () => true, getSignal: () => undefined, abort: () => compacting?.abort(), hasPendingMessages: () => false, shutdown: noop, getContextUsage: () => undefined, compact: opts.native ? piCompact : (o: Any) => o?.onError?.(new Error("rig: no compaction")), getSystemPrompt: () => "You are a coding agent." } as Any,
+		{ getModel: () => model, getScopedModels: () => [], isIdle: () => opts.idle !== false && !compacting && !busy, isProjectTrusted: () => true, getSignal: () => undefined, abort: () => { if (busy) abortsInRun.n++; compacting?.abort(); }, hasPendingMessages: () => false, shutdown: noop, getContextUsage: () => undefined, compact: opts.native ? piCompact : (o: Any) => o?.onError?.(new Error("rig: no compaction")), getSystemPrompt: () => "You are a coding agent." } as Any,
 	);
 	// Pi's TUI hands raw input to the extensions' listeners in order (TuiBase.handleTerminalInput): one may consume it or replace the data
 	const inputListeners = new Set<(data: string) => Any>();
@@ -319,7 +320,7 @@ async function rig(setup: (sm: SessionManager) => void = populate, opts: RigOpts
 	if (opts.start !== false) await prompt();
 	const shutdown = () => runner.emit({ type: "session_shutdown" } as Any);
 	const setModel = (m: Any) => { model = m; };
-	return { sm, runner, request, turnEnd, settle, prompt, steer, drive, order, setModel, narrativeCalls, projectionMessages, compactions, compactCalls, foreignCalls, inputListeners, typeKey, editor, shutdown, zip, checks, noticeCounts };
+	return { sm, runner, request, turnEnd, settle, prompt, steer, drive, order, setModel, narrativeCalls, projectionMessages, compactions, compactCalls, foreignCalls, abortsInRun, inputListeners, typeKey, editor, shutdown, zip, checks, noticeCounts };
 }
 
 // These checks observe Pi's actual request messages and emitted transcript entries, independently of plan flags.
@@ -332,7 +333,7 @@ const assertIntegrationChecks = () => {
 	}
 };
 const saved: Record<string, string | undefined> = {};
-const ENV = { PI_ZIP_COLD_CAP: "3000", PI_ZIP_TTL_SECS: "300", PI_ZIP_IDLE_DOOR: "1" };
+const ENV = { PI_ZIP_COLD_CAP: "3000", PI_ZIP_TTL_SECS: "300", PI_ZIP_IDLE_DOOR: "0" }; // the shipped default (the idle door: its own describe)
 beforeEach(() => { for (const [k, v] of Object.entries(ENV)) { saved[k] = process.env[k]; process.env[k] = v; } });
 afterEach(() => {
 	try { assertIntegrationChecks(); }
@@ -1539,7 +1540,7 @@ for (const order of ORDERS) describe(`the typed-prompt door opens at Pi's input 
 	afterEach(() => { rigOrder = PI_ORDER; });
 	/** A cold session whose return summary is ready (the producer wrote it while the user was away). */
 	const readyRig = async (o: Partial<RigOpts> = {}) => {
-		const r = await rig(undefined, { file: shiftedFile(240 * 60_000, 9000), tui: true, native: true, idle: true, start: false, ...o });
+		const r = await rig(undefined, { file: shiftedFile(240 * 60_000, 9000), tui: true, native: true, idle: true, start: true, ...o }); // a run of this process (the door opens only after one)
 		await r.settle();
 		await sleep(150);
 		expect(r.narrativeCalls.length).toBe(1);
@@ -1690,7 +1691,7 @@ for (const order of ORDERS) describe(`the typed-prompt door opens at Pi's input 
 // return's own decision takes it, and the next run, whoever starts it, carries that decision from its first request.
 for (const order of ORDERS) describe(`the idle door: a ready summary goes in while Pi is idle, for any next run (Pi ${order} order)`, () => {
 	const sleep = (ms: number) => new Promise((res) => setTimeout(res, ms));
-	beforeEach(() => { process.env.PI_ZIP_TTL_SECS = "1"; rigOrder = order; });
+	beforeEach(() => { process.env.PI_ZIP_TTL_SECS = "1"; process.env.PI_ZIP_IDLE_DOOR = "1"; rigOrder = order; });
 	afterEach(() => { rigOrder = PI_ORDER; });
 	const ledgerOf = (r: Any) => {
 		const out: Any[] = [];
@@ -1701,10 +1702,11 @@ for (const order of ORDERS) describe(`the idle door: a ready summary goes in whi
 	const noticeOf = (r: Any) => (r.sm.getBranch().filter((e: Any) => e.type === "custom" && e.customType === "pi-zip/notice" && !e.data?.kind).at(-1) as Any)?.data;
 	/** A cold session (its newest response hours old) whose run just ended: the producer writes the return's summary while Pi is idle. */
 	const coldRig = async (o: Partial<RigOpts> = {}, before?: (r: Any) => void) => {
-		const r = await rig(undefined, { file: shiftedFile(240 * 60_000, 9000), tui: true, native: true, idle: true, start: false, ...o });
+		const r = await rig(undefined, { file: shiftedFile(240 * 60_000, 9000), tui: true, native: true, idle: true, start: true, ...o }); // a run of this process (the door opens only after one)
 		const led = ledgerOf(r);
 		before?.(r);
 		await r.settle();
+		await r.runner.emit({ type: "agent_end", messages: [] } as Any); // the run of this process ends as Pi ends it
 		await sleep(150);
 		expect(r.narrativeCalls.length).toBe(1);
 		return { r, led };
@@ -1787,7 +1789,7 @@ for (const order of ORDERS) describe(`the idle door: a ready summary goes in whi
 		});
 		await sleep(50);
 		expect(r.compactions.map((c: Any) => c.details.door ?? "input"), "an input during the door's clock read keeps the door shut").toEqual(["input"]);
-		expect(led).toContainEqual(expect.objectContaining({ type: "idle_door", taken: false, reason: "a prompt or a run came while the door read its clock" }));
+		expect(led).toContainEqual(expect.objectContaining({ type: "idle_door", taken: false, reason: "a prompt, a run or /zip came while the door read its clock" }));
 		expect(r.compactCalls.n).toBe(1);
 		expect(r.compactions[0].details.door).toBeUndefined(); // the typed door's
 		expect(r.zip.idleNat).toBeNull();
@@ -1809,6 +1811,35 @@ for (const order of ORDERS) describe(`the idle door: a ready summary goes in whi
 		expect(r.compactCalls.n).toBe(1);
 		expect(req.find((m: Any) => m.role === "compactionSummary")?.summary).toBe(r.compactions[0].summary);
 		expect(r.zip.runPlan.native.text).toBe(r.compactions[0].summary);
+	});
+
+	test("a run an extension's message starts while the door's compaction is held up past its deadline is never aborted", async () => {
+		process.env.PI_ZIP_NATIVE_MS = "150";
+		try {
+			let driving: Promise<Any> | null = null;
+			const { r } = await coldRig({ foreign: { at: "before", on: async () => { await sleep(400); return undefined; } } }, (r: Any) => {
+				const native = r.zip.nativeSummary.bind(r.zip);
+				r.zip.nativeSummary = (...a: Any[]) => {
+					const p = native(...a);
+					if (a[3] === "idle") setTimeout(() => { driving = r.drive(); }, 20); // Pi starts it: sendCustomMessage does not check isCompacting
+					return p;
+				};
+			});
+			await sleep(600);
+			expect(driving).not.toBeNull();
+			await driving;
+			expect(r.abortsInRun.n, "the idle door never aborts a run").toBe(0);
+		} finally {
+			delete process.env.PI_ZIP_NATIVE_MS;
+		}
+	});
+
+	test("a session only opened: a summary the producer writes after the open never goes in while idle", async () => {
+		const r = await rig(undefined, { file: shiftedFile(0, 9000), tui: true, native: true, idle: true, start: false });
+		await sleep(2_600); // the producer's timer (armed at open) writes the summary; the TTL (1 s) passes
+		expect(r.narrativeCalls.length).toBe(1);
+		expect(r.compactCalls.n, "no idle door before a run of this process").toBe(0);
+		await r.shutdown();
 	});
 
 	test("another compaction after the idle door (Pi's own, say) voids its decision: the next run reads its own start", async () => {

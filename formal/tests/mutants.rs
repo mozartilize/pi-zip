@@ -435,7 +435,7 @@ fn na_en_the_door_is_the_input_event() {
     ];
     let t = trace_file("na-ready-native.trace");
     caught_files("door1", &late, &["NA"], &t);
-    let busy = [late[0], late[1], ("run.ts", "idle = ctx?.isIdle?.() === true;", "idle = true;", 1), ("run.ts", "idle = ctx.isIdle?.() === true;", "idle = true;", 1)];
+    let busy = [late[0], late[1], ("run.ts", "attempt(() => ctx?.isIdle?.() === true, false)", "true", 1)]; // both gates read idleOf
     caught_files("door2", &busy, &["EN"], &t);
 }
 

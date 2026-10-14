@@ -3,7 +3,7 @@
 ## 0.4.6
 
 - A summary that was ready before a run began, and is applied at that run's turn_end, now says "ready while you were away"
-  instead of "written while you worked" (runs an extension's message starts).
+  instead of "written while you worked" (mostly runs an extension's message starts).
 - New, opt-in: the idle door (`PI_ZIP_IDLE_DOOR=1`, TUI only). A run an extension's message starts has no `input` event, so a
   summary prepared for its return waited for the run's first turn_end: the first request rewrote the whole folded context (one
   session: 230K tokens, then the summarized 44K a turn later), and once that request had warmed the cache again the summary

@@ -121,6 +121,18 @@ const mutants = [
 		edit: (source: string) => rep(source, "this.cancelDoor(); // the idle door opens only after a run of this session", "this.armDoor(ctx, true); // mutant"),
 	},
 	{
+		name: "idle-door-aborts-a-starting-run",
+		pattern: "held up past its deadline",
+		check: "the idle door never aborts a run",
+		edit: (source: string) => rep(source, "!(door === \"idle\" && this.runStarts !== runs0)", "!(door === \"idle\" && this.inRun)"),
+	},
+	{
+		name: "idle-door-before-any-run",
+		pattern: "a session only opened",
+		check: "no idle door before a run of this process",
+		edit: (source: string) => rep(source, "if (!idleDoorOn() || !this.ranHere || ", "if (!idleDoorOn() || "),
+	},
+	{
 		name: "idle-door-every-moment",
 		pattern: "a door that declines asks again",
 		check: "the door asks only when P(warm) changes",

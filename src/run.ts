@@ -153,6 +153,7 @@ export class Zip implements ZipControl {
 	private door: Promise<void> | null = null;
 	private inputs = 0;
 	private idleNat: { nat: NativeRun; note: Start["note"]; head: string; model: string } | null = null;
+	private ranHere = false; // a run of this process in this session: the idle door opens only after one
 	private readyAtStart = new Set<string>(); // summaries ready when the run began: one taken at its turn_end was ready while the user was away
 	// the cache tier (PI_CACHE_RETENTION) of the current model's requests: the payload of its newest request when seen, else the
 	// provider-scoped env resolved once per run (research pi-tricks §3.1); null = nothing known, the process env decides (cache.ts)
@@ -475,6 +476,7 @@ export class Zip implements ZipControl {
 		this.start = null; // a decision carried for a run of the session before is never handed to a run of this one
 		this.startKind = null;
 		this.cancelDoor(); // the idle door opens only after a run of this session (opening old history never compacts it)
+		this.ranHere = false;
 		this.idleNat = null;
 		const branch = this.branch(ctx);
 		for (let i = branch.length - 1; i >= 0; i--) {
@@ -719,6 +721,7 @@ export class Zip implements ZipControl {
 		this.inRun = true;
 		this.cancelTimer(); // the user is back: nothing is started behind their back any more
 		this.cancelDoor();
+		this.ranHere = true;
 		const door = this.idleNat;
 		this.idleNat = null;
 		this.model = ctx?.model;
@@ -868,6 +871,7 @@ export class Zip implements ZipControl {
 		const ask = { compaction: compaction as Any | null, answered: false, askedAt: 0, askedWall: 0, until: Infinity };
 		this.cancelTimer(); // no producer call starts while Pi compacts (input arms the timer again)
 		this.nativeAsk = ask;
+		const runs0 = this.runStarts; // a run an extension's message starts meanwhile (Pi does not hold it back) is never aborted
 		const deadline = nativeDeadlineMs(), t0 = performance.now();
 		const res = await new Promise<{ ok: boolean; err?: string; late?: boolean }>((resolve) => {
 			let settled = false;
@@ -899,8 +903,8 @@ export class Zip implements ZipControl {
 		const last = added[added.length - 1] ?? null;
 		const entry = last && last.summary === cut.text ? last : null;
 		// still pending at the deadline: cancel it now, before the run starts (Pi checks its abort signal right before it appends); the idle
-		// door never aborts a run an extension's message started meanwhile (a late ask of pi-zip's compaction is cancelled all the same)
-		if (res.late && !last && !(door === "idle" && this.inRun)) {
+		// door never aborts a run announced meanwhile (inRun is set only after the door: a late ask is cancelled all the same)
+		if (res.late && !last && !(door === "idle" && this.runStarts !== runs0)) {
 			attempt(() => ctx.abort?.(), undefined);
 		}
 		// "another handler at work" is measured over the time other handlers can occupy: before ours (askMs) and, for handlers after ours, from
@@ -957,7 +961,7 @@ export class Zip implements ZipControl {
 	 */
 	private armDoor(ctx: Any, now: boolean) {
 		this.cancelDoor();
-		if (!idleDoorOn() || ctx?.mode !== "tui" || !this.active() || this.inRun || this.idleNat || this.nativeOff || typeof ctx?.compact !== "function") return;
+		if (!idleDoorOn() || !this.ranHere || ctx?.mode !== "tui" || !this.active() || this.inRun || this.idleNat || this.nativeOff || typeof ctx?.compact !== "function") return;
 		try {
 			const branch = this.branch(ctx), t = Date.now(), at = !readyOf(branch, this.mine).length ? null : now ? t : this.doorNext(ctx, branch, t);
 			if (at === null) return;
@@ -989,14 +993,16 @@ export class Zip implements ZipControl {
 	/** One evaluation of the idle door (armDoor), nothing while a run, an input or a compaction is under way: the typed door's gates (not
 	 *  idle: Pi compacting, a run just ending; the next moment decides), its decision and its compaction. */
 	private async idleDoor(ctx: Any): Promise<void> {
-		if (!idleDoorOn() || !this.active() || !ctx?.model || this.inRun || this.inputBusy || this.start || this.startKind || this.nativeAsk || this.idleNat) return;
-		const inputs = this.inputs, runs = this.runStarts;
+		if (!idleDoorOn() || !this.active() || !ctx?.model || this.inRun || this.inputBusy || this.nativeAsk || this.idleNat) return;
+		// a prompt's decision not taken by a run yet (another extension handled the prompt, or Pi refused it): the next moment decides
+		if (this.start || this.startKind) return void (this.ledger({ type: "idle_door", taken: false, reason: "a prompt's start is pending" }), this.armDoor(ctx, false));
+		const inputs = this.inputs, runs = this.runStarts, gen = this.doorGen;
 		this.inputBusy = true; // the typed door and the idle door never overlap
 		try {
 			this.liveCtx = ctx;
 			const s = await this.readStart(ctx, false);
-			if (inputs !== this.inputs || runs !== this.runStarts || this.inRun) // that prompt or run reads its own start
-				return void this.ledger({ type: "idle_door", taken: false, reason: "a prompt or a run came while the door read its clock" });
+			if (inputs !== this.inputs || runs !== this.runStarts || this.inRun || gen !== this.doorGen || !this.active()) // that prompt or run reads its own start
+				return void this.ledger({ type: "idle_door", taken: false, reason: "a prompt, a run or /zip came while the door read its clock" });
 			await this.compactReady(ctx, undefined, s, "idle");
 			this.ledger({ type: "idle_door", taken: !!s.nat, pWarm: Math.round(s.clk.pWarm * 1000) / 1000, gapS: s.clk.gapS === null ? null : Math.round(s.clk.gapS), ...(s.nat ? {} : { reason: s.note?.native ?? null }) });
 			if (s.nat) this.idleNat = { nat: s.nat, note: { ...s.note, native: "idle" }, head: headOf(this.branch(ctx)), model: s.model };
