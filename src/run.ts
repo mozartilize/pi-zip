@@ -587,6 +587,7 @@ export class Zip implements ZipControl {
 	shutdown() {
 		this.cancelTimer();
 		this.cancelDoor();
+		this.ranHere = false; // a door reading its clock now never arms again
 		// a call still running is lost with the process: aborted, recorded as one unused call at the input it is billed for (a restarted
 		// process decides without it, as without any summary in flight); finished summaries are in the session already, or written now
 		this.discardBg("shutdown");
@@ -871,7 +872,6 @@ export class Zip implements ZipControl {
 		const ask = { compaction: compaction as Any | null, answered: false, askedAt: 0, askedWall: 0, until: Infinity };
 		this.cancelTimer(); // no producer call starts while Pi compacts (input arms the timer again)
 		this.nativeAsk = ask;
-		const runs0 = this.runStarts;
 		const deadline = nativeDeadlineMs(), t0 = performance.now();
 		const res = await new Promise<{ ok: boolean; err?: string; late?: boolean }>((resolve) => {
 			let settled = false;
@@ -881,15 +881,14 @@ export class Zip implements ZipControl {
 				clearTimeout(timer);
 				resolve(r);
 			};
-			const timer = setTimeout(() => {
-				// the idle door's compaction, once a run is announced (Pi does not hold an extension's message back), goes in first however
-				// long it takes: that run waits on it (drivenStart), and ctx.abort() would end the run as well
-				if (door === "idle" && this.runStarts !== runs0) return;
+			// the idle door has no deadline (nobody waits on it): it never aborts, and a run that starts meanwhile (Pi does not hold an
+			// extension's message back) waits for it (drivenStart); what is typed meanwhile Pi queues, as for any compaction
+			const timer = door === "idle" ? undefined : setTimeout(() => {
 				if (!ask.answered) ask.compaction = null; // asked after this, pi-zip cancels: never Pi's own summary on pi-zip's behalf
 				ask.until = Date.now() + 60_000;
 				finish({ ok: false, late: true });
 			}, deadline);
-			timer.unref?.();
+			timer?.unref?.();
 			const done = (r: { ok: boolean; err?: string }) => {
 				if (this.nativeAsk === ask) this.nativeAsk = null; // pi-zip's compaction is over: nothing is answered for it any more
 				finish(r);
@@ -905,8 +904,7 @@ export class Zip implements ZipControl {
 		const added = this.branch(ctx).filter((en: Any) => en?.type === "compaction" && !known.has(en?.id));
 		const last = added[added.length - 1] ?? null;
 		const entry = last && last.summary === cut.text ? last : null;
-		// still pending at the deadline: cancel it now, before the run starts (Pi checks its abort signal right before it appends; no run was
-		// announced at the deadline, and only microtasks ran since)
+		// still pending at the deadline: cancel it now, before the run starts (Pi checks its abort signal right before it appends)
 		if (res.late && !last) attempt(() => ctx.abort?.(), undefined);
 		// "another handler at work" is measured over the time other handlers can occupy: before ours (askMs) and, for handlers after ours, from
 		// our answer to the entry's own append (appendCompaction stamps it). Pi's work after the append (the refresh of its context, the

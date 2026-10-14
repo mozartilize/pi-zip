@@ -118,13 +118,19 @@ const mutants = [
 		name: "idle-door-run-does-not-wait",
 		pattern: "holds the door's compaction past its deadline",
 		check: "the idle door never aborts a run", // without the wait the deadline aborts it (and the run would start without the compaction)
-		edit: (source: string) => rep(source, "if (door === \"idle\" && this.runStarts !== runs0) return;", ""),
+		edit: (source: string) => rep(source, "const timer = door === \"idle\" ? undefined : setTimeout(", "const timer = setTimeout("),
 	},
 	{
 		name: "idle-door-lost-on-re-arm",
 		pattern: "a door armed again while it reads its clock",
 		check: "the door asks again after a re-arm during its read",
 		edit: (source: string) => rep(source, "if (again) this.armDoor(ctx, true);", ""),
+	},
+	{
+		name: "idle-door-after-shutdown",
+		pattern: "a shutdown while the door reads its clock",
+		check: "no idle door after shutdown",
+		edit: (source: string) => rep(source, "this.ranHere = false; // a door reading its clock now never arms again", ""),
 	},
 	{
 		name: "idle-door-before-any-run",

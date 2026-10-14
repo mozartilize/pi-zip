@@ -213,7 +213,9 @@ in rc030 are other candidate-set effects (TRIAGE.md).
   reading the prompt (an error after the provider read it is not modelled), an abort is one it read; two models; the narrative
   model answers instantly with as many words as summary.ts asks for (summary *content* quality is not checked, only what A1
   requires of it); Pi's compaction uses `keepRecentTokens` 20,000 and a fixed summary text; another extension's edit always prunes
-  the oldest visible output; the cache warmer's refresh is a 1-token request that re-sends the newest prefix.
+  the oldest visible output; the cache warmer's refresh is a 1-token request that re-sends the newest prefix. The idle door
+  (0.4.6, on by default) is switched off in the bridge: its compaction while Pi is idle is outside EN's two doors, and it is
+  checked by the integration suite (its own describe and mutants) and by the `idle` and `race` paths of the real-TUI doors run.
 * **WL's bounds.** The observer checks decision points and reuse of finished calls; NA separately supplies an independent oracle
   for taking a ready summary at the native door. An independent oracle for every possible production cut is not built.
 * **Taken from the code, not derived.** A2 reads g (the growth per request in the law's read term) from the planner's own trace:
@@ -357,7 +359,8 @@ provider, isolated settings and session storage under `formal/out`, and no netwo
 history starts no call, while a completed run prepares its next return in the background and persists the finished summary.
 
 Step 6 checks run `bash formal/tui/r7-doors.sh` under the machine lease. The real TUI and local fake provider exercise a typed
-prompt, a driven run and a mid-run boundary. Each checks the displayed “Compacted from” against the appended compaction and
+prompt, a driven run, a mid-run boundary, the idle door, and a run an extension starts while another handler holds the idle
+door's compaction past the typed door's deadline. Each checks the displayed “Compacted from” against the appended compaction and
 pi-zip's recorded before size. Histories, settings, cache and captured output stay isolated under `formal/out`.
 
 Step 7 drops Q2 and checks the shipped plain-law policy with `formal/simulator/r7_q2.py`. Run separate `b1` and `b2` processes,

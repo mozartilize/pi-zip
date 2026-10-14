@@ -1849,6 +1849,19 @@ for (const order of ORDERS) describe(`the idle door: a ready summary goes in whi
 		expect(r.compactCalls.n, "the door asks again after a re-arm during its read").toBe(1);
 	});
 
+	test("a shutdown while the door reads its clock (/new, /resume) never compacts the session being left", async () => {
+		const { r } = await coldRig({}, (r: Any) => {
+			const read = r.zip.readStart.bind(r.zip);
+			let once = false;
+			r.zip.readStart = async (ctx: Any, viaPrompt: boolean) => {
+				if (!viaPrompt && !once) (once = true), r.zip.shutdown(), await sleep(30);
+				return read(ctx, viaPrompt);
+			};
+		});
+		await sleep(300);
+		expect(r.compactCalls.n, "no idle door after shutdown").toBe(0);
+	});
+
 	test("a session only opened: a summary the producer writes after the open never goes in while idle", async () => {
 		const r = await rig(undefined, { file: shiftedFile(0, 9000), tui: true, native: true, idle: true, start: false });
 		await sleep(2_600); // the producer's timer (armed at open) writes the summary; the TTL (1 s) passes
