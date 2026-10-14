@@ -9,7 +9,8 @@
   for and how it is priced.
 - A failed narrative still makes a summary, as in 0.3.1: the deterministic sections, with the previous narrative carried and marked
   as possibly stale. 0.4.0 and 0.4.1 dropped it and called again at every trigger, so a narrative that kept failing kept the session
-  from ever compacting. A reply cut at the cap is no longer retried as an identical call.
+  from ever compacting. A reply cut at the cap is no longer retried as an identical call. The fallback is final for its cut, as in
+  0.3.1: a transient error (overload, network, or a reply slower than the 240 s limit) no longer gets a new call at a later trigger.
 - `/zip` shows how many narrative calls failed in this session and why the newest did. A call that threw records its error.
 - New checks: integration tests with a provider that cuts a long reply at the cap, three mutants that reintroduce this bug, and a
   release check with a real model on a real session (`formal/live/narrative.sh`). The mutant runner now fails when a mutation site is

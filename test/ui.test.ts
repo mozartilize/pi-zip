@@ -57,6 +57,9 @@ describe("status card", () => {
 		const l = renderCard(c, 200, tag);
 		expect(l.filter((x) => x.includes("<warning>59 narrative calls failed"))).toHaveLength(1);
 		for (const w of [10, 30, 60, 120]) expect(fits(renderCard(c, w, tag), w, plainW)).toBe(true);
+		const raw = cardText({ ...card, failed: 2, failedWhy: "07:10 overloaded:\n\t\x1b[31mretry\x1b[0m later\r\n" });
+		expect(raw).toContain("errors   2 narrative calls failed \u00b7 last 07:10 overloaded: retry later");
+		expect(raw.join("\n")).not.toMatch(/\x1b|\r|\t|overloaded:\n/);
 	});
 	test("nothing learned yet: one line, no empty chart, the declared lifetime and what makes a chart appear; narrow keeps the fact whole", () => {
 		const c: CardData = { ...card, life: "~5 min" };

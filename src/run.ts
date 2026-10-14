@@ -1003,8 +1003,8 @@ export class Zip implements ZipControl {
 	 * cut is summarised while the turn waits (Pi would stop for its own, lossy compaction otherwise). A call running for that very cut
 	 * is awaited (Esc ends the wait, not the call); any other call is ended first, so there is never a second one in flight. A call
 	 * made here is a pi-zip/summary entry and in the session totals at once, like a background one, so a summary the commit then
-	 * refuses is neither lost nor missing from the totals. null: the call threw or was cancelled (a failed narrative still yields its
-	 * fallback summary).
+	 * refuses is neither lost nor missing from the totals. null: the call threw or pi-zip cancelled it (a narrative that failed, timed out or was
+	 * aborted by the provider still yields its fallback summary).
 	 */
 	private async roomWait(c: PlanResult, ctx: Any): Promise<{ cut: Cut; ms: number } | null> {
 		this.cancelTimer(); // the room owns the slot; invalidate queued ordinary replacements before awaiting cancellation
@@ -1571,7 +1571,7 @@ export class Zip implements ZipControl {
 		const hhmm = ts && !Number.isNaN(ts.getTime()) ? `${String(ts.getHours()).padStart(2, "0")}:${String(ts.getMinutes()).padStart(2, "0")}  ` : "";
 		const last = t.last ? `${hhmm}${t.last.data.desc}${t.last.data.why ? " · " + t.last.data.why : ""}` : undefined;
 		const fts = t.failedLast?.timestamp ? new Date(t.failedLast.timestamp) : null;
-		const failedWhy = t.failedLast ? `${fts && !Number.isNaN(fts.getTime()) ? `${String(fts.getHours()).padStart(2, "0")}:${String(fts.getMinutes()).padStart(2, "0")} ` : ""}${String(t.failedLast.data?.cut?.llmError ?? t.failedLast.data?.error ?? "unknown")}` : undefined;
+		const failedWhy = t.failedLast ? `${fts && !Number.isNaN(fts.getTime()) ? `${String(fts.getHours()).padStart(2, "0")}:${String(fts.getMinutes()).padStart(2, "0")} ` : ""}${String(t.failedLast.data?.cut?.llmError ?? t.failedLast.data?.error ?? "reason not recorded")}` : undefined; // 0.4.0/0.4.1 did not record it
 		const file = this.recallMode === "file" && !!this.fileRecall(ctx);
 		const state = this.off ? "off" : this.conflict ? "paused" : this.recallMode === "tool" || file ? "on" : "reread-only"; // file recall is a full mode
 		const rereadWhy = this.recallMode === "file" ? "a tool allowlist hides zip_recall · no session file, so no recall copies" : "a tool allowlist hides zip_recall · only re-readable outputs fold";
