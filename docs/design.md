@@ -404,7 +404,7 @@ No cell of 4 price/cache regimes × 8 session strata has a cost-ratio confidence
   (RPC refuses such a prompt), and only after a run of the process: opening old history never compacts it. It keeps the typed
   door's deadline, so a slow foreign handler's own summary call is cancelled, but only while no run is announced: Pi's abort
   would end such a run as well, so a run pi-zip has seen start waits for the compaction instead (a run Pi has begun whose
-  announcement an earlier extension's handler still delays at the deadline is the one left exposed). It costs nothing extra,
-  so it has no setting; `PI_ZIP_IDLE_DOOR=0` is an emergency off switch.
+  announcement an earlier extension's handler still delays at the deadline is the one left exposed). pi-zip makes no extra
+  call for it, so it has no setting; `PI_ZIP_IDLE_DOOR=0` is an emergency off switch.
 - **Offline is not live.** The model's behaviour after a fold comes from a calibrated simulator, and the cells to watch live are
   one-hour-cache main sessions.

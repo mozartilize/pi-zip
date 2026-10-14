@@ -1826,7 +1826,7 @@ for (const order of ORDERS) describe(`the idle door: a ready summary goes in whi
 				});
 				expect(driving).not.toBeNull();
 				await driving;
-				expect(r.abortsInRun.n, "the idle door never aborts a run").toBe(0);
+				expect(r.abortsInRun.n, "the idle door never aborts an announced run").toBe(0);
 				expect(r.compactions.length).toBe(1);
 				const req = await r.request();
 				expect(req.find((m: Any) => m.role === "compactionSummary")?.summary, "the run waits for the door's compaction").toBe(r.compactions[0].summary);

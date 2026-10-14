@@ -906,8 +906,8 @@ export class Zip implements ZipControl {
 		const added = this.branch(ctx).filter((en: Any) => en?.type === "compaction" && !known.has(en?.id));
 		const last = added[added.length - 1] ?? null;
 		const entry = last && last.summary === cut.text ? last : null;
-		// still pending at the deadline: cancel it now, before the run starts (Pi checks its abort signal right before it appends; no run was
-		// announced to pi-zip at the deadline, and only microtasks ran since)
+		// still pending at the deadline: cancel it now, before the run starts (Pi checks its abort signal right before it appends; at the idle
+		// door, no run was announced to pi-zip at the deadline, and only microtasks ran since)
 		if (res.late && !last) attempt(() => ctx.abort?.(), undefined);
 		// "another handler at work" is measured over the time other handlers can occupy: before ours (askMs) and, for handlers after ours, from
 		// our answer to the entry's own append (appendCompaction stamps it). Pi's work after the append (the refresh of its context, the
