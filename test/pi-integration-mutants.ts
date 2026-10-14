@@ -117,7 +117,7 @@ const mutants = [
 	{
 		name: "idle-door-run-does-not-wait",
 		pattern: "holds the door's compaction past its deadline",
-		check: "the idle door never aborts a run", // without the wait the deadline aborts it (and the run would start without the compaction)
+		check: "the idle door never aborts an announced run", // without the wait the deadline aborts it (and the run would start without the compaction)
 		edit: (source: string) => rep(source, "if (door === \"idle\" && this.runStarts !== runs0) return;", ""),
 	},
 	{

@@ -10,8 +10,8 @@
   usually no longer paid and was never applied. The idle door asks the typed-prompt door's decision, unchanged, while Pi is idle:
   when a summary finishes and then at each moment the return's P(warm) changes. A summary it takes goes in through Pi's
   compaction, and the next run, whoever starts it, carries it from its first request. On the recorded sessions of 10-12 to
-  10-14 it would have applied 30 summaries those runs wrote around, about 1 % of their spend at list prices. It costs nothing
-  extra (it applies a summary already written, only once the return's own decision takes it), so it is on, with no setting;
+  10-14 it would have applied 30 summaries those runs wrote around, about 1 % of their spend at list prices. pi-zip makes no
+  extra call for it (it applies a summary already written, only once the return's own decision takes it), so it is on, with no setting;
   `PI_ZIP_IDLE_DOOR=0` is an emergency off switch. It opens only after a run of the process (opening a session compacts
   nothing). A slow foreign `session_before_compact` handler is cancelled after the typed door's deadline (2 s), as there, so
   its own summary call is not left to run; text typed in those 2 s comes back to the editor, as at the typed door. Once
