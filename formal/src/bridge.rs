@@ -55,6 +55,9 @@ impl Pool {
             Some(o) => cmd.env("PZF_PLAN_OPTS", o),
             None => cmd.env_remove("PZF_PLAN_OPTS"),
         };
+        // the idle door is off here: the spec's doors are the typed prompt and the first turn_end (the idle door is checked by the
+        // integration suite and the real-TUI doors run)
+        cmd.env("PI_ZIP_IDLE_DOOR", "0");
         for v in ["PI_ZIP_TTL_SECS", "PI_ZIP_COLD_CAP", "PI_ZIP_FOLD_MIN", "PI_ZIP_KEEP_LINES", "PI_ZIP_MIN_GAIN", "PI_ZIP_INTURN_AGE", "PI_ZIP_OFF", "PI_CACHE_RETENTION", "PI_ZIP_LEDGER"] {
             cmd.env_remove(v);
         }
