@@ -11,21 +11,24 @@ mkdir -p "$OUT"
 R=$(mktemp -d "$OUT/tui-doors-XXXXXX")
 S="pz-doors-$$"
 trap 'tmux kill-session -t "$S" 2>/dev/null || true' EXIT
-for path in typed driven midrun idle; do
+for path in typed driven midrun idle race; do
   D="$R/$path"
   mkdir -p "$D/agent" "$D/work"
   export PI_CODING_AGENT_DIR="$D/agent" PI_ZIP_CACHE_STATS="$D/stats.json" XDG_CACHE_HOME="$D/cache"
   export FAKE_LOG="$D/requests.jsonl" PI_ZIP_LEDGER="$D/ledger.jsonl" DOOR_LOG="$D/doors.jsonl"
-  # idle: a typed run, a summary that finishes after it (1.5 s), the idle door (opt-in) once the 3 s TTL has passed, then /drive
-  IDLE=0 TTL=300 DELAY=50
-  if [[ "$path" == idle ]]; then IDLE=1 TTL=3 DELAY=1500; fi
-  export FAKE_EXPLICIT=1 FAKE_SUMMARY_DELAY_MS=$DELAY PI_ZIP_TTL_SECS=$TTL PI_ZIP_IDLE_DOOR=$IDLE
+  # every path runs the shipped default (the idle door on); idle: a typed run, a summary that finishes after it (1.5 s), the idle door
+  # once the 3 s TTL has passed, then /drive
+  # race: the same door, but an extension's message starts a run while another handler holds the door's compaction 3 s (past its deadline)
+  TTL=300 DELAY=50 RACE=0
+  if [[ "$path" == idle || "$path" == race ]]; then TTL=3 DELAY=1500; fi
+  if [[ "$path" == race ]]; then RACE=3000; fi
+  export FAKE_EXPLICIT=1 FAKE_SUMMARY_DELAY_MS=$DELAY PI_ZIP_TTL_SECS=$TTL
   printf '{"compaction":{"enabled":false},"lastChangelogVersion":"%s","quietStartup":true}\n' "$PI_VERSION" > "$D/agent/settings.json"
   ready=ready
-  if [[ "$path" == midrun || "$path" == idle ]]; then ready=unready; fi
+  if [[ "$path" == midrun || "$path" == idle || "$path" == race ]]; then ready=unready; fi
   (cd "$D/work" && bun "$ROOT/formal/tui/r7-doors.ts" fixture "$D/session.jsonl" "$ready")
   P=("$PI_BIN" --no-extensions -e "$ROOT/formal/tui/fakeprov.ts" -e "$ROOT/src/index.ts" -e "$ROOT/formal/tui/r7-doors.ts" --provider fake --model m --session "$D/session.jsonl")
-  printf -v CMD '%q ' env "PATH=$PATH" "PI_CODING_AGENT_DIR=$PI_CODING_AGENT_DIR" "PI_ZIP_CACHE_STATS=$PI_ZIP_CACHE_STATS" "XDG_CACHE_HOME=$XDG_CACHE_HOME" "FAKE_LOG=$FAKE_LOG" "PI_ZIP_LEDGER=$PI_ZIP_LEDGER" "DOOR_LOG=$DOOR_LOG" "FAKE_EXPLICIT=1" "FAKE_SUMMARY_DELAY_MS=$DELAY" "PI_ZIP_TTL_SECS=$TTL" "PI_ZIP_IDLE_DOOR=$IDLE" "${P[@]}"
+  printf -v CMD '%q ' env "PATH=$PATH" "PI_CODING_AGENT_DIR=$PI_CODING_AGENT_DIR" "PI_ZIP_CACHE_STATS=$PI_ZIP_CACHE_STATS" "XDG_CACHE_HOME=$XDG_CACHE_HOME" "FAKE_LOG=$FAKE_LOG" "PI_ZIP_LEDGER=$PI_ZIP_LEDGER" "DOOR_LOG=$DOOR_LOG" "FAKE_EXPLICIT=1" "FAKE_SUMMARY_DELAY_MS=$DELAY" "PI_ZIP_TTL_SECS=$TTL" "DOOR_RACE_MS=$RACE" "${P[@]}"
   (cd "$D/work" && tmux new-session -d -s "$S" -x 150 -y 55 'bash --noprofile --norc')
   tmux send-keys -t "$S" -l "$CMD"
   tmux send-keys -t "$S" Enter
@@ -34,7 +37,7 @@ for path in typed driven midrun idle; do
     typed) text='Continue with a short answer.' ;;
     driven) text='/drive' ;;
     midrun) text='Continue. [[bash:sleep 1]]' ;;
-    idle) text='Continue with a short answer.' ;;
+    idle|race) text='Continue with a short answer.' ;;
   esac
   tmux send-keys -t "$S" -l "$text"
   tmux send-keys -t "$S" Enter
@@ -44,6 +47,8 @@ for path in typed driven midrun idle; do
     tmux send-keys -t "$S" -l '/drive'
     tmux send-keys -t "$S" Enter
     sleep 4
+  elif [[ "$path" == race ]]; then
+    sleep 10
   fi
   tmux capture-pane -t "$S" -p -S -2000 > "$D/tui.txt"
   tmux send-keys -t "$S" -l '/quit'
@@ -62,13 +67,14 @@ summary=next(e for e in rows if e.get('type')=='summary')
 comp=comps[0]
 assert comp['tokensBefore']==summary['tokensBefore'], f'{door}: number differs from before'
 if door=='typed': assert comp['details'].get('via')=='native'
-elif door=='idle':
+elif door in ('idle','race'):
     assert comp['details'].get('via')=='native' and comp['details'].get('door')=='idle', f'idle: {comp["details"]}'
     assert len(comps)==1, 'idle: one compaction'
     assert any(r.get('type')=='idle_door' and r.get('taken') for r in rows), 'idle: no idle_door taken'
     reqs=[json.loads(x) for x in (p/'requests.jsonl').read_text().splitlines()]
     work=[r for r in reqs if not r['summarizer']]
-    assert not work[0]['summary'] and work[-1]['summary'], f'idle: the driven run does not carry the summary {[(r["i"], r["summary"]) for r in work]}'
+    assert len(work)>=2 and not work[0]['summary'] and all(r['summary'] for r in work[1:]), f'{door}: the driven run does not carry the summary from its first request {[(r["i"], r["summary"]) for r in work]}'
+    assert not any(e.get('message',{}).get('stopReason')=='aborted' for e in entries), f'{door}: a run was aborted'
     drafts=[json.loads(x)['drafts'] for x in (p/'doors.jsonl').read_text().splitlines()]
     assert not any(d and d[0]=='compaction' for d in drafts), 'idle: a turn_end wrote a compaction'
 else:

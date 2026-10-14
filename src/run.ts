@@ -62,8 +62,8 @@ const nativeDeadlineMs = () => envInt("NATIVE_MS", 2_000);
 /** A compaction slower than this (or half the deadline) had another handler at work too: the native path ends for the process, so its
  *  work (a model call, say) is not paid for, and waited for, at every cold return. */
 const NATIVE_SLOW_MS = 250;
-/** The idle door (research pi-tricks §1b variant 4, "ε"): opt-in (PI_ZIP_IDLE_DOOR=1) until replays and a live week show its gain. */
-const idleDoorOn = () => process.env.PI_ZIP_IDLE_DOOR === "1";
+/** The idle door (research pi-tricks §1b variant 4, "\u03b5"): on; PI_ZIP_IDLE_DOOR=0 is an emergency off switch, not a setting. */
+const idleDoorOn = () => process.env.PI_ZIP_IDLE_DOOR !== "0";
 const idleOf = (ctx: Any): boolean => attempt(() => ctx?.isIdle?.() === true, false);
 /** The customInstructions pi-zip passes on its own ctx.compact() (Pi hands them to every session_before_compact handler as
  *  event.customInstructions). A handler that supplies its own summaries for every compaction (a model call, say) should return undefined
@@ -871,7 +871,7 @@ export class Zip implements ZipControl {
 		const ask = { compaction: compaction as Any | null, answered: false, askedAt: 0, askedWall: 0, until: Infinity };
 		this.cancelTimer(); // no producer call starts while Pi compacts (input arms the timer again)
 		this.nativeAsk = ask;
-		const runs0 = this.runStarts; // a run an extension's message starts meanwhile (Pi does not hold it back) is never aborted
+		const runs0 = this.runStarts;
 		const deadline = nativeDeadlineMs(), t0 = performance.now();
 		const res = await new Promise<{ ok: boolean; err?: string; late?: boolean }>((resolve) => {
 			let settled = false;
@@ -882,6 +882,9 @@ export class Zip implements ZipControl {
 				resolve(r);
 			};
 			const timer = setTimeout(() => {
+				// the idle door's compaction, once a run is announced (Pi does not hold an extension's message back), goes in first however
+				// long it takes: that run waits on it (drivenStart), and ctx.abort() would end the run as well
+				if (door === "idle" && this.runStarts !== runs0) return;
 				if (!ask.answered) ask.compaction = null; // asked after this, pi-zip cancels: never Pi's own summary on pi-zip's behalf
 				ask.until = Date.now() + 60_000;
 				finish({ ok: false, late: true });
@@ -902,11 +905,9 @@ export class Zip implements ZipControl {
 		const added = this.branch(ctx).filter((en: Any) => en?.type === "compaction" && !known.has(en?.id));
 		const last = added[added.length - 1] ?? null;
 		const entry = last && last.summary === cut.text ? last : null;
-		// still pending at the deadline: cancel it now, before the run starts (Pi checks its abort signal right before it appends); the idle
-		// door never aborts a run announced meanwhile (inRun is set only after the door: a late ask is cancelled all the same)
-		if (res.late && !last && !(door === "idle" && this.runStarts !== runs0)) {
-			attempt(() => ctx.abort?.(), undefined);
-		}
+		// still pending at the deadline: cancel it now, before the run starts (Pi checks its abort signal right before it appends; no run was
+		// announced at the deadline, and only microtasks ran since)
+		if (res.late && !last) attempt(() => ctx.abort?.(), undefined);
 		// "another handler at work" is measured over the time other handlers can occupy: before ours (askMs) and, for handlers after ours, from
 		// our answer to the entry's own append (appendCompaction stamps it). Pi's work after the append (the refresh of its context, the
 		// projection and token estimate, session_compact, compaction_end and the chat rebuild) grows with the branch and is nobody's handler:
@@ -998,11 +999,14 @@ export class Zip implements ZipControl {
 		if (this.start || this.startKind) return void (this.ledger({ type: "idle_door", taken: false, reason: "a prompt's start is pending" }), this.armDoor(ctx, false));
 		const inputs = this.inputs, runs = this.runStarts, gen = this.doorGen;
 		this.inputBusy = true; // the typed door and the idle door never overlap
+		let again = false; // only the door was armed again meanwhile (a summary finished): it asks once this evaluation ends
 		try {
 			this.liveCtx = ctx;
 			const s = await this.readStart(ctx, false);
-			if (inputs !== this.inputs || runs !== this.runStarts || this.inRun || gen !== this.doorGen || !this.active()) // that prompt or run reads its own start
-				return void this.ledger({ type: "idle_door", taken: false, reason: "a prompt, a run or /zip came while the door read its clock" });
+			if (inputs !== this.inputs || runs !== this.runStarts || this.inRun || gen !== this.doorGen || !this.active()) { // that prompt or run reads its own start
+				again = inputs === this.inputs && runs === this.runStarts && !this.inRun;
+				return void this.ledger({ type: "idle_door", taken: false, reason: "a prompt, a run, /zip or a new summary came while the door read its clock" });
+			}
 			await this.compactReady(ctx, undefined, s, "idle");
 			this.ledger({ type: "idle_door", taken: !!s.nat, pWarm: Math.round(s.clk.pWarm * 1000) / 1000, gapS: s.clk.gapS === null ? null : Math.round(s.clk.gapS), ...(s.nat ? {} : { reason: s.note?.native ?? null }) });
 			if (s.nat) this.idleNat = { nat: s.nat, note: { ...s.note, native: "idle" }, head: headOf(this.branch(ctx)), model: s.model };
@@ -1011,6 +1015,7 @@ export class Zip implements ZipControl {
 			this.ledger({ type: "error", where: "idle_door", error: errText(err) });
 		} finally {
 			this.inputBusy = false;
+			if (again) this.armDoor(ctx, true);
 		}
 	}
 
