@@ -13,7 +13,7 @@ import { handleFor, PH_MARK, RECALL_TOOL } from "./placeholder.ts";
 import { branchOutputs, recalledHandlesFromBranch, resolveHandlesInBranch } from "./recall.ts";
 import { cleanupRecall, commandNamesRecall, fileRecallFor, materialize, parseRecallPath, recallRoot, recallRootShown, rewriteCommand, sidDir, type FileRecall } from "./recallfile.ts";
 import { buildCut } from "./summary.ts";
-import { type Any, COMMIT_CUSTOM, envInt, PRODUCT, textOf, tok4, tokensOf } from "./util.ts";
+import { type Any, attempt, COMMIT_CUSTOM, envInt, PRODUCT, textOf, tok4, tokensOf } from "./util.ts";
 import { pendingSummary, replayGrowth } from "./state.ts";
 import { fmtLife, type CardData, type ChartBin, type StateWord } from "./ui.ts";
 
@@ -62,6 +62,9 @@ const nativeDeadlineMs = () => envInt("NATIVE_MS", 2_000);
 /** A compaction slower than this (or half the deadline) had another handler at work too: the native path ends for the process, so its
  *  work (a model call, say) is not paid for, and waited for, at every cold return. */
 const NATIVE_SLOW_MS = 250;
+/** The idle door (research pi-tricks §1b variant 4, "ε"): opt-in (PI_ZIP_IDLE_DOOR=1) until replays and a live week show its gain. */
+const idleDoorOn = () => process.env.PI_ZIP_IDLE_DOOR === "1";
+const idleOf = (ctx: Any): boolean => attempt(() => ctx?.isIdle?.() === true, false);
 /** The customInstructions pi-zip passes on its own ctx.compact() (Pi hands them to every session_before_compact handler as
  *  event.customInstructions). A handler that supplies its own summaries for every compaction (a model call, say) should return undefined
  *  when event.customInstructions starts with this: pi-zip answers this one itself, and its summary is already written. pi-zip answers or
@@ -144,6 +147,13 @@ export class Zip implements ZipControl {
 	private foreignRun = false;
 	// the native summary already went in; its joint decision supplies the first request's folds and notice sizes
 	private nativeRun: NativeRun | null = null;
+	// the idle door (armDoor): its timer, the evaluation in flight, the inputs seen, and the decision the next run carries (any run)
+	private doorTimer: ReturnType<typeof setTimeout> | null = null;
+	private doorGen = 0;
+	private door: Promise<void> | null = null;
+	private inputs = 0;
+	private idleNat: { nat: NativeRun; note: Start["note"]; head: string; model: string } | null = null;
+	private readyAtStart = new Set<string>(); // summaries ready when the run began: one taken at its turn_end was ready while the user was away
 	// the cache tier (PI_CACHE_RETENTION) of the current model's requests: the payload of its newest request when seen, else the
 	// provider-scoped env resolved once per run (research pi-tricks §3.1); null = nothing known, the process env decides (cache.ts)
 	private retention: { key: string; tier: "short" | "long"; src: "env" | "provider env" | "payload" } | null = null;
@@ -242,11 +252,7 @@ export class Zip implements ZipControl {
 			return undefined;
 		}
 		if (memo && n >= 0 && memo.n === n) return undefined;
-		let branch: Any[] = [];
-		try {
-			branch = sm?.getBranch?.() ?? [];
-		} catch {}
-		for (const e of branch) {
+		for (const e of attempt((): Any[] => sm?.getBranch?.() ?? [], [])) {
 			const m = e?.type === "message" ? e.message : null;
 			if (m?.role === "user" && Number(m.timestamp) > reqTs) {
 				this.realMemo.set(reqTs, { real: undefined }); // a later prompt came first: no response can be this plan's any more
@@ -313,17 +319,11 @@ export class Zip implements ZipControl {
 		this.stats.notices++;
 		this.ledger({ type: "notice", text });
 		if (keep && ctx?.mode === "tui" && this.entryRenderer) {
-			setTimeout(() => { // after Pi has appended this turn's edits
-				try {
-					this.pi.appendEntry(NOTICE_CUSTOM, keep);
-				} catch {}
-			}, 0);
+			setTimeout(() => attempt(() => this.pi.appendEntry(NOTICE_CUSTOM, keep), undefined), 0); // after Pi has appended this turn's edits
 			return;
 		}
 		if (ctx?.ui?.notify && (ctx.mode === "tui" || ctx.mode === "rpc")) {
-			try {
-				ctx.ui.notify(text, "info");
-			} catch {}
+			attempt(() => ctx.ui.notify(text, "info"), undefined);
 		}
 	}
 
@@ -350,15 +350,8 @@ export class Zip implements ZipControl {
 
 	/** The system prompt and the declared tools from Pi's API: only used when the transcript records no system message (plan.ts calibrate). */
 	private sysInfo(ctx: Any): SysInfo {
-		let text = "", tools: Any[] = [];
-		try {
-			text = ctx?.getSystemPrompt?.() ?? "";
-		} catch {}
-		try {
-			const active = new Set(this.pi.getActiveTools?.() ?? []);
-			tools = (this.pi.getAllTools?.() ?? []).filter((t: Any) => active.has(t?.name));
-		} catch {}
-		return { text, tools };
+		const active = attempt(() => new Set(this.pi.getActiveTools?.() ?? []), new Set());
+		return { text: attempt((): string => ctx?.getSystemPrompt?.() ?? "", ""), tools: attempt((): Any[] => (this.pi.getAllTools?.() ?? []).filter((t: Any) => active.has(t?.name)), []) };
 	}
 
 	/** The cache tier of `model`'s requests, when known (see `retention`). */
@@ -481,6 +474,8 @@ export class Zip implements ZipControl {
 		this.liveCtx = ctx;
 		this.start = null; // a decision carried for a run of the session before is never handed to a run of this one
 		this.startKind = null;
+		this.cancelDoor(); // the idle door opens only after a run of this session (opening old history never compacts it)
+		this.idleNat = null;
 		const branch = this.branch(ctx);
 		for (let i = branch.length - 1; i >= 0; i--) {
 			const en = branch[i];
@@ -497,10 +492,7 @@ export class Zip implements ZipControl {
 		this.restoreState(branch);
 		this.nextEdit = pendingSummary(branch) ? this.scaleOf(ctx).O : null;
 		this.detectConflict(ctx);
-		let recallFilesRemoved = 0;
-		try {
-			recallFilesRemoved = cleanupRecall(); // recall copies older than 14 days (they can be written again from the session)
-		} catch {}
+		const recallFilesRemoved = attempt(cleanupRecall, 0); // recall copies older than 14 days (they can be written again from the session)
 		this.ledger({ type: "session_start", off: this.off, quiet: this.quiet, conflict: this.conflict, ...(recallFilesRemoved ? { recallFilesRemoved } : {}) });
 	}
 
@@ -592,6 +584,7 @@ export class Zip implements ZipControl {
 
 	shutdown() {
 		this.cancelTimer();
+		this.cancelDoor();
 		// a call still running is lost with the process: aborted, recorded as one unused call at the input it is billed for (a restarted
 		// process decides without it, as without any summary in flight); finished summaries are in the session already, or written now
 		this.discardBg("shutdown");
@@ -618,6 +611,8 @@ export class Zip implements ZipControl {
 	 *  streaming) belongs to the run in progress. */
 	async input(e: Any, ctx: Any): Promise<void> {
 		if (e?.streamingBehavior) return;
+		this.inputs++;
+		if (this.door) await this.door; // the idle door at work: it sees this input and stays shut, or its compaction (milliseconds) ends first
 		// Pi emits the same idle input for steer()/followUp() called while idle (RPC, the TUI's queue after a compaction): no field tells it
 		// from a prompt. Two inputs can overlap (that queue sends a prompt and then its rest without waiting): the second gate check could
 		// pass before the first ctx.compact() sets Pi's controller (compact awaits abort() first). The later one is skipped and changes nothing.
@@ -631,12 +626,8 @@ export class Zip implements ZipControl {
 	}
 
 	private async idleInput(e: Any, ctx: Any): Promise<void> {
-		let idle = false;
-		try {
-			idle = ctx?.isIdle?.() === true;
-		} catch {}
 		// not idle: Pi refuses this prompt (a run is starting or in progress: what it announced stays as it is), or a Pi that cannot say so
-		if (!idle) return;
+		if (!idleOf(ctx)) return;
 		this.start = null; // a new prompt: what an earlier one decided (it started no run) is dropped
 		this.startKind = null;
 		if (!this.active()) return; // its run (if any) reads its own start
@@ -647,17 +638,7 @@ export class Zip implements ZipControl {
 		const s = await this.readStart(ctx, true);
 		const ready = readyOf(this.branch(ctx), this.mine).length > 0;
 		if (s.clk.cold && this.bg && !ready) s.note = { native: "summary not finished when the prompt came" };
-		if (ready) {
-			const gen = this.timerGen;
-			try {
-				await this.nativeSummary(ctx, e, s);
-			} catch (err) {
-				const a = this.nativeAsk;
-				if (a && !a.answered) a.compaction = null; // a late ask of pi-zip's compaction is cancelled, never left to Pi's own summary
-				this.ledger({ type: "error", where: "native_summary", error: errText(err) });
-			}
-			if (gen !== this.timerGen) this.armProducer(ctx); // the timer stopped for the compaction: armed again, as if no prompt had come
-		}
+		if (ready) await this.compactReady(ctx, e, s, "input");
 		s.head = headOf(this.branch(ctx));
 		if (runs === this.runStarts) this.start = s; // a run that started meanwhile is not this prompt's: it read its own start
 		else this.ledger({ type: "start_dropped", reason: "a run started while the prompt's input was handled", native: !!s.nat });
@@ -691,7 +672,8 @@ export class Zip implements ZipControl {
 	}
 
 	private drivenStart(ctx: Any): Promise<void> {
-		this.starting = this.beginRun(ctx, false)
+		const door = this.door ?? Promise.resolve(); // the idle door's compaction in flight goes in first: the run starts on it
+		this.starting = door.then(() => this.beginRun(ctx, false))
 			.catch((err) => this.ledger({ type: "error", where: "agent_start", error: errText(err) }))
 			.then(() => {
 				this.runUserSeen = 1; // no prompt in this run: a user message that comes later is steering
@@ -736,6 +718,9 @@ export class Zip implements ZipControl {
 		this.liveCtx = ctx;
 		this.inRun = true;
 		this.cancelTimer(); // the user is back: nothing is started behind their back any more
+		this.cancelDoor();
+		const door = this.idleNat;
+		this.idleNat = null;
 		this.model = ctx?.model;
 		this.cold = false;
 		this.turnWhy = ""; // a turn_end's judgement belongs to its run
@@ -761,7 +746,14 @@ export class Zip implements ZipControl {
 			carried = null;
 		}
 		const s = carried ?? (await this.readStart(ctx, viaPrompt));
+		// a summary that went in through the idle door: this run carries its decision, as a typed prompt's run carries its input's
+		if (door && !s.nat) {
+			const moved = door.head !== headOf(branch) ? "the projection" : door.model !== modelKey(ctx.model) ? "the model" : null;
+			if (moved) this.ledger({ type: "start_dropped", reason: `${moved} changed after the idle door`, native: true });
+			else [s.nat, s.note] = [door.nat, door.note];
+		}
 		this.branchLastMs = lastMessageMs(branch);
+		this.readyAtStart = new Set(readyOf(branch, this.mine).map((a) => a.key));
 		if (!this.prevKey) ({ key: this.prevKey, total: this.prevTotal } = lastPrompt(branch)); // fresh process: the session's newest response
 		const { cold, reason, ttl, pWarm: p, src, gapS, pause } = s.clk;
 		this.cold = cold;
@@ -832,17 +824,9 @@ export class Zip implements ZipControl {
 		if (typeof ctx?.abort !== "function") return "no ctx.abort"; // what cancels a compaction another handler holds up
 		// another extension supplies compactions in this session: its session_before_compact handler would run for pi-zip's too
 		if (branch.some(foreignCompaction)) return "another extension's compaction is in this branch";
-		let idle = false;
-		try {
-			idle = ctx.isIdle?.() === true; // compact() aborts whatever runs first: only ever called while Pi is idle (it is at a prompt's input)
-		} catch {}
-		if (!idle) return "not idle";
+		if (!idleOf(ctx)) return "not idle"; // compact() aborts whatever runs first: only ever called while Pi is idle
 		if (branch[branch.length - 1]?.type === "compaction") return "already compacted";
-		let settings: Any;
-		try {
-			settings = this.pi.getSettings?.();
-		} catch {}
-		if (!piCanCompact(pre, keepRecentTokensFor(settings, ctx?.model))) return "nothing to compact";
+		if (!piCanCompact(pre, keepRecentTokensFor(attempt(() => this.pi.getSettings?.(), undefined), ctx?.model))) return "nothing to compact";
 		return null;
 	}
 
@@ -855,7 +839,7 @@ export class Zip implements ZipControl {
 	 * entry is the one that went in, fast, the native path ends for the process (endNative). A compaction not finished by the deadline
 	 * is cancelled first, and a summary prepared for a context another extension's compaction has replaced is never used (its head is gone).
 	 */
-	private async nativeSummary(ctx: Any, e: Any, s: Start): Promise<void> {
+	private async nativeSummary(ctx: Any, e: Any, s: Start, door: "input" | "idle" = "input"): Promise<void> {
 		const branch = this.branch(ctx);
 		const pre = ((ctx.sessionManager.buildSessionProjection() as Any)?.entries ?? []) as Any[];
 		const skip = (reason: string) => {
@@ -879,7 +863,7 @@ export class Zip implements ZipControl {
 		if (gate) return skip(gate);
 		const before = Math.round(p.ctxTokens);
 		const trigger: Cut["trigger"] = cold ? "cold" : "valve"; // the return that adopts it labels it (written early for a warm one, say)
-		const compaction = { summary: cut.text, firstKeptEntryId: cut.firstKeptEntryId, tokensBefore: before, details: { by: PRODUCT, via: "native", trigger }, usage: cut.usage };
+		const compaction = { summary: cut.text, firstKeptEntryId: cut.firstKeptEntryId, tokensBefore: before, details: { by: PRODUCT, via: "native", trigger, ...(door === "idle" ? { door } : {}) }, usage: cut.usage };
 		const known = new Set(branch.map((en: Any) => en?.id));
 		const ask = { compaction: compaction as Any | null, answered: false, askedAt: 0, askedWall: 0, until: Infinity };
 		this.cancelTimer(); // no producer call starts while Pi compacts (input arms the timer again)
@@ -914,11 +898,10 @@ export class Zip implements ZipControl {
 		const added = this.branch(ctx).filter((en: Any) => en?.type === "compaction" && !known.has(en?.id));
 		const last = added[added.length - 1] ?? null;
 		const entry = last && last.summary === cut.text ? last : null;
-		// still pending at the deadline: cancel it now, before the run starts (Pi checks its abort signal right before it appends)
-		if (res.late && !last) {
-			try {
-				ctx.abort?.();
-			} catch {}
+		// still pending at the deadline: cancel it now, before the run starts (Pi checks its abort signal right before it appends); the idle
+		// door never aborts a run an extension's message started meanwhile (a late ask of pi-zip's compaction is cancelled all the same)
+		if (res.late && !last && !(door === "idle" && this.inRun)) {
+			attempt(() => ctx.abort?.(), undefined);
 		}
 		// "another handler at work" is measured over the time other handlers can occupy: before ours (askMs) and, for handlers after ours, from
 		// our answer to the entry's own append (appendCompaction stamps it). Pi's work after the append (the refresh of its context, the
@@ -956,7 +939,86 @@ export class Zip implements ZipControl {
 			st.pressureEdits++;
 			st.pressureRewriteTokens += before;
 		}
-		this.ledger({ type: "summary", via: "native", handlerMs, trigger, source: cold ? "settle" : "valve", count: cut.count, tokensBefore: before, prefixTokens: Math.round(p.scale.c * cut.prefixTokens), summaryTokens: Math.round(p.scale.c * cut.summaryTokens), ms: cut.ms, compactMs: ms, askMs, waitedMs: 0, llmOk: cut.llmOk, llmError: cut.llmError, costUsd: cut.costUsd, ...this.usageOf(cut) });
+		this.ledger({ type: "summary", via: "native", ...(door === "idle" ? { door } : {}), handlerMs, trigger, source: cold ? "settle" : "valve", count: cut.count, tokensBefore: before, prefixTokens: Math.round(p.scale.c * cut.prefixTokens), summaryTokens: Math.round(p.scale.c * cut.summaryTokens), ms: cut.ms, compactMs: ms, askMs, waitedMs: 0, llmOk: cut.llmOk, llmError: cut.llmError, costUsd: cut.costUsd, ...this.usageOf(cut) });
+	}
+
+	private cancelDoor() {
+		this.doorGen++;
+		if (this.doorTimer) clearTimeout(this.doorTimer);
+		this.doorTimer = null;
+	}
+
+	/**
+	 * The idle door ("\u03b5"): a summary ready while Pi is idle goes in through Pi's compaction at the first moment the return's own
+	 * decision (the typed door's, unchanged: decideEdits "native" at the return's P(warm)) takes it: now (`now`: a summary just finished),
+	 * then at each moment that P(warm) changes. The next run, typed or started by an extension's message, carries it from its first
+	 * request (before, an extension's run wrote the whole folded context first). Armed only after a run of this process; TUI only: it
+	 * queues what is typed while Pi compacts, where RPC (sub-agents) refuses the prompt.
+	 */
+	private armDoor(ctx: Any, now: boolean) {
+		this.cancelDoor();
+		if (!idleDoorOn() || ctx?.mode !== "tui" || !this.active() || this.inRun || this.idleNat || this.nativeOff || typeof ctx?.compact !== "function") return;
+		try {
+			const branch = this.branch(ctx), t = Date.now(), at = !readyOf(branch, this.mine).length ? null : now ? t : this.doorNext(ctx, branch, t);
+			if (at === null) return;
+			const gen = this.doorGen;
+			this.doorTimer = setTimeout(() => {
+				this.doorTimer = null;
+				if (gen === this.doorGen && !this.door) this.door = this.idleDoor(ctx).finally(() => { this.door = null; });
+			}, Math.max(0, at - t));
+			this.doorTimer.unref?.();
+		} catch (err) {
+			this.ledger({ type: "error", where: "idle_door_arm", error: errText(err) });
+		}
+	}
+
+	/** The next moment after `nowMs` at which a return's P(warm) differs from a return's now (null: it never changes again). */
+	private doorNext(ctx: Any, branch: Any[], nowMs: number): number | null {
+		const touch = Math.max(this.lastReqMs, lastMessageMs(branch));
+		if (!touch) return null;
+		this.loadEnt(modelKey(ctx.model));
+		const lam = { model: ctx.model, ent: this.ent, tier: this.tier(ctx.model) }, last = { reqMs: this.lastReqMs, modelKey: this.lastModelKey };
+		const c = clock(branch, lam, nowMs, last), tau = c.ttl.ms / 1000;
+		for (const g of [...new Set([...GAP_EDGES, tau])].sort((a, b) => a - b)) {
+			const t = touch + (g + 1) * 1000; // just past the edge: the bins are [edge, next edge), the TTL prior is 1 up to the TTL itself
+			if (t > nowMs && clock(branch, lam, t, last).pWarm !== c.pWarm) return t;
+		}
+		return null;
+	}
+
+	/** One evaluation of the idle door (armDoor), nothing while a run, an input or a compaction is under way: the typed door's gates (not
+	 *  idle: Pi compacting, a run just ending; the next moment decides), its decision and its compaction. */
+	private async idleDoor(ctx: Any): Promise<void> {
+		if (!idleDoorOn() || !this.active() || !ctx?.model || this.inRun || this.inputBusy || this.start || this.startKind || this.nativeAsk || this.idleNat) return;
+		const inputs = this.inputs, runs = this.runStarts;
+		this.inputBusy = true; // the typed door and the idle door never overlap
+		try {
+			this.liveCtx = ctx;
+			const s = await this.readStart(ctx, false);
+			if (inputs !== this.inputs || runs !== this.runStarts || this.inRun) // that prompt or run reads its own start
+				return void this.ledger({ type: "idle_door", taken: false, reason: "a prompt or a run came while the door read its clock" });
+			await this.compactReady(ctx, undefined, s, "idle");
+			this.ledger({ type: "idle_door", taken: !!s.nat, pWarm: Math.round(s.clk.pWarm * 1000) / 1000, gapS: s.clk.gapS === null ? null : Math.round(s.clk.gapS), ...(s.nat ? {} : { reason: s.note?.native ?? null }) });
+			if (s.nat) this.idleNat = { nat: s.nat, note: { ...s.note, native: "idle" }, head: headOf(this.branch(ctx)), model: s.model };
+			else if (!this.inRun) this.armDoor(ctx, false);
+		} catch (err) {
+			this.ledger({ type: "error", where: "idle_door", error: errText(err) });
+		} finally {
+			this.inputBusy = false;
+		}
+	}
+
+	/** A door's compaction (nativeSummary); the producer's timer, stopped for it, armed again unless a run started meanwhile. */
+	private async compactReady(ctx: Any, e: Any, s: Start, door: "input" | "idle") {
+		const gen = this.timerGen;
+		try {
+			await this.nativeSummary(ctx, e, s, door);
+		} catch (err) {
+			const a = this.nativeAsk as Zip["nativeAsk"]; // set again inside nativeSummary
+			if (a && !a.answered) a.compaction = null; // a late ask of pi-zip's compaction is cancelled, never left to Pi's own summary
+			this.ledger({ type: "error", where: "native_summary", ...(door === "idle" ? { door } : {}), error: errText(err) });
+		}
+		if (gen !== this.timerGen && !this.inRun) this.armProducer(ctx);
 	}
 
 	private cancelTimer() {
@@ -986,9 +1048,7 @@ export class Zip implements ZipControl {
 		else this.write(a);
 	}
 	private write(a: Artifact) {
-		try {
-			this.pi.appendEntry(SUMMARY_CUSTOM, a);
-		} catch {}
+		attempt(() => this.pi.appendEntry(SUMMARY_CUSTOM, a), undefined);
 	}
 	private writeUnwritten() {
 		for (const a of this.unwritten.splice(0)) this.write(a);
@@ -1081,15 +1141,11 @@ export class Zip implements ZipControl {
 	/** While the user waits for a summary, Pi's working line says what for. */
 	private async working<T>(ctx: Any, text: string, p: Promise<T>): Promise<T> {
 		const ui = ctx?.mode === "tui" ? ctx?.ui : null;
-		try {
-			ui?.setWorkingMessage?.(text);
-		} catch {}
+		attempt(() => ui?.setWorkingMessage?.(text), undefined);
 		try {
 			return await p;
 		} finally {
-			try {
-				ui?.setWorkingMessage?.(undefined);
-			} catch {}
+			attempt(() => ui?.setWorkingMessage?.(undefined), undefined);
 		}
 	}
 
@@ -1151,6 +1207,7 @@ export class Zip implements ZipControl {
 		this.inRun = false;
 		const recs = this.drafts();
 		this.want("settle", ctx, undefined, e.context.contextEntries);
+		this.armDoor(ctx, false); // a summary ready now was priced by this run's last turn_end at this P(warm): the next change decides
 		return recs.length ? { entries: [...e.entries, ...recs] } : undefined;
 	}
 
@@ -1217,6 +1274,7 @@ export class Zip implements ZipControl {
 			this.lastReqMs = Date.now();
 		}
 		this.want("timer", ctx);
+		if (e?.action === "warm") this.armDoor(ctx, false); // the touch moved the door's moments
 		return undefined;
 	}
 
@@ -1254,6 +1312,7 @@ export class Zip implements ZipControl {
 				if (bg.aborted || !c) return null;
 				this.completed(c, model, head, key, estUsd, p.scale.c * c.prefixTokens);
 				this.ledger({ type: "away_summary", key, ms: c.ms, llmOk: c.llmOk, ...(c.llmOk ? {} : { llmError: c.llmError }), costUsd: c.costUsd, ...this.usageOf(c) });
+				if (!this.inRun) this.armDoor(this.liveCtx ?? ctx, true); // finished while Pi is idle: the door asks now (a run's settle asks otherwise)
 				return c;
 			})
 			.catch((err) => {
@@ -1338,11 +1397,11 @@ export class Zip implements ZipControl {
 			if (d.o.trace?.length) this.lawLedger("turn_end", d.o);
 		}
 		const rentNext = d.p && pIn >= 0.5 ? this.rent : d.rentNext;
-		let p = d.kind === "plan" ? d.p : null, cut: Cut | null = null, ready = false, waitMs = 0;
+		let p = d.kind === "plan" ? d.p : null, cut: Cut | null = null, ready = false, waitMs = 0, away = false;
 		if (p && p.cutIdx !== null) {
 			const art = readyOf(branch, this.mine).find((a) => a.key === p!.firstKeptEntryId);
 			if (art?.cut) {
-				[cut, ready] = [{ ...art.cut, trigger: "valve", prepared: true }, true];
+				[cut, ready, away] = [{ ...art.cut, trigger: "valve", prepared: true }, true, this.readyAtStart.has(art.key)];
 				this.ledger({ type: "take", where: "turn_end", key: p.firstKeptEntryId });
 			}
 		}
@@ -1353,7 +1412,7 @@ export class Zip implements ZipControl {
 			if (got) [p, cut, waitMs, ready] = [d.room, got.cut, got.ms, false];
 		}
 		if (cut) this.discardBg("replaced");
-		const plan = p ? { ...valvePlanOf(p, cut, ready, waitMs, performance.now() - t0),
+		const plan = p ? { ...valvePlanOf(p, cut, ready, waitMs, performance.now() - t0), ...(ready && away ? { ready: "away" as const } : {}),
 			...(runPlan ? { source: runPlan.source, sent: runPlan.sent, carriedIds: runPlan.applied, native: runPlan.native, noticed: runPlan.noticed, noticeTs: runPlan.noticeTs } : {}) } : runPlan;
 		const out = plan ? this.commit(e, ctx, plan, o) : undefined;
 		this.rent = out ? 0 : rentNext; // a selected warm edit resets paid rent only after the commit validates it
@@ -1537,9 +1596,7 @@ export class Zip implements ZipControl {
 
 	// ---- /zip --------------------------------------------------------------------------------------------------
 	private persistState() {
-		try {
-			this.pi.appendEntry(STATE_CUSTOM, { off: this.off, quiet: this.quiet });
-		} catch {}
+		attempt(() => this.pi.appendEntry(STATE_CUSTOM, { off: this.off, quiet: this.quiet }), undefined);
 	}
 	/** What this session carries: folds and summaries persisted in its file (they survive restarts) and the recalls in its branch. */
 	private totals(ctx: Any) {
@@ -1626,7 +1683,7 @@ export class Zip implements ZipControl {
 	statsLine = (ctx?: Any) => `${PRODUCT} ${this.sessionTotals(ctx)} (tokens on the provider's scale, calibrated from this session's usage)`;
 	setOff(off: boolean): string {
 		this.off = off;
-		if (off) { this.runPlan = null; this.runEdits = false; this.cancelTimer(); this.discardBg("off"); }
+		if (off) { this.runPlan = null; this.runEdits = false; this.cancelTimer(); this.cancelDoor(); this.discardBg("off"); }
 		this.persistState();
 		return off ? `${PRODUCT}: off. Nothing is folded or summarised and requests are left untouched; earlier folds stay recallable (/zip on to resume)` : `${PRODUCT}: on`;
 	}

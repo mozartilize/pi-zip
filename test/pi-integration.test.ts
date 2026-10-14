@@ -332,7 +332,7 @@ const assertIntegrationChecks = () => {
 	}
 };
 const saved: Record<string, string | undefined> = {};
-const ENV = { PI_ZIP_COLD_CAP: "3000", PI_ZIP_TTL_SECS: "300" };
+const ENV = { PI_ZIP_COLD_CAP: "3000", PI_ZIP_TTL_SECS: "300", PI_ZIP_IDLE_DOOR: "1" };
 beforeEach(() => { for (const [k, v] of Object.entries(ENV)) { saved[k] = process.env[k]; process.env[k] = v; } });
 afterEach(() => {
 	try { assertIntegrationChecks(); }
@@ -1444,7 +1444,8 @@ for (const order of ORDERS) describe(`item 5: a run an extension's message start
 		expect(req.some((m) => m.role === "custom")).toBe(true); // the message that started the run is kept
 	});
 
-	test("a driven run defers its ready summary to the first turn_end and never calls ctx.compact()", async () => {
+	test("with the idle door off, a driven run defers its ready summary to the first turn_end and never calls ctx.compact()", async () => {
+		process.env.PI_ZIP_IDLE_DOOR = "0";
 		const r = await rig(undefined, { file: template(240 * 60_000), tui: true, native: true, idle: true, start: false });
 		await r.settle(); // the end of a run asks the shared producer about the next return
 		await sleep(150);
@@ -1463,6 +1464,7 @@ for (const order of ORDERS) describe(`item 5: a run an extension's message start
 		const notice = r.sm.getBranch().find((e: Any) => e.customType === "pi-zip/notice" && !e.data?.kind) as Any;
 		expect(comp.tokensBefore).toBe(before);
 		expect(notice.data.before).toBe(before);
+		expect(notice.data.desc).toMatch(/ready while you were away$/); // ready before the run began (0.4.5 said "written while you worked")
 		expect((await r.request()).some((m) => m.role === "compactionSummary")).toBe(true);
 	});
 
@@ -1532,7 +1534,8 @@ for (const order of ORDERS) describe(`item 5: a run an extension's message start
 // before_agent_start on: 0.4.0's door there stayed closed, and the first request carried the whole old history).
 for (const order of ORDERS) describe(`the typed-prompt door opens at Pi's input event (Pi ${order} order)`, () => {
 	const sleep = (ms: number) => new Promise((res) => setTimeout(res, ms));
-	beforeEach(() => { process.env.PI_ZIP_TTL_SECS = "1"; rigOrder = order; });
+	// the typed door alone: the idle door would take the ready summary before the prompt comes (its own describe below)
+	beforeEach(() => { process.env.PI_ZIP_TTL_SECS = "1"; process.env.PI_ZIP_IDLE_DOOR = "0"; rigOrder = order; });
 	afterEach(() => { rigOrder = PI_ORDER; });
 	/** A cold session whose return summary is ready (the producer wrote it while the user was away). */
 	const readyRig = async (o: Partial<RigOpts> = {}) => {
@@ -1681,6 +1684,187 @@ for (const order of ORDERS) describe(`the typed-prompt door opens at Pi's input 
 	});
 });
 
+// 0.4.6: the idle door ("epsilon", research pi-tricks §1b variant 4). A run an extension's message starts has no idle input: before, its
+// ready summary waited for the first turn_end, so a cold return wrote the whole folded context and, a turn later, the summarized one
+// (demo 10-14 13:32: 230K, then 44K more). Now the summary goes in through Pi's compaction while Pi is idle, at the first moment the
+// return's own decision takes it, and the next run, whoever starts it, carries that decision from its first request.
+for (const order of ORDERS) describe(`the idle door: a ready summary goes in while Pi is idle, for any next run (Pi ${order} order)`, () => {
+	const sleep = (ms: number) => new Promise((res) => setTimeout(res, ms));
+	beforeEach(() => { process.env.PI_ZIP_TTL_SECS = "1"; rigOrder = order; });
+	afterEach(() => { rigOrder = PI_ORDER; });
+	const ledgerOf = (r: Any) => {
+		const out: Any[] = [];
+		const ledger = r.zip.ledger;
+		r.zip.ledger = (rec: Any) => (out.push(rec), ledger(rec));
+		return out;
+	};
+	const noticeOf = (r: Any) => (r.sm.getBranch().filter((e: Any) => e.type === "custom" && e.customType === "pi-zip/notice" && !e.data?.kind).at(-1) as Any)?.data;
+	/** A cold session (its newest response hours old) whose run just ended: the producer writes the return's summary while Pi is idle. */
+	const coldRig = async (o: Partial<RigOpts> = {}, before?: (r: Any) => void) => {
+		const r = await rig(undefined, { file: shiftedFile(240 * 60_000, 9000), tui: true, native: true, idle: true, start: false, ...o });
+		const led = ledgerOf(r);
+		before?.(r);
+		await r.settle();
+		await sleep(150);
+		expect(r.narrativeCalls.length).toBe(1);
+		return { r, led };
+	};
+
+	test("a summary finished while Pi is idle and the cache is cold goes in at once; an extension's run carries it from its first request and no turn_end writes it again", async () => {
+		const { r, led } = await coldRig();
+		expect(r.compactCalls.n).toBe(1); // old code: none; the driven run's first request carried the whole folded history
+		expect(r.compactions[0].details).toMatchObject({ by: "pi-zip", via: "native", trigger: "cold", door: "idle" });
+		expect(led).toContainEqual(expect.objectContaining({ type: "idle_door", taken: true, pWarm: 0 }));
+		const carried = r.zip.idleNat;
+		expect(carried?.nat.before).toBe(r.compactions[0].tokensBefore);
+		await r.drive();
+		const req = await r.request();
+		expect(r.compactCalls.n).toBe(1);
+		expect(req.find((m: Any) => m.role === "compactionSummary")?.summary).toBe(r.compactions[0].summary);
+		expect(r.zip.runPlan?.native?.text, "the next run carries the idle door's decision").toBe(r.compactions[0].summary);
+		expect(r.zip.runPlan.ctxBefore).toBe(r.compactions[0].tokensBefore);
+		expect(r.zip.runPlan.folds.map((t: Any) => t.entryId)).toEqual(carried.nat.p.folds.map((t: Any) => t.entryId));
+		expect(r.zip.idleNat).toBeNull(); // taken once
+		const notice = noticeOf(r);
+		expect([notice.before, notice.native]).toEqual([r.compactions[0].tokensBefore, "idle"]); // Pi's "Compacted from N" is the notice's before
+		expect(notice.why).toMatch(/^cache cold · away/);
+		const response = asst([call("driven")], "toolUse");
+		const id = r.sm.appendMessage(response);
+		r.sm.appendMessage(result("driven", "short output"));
+		const drafts = await r.turnEnd(id, response);
+		expect(drafts.some((d: Any) => d.type === "compaction")).toBe(false);
+		expect(r.sm.getBranch().filter((e: Any) => e.type === "compaction")).toHaveLength(1);
+	});
+
+	test("a typed prompt after the idle door finds nothing left to compact: its run carries the idle door's decision", async () => {
+		const { r } = await coldRig();
+		expect(r.compactCalls.n).toBe(1);
+		await r.prompt("Continue with the task.");
+		expect(r.compactCalls.n).toBe(1);
+		sendPrompt(r.sm, "Continue with the task.");
+		const req = await r.request();
+		expect(req.find((m: Any) => m.role === "compactionSummary")?.summary).toBe(r.compactions[0].summary);
+		expect(r.zip.runPlan.native.text).toBe(r.compactions[0].summary);
+		expect(noticeOf(r).native).toBe("idle");
+	});
+
+	test("opening a session whose summary is ready arms no idle door: old history is never compacted by just being open", async () => {
+		process.env.PI_ZIP_IDLE_DOOR = "0";
+		const { r } = await coldRig();
+		expect(r.compactCalls.n).toBe(0);
+		process.env.PI_ZIP_IDLE_DOOR = "1";
+		const opened = await rig(undefined, { file: [r.sm.getHeader() as Any, ...r.sm.getEntries()], tui: true, native: true, idle: true, start: false });
+		await sleep(1_300); // past the TTL: a door armed at session start would have opened by now
+		expect(opened.compactCalls.n, "opening a session compacts nothing").toBe(0);
+		expect(opened.zip.doorTimer).toBeNull();
+		await opened.shutdown();
+	});
+
+	test("without the TUI (RPC: a sub-agent) no idle door: Pi refuses a prompt sent while it compacts, the TUI queues it", async () => {
+		const r = await rig(undefined, { file: shiftedFile(240 * 60_000, 9000), tui: false, native: true, idle: true, start: false });
+		await r.settle();
+		await sleep(150);
+		expect(r.narrativeCalls.length).toBe(1);
+		expect(r.compactCalls.n, "no idle door without the TUI").toBe(0);
+	});
+
+	test("with the idle door off nothing goes in while idle (PI_ZIP_IDLE_DOOR=0)", async () => {
+		process.env.PI_ZIP_IDLE_DOOR = "0";
+		const { r } = await coldRig();
+		await sleep(1_300);
+		expect(r.compactCalls.n).toBe(0);
+	});
+
+	test("a prompt whose input comes while the door reads its clock: the door stays shut and the prompt's own door takes the summary", async () => {
+		const { r, led } = await coldRig({}, (r: Any) => {
+			const read = r.zip.readStart.bind(r.zip);
+			let once = false;
+			r.zip.readStart = async (ctx: Any, viaPrompt: boolean) => {
+				const s = await read(ctx, viaPrompt);
+				if (!viaPrompt && !once) { once = true; void r.prompt("Continue with the task."); await sleep(20); } // the rig emits input 5 ms in
+				return s;
+			};
+		});
+		await sleep(50);
+		expect(r.compactions.map((c: Any) => c.details.door ?? "input"), "an input during the door's clock read keeps the door shut").toEqual(["input"]);
+		expect(led).toContainEqual(expect.objectContaining({ type: "idle_door", taken: false, reason: "a prompt or a run came while the door read its clock" }));
+		expect(r.compactCalls.n).toBe(1);
+		expect(r.compactions[0].details.door).toBeUndefined(); // the typed door's
+		expect(r.zip.idleNat).toBeNull();
+	});
+
+	test("a run an extension's message starts while the door's compaction is in flight starts on the compacted session and carries it", async () => {
+		let driving: Promise<Any> | null = null;
+		const { r } = await coldRig({}, (r: Any) => {
+			const native = r.zip.nativeSummary.bind(r.zip);
+			r.zip.nativeSummary = (...a: Any[]) => {
+				const p = native(...a);
+				if (a[3] === "idle") driving = r.drive();
+				return p;
+			};
+		});
+		expect(driving).not.toBeNull();
+		await driving;
+		const req = await r.request();
+		expect(r.compactCalls.n).toBe(1);
+		expect(req.find((m: Any) => m.role === "compactionSummary")?.summary).toBe(r.compactions[0].summary);
+		expect(r.zip.runPlan.native.text).toBe(r.compactions[0].summary);
+	});
+
+	test("another compaction after the idle door (Pi's own, say) voids its decision: the next run reads its own start", async () => {
+		const { r, led } = await coldRig();
+		r.sm.appendCompaction("Pi's own summary.", r.compactions[0].firstKeptEntryId, 50_000, undefined, false);
+		await r.drive();
+		await r.request();
+		expect(led).toContainEqual(expect.objectContaining({ type: "start_dropped", reason: "the projection changed after the idle door", native: true }));
+		expect(r.zip.runPlan?.native).toBeUndefined();
+	});
+
+	test("a door that declines asks again only at the return's next P(warm) change (here the TTL, 1 s past the newest touch), not before", async () => {
+		const asked: number[] = [];
+		const { r, led } = await coldRig({ file: shiftedFile(0, 9000) }, (r: Any) => {
+			const native = r.zip.nativeSummary.bind(r.zip);
+			r.zip.nativeSummary = async (...a: Any[]) => {
+				if (a[3] !== "idle") return native(...a);
+				asked.push(Date.now());
+				if (asked.length === 1) return; // the decision declines at this moment (s.nat stays unset)
+				return native(...a);
+			};
+		});
+		const doors = () => led.filter((x: Any) => x.type === "idle_door");
+		expect(doors()).toEqual([expect.objectContaining({ taken: false, pWarm: 1 })]);
+		const touch = Math.max(r.zip.lastReqMs, ...r.sm.getBranch().map((e: Any) => e.message?.timestamp ?? 0));
+		expect(r.zip.doorNext(r.zip.liveCtx, r.sm.getBranch(), Date.now())).toBe(touch + 2_000); // just past the TTL edge
+		await sleep(touch + 1_900 - Date.now());
+		expect(asked.length, "the door asks only when P(warm) changes").toBe(1); // nothing in between
+		await sleep(touch + 2_300 - Date.now());
+		expect(asked.length).toBe(2);
+		expect(asked[1]).toBeGreaterThanOrEqual(touch + 2_000);
+		expect(doors().at(-1)).toMatchObject({ taken: true, pWarm: 0 });
+		expect(r.compactCalls.n).toBe(1);
+		expect(r.compactions[0].details).toMatchObject({ door: "idle", trigger: "cold" });
+		expect(r.zip.doorNext(r.zip.liveCtx, r.sm.getBranch(), Date.now())).toBeNull(); // nothing changes after the TTL
+	});
+
+	test("a run that starts before the door's next moment closes it: nothing is compacted behind it, and its own turn_end decides", async () => {
+		const asked: number[] = [];
+		const { r, led } = await coldRig({ file: shiftedFile(0, 9000) }, (r: Any) => {
+			const native = r.zip.nativeSummary.bind(r.zip);
+			r.zip.nativeSummary = async (...a: Any[]) => {
+				if (a[3] === "idle" && (asked.push(Date.now()), asked.length === 1)) return; // declines now
+				return native(...a);
+			};
+		});
+		expect(r.zip.doorTimer).not.toBeNull();
+		await r.drive();
+		expect(r.zip.doorTimer).toBeNull();
+		await sleep(2_300);
+		expect(asked.length).toBe(1);
+		expect(r.compactCalls.n, "nothing is compacted behind a run").toBe(0);
+		expect(led.filter((x: Any) => x.type === "idle_door")).toHaveLength(1);
+	});
+});
+
 describe("the notice's why line says the cache was judged cold, as the warm one says it was warm", () => {
 	test("a cold return: 'cache cold · away ...'", async () => {
 		const r = await rig(undefined, { tui: true }); // every message is hours old
@@ -1719,7 +1903,7 @@ for (const order of ORDERS) describe(`round 5 on real Pi: rule A starts the warm
 		const req = await r.request();
 		return { req, waited: performance.now() - t0 };
 	};
-	beforeEach(() => { process.env.PI_ZIP_TTL_SECS = "300"; });
+	beforeEach(() => { process.env.PI_ZIP_TTL_SECS = "300"; process.env.PI_ZIP_IDLE_DOOR = "0"; }); // the typed door alone (the idle door: below)
 
 	test("a warm restart stays quiet through typing until a decision wants production", async () => {
 		const r = await rig(undefined, { file: template(60_000), tui: true, native: false, idle: false, start: false });

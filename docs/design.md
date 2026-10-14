@@ -110,6 +110,7 @@ on call completion: record pi-zip/summary; a narrative that failed, timed out or
 on shutdown: abort the running call and record one estimated unused charge
 
 doors: idle typed prompt (Pi's input event) → ctx.compact() with the ready answer and Pi's before-size
+       idle, opt-in (PI_ZIP_IDLE_DOOR=1, TUI) → the same decision and compaction while Pi is idle; the next run carries it
        turn_end → compaction draft first, then folds and artifact records
        first request → folds only, persisted at its first turn_end
 ```
@@ -391,5 +392,15 @@ No cell of 4 price/cache regimes × 8 session strata has a cost-ratio confidence
   starts, the run reads its own start instead. If no run follows (another extension handles the input, or Pi refuses the
   model), a summary that went in stays in the session (pi-zip's own, with its exact size before) and nothing else of that
   prompt is kept. All three doors are checked in a real TUI on Pi 1.1.0 and 1.2.0.
+- **The idle door is opt-in (`PI_ZIP_IDLE_DOOR=1`).** A run an extension's message starts (`sendMessage` with `triggerTurn`) has
+  no `input` event, so without it a summary ready for that return waits for the run's first turn_end. By then the first request
+  has rewritten the whole folded context, and at the next turn_end the cache is warm again, so the law usually declines the
+  summary. The idle door asks the typed door's decision, unchanged (decideEdits "native" at the return's P(warm), no prompt yet),
+  while Pi is idle: when a summary finishes, then at each later moment that P(warm) changes (the learned curve's bin edges and
+  the TTL after the newest touch). What it takes, the next run carries from its first request, whoever starts it. Research round
+  5 had dropped this variant (pi-tricks §1b, variant 4) because the simulator only models typed returns, where it equals the
+  typed door. On the recorded sessions of 10-12 to 10-14 it would have applied 30 summaries that cold extension-driven runs
+  wrote around (about 1 % of the spend at list prices). It runs only in the TUI, which queues what is typed while Pi compacts
+  (RPC refuses such a prompt), and only after a run of the process: opening old history never compacts it.
 - **Offline is not live.** The model's behaviour after a fold comes from a calibrated simulator, and the cells to watch live are
   one-hour-cache main sessions.

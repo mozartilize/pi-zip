@@ -145,7 +145,7 @@ describe("I1 byte stability: every request of a run sends the same prefix, and i
 		const projected = flat(project(all, te.entries));
 		expect(projected[0].role).toBe("compactionSummary");
 		expect(norm(projected.slice(1))).toBe(norm(flat(all).slice(8)));
-		expect(r.notes.at(-1)).toMatch(/summarized 2 requests .* written while you worked/); // 0.3.1: written at the return, "waited"
+		expect(r.notes.at(-1)).toMatch(/summarized 2 requests .* ready while you were away/); // 0.3.1: written at the return, "waited"; 0.4.5: "written while you worked" (it was ready before the prompt)
 	});
 
 	test("a summary and folds in one batch: the compaction draft comes first (Pi takes its tokensBefore before any fold makes the usage stale)", async () => {
@@ -606,7 +606,7 @@ describe("never wait: rule A starts early; a summary is used once ready; the one
 		expect(te.entries[0].type).toBe("compaction");
 		expect(st.calls).toBe(1);
 		await sleep(5);
-		expect(noticeOf(r).desc).toMatch(/written while you worked$/);
+		expect(noticeOf(r).desc).toMatch(/ready while you were away$/); // settled before the prompt (0.4.5: "written while you worked")
 	});
 
 	test("settle produces despite b2b in interactive and no-UI sessions", async () => {
