@@ -95,7 +95,7 @@ const mutants = [
 		check: "a narrative refused for its reasoning effort is retried with low effort",
 		edit: (source: string) => rep(source, "if (!low && model.reasoning && EFFORT_REFUSED_RE.test(lastErr) && !signal.aborted) {", "if (false) {"),
 	},
-	// 0.4.6: the idle door (PI_ZIP_IDLE_DOOR=1)
+	// 0.4.6: the idle door (on by default)
 	{
 		name: "idle-door-decision-not-carried",
 		pattern: "the idle door: a ready summary goes in",
@@ -106,25 +106,25 @@ const mutants = [
 		name: "idle-door-without-tui",
 		pattern: "without the TUI",
 		check: "no idle door without the TUI",
-		edit: (source: string) => rep(source, 'if (!idleDoorOn() || ctx?.mode !== "tui" || ', "if (!idleDoorOn() || "),
+		edit: (source: string) => rep(source, 'if (!idleDoorOn() || !this.ranHere || ctx?.mode !== "tui" || ', "if (!idleDoorOn() || !this.ranHere || "),
 	},
 	{
 		name: "idle-door-ignores-input",
 		pattern: "while the door reads its clock",
 		check: "an input during the door's clock read keeps the door shut",
-		edit: (source: string) => rep(source, "if (inputs !== this.inputs || runs !== this.runStarts || this.inRun)", "if (this.inRun)"),
+		edit: (source: string) => rep(source, "if (inputs !== this.inputs || runs !== this.runStarts || this.inRun ||", "if (this.inRun ||"),
 	},
 	{
-		name: "idle-door-armed-at-session-start",
-		pattern: "opening a session whose summary is ready",
-		check: "opening a session compacts nothing",
-		edit: (source: string) => rep(source, "this.cancelDoor(); // the idle door opens only after a run of this session", "this.armDoor(ctx, true); // mutant"),
+		name: "idle-door-run-does-not-wait",
+		pattern: "holds the door's compaction past its deadline",
+		check: "the idle door never aborts a run", // without the wait the deadline aborts it (and the run would start without the compaction)
+		edit: (source: string) => rep(source, "if (door === \"idle\" && this.runStarts !== runs0) return;", ""),
 	},
 	{
-		name: "idle-door-aborts-a-starting-run",
-		pattern: "held up past its deadline",
-		check: "the idle door never aborts a run",
-		edit: (source: string) => rep(source, "!(door === \"idle\" && this.runStarts !== runs0)", "!(door === \"idle\" && this.inRun)"),
+		name: "idle-door-lost-on-re-arm",
+		pattern: "a door armed again while it reads its clock",
+		check: "the door asks again after a re-arm during its read",
+		edit: (source: string) => rep(source, "if (again) this.armDoor(ctx, true);", ""),
 	},
 	{
 		name: "idle-door-before-any-run",

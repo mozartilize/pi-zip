@@ -28,6 +28,16 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("drive", { description: "Exercise the driven door offline", handler: async () => {
 		pi.sendMessage({ customType: "door-drive", content: "Continue with a short answer.", display: true }, { triggerTurn: true });
 	} });
+	// DOOR_RACE_MS: another handler after pi-zip's holds the first compaction that long, and an extension's message starts a run meanwhile
+	let raced = false;
+	pi.on("session_before_compact", async () => {
+		const hold = Number(process.env.DOOR_RACE_MS || 0);
+		if (!hold || raced) return undefined;
+		raced = true;
+		setTimeout(() => pi.sendMessage({ customType: "door-drive", content: "Continue with a short answer.", display: true }, { triggerTurn: true }), 200);
+		await new Promise((r) => setTimeout(r, hold));
+		return undefined;
+	});
 	pi.on("turn_end", async (e: any) => {
 		if (process.env.DOOR_LOG) appendFileSync(process.env.DOOR_LOG, JSON.stringify({ drafts: e.entries.map((d: any) => d.type) }) + "\n");
 	});

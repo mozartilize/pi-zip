@@ -333,7 +333,7 @@ const assertIntegrationChecks = () => {
 	}
 };
 const saved: Record<string, string | undefined> = {};
-const ENV = { PI_ZIP_COLD_CAP: "3000", PI_ZIP_TTL_SECS: "300", PI_ZIP_IDLE_DOOR: "0" }; // the shipped default (the idle door: its own describe)
+const ENV = { PI_ZIP_COLD_CAP: "3000", PI_ZIP_TTL_SECS: "300", PI_ZIP_IDLE_DOOR: "" }; // the shipped default: the idle door on
 beforeEach(() => { for (const [k, v] of Object.entries(ENV)) { saved[k] = process.env[k]; process.env[k] = v; } });
 afterEach(() => {
 	try { assertIntegrationChecks(); }
@@ -1691,7 +1691,7 @@ for (const order of ORDERS) describe(`the typed-prompt door opens at Pi's input 
 // return's own decision takes it, and the next run, whoever starts it, carries that decision from its first request.
 for (const order of ORDERS) describe(`the idle door: a ready summary goes in while Pi is idle, for any next run (Pi ${order} order)`, () => {
 	const sleep = (ms: number) => new Promise((res) => setTimeout(res, ms));
-	beforeEach(() => { process.env.PI_ZIP_TTL_SECS = "1"; process.env.PI_ZIP_IDLE_DOOR = "1"; rigOrder = order; });
+	beforeEach(() => { process.env.PI_ZIP_TTL_SECS = "1"; rigOrder = order; });
 	afterEach(() => { rigOrder = PI_ORDER; });
 	const ledgerOf = (r: Any) => {
 		const out: Any[] = [];
@@ -1754,7 +1754,7 @@ for (const order of ORDERS) describe(`the idle door: a ready summary goes in whi
 		process.env.PI_ZIP_IDLE_DOOR = "0";
 		const { r } = await coldRig();
 		expect(r.compactCalls.n).toBe(0);
-		process.env.PI_ZIP_IDLE_DOOR = "1";
+		process.env.PI_ZIP_IDLE_DOOR = "";
 		const opened = await rig(undefined, { file: [r.sm.getHeader() as Any, ...r.sm.getEntries()], tui: true, native: true, idle: true, start: false });
 		await sleep(1_300); // past the TTL: a door armed at session start would have opened by now
 		expect(opened.compactCalls.n, "opening a session compacts nothing").toBe(0);
@@ -1763,10 +1763,8 @@ for (const order of ORDERS) describe(`the idle door: a ready summary goes in whi
 	});
 
 	test("without the TUI (RPC: a sub-agent) no idle door: Pi refuses a prompt sent while it compacts, the TUI queues it", async () => {
-		const r = await rig(undefined, { file: shiftedFile(240 * 60_000, 9000), tui: false, native: true, idle: true, start: false });
-		await r.settle();
-		await sleep(150);
-		expect(r.narrativeCalls.length).toBe(1);
+		const { r } = await coldRig({ tui: false }); // after a run of this process, as in the TUI
+		await sleep(1_300);
 		expect(r.compactCalls.n, "no idle door without the TUI").toBe(0);
 	});
 
@@ -1789,7 +1787,7 @@ for (const order of ORDERS) describe(`the idle door: a ready summary goes in whi
 		});
 		await sleep(50);
 		expect(r.compactions.map((c: Any) => c.details.door ?? "input"), "an input during the door's clock read keeps the door shut").toEqual(["input"]);
-		expect(led).toContainEqual(expect.objectContaining({ type: "idle_door", taken: false, reason: "a prompt, a run or /zip came while the door read its clock" }));
+		expect(led).toContainEqual(expect.objectContaining({ type: "idle_door", taken: false, reason: "a prompt, a run, /zip or a new summary came while the door read its clock" }));
 		expect(r.compactCalls.n).toBe(1);
 		expect(r.compactions[0].details.door).toBeUndefined(); // the typed door's
 		expect(r.zip.idleNat).toBeNull();
@@ -1813,25 +1811,42 @@ for (const order of ORDERS) describe(`the idle door: a ready summary goes in whi
 		expect(r.zip.runPlan.native.text).toBe(r.compactions[0].summary);
 	});
 
-	test("a run an extension's message starts while the door's compaction is held up past its deadline is never aborted", async () => {
-		process.env.PI_ZIP_NATIVE_MS = "150";
-		try {
-			let driving: Promise<Any> | null = null;
-			const { r } = await coldRig({ foreign: { at: "before", on: async () => { await sleep(400); return undefined; } } }, (r: Any) => {
-				const native = r.zip.nativeSummary.bind(r.zip);
-				r.zip.nativeSummary = (...a: Any[]) => {
-					const p = native(...a);
-					if (a[3] === "idle") setTimeout(() => { driving = r.drive(); }, 20); // Pi starts it: sendCustomMessage does not check isCompacting
-					return p;
-				};
-			});
-			await sleep(600);
-			expect(driving).not.toBeNull();
-			await driving;
-			expect(r.abortsInRun.n, "the idle door never aborts a run").toBe(0);
-		} finally {
-			delete process.env.PI_ZIP_NATIVE_MS;
-		}
+	for (const at of ["before", "after"] as const)
+		test(`a run an extension's message starts while another handler (${at} pi-zip's) holds the door's compaction past its deadline waits for it: never aborted, it starts on the compaction`, async () => {
+			process.env.PI_ZIP_NATIVE_MS = "150";
+			try {
+				let driving: Promise<Any> | null = null;
+				const { r, led } = await coldRig({ foreign: { at, on: async () => { await sleep(400); return undefined; } } }, (r: Any) => {
+					const native = r.zip.nativeSummary.bind(r.zip);
+					r.zip.nativeSummary = (...a: Any[]) => {
+						const p = native(...a);
+						if (a[3] === "idle") setTimeout(() => { driving = r.drive(); }, 20); // Pi starts it: sendCustomMessage does not check isCompacting
+						return p;
+					};
+				});
+				expect(driving).not.toBeNull();
+				await driving;
+				expect(r.abortsInRun.n, "the idle door never aborts a run").toBe(0);
+				expect(r.compactions.length).toBe(1);
+				const req = await r.request();
+				expect(req.find((m: Any) => m.role === "compactionSummary")?.summary, "the run waits for the door's compaction").toBe(r.compactions[0].summary);
+				expect(led.some((x: Any) => x.type === "idle_door" && x.taken)).toBe(true);
+			} finally {
+				delete process.env.PI_ZIP_NATIVE_MS;
+			}
+		});
+
+	test("a door armed again while it reads its clock (a summary finished meanwhile) asks again once that read ends", async () => {
+		const { r, led } = await coldRig({}, (r: Any) => {
+			const read = r.zip.readStart.bind(r.zip);
+			let once = false;
+			r.zip.readStart = async (ctx: Any, viaPrompt: boolean) => {
+				if (!viaPrompt && !once) (once = true), r.zip.armDoor(ctx, true), await sleep(30); // startBg's arm while the read awaits a token refresh
+				return read(ctx, viaPrompt);
+			};
+		});
+		await sleep(300);
+		expect(r.compactCalls.n, "the door asks again after a re-arm during its read").toBe(1);
 	});
 
 	test("a session only opened: a summary the producer writes after the open never goes in while idle", async () => {
