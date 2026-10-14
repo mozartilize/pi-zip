@@ -21,6 +21,11 @@ const PROTECT_USER_TURNS = 2; // the latest user turn and the one before it are 
  *  code carries them forward), plus output of at most the narrative budget. */
 /** The narrative's token budget (chars/4), summary.ts buildCut: clamp(planned - skeleton, 300, NARRATIVE_MAX). */
 export const NARRATIVE_MAX = 4000;
+/** The narrative call's output cap (summary.ts narrative): room above the budget, which is what the prompt asks for and the law
+ *  prices. Real replies overshoot the budget (a merge writes ~1.55x its words, CJK text runs ~2 tokens per chars/4 token, reasoning
+ *  counts against the cap): capped at the budget, every call of a real CJK session hit the cap (0.4.0, 0.4.1). Never above the
+ *  model's own output limit. */
+export const NARRATIVE_CALL_MAX = 16_000;
 const SUMMARY_FLOOR = 1000;
 const SUMMARY_CAP = 8000;
 const SUMMARY_RATIO = 0.1;

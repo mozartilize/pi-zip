@@ -337,7 +337,7 @@ describe("one producer prepares the return with one timer", () => {
 		expect(st.calls).toBe(1);
 	});
 
-	test("a failed background call retains its cost, makes no ready artifact, and the next trigger retries", async () => {
+	test("a failed narrative retains its cost and still makes a ready summary (the fallback): the cut is not called for again", async () => {
 		const st = { calls: 0 };
 		const r = await rig(done, WARM_TS(), { modelRegistry: { complete: async () => { st.calls++; throw new Error("content policy refusal"); } } });
 		const zip = await zipOf(r);
@@ -345,14 +345,14 @@ describe("one producer prepares the return with one timer", () => {
 		await sleep(20);
 		expect(st.calls).toBe(1);
 		expect(zip.bg).toBeNull();
-		expect(zip.mine.at(-1)).toMatchObject({ key: "u3", lost: "failed", estimated: true });
+		expect(zip.mine.at(-1)).toMatchObject({ key: "u3", estimated: true, cut: { llmOk: false, llmError: "content policy refusal" } });
+		expect(zip.mine.at(-1).lost).toBeUndefined();
 		expect(zip.mine.at(-1).usd).toBeGreaterThan(0);
-		expect(zip.ready(r.ctx.sessionManager.getBranch())).toHaveLength(0);
+		expect(zip.ready(r.ctx.sessionManager.getBranch())).toHaveLength(1);
 		r.ctx.modelRegistry.complete = mkComplete(st);
 		await settle(r);
 		await sleep(20);
-		expect(st.calls).toBe(2);
-		expect(zip.mine.at(-1).cut.llmOk).toBe(true);
+		expect(st.calls).toBe(1);
 		expect(zip.stats.summaryUsd).toBeCloseTo(zip.mine.reduce((n: number, a: Any) => n + a.usd, 0), 10);
 		expect(zip.ready(r.ctx.sessionManager.getBranch())).toHaveLength(1);
 	});

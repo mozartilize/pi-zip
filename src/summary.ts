@@ -2,12 +2,13 @@
 // Thinking is never quoted or paraphrased: it is stripped before the model sees the prefix.
 import { randomUUID } from "node:crypto";
 import { blockTime, cdDirOf, clipMid, distinctLines, handleFor, keyTexts, outcomeHint, RECALL_TOOL, shortArgs, strippableCdDirs, whenLabel } from "./placeholder.ts";
-import { type Block, type Cut, type PlanResult, NARRATIVE_MAX, settings, toolCallIndex } from "./plan.ts";
+import { type Block, type Cut, type PlanResult, NARRATIVE_CALL_MAX, NARRATIVE_MAX, settings, toolCallIndex } from "./plan.ts";
 import { type FileRecall, fileRecallHow } from "./recallfile.ts";
 import { type Any, clamp, clip, envInt, fmtWhen, textOf, tok4 } from "./util.ts";
 
 export const SUMMARY_MARK = "[summary of earlier conversation by pi-zip]";
 const POLICY_BLOCK_RE = /violate|terms of service|usage polic|content polic|acceptable use/i;
+const CAP_ERR = "narrative hit the token cap";
 const NARRATIVE_SYSTEM =
 	"You are a context summarization assistant. Read the conversation and write ONLY the requested summary sections. " +
 	"Do NOT continue the conversation, do NOT answer questions in it, do NOT call tools.";
@@ -564,6 +565,7 @@ export async function narrative(prefix: Block[], ctx: Any, budgetTokens: number,
 	const t0 = Date.now();
 	const model = ctx.model;
 	if (!model) return { text: null, ok: false, ms: 0, costUsd: 0, error: "no current model" };
+	const cap = Math.min(NARRATIVE_CALL_MAX, Number(model.maxTokens) > 0 ? Number(model.maxTokens) : NARRATIVE_CALL_MAX);
 	const msgs = prefix
 		.filter((b) => b.kind !== "summary")
 		.map((b) => {
@@ -607,7 +609,7 @@ export async function narrative(prefix: Block[], ctx: Any, budgetTokens: number,
 				const res: Any = await ctx.modelRegistry.complete(
 					model,
 					{ systemPrompt: NARRATIVE_SYSTEM, messages: [{ role: "user", content: [{ type: "text", text: prompt }], timestamp: Date.now() }] },
-					{ maxTokens: NARRATIVE_MAX, signal, cacheRetention: "none", sessionId: randomUUID() },
+					{ maxTokens: cap, signal, cacheRetention: "none", sessionId: randomUUID() },
 				);
 				costUsd += Number(res.usage?.cost?.total) || 0;
 				if (res.usage) {
@@ -618,14 +620,14 @@ export async function narrative(prefix: Block[], ctx: Any, budgetTokens: number,
 				}
 				if (res.stopReason === "aborted" || signal.aborted) return { text: null, ok: false, ms: Date.now() - t0, costUsd, usage, error: "narrative aborted" };
 				if (res.stopReason === "error") throw new Error(res.errorMessage || "provider error");
-				if (res.stopReason === "length") throw new Error("narrative hit the token cap");
+				if (res.stopReason === "length") throw new Error(CAP_ERR);
 				if ((res.content ?? []).some((c: Any) => c.type === "toolCall")) throw new Error("summariser attempted a tool call");
 				const text = textOf(res.content).trim();
 				if (!text) throw new Error("empty narrative");
 				return { text, ok: true, ms: Date.now() - t0, costUsd, usage };
 			} catch (err) {
 				lastErr = err instanceof Error ? err.message : String(err);
-				if (POLICY_BLOCK_RE.test(lastErr) || signal.aborted) break; // an identical retry fails the same way
+				if (POLICY_BLOCK_RE.test(lastErr) || lastErr === CAP_ERR || signal.aborted) break; // an identical retry fails the same way
 			}
 		}
 	} catch (err) {

@@ -1003,7 +1003,8 @@ export class Zip implements ZipControl {
 	 * cut is summarised while the turn waits (Pi would stop for its own, lossy compaction otherwise). A call running for that very cut
 	 * is awaited (Esc ends the wait, not the call); any other call is ended first, so there is never a second one in flight. A call
 	 * made here is a pi-zip/summary entry and in the session totals at once, like a background one, so a summary the commit then
-	 * refuses is neither lost nor missing from the totals. null: the call failed or was cancelled.
+	 * refuses is neither lost nor missing from the totals. null: the call threw or was cancelled (a failed narrative still yields its
+	 * fallback summary).
 	 */
 	private async roomWait(c: PlanResult, ctx: Any): Promise<{ cut: Cut; ms: number } | null> {
 		this.cancelTimer(); // the room owns the slot; invalidate queued ordinary replacements before awaiting cancellation
@@ -1198,13 +1199,15 @@ export class Zip implements ZipControl {
 		return undefined;
 	}
 
-	/** Each completed call teaches its starting model and books its artifact once, whether it ran at the room or in the background. */
+	/** Each completed call teaches its starting model and books its artifact once, whether it ran at the room or in the background.
+	 *  A failed narrative still yields a summary (the deterministic sections, the previous narrative carried and marked possibly stale):
+	 *  dropping it left a session whose every narrative failed (a cap below the reply, 0.4.0/0.4.1) without any summary, retrying forever. */
 	private completed(c: Cut, model: string, head: string, key: string, estimated = 0, prefixReal = c.prefixTokens) {
 		const learned = record(model, { explicit: false, total: 0, call: { ms: c.ms, tokens: Math.max(1, prefixReal) } });
 		if (this.entKey === model) this.ent = learned;
 		const usd = c.llmOk || c.costUsd > 0 ? c.costUsd : estimated;
 		this.stats.summaryUsd += usd;
-		this.record({ head, key, ...(c.llmOk ? { cut: c } : { lost: "failed", estimated: c.costUsd === 0 }), usd });
+		this.record({ head, key, cut: c, usd, ...(c.llmOk || c.costUsd > 0 ? {} : { estimated: true }) });
 	}
 
 	/** Write the summary for `p` in the background (its own abort signal: nothing is running, so the run's would be stale). Nothing
@@ -1229,15 +1232,15 @@ export class Zip implements ZipControl {
 			.then((c) => {
 				if (bg.aborted || !c) return null;
 				this.completed(c, model, head, key, estUsd, p.scale.c * c.prefixTokens);
-				if (!c.llmOk) return null;
-				this.ledger({ type: "away_summary", key, ms: c.ms, llmOk: c.llmOk, costUsd: c.costUsd, ...this.usageOf(c) });
+				this.ledger({ type: "away_summary", key, ms: c.ms, llmOk: c.llmOk, ...(c.llmOk ? {} : { llmError: c.llmError }), costUsd: c.costUsd, ...this.usageOf(c) });
 				return c;
 			})
 			.catch((err) => {
 				if (!bg.aborted) {
 					this.stats.summaryUsd += estUsd;
-					this.record({ head, key, usd: estUsd, estimated: true, lost: "failed" });
-					this.ledger({ type: "error", where: "away_summary", error: err instanceof Error ? err.message : String(err) });
+					const error = err instanceof Error ? err.message : String(err);
+					this.record({ head, key, usd: estUsd, estimated: true, lost: "failed", error });
+					this.ledger({ type: "error", where: "away_summary", error });
 				}
 				return null;
 			})
@@ -1510,8 +1513,8 @@ export class Zip implements ZipControl {
 	private totals(ctx: Any) {
 		const branch = ctx ? this.branch(ctx) : [];
 		const byId = new Map(branch.map((e: Any) => [e?.id, e]));
-		let folds = 0, summaries = 0, recalls = 0, usd = 0, key = "";
-		let last: Any = null;
+		let folds = 0, summaries = 0, recalls = 0, usd = 0, key = "", failed = 0;
+		let last: Any = null, failedLast: Any = null;
 		const fileRecalls = new Set<string>(); // tool call ids of built-in reads of recall files (file recall): unzips too
 		const byModel = new Map<string, number>(); // chars/4 folded, by the model of the newest response before the fold (the one that planned it)
 		for (const e of branch) {
@@ -1526,6 +1529,7 @@ export class Zip implements ZipControl {
 				summaries++;
 				usd += Number(e.usage?.cost?.total) || 0;
 			} else if (e?.type === "custom" && e.customType === LEGACY_UNUSED_CUSTOM) usd += Number(e.data?.usd) || 0;
+			else if (e?.type === "custom" && e.customType === SUMMARY_CUSTOM && (e.data?.cut ? e.data.cut.llmOk === false : e.data?.lost === "failed")) [failed, failedLast] = [failed + 1, e];
 			else if (e?.type === "custom" && e.customType === NOTICE_CUSTOM && e.data?.v === 2 && !e.data?.kind) last = e;
 			else if (e?.type === "message" && e.message?.role === "toolResult" && (e.message?.toolName === RECALL_TOOL || fileRecalls.has(e.message?.toolCallId))) recalls++;
 		}
@@ -1536,7 +1540,7 @@ export class Zip implements ZipControl {
 			for (const [k, v] of byModel) folded += v * (byModel.size > 1 && k ? this.scaleAt(ctx, entries, k) : this.scaleOf(ctx)).c;
 		}
 		usd += unusedOf(branch).usd; // background summaries no compaction used, and calls lost or ended before they wrote one
-		return { folds, folded, summaries, recalls, usd, last };
+		return { folds, folded, summaries, recalls, usd, last, failed, failedLast };
 	}
 	/** What this session carries: folds and summaries persisted in its file (they survive restarts) and the recalls in its branch. */
 	private sessionTotals(ctx: Any): string {
@@ -1566,12 +1570,15 @@ export class Zip implements ZipControl {
 		const ts = t.last?.timestamp ? new Date(t.last.timestamp) : null;
 		const hhmm = ts && !Number.isNaN(ts.getTime()) ? `${String(ts.getHours()).padStart(2, "0")}:${String(ts.getMinutes()).padStart(2, "0")}  ` : "";
 		const last = t.last ? `${hhmm}${t.last.data.desc}${t.last.data.why ? " · " + t.last.data.why : ""}` : undefined;
+		const fts = t.failedLast?.timestamp ? new Date(t.failedLast.timestamp) : null;
+		const failedWhy = t.failedLast ? `${fts && !Number.isNaN(fts.getTime()) ? `${String(fts.getHours()).padStart(2, "0")}:${String(fts.getMinutes()).padStart(2, "0")} ` : ""}${String(t.failedLast.data?.cut?.llmError ?? t.failedLast.data?.error ?? "unknown")}` : undefined;
 		const file = this.recallMode === "file" && !!this.fileRecall(ctx);
 		const state = this.off ? "off" : this.conflict ? "paused" : this.recallMode === "tool" || file ? "on" : "reread-only"; // file recall is a full mode
 		const rereadWhy = this.recallMode === "file" ? "a tool allowlist hides zip_recall · no session file, so no recall copies" : "a tool allowlist hides zip_recall · only re-readable outputs fold";
 		return {
 			state, stateNote: state === "paused" ? `${this.conflict} also manages context` : state === "off" ? "/zip on to resume" : state === "reread-only" ? rereadWhy : undefined,
 			model: key || undefined, life, ...(bins.length ? { bins, s1, s2, usually } : {}), folds: t.folds, foldedTokens: fmtK(t.folded), summaries: t.summaries, summaryUsd: t.usd, recalls: t.recalls, last, quiet: this.quiet,
+			...(t.failed ? { failed: t.failed, failedWhy } : {}),
 			...(file ? { unzip: `from files in ${recallRootShown()} (a tool allowlist hides zip_recall)` } : {}),
 		};
 	}

@@ -70,6 +70,8 @@ export interface CardData {
 	last?: string; // "10:50  folded 12 old outputs · cache cold (away 47 min)"
 	quiet: boolean;
 	unzip?: string; // how the model gets folded outputs back, when it is not zip_recall (file recall under a tool allowlist)
+	failed?: number; // summary calls of this session whose narrative failed (each still a summary: the fallback)
+	failedWhy?: string; // "07:10 narrative hit the token cap": when and why the newest one failed
 }
 
 /** "~5 min", "~1 h", "~2.5 h" */
@@ -182,6 +184,7 @@ export function cardText(c: CardData): string[] {
 	const n = (x: number, one: string, many = one + "s") => `${x} ${x === 1 ? one : many}`;
 	rows.push(["session", `${c.folds} zipped ~${c.foldedTokens}  ·  ${n(c.summaries, "summary", "summaries")}${c.summaryUsd > 0 ? ` $${c.summaryUsd.toFixed(2)}` : ""}  ·  ${n(c.recalls, "unzip")}`]);
 	if (c.last) rows.push(["last", c.last]);
+	if (c.failed) rows.push(["errors", `${n(c.failed, "narrative call")} failed${c.failedWhy ? ` · last ${c.failedWhy}` : ""}`]);
 	if (c.unzip) rows.push(["unzip", c.unzip]);
 	if (c.quiet) rows.push(["notices", "off  (/zip quiet turns them back on)"]); // the default says nothing, so it is not shown
 	return rows.map(([k, v]) => `${k.padEnd(LABEL_W)}${v}`);
@@ -253,7 +256,7 @@ export function renderCard(c: CardData, width: number, th: Th, m: Measure = plai
 		const line = m.cut(indent + r, width);
 		if (!line) continue;
 		const k = line.slice(0, indent.length + LABEL_W), v = line.slice(indent.length + LABEL_W);
-		out.push(th.fg("dim", k) + (r.startsWith("session") ? th.fg("text", v) : th.fg("dim", v)));
+		out.push(th.fg("dim", k) + (r.startsWith("session") ? th.fg("text", v) : r.startsWith("errors") ? th.fg("warning", v) : th.fg("dim", v)));
 	}
 	return out;
 }

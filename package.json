@@ -1,6 +1,6 @@
 {
   "name": "pi-zip",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "description": "Keeps long Pi sessions cheap without losing anything: folds older output when the savings pay for the rewrite, prepares summaries in the background, and recalls originals byte for byte. Zero config.",
   "type": "module",
   "license": "MIT",
@@ -32,7 +32,8 @@
   },
   "scripts": {
     "test": "bun test",
-    "build-check": "bun build src/index.ts --target=node --external '@earendil-works/*' --outfile /dev/null"
+    "build-check": "bun build src/index.ts --target=node --external '@earendil-works/*' --outfile /dev/null",
+    "mutants": "bun test/pi-integration-mutants.ts"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*"

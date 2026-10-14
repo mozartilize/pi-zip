@@ -49,6 +49,15 @@ describe("status card", () => {
 		expect(l.filter((x) => x.includes("<text>"))).toHaveLength(1);
 		expect(renderCard({ ...card, state: "reread-only", stateNote: "a tool allowlist hides zip_recall" }, 200, tag)[0]).toContain("<warning>reread-only</warning>");
 	});
+	test("failed narrative calls get one warning row: how many, when and why the newest failed; none, no row", () => {
+		const c: CardData = { ...card, failed: 59, failedWhy: "07:10 narrative hit the token cap" };
+		expect(cardText(c)).toContain("errors   59 narrative calls failed \u00b7 last 07:10 narrative hit the token cap");
+		expect(cardText({ ...card, failed: 1 })).toContain("errors   1 narrative call failed");
+		expect(cardText(card).some((r) => r.startsWith("errors"))).toBe(false);
+		const l = renderCard(c, 200, tag);
+		expect(l.filter((x) => x.includes("<warning>59 narrative calls failed"))).toHaveLength(1);
+		for (const w of [10, 30, 60, 120]) expect(fits(renderCard(c, w, tag), w, plainW)).toBe(true);
+	});
 	test("nothing learned yet: one line, no empty chart, the declared lifetime and what makes a chart appear; narrow keeps the fact whole", () => {
 		const c: CardData = { ...card, life: "~5 min" };
 		expect(renderCard(c, 120, th).slice(1, 3)).toEqual(["  model    gateway-gpt/gpt-6.1-sol", "  cache    expires after ~5 min idle · a chart appears once you come back after a break"]);

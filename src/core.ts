@@ -13,8 +13,9 @@ export const SUMMARY_CUSTOM = "pi-zip/summary"; // a summary call pi-zip made in
 /** A `pi-zip/summary` entry: the summary written for the cut at entry `key` of the projection whose head is `head` (the id of the
  *  branch's newest compaction, "" before any), and what the call cost. Without `cut`, a call that ended without a summary it could
  *  hand over (aborted when it was replaced or pi-zip was switched off, or still running when the process exited): unused, its cost
- *  `estimated` from the input it is billed for. A summary is READY while its head is the branch's head; using it (a compaction with its
- *  text) or any other compaction moves the head, so it is never taken twice. */
+ *  `estimated` from the input it is billed for, or a call that threw (`error`). A failed narrative is not a lost call: its `cut` is the
+ *  fallback summary (cut.llmOk false, cut.llmError why), READY like any other. A summary is READY while its head is the branch's head;
+ *  using it (a compaction with its text) or any other compaction moves the head, so it is never taken twice. */
 export interface Artifact {
 	head: string;
 	key: string;
@@ -22,6 +23,7 @@ export interface Artifact {
 	usd: number;
 	estimated?: boolean;
 	lost?: string;
+	error?: string;
 }
 
 /** Λ for the model a decision is about: its learned class and survival (learn.ts), the cache tier its requests ask for (when known),

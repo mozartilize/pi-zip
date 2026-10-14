@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.4.2
+
+- Summaries work again on long sessions. 0.4.0 and 0.4.1 capped the narrative call at its 4,000-token budget. A real model writes
+  more than that when it merges a long previous narrative, CJK text needs about twice the tokens of the chars/4 estimate, and
+  reasoning counts against the cap. On one real session every call hit the cap (59 in 3 hours, no compaction) while the context grew
+  from 161K to 437K. The call may now write up to 16,000 tokens or the model's own output limit; the budget still sets what it is asked
+  for and how it is priced.
+- A failed narrative still makes a summary, as in 0.3.1: the deterministic sections, with the previous narrative carried and marked
+  as possibly stale. 0.4.0 and 0.4.1 dropped it and called again at every trigger, so a narrative that kept failing kept the session
+  from ever compacting. A reply cut at the cap is no longer retried as an identical call.
+- `/zip` shows how many narrative calls failed in this session and why the newest did. A call that threw records its error.
+- New checks: integration tests with a provider that cuts a long reply at the cap, three mutants that reintroduce this bug, and a
+  release check with a real model on a real session (`formal/live/narrative.sh`). The mutant runner now fails when a mutation site is
+  missing; one existing mutant had silently stopped testing anything and is fixed.
+
 ## 0.4.1
 
 - The typed-prompt door works again on Pi 1.2.0. A summary that is ready when you type a prompt goes in through Pi's own compaction
