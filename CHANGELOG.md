@@ -13,9 +13,11 @@
   10-14 it would have applied 30 summaries those runs wrote around, about 1 % of their spend at list prices. It costs nothing
   extra (it applies a summary already written, only once the return's own decision takes it), so it is on, with no setting;
   `PI_ZIP_IDLE_DOOR=0` is an emergency off switch. It opens only after a run of the process (opening a session compacts
-  nothing). Nobody waits on it, so it has no deadline and never aborts anything: a run an extension's message starts while its
-  compaction is under way waits for it, however long another handler holds it, and starts on the compaction (checked in a
-  real TUI on Pi 1.1.0 and 1.2.0); what is typed meanwhile Pi queues, as for any compaction.
+  nothing). A slow foreign `session_before_compact` handler is cancelled after the typed door's deadline (2 s), as there, so
+  its own summary call is not left to run; text typed in those 2 s comes back to the editor, as at the typed door. Once
+  pi-zip has seen a run start (an extension's message), that run waits for the compaction instead, however long another
+  handler holds it, and starts on it (checked in a real TUI on Pi 1.1.0 and 1.2.0); that handler's call then runs to its
+  end. A run Pi has begun but whose start an earlier extension's handler still delays at the deadline can be aborted.
 - Small cleanup: host calls that may throw go through one helper.
 
 ## 0.4.5

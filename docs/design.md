@@ -401,9 +401,10 @@ No cell of 4 price/cache regimes × 8 session strata has a cost-ratio confidence
   5 had dropped this variant (pi-tricks §1b, variant 4) because the simulator only models typed returns, where it equals the
   typed door. On the recorded sessions of 10-12 to 10-14 it would have applied 30 summaries that cold extension-driven runs
   wrote around (about 1 % of the spend at list prices). It runs only in the TUI, which queues what is typed while Pi compacts
-  (RPC refuses such a prompt), and only after a run of the process: opening old history never compacts it. Unlike the typed
-  door it has no deadline, since nobody waits on it, so it never aborts: Pi's abort would end a run that started meanwhile as
-  well, and that run waits for the compaction instead. It costs nothing extra, so it has no setting; `PI_ZIP_IDLE_DOOR=0` is an
-  emergency off switch.
+  (RPC refuses such a prompt), and only after a run of the process: opening old history never compacts it. It keeps the typed
+  door's deadline, so a slow foreign handler's own summary call is cancelled, but only while no run is announced: Pi's abort
+  would end such a run as well, so a run pi-zip has seen start waits for the compaction instead (a run Pi has begun whose
+  announcement an earlier extension's handler still delays at the deadline is the one left exposed). It costs nothing extra,
+  so it has no setting; `PI_ZIP_IDLE_DOOR=0` is an emergency off switch.
 - **Offline is not live.** The model's behaviour after a fold comes from a calibrated simulator, and the cells to watch live are
   one-hour-cache main sessions.

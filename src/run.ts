@@ -57,7 +57,7 @@ const foreignCompaction = (e: Any): boolean => e?.type === "compaction" && !!e.f
 
 /** pi-zip's own compaction takes milliseconds: the summary is done. Pi runs every extension's session_before_compact handler for it, so
  *  one that is not finished by this deadline has another handler at work (writing its own summary, say): pi-zip cancels it then, so it
- *  can never land during the run, and the draft path takes the summary. */
+ *  can never land during the run, and the draft path takes the summary (the idle door's, only while no run is announced). */
 const nativeDeadlineMs = () => envInt("NATIVE_MS", 2_000);
 /** A compaction slower than this (or half the deadline) had another handler at work too: the native path ends for the process, so its
  *  work (a model call, say) is not paid for, and waited for, at every cold return. */
@@ -841,7 +841,7 @@ export class Zip implements ZipControl {
 	 * done. The run plan folds the resulting projection; a closed native door defers the summary to turn_end.
 	 * Pi runs every extension's session_before_compact handler for it (the last answer wins, a cancel stops it): unless pi-zip's own
 	 * entry is the one that went in, fast, the native path ends for the process (endNative). A compaction not finished by the deadline
-	 * is cancelled first, and a summary prepared for a context another extension's compaction has replaced is never used (its head is gone).
+	 * is cancelled first (at the idle door, while no run is announced), and a summary prepared for a context another extension's compaction has replaced is never used (its head is gone).
 	 */
 	private async nativeSummary(ctx: Any, e: Any, s: Start, door: "input" | "idle" = "input"): Promise<void> {
 		const branch = this.branch(ctx);
@@ -872,6 +872,7 @@ export class Zip implements ZipControl {
 		const ask = { compaction: compaction as Any | null, answered: false, askedAt: 0, askedWall: 0, until: Infinity };
 		this.cancelTimer(); // no producer call starts while Pi compacts (input arms the timer again)
 		this.nativeAsk = ask;
+		const runs0 = this.runStarts;
 		const deadline = nativeDeadlineMs(), t0 = performance.now();
 		const res = await new Promise<{ ok: boolean; err?: string; late?: boolean }>((resolve) => {
 			let settled = false;
@@ -881,14 +882,15 @@ export class Zip implements ZipControl {
 				clearTimeout(timer);
 				resolve(r);
 			};
-			// the idle door has no deadline (nobody waits on it): it never aborts, and a run that starts meanwhile (Pi does not hold an
-			// extension's message back) waits for it (drivenStart); what is typed meanwhile Pi queues, as for any compaction
-			const timer = door === "idle" ? undefined : setTimeout(() => {
+			const timer = setTimeout(() => {
+				// the idle door's compaction, once a run is announced (Pi does not hold an extension's message back), goes in however long it
+				// takes: that run waits on it (drivenStart), ctx.abort() would end it too. Before that, a slow handler is cancelled as at input
+				if (door === "idle" && this.runStarts !== runs0) return;
 				if (!ask.answered) ask.compaction = null; // asked after this, pi-zip cancels: never Pi's own summary on pi-zip's behalf
 				ask.until = Date.now() + 60_000;
 				finish({ ok: false, late: true });
 			}, deadline);
-			timer?.unref?.();
+			timer.unref?.();
 			const done = (r: { ok: boolean; err?: string }) => {
 				if (this.nativeAsk === ask) this.nativeAsk = null; // pi-zip's compaction is over: nothing is answered for it any more
 				finish(r);
@@ -904,7 +906,8 @@ export class Zip implements ZipControl {
 		const added = this.branch(ctx).filter((en: Any) => en?.type === "compaction" && !known.has(en?.id));
 		const last = added[added.length - 1] ?? null;
 		const entry = last && last.summary === cut.text ? last : null;
-		// still pending at the deadline: cancel it now, before the run starts (Pi checks its abort signal right before it appends)
+		// still pending at the deadline: cancel it now, before the run starts (Pi checks its abort signal right before it appends; no run was
+		// announced to pi-zip at the deadline, and only microtasks ran since)
 		if (res.late && !last) attempt(() => ctx.abort?.(), undefined);
 		// "another handler at work" is measured over the time other handlers can occupy: before ours (askMs) and, for handlers after ours, from
 		// our answer to the entry's own append (appendCompaction stamps it). Pi's work after the append (the refresh of its context, the

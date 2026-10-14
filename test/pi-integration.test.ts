@@ -1836,6 +1836,24 @@ for (const order of ORDERS) describe(`the idle door: a ready summary goes in whi
 			}
 		});
 
+	test("a slow handler at the idle door with no run is cancelled at the deadline (its own summary call is not left to run)", async () => {
+		process.env.PI_ZIP_NATIVE_MS = "150";
+		try {
+			let aborted = false;
+			const { r, led } = await coldRig({
+				foreign: { at: "before", on: async (e: Any) => { await sleep(400); aborted = e.signal?.aborted === true; return undefined; } },
+			});
+			await sleep(600);
+			expect(r.compactCalls.n).toBe(1);
+			expect(aborted, "a slow handler at the idle door is cancelled").toBe(true);
+			expect(r.compactions.length).toBe(0);
+			expect(r.abortsInRun.n).toBe(0);
+			expect(led.some((x: Any) => x.type === "native_fail" && x.error === "deadline")).toBe(true);
+		} finally {
+			delete process.env.PI_ZIP_NATIVE_MS;
+		}
+	});
+
 	test("a door armed again while it reads its clock (a summary finished meanwhile) asks again once that read ends", async () => {
 		const { r, led } = await coldRig({}, (r: Any) => {
 			const read = r.zip.readStart.bind(r.zip);
