@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.4.6
+
+- A summary that was ready before a run began, and is applied at that run's turn_end, now says "ready while you were away"
+  instead of "written while you worked" (runs an extension's message starts).
+- New, opt-in: the idle door (`PI_ZIP_IDLE_DOOR=1`, TUI only). A run an extension's message starts has no `input` event, so a
+  summary prepared for its return waited for the run's first turn_end: the first request rewrote the whole folded context (one
+  session: 230K tokens, then the summarized 44K a turn later), and once that request had warmed the cache again the summary
+  usually no longer paid and was never applied. The idle door asks the typed-prompt door's decision, unchanged, while Pi is idle:
+  when a summary finishes and then at each moment the return's P(warm) changes. A summary it takes goes in through Pi's
+  compaction, and the next run, whoever starts it, carries it from its first request. On the recorded sessions of 10-12 to
+  10-14 it would have applied 30 summaries those runs wrote around, about 1 % of their spend at list prices. Off by default
+  until a live week confirms it.
+- Small cleanup: host calls that may throw go through one helper.
+
 ## 0.4.5
 
 - A `/model` in the middle of a run no longer makes every later turn look like a model switch. Requests were booked under the model

@@ -95,6 +95,37 @@ const mutants = [
 		check: "a narrative refused for its reasoning effort is retried with low effort",
 		edit: (source: string) => rep(source, "if (!low && model.reasoning && EFFORT_REFUSED_RE.test(lastErr) && !signal.aborted) {", "if (false) {"),
 	},
+	// 0.4.6: the idle door (PI_ZIP_IDLE_DOOR=1)
+	{
+		name: "idle-door-decision-not-carried",
+		pattern: "the idle door: a ready summary goes in",
+		check: "the next run carries the idle door's decision",
+		edit: (source: string) => rep(source, "else [s.nat, s.note] = [door.nat, door.note];", ""),
+	},
+	{
+		name: "idle-door-without-tui",
+		pattern: "without the TUI",
+		check: "no idle door without the TUI",
+		edit: (source: string) => rep(source, 'if (!idleDoorOn() || ctx?.mode !== "tui" || ', "if (!idleDoorOn() || "),
+	},
+	{
+		name: "idle-door-ignores-input",
+		pattern: "while the door reads its clock",
+		check: "an input during the door's clock read keeps the door shut",
+		edit: (source: string) => rep(source, "if (inputs !== this.inputs || runs !== this.runStarts || this.inRun)", "if (this.inRun)"),
+	},
+	{
+		name: "idle-door-armed-at-session-start",
+		pattern: "opening a session whose summary is ready",
+		check: "opening a session compacts nothing",
+		edit: (source: string) => rep(source, "this.cancelDoor(); // the idle door opens only after a run of this session", "this.armDoor(ctx, true); // mutant"),
+	},
+	{
+		name: "idle-door-every-moment",
+		pattern: "a door that declines asks again",
+		check: "the door asks only when P(warm) changes",
+		edit: (source: string) => rep(source, "now ? t : this.doorNext(ctx, branch, t)", "now ? t : t + 200"),
+	},
 ];
 const only = process.env.PZ_MUTANTS?.split(","); // run some by name
 for (const mutant of mutants.filter((m) => !only || only.includes(m.name))) {

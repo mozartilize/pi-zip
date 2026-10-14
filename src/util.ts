@@ -15,6 +15,8 @@ export const textOf = (c: Any): string =>
 
 export const tok4 = (s: string) => Math.ceil(s.length / 4);
 export const clamp = (x: number, lo: number, hi: number) => Math.min(Math.max(x, lo), hi);
+/** f(), or `fallback` when it throws (a host API that may be missing or fail). */
+export const attempt = <T>(f: () => T, fallback: T): T => { try { return f(); } catch { return fallback; } };
 
 export function clip(s: string, n: number): string {
 	s = s.replace(/\s+/g, " ").trim();
