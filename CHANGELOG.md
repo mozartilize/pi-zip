@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.4.7
+
+- Pi's compaction path (the idle door and the typed-prompt door) was refused for good in a session that ever held a compaction
+  another extension supplied, however old. One live session kept 6 from its first days (an extension removed since), followed by
+  158 of pi-zip's: neither door could apply a summary there, so an extension's run after a pause still wrote the whole folded
+  context first (152K tokens) and took the summary a turn later. Only the newest compaction an extension supplied counts now:
+  when it is another extension's, its `session_before_compact` handler would run for pi-zip's too, and the doors stay shut as before.
+
 ## 0.4.6
 
 - A summary that was ready before a run began, and is applied at that run's turn_end, now says "ready while you were away"

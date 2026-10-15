@@ -826,8 +826,8 @@ export class Zip implements ZipControl {
 		if (this.nativeOff) return "off for this process";
 		if (typeof ctx?.compact !== "function") return "no ctx.compact";
 		if (typeof ctx?.abort !== "function") return "no ctx.abort"; // what cancels a compaction another handler holds up
-		// another extension supplies compactions in this session: its session_before_compact handler would run for pi-zip's too
-		if (branch.some(foreignCompaction)) return "another extension's compaction is in this branch";
+		// another extension's compaction is the newest an extension supplied (its handler would run for pi-zip's too); an older one, from an extension since removed, says nothing
+		if (foreignCompaction(branch.filter((en: Any) => en?.type === "compaction" && en.fromHook).at(-1))) return "another extension's compaction is the newest in this branch";
 		if (!idleOf(ctx)) return "not idle"; // compact() aborts whatever runs first: only ever called while Pi is idle
 		if (branch[branch.length - 1]?.type === "compaction") return "already compacted";
 		if (!piCanCompact(pre, keepRecentTokensFor(attempt(() => this.pi.getSettings?.(), undefined), ctx?.model))) return "nothing to compact";

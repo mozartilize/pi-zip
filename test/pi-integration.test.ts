@@ -64,8 +64,9 @@ const PI_ORDER: PiOrder = process.env.PZ_PI_ORDER === "1.2" ? "1.2" : "1.1";
 const ORDERS: PiOrder[] = ["1.1", "1.2"];
 let rigOrder: PiOrder = PI_ORDER; // the order of rigs built without one (a describe run under both orders sets it)
 /** A populated session file whose newest response is `agoMs` old. */
-const shiftedFile = (agoMs: number, prose: number) => {
+const shiftedFile = (agoMs: number, prose: number, early?: (sm: Any) => void) => {
 	const sm = SessionManager.inMemory(CWD);
+	early?.(sm); // entries before the populated history (old compactions, say)
 	populate(sm, prose);
 	const file = [sm.getHeader() as Any, ...sm.getEntries()];
 	const newest = Math.max(...file.map((e) => e.message?.timestamp ?? 0));
@@ -1736,6 +1737,29 @@ for (const order of ORDERS) describe(`the idle door: a ready summary goes in whi
 		const drafts = await r.turnEnd(id, response);
 		expect(drafts.some((d: Any) => d.type === "compaction")).toBe(false);
 		expect(r.sm.getBranch().filter((e: Any) => e.type === "compaction")).toHaveLength(1);
+	});
+
+	/** Old compactions: one an extension since removed supplied (Pi's own details, fromHook), then one of pi-zip's, or the reverse. */
+	const oldCompactions = (foreignNewest: boolean) => shiftedFile(240 * 60_000, 9000, (sm: Any) => {
+		const first = sm.appendMessage(user("an early task"));
+		sm.appendMessage({ ...asst([{ type: "text", text: "done" }]), usage: undefined });
+		const theirs = () => sm.appendCompaction("an extension's summary", first, 50_000, { readFiles: [], modifiedFiles: [] }, true);
+		const ours = () => sm.appendCompaction("pi-zip's summary", first, 40_000, { by: "pi-zip" }, true);
+		if (foreignNewest) { ours(); theirs(); } else { theirs(); ours(); }
+	});
+
+	test("an old compaction by an extension since removed, followed by pi-zip's own, leaves the door open", async () => {
+		// a live session (walle) kept 6 such compactions from its first days: every native compaction was refused for good
+		const { r, led } = await coldRig({ file: oldCompactions(false) });
+		expect(led.filter((x: Any) => x.type === "native_skip").map((x: Any) => x.reason), "an old foreign compaction never closes the door").toEqual([]);
+		expect(r.compactCalls.n).toBe(1);
+		expect(r.compactions.at(-1).details).toMatchObject({ by: "pi-zip", via: "native", door: "idle" });
+	});
+
+	test("another extension's compaction newer than pi-zip's keeps the door shut: its handler would run for pi-zip's too", async () => {
+		const { r, led } = await coldRig({ file: oldCompactions(true) });
+		expect(r.compactCalls.n).toBe(0);
+		expect(led).toContainEqual(expect.objectContaining({ type: "native_skip", reason: "another extension's compaction is the newest in this branch" }));
 	});
 
 	test("a typed prompt after the idle door finds nothing left to compact: its run carries the idle door's decision", async () => {
