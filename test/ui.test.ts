@@ -327,8 +327,8 @@ describe("transcript wiring", () => {
 			else process.env.PI_ZIP_CACHE_STATS = was;
 		}
 	});
-	test("a notice shows the real size of the request that carried its plan once that request is answered, and the before-size on the same scale (estimate before; errors skipped; old notices unchanged)", async () => {
-		const { default: piZip } = await import("../src/index.ts");
+	test("a notice shows the real size of the request that carried its plan once that request is answered, and a zip's before-size on the same scale (estimate before; errors skipped; old notices unchanged)", async () => {
+		const { default: piZip } = await import(process.env.PI_ZIP_TEST_SRC ? `${process.env.PI_ZIP_TEST_SRC}/index.ts` : "../src/index.ts"); // the mutants' copy
 		const renderers = new Map<string, Any>();
 		const f = fakePi({ registerEntryRenderer: (t: string, fn: Any) => renderers.set(t, fn), registerToolRenderer: () => {} });
 		piZip(f.pi);
@@ -358,6 +358,11 @@ describe("transcript wiring", () => {
 		branch.push({ type: "message", id: "a4", message: { role: "assistant", timestamp: t0 + 120, stopReason: "toolUse", usage: { input: 4, cacheRead: 0, cacheWrite: 183_611 } } });
 		expect(render(off)).toBe("ƶ zipped 6 old outputs   209K → 184K   5 ms"); // never a zip that grew
 		expect(render({ ...off, after: 0 })).toBe("ƶ zipped 6 old outputs   93.1K → 184K   5 ms"); // no estimate to scale by: as recorded
+		// a summary's "before" is Pi's own number (its "Compacted from N tokens"): kept, only "after" becomes real (review P1)
+		branch.push({ type: "message", id: "a5", message: { role: "assistant", timestamp: t0 + 220, stopReason: "stop", usage: { input: 2_000, cacheRead: 0, cacheWrite: 58_000 } } });
+		const sum = { ...data, before: 150_000, after: 30_000, desc: "summarized 64 requests in 38.2 s · written while you worked", reqTs: t0 + 200 };
+		expect(render(sum)).toContain("150K → 60K");
+		expect(render({ ...sum, desc: "zipped 3 old outputs in 4 ms · summarized earlier turns in 38.2 s" })).toContain("150K → 60K");
 	});
 	test("print mode: /zip status stays plain text on stderr, nothing appended", async () => {
 		const { f, ctx } = await setup();

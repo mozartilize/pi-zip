@@ -162,6 +162,14 @@ const mutants = [
 		check: "the door asks only when P(warm) changes",
 		edit: (source: string) => rep(source, "now ? t : this.doorNext(ctx, branch, t)", "now ? t : t + 200"),
 	},
+	{
+		name: "notice-rescales-summary-before",
+		file: "index.ts",
+		test: "test/ui.test.ts",
+		pattern: "a notice shows the real size",
+		check: "expect(received).toContain(expected)",
+		edit: (source: string) => rep(source, ` && !/summarized /.test(d.desc ?? "")`, ""),
+	},
 ];
 const only = process.env.PZ_MUTANTS?.split(","); // run some by name
 for (const mutant of mutants.filter((m) => !only || only.includes(m.name))) {
@@ -173,7 +181,7 @@ for (const mutant of mutants.filter((m) => !only || only.includes(m.name))) {
 		const changed = mutant.edit(original);
 		if (changed === original) throw new Error(`${mutant.name}: mutation site missing`);
 		writeFileSync(file, changed);
-		const result = Bun.spawnSync(["bun", "test", "test/pi-integration.test.ts", "--test-name-pattern", mutant.pattern ?? "mixed room boundary"], {
+		const result = Bun.spawnSync(["bun", "test", (mutant as { test?: string }).test ?? "test/pi-integration.test.ts", "--test-name-pattern", mutant.pattern ?? "mixed room boundary"], {
 			cwd: root, env: { ...process.env, PI_ZIP_TEST_SRC: source }, stdout: "pipe", stderr: "pipe",
 		});
 		const text = result.stdout.toString() + result.stderr.toString();
