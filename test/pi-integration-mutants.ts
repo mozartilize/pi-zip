@@ -115,6 +115,12 @@ const mutants = [
 		edit: (source: string) => rep(source, "if (inputs !== this.inputs || runs !== this.runStarts || this.inRun ||", "if (this.inRun ||"),
 	},
 	{
+		name: "foreign-gate-any-age",
+		pattern: "followed by pi-zip's own, leaves the door open",
+		check: "an old foreign compaction never closes the door",
+		edit: (source: string) => rep(source, "if (foreignCompaction(branch.filter((en: Any) => en?.type === \"compaction\" && en.fromHook).at(-1)))", "if (branch.some(foreignCompaction))"),
+	},
+	{
 		name: "idle-door-run-does-not-wait",
 		pattern: "holds the door's compaction past its deadline",
 		check: "the idle door never aborts an announced run", // without the wait the deadline aborts it (and the run would start without the compaction)
