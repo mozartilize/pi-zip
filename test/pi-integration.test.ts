@@ -1089,7 +1089,12 @@ for (const order of ORDERS) describe(`real Pi: a summary prepared while the user
 			expect(caps).toHaveLength(1);
 			// /zip says so: how many narrative calls failed, and why the newest did
 			expect(r.zip.card(ctx).failed).toBe(fails ? 1 : undefined);
-			if (fails) expect(r.zip.card(ctx).failedWhy).toContain("narrative hit the token cap");
+			if (fails) {
+				expect(r.zip.card(ctx).failedWhy).toMatch(/^\d\d:\d\d narrative hit the token cap/); // today: the time alone
+				const e = r.sm.getBranch().filter((x: Any) => x.customType === "pi-zip/summary").at(-1) as Any;
+				e.timestamp = new Date(Date.now() - 36 * 3_600_000).toISOString();
+				expect(r.zip.card(ctx).failedWhy, "an old failure carries its date").toMatch(/^\d\d-\d\d \d\d:\d\d narrative hit the token cap/);
+			}
 		} finally {
 			ctx.modelRegistry.complete = provider;
 			await r.shutdown();
