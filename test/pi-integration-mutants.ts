@@ -121,6 +121,12 @@ const mutants = [
 		edit: (source: string) => rep(source, "if (foreignCompaction(branch.filter((en: Any) => en?.type === \"compaction\" && en.fromHook).at(-1)))", "if (branch.some(foreignCompaction))"),
 	},
 	{
+		name: "foreign-gate-counts-pi-compactions",
+		pattern: "Pi's own compaction after another extension's",
+		check: "a Pi compaction does not hide another extension's",
+		edit: (source: string) => rep(source, "en?.type === \"compaction\" && en.fromHook).at(-1)", "en?.type === \"compaction\").at(-1)"),
+	},
+	{
 		name: "idle-door-run-does-not-wait",
 		pattern: "holds the door's compaction past its deadline",
 		check: "the idle door never aborts an announced run", // without the wait the deadline aborts it (and the run would start without the compaction)

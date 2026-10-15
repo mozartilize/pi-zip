@@ -1740,12 +1740,13 @@ for (const order of ORDERS) describe(`the idle door: a ready summary goes in whi
 	});
 
 	/** Old compactions: one an extension since removed supplied (Pi's own details, fromHook), then one of pi-zip's, or the reverse. */
-	const oldCompactions = (foreignNewest: boolean) => shiftedFile(240 * 60_000, 9000, (sm: Any) => {
+	const oldCompactions = (foreignNewest: boolean, piAfter = false) => shiftedFile(240 * 60_000, 9000, (sm: Any) => {
 		const first = sm.appendMessage(user("an early task"));
 		sm.appendMessage({ ...asst([{ type: "text", text: "done" }]), usage: undefined });
 		const theirs = () => sm.appendCompaction("an extension's summary", first, 50_000, { readFiles: [], modifiedFiles: [] }, true);
 		const ours = () => sm.appendCompaction("pi-zip's summary", first, 40_000, { by: "pi-zip" }, true);
 		if (foreignNewest) { ours(); theirs(); } else { theirs(); ours(); }
+		if (piAfter) sm.appendCompaction("Pi's own summary", first, 30_000, { readFiles: [], modifiedFiles: [] }, false); // not supplied by an extension
 	});
 
 	test("an old compaction by an extension since removed, followed by pi-zip's own, leaves the door open", async () => {
@@ -1759,6 +1760,12 @@ for (const order of ORDERS) describe(`the idle door: a ready summary goes in whi
 	test("another extension's compaction newer than pi-zip's keeps the door shut: its handler would run for pi-zip's too", async () => {
 		const { r, led } = await coldRig({ file: oldCompactions(true) });
 		expect(r.compactCalls.n).toBe(0);
+		expect(led).toContainEqual(expect.objectContaining({ type: "native_skip", reason: "another extension's compaction is the newest in this branch" }));
+	});
+
+	test("Pi's own compaction after another extension's says nothing about that extension: the door stays shut", async () => {
+		const { r, led } = await coldRig({ file: oldCompactions(true, true) });
+		expect(r.compactCalls.n, "a Pi compaction does not hide another extension's").toBe(0);
 		expect(led).toContainEqual(expect.objectContaining({ type: "native_skip", reason: "another extension's compaction is the newest in this branch" }));
 	});
 
