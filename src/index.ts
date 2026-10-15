@@ -39,9 +39,9 @@ export default function piZip(pi: ExtensionAPI) {
 						if (d.v !== 2) return [theme.fg("dim", measure.cut(d.text, width))];
 						if (d.kind === "state") return renderState(d.word, d.reason ?? "", width, theme, measure);
 						if (d.kind === "card" && d.card) return renderCard(d.card, width, theme, measure);
-						// once the request that carried the plan has been answered, "after" is its real size (older notices keep their number)
+						// once the request that carried the plan is answered: "after" is its real size, "before" the estimate in the same proportion
 						const real = typeof d.reqTs === "number" ? zip.realSizeAfter(d.reqTs) : undefined;
-						return renderNotice((real ? { ...d, after: real } : d) as NoticeData, open(), width, theme, measure.vw);
+						return renderNotice((real ? { ...d, after: real, before: d.after > 0 ? Math.round((d.before * real) / d.after) : d.before } : d) as NoticeData, open(), width, theme, measure.vw);
 					} catch {
 						return [];
 					}
