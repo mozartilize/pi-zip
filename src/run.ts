@@ -1668,11 +1668,10 @@ export class Zip implements ZipControl {
 		for (const x of cur) { if (x.p >= 0.8) s1 = x.hi; else break; }
 		const s2 = cur.find((x) => x.lo >= s1 && x.p <= 0.2)?.lo ?? 7200;
 		const usually = cur.some((x) => x.hi <= s1 && x.p < 0.95);
-		const ts = t.last?.timestamp ? new Date(t.last.timestamp) : null;
-		const hhmm = ts && !Number.isNaN(ts.getTime()) ? `${String(ts.getHours()).padStart(2, "0")}:${String(ts.getMinutes()).padStart(2, "0")}  ` : "";
+		const when = (s?: string, d = s ? new Date(s) : null, p = (x: number) => String(x).padStart(2, "0")) => !d || Number.isNaN(d.getTime()) ? "" : `${d.toDateString() === new Date().toDateString() ? "" : `${p(d.getMonth() + 1)}-${p(d.getDate())} `}${p(d.getHours())}:${p(d.getMinutes())} `; // the date only when not today
+		const hhmm = when(t.last?.timestamp).replace(/ $/, "  ");
 		const last = t.last ? `${hhmm}${t.last.data.desc}${t.last.data.why ? " · " + t.last.data.why : ""}` : undefined;
-		const fts = t.failedLast?.timestamp ? new Date(t.failedLast.timestamp) : null;
-		const failedWhy = t.failedLast ? `${fts && !Number.isNaN(fts.getTime()) ? `${String(fts.getHours()).padStart(2, "0")}:${String(fts.getMinutes()).padStart(2, "0")} ` : ""}${String(t.failedLast.data?.cut?.llmError ?? t.failedLast.data?.error ?? "reason not recorded")}` : undefined; // 0.4.0/0.4.1 did not record it
+		const failedWhy = t.failedLast ? `${when(t.failedLast.timestamp)}${String(t.failedLast.data?.cut?.llmError ?? t.failedLast.data?.error ?? "reason not recorded")}` : undefined; // 0.4.0/0.4.1 did not record it
 		const file = this.recallMode === "file" && !!this.fileRecall(ctx);
 		const state = this.off ? "off" : this.conflict ? "paused" : this.recallMode === "tool" || file ? "on" : "reread-only"; // file recall is a full mode
 		const rereadWhy = this.recallMode === "file" ? "a tool allowlist hides zip_recall · no session file, so no recall copies" : "a tool allowlist hides zip_recall · only re-readable outputs fold";
