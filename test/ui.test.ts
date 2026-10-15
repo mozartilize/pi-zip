@@ -327,7 +327,7 @@ describe("transcript wiring", () => {
 			else process.env.PI_ZIP_CACHE_STATS = was;
 		}
 	});
-	test("a notice shows the real size of the request that carried its plan once that request is answered (estimate before; errors skipped; old notices unchanged)", async () => {
+	test("a notice shows the real size of the request that carried its plan once that request is answered, and the before-size on the same scale (estimate before; errors skipped; old notices unchanged)", async () => {
 		const { default: piZip } = await import("../src/index.ts");
 		const renderers = new Map<string, Any>();
 		const f = fakePi({ registerEntryRenderer: (t: string, fn: Any) => renderers.set(t, fn), registerToolRenderer: () => {} });
@@ -347,12 +347,17 @@ describe("transcript wiring", () => {
 		branch.push({ type: "message", id: "a1", message: { role: "assistant", timestamp: t0 + 3, stopReason: "error", usage: { input: 0, cacheRead: 0, cacheWrite: 0 } } }); // failed: its retry carries the plan
 		expect(render(data)).toBe("ƶ zipped 12 old outputs   74K → 43K   6 ms");
 		branch.push({ type: "message", id: "a2", message: { role: "assistant", timestamp: t0 + 9, stopReason: "toolUse", usage: { input: 1_200, cacheRead: 38_000, cacheWrite: 1_300 } } });
-		expect(render(data)).toBe("ƶ zipped 12 old outputs   74K → 40.5K   6 ms"); // input + cacheRead + cacheWrite
+		expect(render(data)).toBe("ƶ zipped 12 old outputs   69.7K → 40.5K   6 ms"); // input + cacheRead + cacheWrite; before x 40.5/43
 		const w = walks;
 		branch.push({ type: "message", id: "a3", message: { role: "assistant", timestamp: t0 + 20, usage: { input: 5, cacheRead: 60_000, cacheWrite: 0 } } });
-		for (let i = 0; i < 5; i++) expect(render(data)).toBe("ƶ zipped 12 old outputs   74K → 40.5K   6 ms");
+		for (let i = 0; i < 5; i++) expect(render(data)).toBe("ƶ zipped 12 old outputs   69.7K → 40.5K   6 ms");
 		expect(walks).toBe(w); // found once, kept
 		expect(render({ ...data, reqTs: undefined })).toBe("ƶ zipped 12 old outputs   74K → 43K   6 ms"); // a notice from before: as it was
+		// live, 10-15: a provider switch left the first request's estimate at half its real size; the zip read "93.1K → 184K"
+		const off = { ...data, before: 93_121, after: 81_979, desc: "zipped 6 old outputs in 5 ms", reqTs: t0 + 100 };
+		branch.push({ type: "message", id: "a4", message: { role: "assistant", timestamp: t0 + 120, stopReason: "toolUse", usage: { input: 4, cacheRead: 0, cacheWrite: 183_611 } } });
+		expect(render(off)).toBe("ƶ zipped 6 old outputs   209K → 184K   5 ms"); // never a zip that grew
+		expect(render({ ...off, after: 0 })).toBe("ƶ zipped 6 old outputs   93.1K → 184K   5 ms"); // no estimate to scale by: as recorded
 	});
 	test("print mode: /zip status stays plain text on stderr, nothing appended", async () => {
 		const { f, ctx } = await setup();

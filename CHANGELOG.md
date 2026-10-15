@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.4.8
+
+- A notice's two sizes are on one scale again. Once the request that carried a zip or a summary is answered, the size
+  after is its real size; the size before stayed the estimate. When the estimate was off (the first request after a provider
+  switch: 93K estimated, about 205K real), the line read `93.1K → 184K`, a zip that grew. The size before is now rescaled in the
+  same proportion (`209K → 184K`). Display only.
+- `/zip`: a `last` or `errors` time from an earlier day carries its date (a failure from yesterday read as today's).
+
 ## 0.4.7
 
 - Pi's compaction path (the idle door and the typed-prompt door) was refused for good in a session that ever held a compaction
