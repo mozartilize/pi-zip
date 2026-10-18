@@ -816,7 +816,11 @@ async function runTrace(tr: Any): Promise<Any> {
 		checkSizes(z, view);
 		const payload = payloadOf(view);
 		const before = JSON.stringify(payload);
-		const sent = await fire(live, "before_provider_request", { type: "before_provider_request", payload });
+		const sent0 = await fire(live, "before_provider_request", { type: "before_provider_request", payload });
+		// 0.4.9: pi-zip names the session for a relay (metadata.user_id on a request that has none): not an edit of the request's content
+		const sticky = sent0?.metadata && !payload.metadata ? sent0.metadata.user_id : undefined;
+		if (sticky !== undefined && !String(sticky).endsWith(`_account__session_${sm.getSessionId()}`)) throw new Error(`metadata.user_id does not name the session: ${sticky}`);
+		const sent = sticky === undefined ? sent0 : (({ metadata: _m, ...rest }) => (JSON.stringify(rest) === before ? undefined : rest))(sent0);
 		// a well-formed request goes out as built: the guard rewriting it means an edit broke the tool_use / tool_result pairing
 		const guardRewrote = sent !== undefined && JSON.stringify(sent) !== before ? `the request guard rewrote the request (${(sent?.messages ?? []).filter((m: Any, k: number) => JSON.stringify(m) !== JSON.stringify(payload.messages[k])).length} message(s)): an edit broke the tool_use / tool_result pairing` : null;
 		const desc = describeView(view, sm);
