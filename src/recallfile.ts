@@ -5,6 +5,7 @@
 import { chmodSync, lstatSync, mkdirSync, readdirSync, readFileSync, renameSync, rmdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join, sep } from "node:path";
+import { attempt } from "./util.ts";
 
 /** What placeholders and summaries name: portable, `~` is expanded by read, grep, find and ls, and by the shell. */
 export const RECALL_DIR = "~/.cache/pi-zip/recall";
@@ -90,12 +91,7 @@ export function rewriteCommand(cmd: string, localDir: string): { command: string
 /** A copy on disk is the original only when it is a plain file holding exactly its bytes: a bash command may append to it or edit it
  *  in place (the rewrite points writes at it too), and write and edit are not hooked. */
 function intact(file: string, bytes: Buffer): boolean {
-	try {
-		const st = lstatSync(file);
-		return st.isFile() && st.size === bytes.length && readFileSync(file).equals(bytes);
-	} catch {
-		return false;
-	}
+	return attempt(() => { const st = lstatSync(file); return st.isFile() && st.size === bytes.length && readFileSync(file).equals(bytes); }, false);
 }
 
 /** Write each original that is not on disk as it is (directory 0700, file 0600, written whole then renamed over anything there, a
@@ -129,12 +125,8 @@ export function materialize(root: string, sid: string, items: { handle: string; 
  *  session directory or as a file, is never followed nor deleted. */
 export function cleanupRecall(root: string = recallRoot(), now = Date.now(), maxAgeMs = RECALL_MAX_AGE_MS): number {
 	let removed = 0;
-	let sids: string[];
-	try {
-		sids = readdirSync(root);
-	} catch {
-		return 0;
-	}
+	const sids = attempt((): string[] | null => readdirSync(root), null);
+	if (!sids) return 0;
 	for (const sid of sids) {
 		if (!SID_RE.test(sid)) continue;
 		const dir = join(root, sid);
@@ -158,11 +150,7 @@ export function cleanupRecall(root: string = recallRoot(), now = Date.now(), max
 				}
 			} catch {}
 		}
-		if (left === 0) {
-			try {
-				rmdirSync(dir);
-			} catch {}
-		}
+		if (left === 0) attempt(() => rmdirSync(dir), undefined);
 	}
 	return removed;
 }

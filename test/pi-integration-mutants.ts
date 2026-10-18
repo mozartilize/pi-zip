@@ -175,7 +175,7 @@ const mutants = [
 		name: "sticky-never-sent",
 		pattern: "a relay keeps the session",
 		check: "an Anthropic request names its session",
-		edit: (source: string) => rep(source, "const q = uid ? { ...p, metadata: { user_id: uid } } : p,", "const q = p,"),
+		edit: (source: string) => rep(source, "return this.guarded({ ...p, metadata: { user_id: uid } }, true);", "return this.guarded(p, false);"),
 	},
 	{
 		name: "sticky-overwrites-their-metadata",
@@ -199,13 +199,13 @@ const mutants = [
 		name: "sticky-claude-cli-agent",
 		pattern: "a relay keeps the session",
 		check: "a claude-cli user agent is left alone",
-		edit: (source: string) => rep(source, "/claude-cli/i.test(String(v))", "false"),
+		edit: (source: string) => rep(source, "/claude-cli/i.test(JSON.stringify(a?.headers ?? {}))", "false"),
 	},
 	{
 		name: "sticky-to-api-anthropic",
 		pattern: "a relay keeps the session",
 		check: "api.anthropic.com is left alone",
-		edit: (source: string) => rep(source, "!/^https?:\\/\\/api\\.anthropic\\.com/i.test(String(m.baseUrl ?? \"\"))", "true"),
+		edit: (source: string) => rep(source, " || /^https?:\\/\\/api\\.anthropic\\.com/i.test(String(a?.baseUrl ?? m.baseUrl ?? \"\"))", ""),
 	},
 	{
 		name: "sticky-to-copilot",
@@ -235,13 +235,31 @@ const mutants = [
 		name: "sticky-answered-400-turns-off",
 		pattern: "a relay keeps the session",
 		check: "a 400 after an answer keeps it",
-		edit: (source: string) => rep(source, "this.stickyOf(sk) !== \"ok\" && /^4", "/^4"),
+		edit: (source: string) => rep(source, "(ok ? 2 : 1)", "1"),
 	},
 	{
 		name: "sticky-refusal-forgotten-by-next-process",
 		pattern: "a relay keeps the session",
 		check: "a refused metadata.user_id is not sent in the next process",
 		edit: (source: string) => rep(source, "this.sticky ??= read();", "this.sticky ??= {};"),
+	},
+	{
+		name: "sticky-oauth-key",
+		pattern: "a relay keeps the session",
+		check: "an OAuth key is left alone",
+		edit: (source: string) => rep(source, " || /sk-ant-oat/.test(String(a?.apiKey ?? \"\"))", ""),
+	},
+	{
+		name: "sticky-400s-in-a-row-never-off",
+		pattern: "a relay keeps the session",
+		check: "the second 400 in a row after an answer turns it off",
+		edit: (source: string) => rep(source, "(ok ? 2 : 1)", "(ok ? 99 : 1)"),
+	},
+	{
+		name: "sticky-state-per-model-only",
+		pattern: "a relay keeps the session",
+		check: "another endpoint has its own state",
+		edit: (source: string) => rep(source, "sk = `${key}@${m?.baseUrl ?? \"\"}`", "sk = key"),
 	},
 ];
 const only = process.env.PZ_MUTANTS?.split(","); // run some by name

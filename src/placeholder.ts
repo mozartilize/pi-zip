@@ -2,7 +2,7 @@
 import { createHash } from "node:crypto";
 import type { Block, Calls } from "./plan.ts";
 import { type FileRecall, fileRecallHow } from "./recallfile.ts";
-import { type Any, clip, fmtWhen, textOf } from "./util.ts";
+import { type Any, attempt, clip, fmtWhen, textOf } from "./util.ts";
 
 export const PH_MARK = "[folded by pi-zip";
 export const RECALL_TOOL = "zip_recall";
@@ -196,11 +196,7 @@ export function shortArgs(args: Any, n = ARG_CHARS, shared?: Set<string>): strin
 		return clipMid(path, n) + win;
 	}
 	if (typeof args.pattern === "string") return clipMid(args.pattern + (args.path ? " " + args.path : ""), n);
-	try {
-		return clipMid(JSON.stringify(args), n);
-	} catch {
-		return "";
-	}
+	return attempt(() => clipMid(JSON.stringify(args), n), "");
 }
 
 /**
