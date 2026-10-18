@@ -2285,12 +2285,19 @@ describe("a mid-run /model: the new model's requests are its own", () => {
 });
 
 // 0.4.9: a relay that pools accounts (sub2api) keeps a session on one account only when the request names it, as Claude Code's
-// metadata.user_id does (sub2api's legacy form below); a request that names its own, another API, and an endpoint that refused it are
-// left alone. The request goes through Pi's real before_provider_request chain.
+// metadata.user_id does (sub2api's legacy form below); a request that names its own, another API, a request that already speaks as
+// Claude Code, a first-party endpoint, and a model whose endpoint refused it are left alone. The request goes through Pi's real
+// before_provider_request chain; the model state is kept in sticky.json next to the cache stats (a fresh directory per test).
 describe("a relay keeps the session on one account: metadata.user_id", () => {
 	const SUB2API_LEGACY = /^user_([a-fA-F0-9]{64})_account_([a-fA-F0-9-]*)_session_([a-fA-F0-9-]{36})$/;
 	const body = (): Any => ({ model: "m", max_tokens: 10, messages: [{ role: "user", content: "hi" }] });
 	const send = async (r: Any, p: Any = body()) => (await r.runner.emitBeforeProviderRequest(p)) as Any;
+	const none = { ...usage, input: 0, output: 0, totalTokens: 0 };
+	const refuse = (r: Any, errorMessage: string) => r.runner.emitMessageEnd({ type: "message_end", message: { ...asst([], "error"), usage: none, errorMessage } } as Any);
+	const answer = (r: Any) => r.runner.emitMessageEnd({ type: "message_end", message: asst([{ type: "text", text: "ok" }]) } as Any);
+	const stats = process.env.PI_ZIP_CACHE_STATS;
+	beforeEach(() => { process.env.PI_ZIP_CACHE_STATS = join(mkdtempSync(join(tmpdir(), "pz-sticky-")), "cache-survival.json"); });
+	afterEach(() => { process.env.PI_ZIP_CACHE_STATS = stats; });
 
 	test("a relay keeps the session: an Anthropic request names its session, and only that", async () => {
 		const r = await rig(undefined, { start: false });
@@ -2302,18 +2309,41 @@ describe("a relay keeps the session on one account: metadata.user_id", () => {
 		process.env.PI_ZIP_STICKY = "0";
 		expect((await send(r)).metadata, "the emergency switch turns it off").toBeUndefined();
 		delete process.env.PI_ZIP_STICKY;
+		expect((await send(r, { ...body(), system: [{ type: "text", text: "You are Claude Code, Anthropic's official CLI for Claude." }] })).metadata, "a request that speaks as Claude Code is left alone").toBeUndefined();
+		r.setModel({ ...MODEL, headers: { "User-Agent": "claude-cli/2.1.280" } });
+		expect((await send(r)).metadata, "a claude-cli user agent is left alone").toBeUndefined();
+		r.setModel({ ...MODEL, baseUrl: "https://api.anthropic.com" });
+		expect((await send(r)).metadata, "api.anthropic.com is left alone").toBeUndefined();
+		r.setModel({ ...MODEL, provider: "github-copilot" });
+		expect((await send(r)).metadata, "Copilot is left alone").toBeUndefined();
 		r.setModel({ ...MODEL, api: "openai-responses" });
 		expect((await send(r)).metadata, "another API is left alone").toBeUndefined();
 		await r.shutdown();
 	});
 
-	test("a relay keeps the session: an endpoint that refuses it is not sent it again", async () => {
+	test("a relay keeps the session: an endpoint that refuses it is not sent it again, in this process or the next", async () => {
 		const r = await rig(undefined, { start: false });
 		expect((await send(r)).metadata).toBeDefined();
-		const none = { ...usage, input: 0, output: 0, totalTokens: 0 };
-		await r.runner.emitMessageEnd({ type: "message_end", message: { ...asst([], "error"), usage: none, errorMessage: "400 overloaded" } } as Any);
+		await refuse(r, "529 overloaded");
 		expect((await send(r)).metadata, "another refusal keeps it").toBeDefined();
-		await r.runner.emitMessageEnd({ type: "message_end", message: { ...asst([], "error"), usage: none, errorMessage: "400 metadata: Extra inputs are not permitted" } } as Any);
+		await refuse(r, "400 prompt is too long: 2430000 tokens > 1000000 maximum");
+		expect((await send(r)).metadata, "a prompt too long keeps it").toBeDefined();
+		await refuse(r, "400 status code (no body)");
+		expect((await send(r)).metadata, "a first 400 without a body turns it off").toBeUndefined();
+		await r.shutdown();
+		const next = await rig(undefined, { start: false });
+		expect((await send(next)).metadata, "a refused metadata.user_id is not sent in the next process").toBeUndefined();
+		await next.shutdown();
+	});
+
+	test("a relay keeps the session: once an endpoint answered it, only a refusal that names it turns it off", async () => {
+		const r = await rig(undefined, { start: false });
+		expect((await send(r)).metadata).toBeDefined();
+		await answer(r);
+		await send(r);
+		await refuse(r, "400 status code (no body)");
+		expect((await send(r)).metadata, "a 400 after an answer keeps it").toBeDefined();
+		await refuse(r, "400 metadata: Extra inputs are not permitted");
 		expect((await send(r)).metadata, "a refused metadata.user_id is not sent again").toBeUndefined();
 		await r.shutdown();
 	});

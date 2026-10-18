@@ -170,7 +170,7 @@ const mutants = [
 		check: "expect(received).toContain(expected)",
 		edit: (source: string) => rep(source, ` && !/summarized /.test(d.desc ?? "")`, ""),
 	},
-	// 0.4.9: metadata.user_id for a relay that pools accounts
+	// 0.4.9: metadata.user_id for a relay that pools accounts (where it is sent, where not, and when an endpoint refuses it)
 	{
 		name: "sticky-never-sent",
 		pattern: "a relay keeps the session",
@@ -187,13 +187,61 @@ const mutants = [
 		name: "sticky-on-any-api",
 		pattern: "a relay keeps the session",
 		check: "another API is left alone",
-		edit: (source: string) => rep(source, 'this.model?.api === "anthropic-messages" && ', ""),
+		edit: (source: string) => rep(source, " && m?.api === \"anthropic-messages\"", ""),
+	},
+	{
+		name: "sticky-speaks-as-claude-code",
+		pattern: "a relay keeps the session",
+		check: "a request that speaks as Claude Code is left alone",
+		edit: (source: string) => rep(source, "/^You are Claude Code/", "/^(?!)/"),
+	},
+	{
+		name: "sticky-claude-cli-agent",
+		pattern: "a relay keeps the session",
+		check: "a claude-cli user agent is left alone",
+		edit: (source: string) => rep(source, "/claude-cli/i.test(String(v))", "false"),
+	},
+	{
+		name: "sticky-to-api-anthropic",
+		pattern: "a relay keeps the session",
+		check: "api.anthropic.com is left alone",
+		edit: (source: string) => rep(source, "!/^https?:\\/\\/api\\.anthropic\\.com/i.test(String(m.baseUrl ?? \"\"))", "true"),
+	},
+	{
+		name: "sticky-to-copilot",
+		pattern: "a relay keeps the session",
+		check: "Copilot is left alone",
+		edit: (source: string) => rep(source, "m.provider !== \"github-copilot\" && ", ""),
 	},
 	{
 		name: "sticky-refused-sent-again",
 		pattern: "a relay keeps the session",
 		check: "a refused metadata.user_id is not sent again",
-		edit: (source: string) => rep(source, "this.unsticky.add(this.stickyKey);", ""),
+		edit: (source: string) => rep(source, "this.stickyOf(sk, \"off\");", ""),
+	},
+	{
+		name: "sticky-unanswered-400-sent-again",
+		pattern: "a relay keeps the session",
+		check: "a first 400 without a body turns it off",
+		edit: (source: string) => rep(source, "/^4(00|22)\\b/.test(err)", "false"),
+	},
+	{
+		name: "sticky-too-long-turns-off",
+		pattern: "a relay keeps the session",
+		check: "a prompt too long keeps it",
+		edit: (source: string) => rep(source, " && !/too long|exceed/i.test(err)", ""),
+	},
+	{
+		name: "sticky-answered-400-turns-off",
+		pattern: "a relay keeps the session",
+		check: "a 400 after an answer keeps it",
+		edit: (source: string) => rep(source, "this.stickyOf(sk) !== \"ok\" && /^4", "/^4"),
+	},
+	{
+		name: "sticky-refusal-forgotten-by-next-process",
+		pattern: "a relay keeps the session",
+		check: "a refused metadata.user_id is not sent in the next process",
+		edit: (source: string) => rep(source, "this.sticky ??= read();", "this.sticky ??= {};"),
 	},
 ];
 const only = process.env.PZ_MUTANTS?.split(","); // run some by name
