@@ -144,7 +144,7 @@ The request guard also repairs a tool result that lost its tool call before the 
 
 **Does it work with `/tree`, fork, resume and model switches?** Yes. Folds are ordinary `context_edit` entries that Pi projects per branch; the originals stay in the session file, and a restart rebuilds pi-zip's state from it.
 
-**Which providers?** Anything Pi supports. The cache lifetime starts from what the requests ask for (5 minutes, or 1 hour with `PI_CACHE_RETENTION=long`) and is then learned. Providers that do not report cache usage still work; the stats are then estimates. Relays that rewrite `cache_control` are detected where the provider reports it; see [docs/details.md](https://github.com/purboo/pi-zip/blob/master/docs/details.md#faq).
+**Which providers?** Anything Pi supports. The cache lifetime starts from what the requests ask for (5 minutes, or 1 hour with `PI_CACHE_RETENTION=long`) and is then learned. Providers that do not report cache usage still work; the stats are then estimates. Relays that rewrite `cache_control` are detected where the provider reports it. For relays that pool accounts (sub2api, say), Anthropic requests name their session in `metadata.user_id`, as Claude Code does, so a typed prompt stays on the account that holds its cache. See [docs/details.md](https://github.com/purboo/pi-zip/blob/master/docs/details.md#faq).
 
 ## Testing
 

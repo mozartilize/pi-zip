@@ -1,6 +1,7 @@
 // The per-session shell behind index.ts: Pi's events, the run plan (F8) and the warm valve (F10) carried out and persisted at
 // turn_end, the producer and its timer for the summary (F12). The decisions themselves are pure functions in core.ts.
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { createHash } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { lastMessageMs, lastPrompt, modelKey, payloadRetention, refused, ttlFor, type ColdInfo } from "./cache.ts";
@@ -64,6 +65,11 @@ const nativeDeadlineMs = () => envInt("NATIVE_MS", 2_000);
 const NATIVE_SLOW_MS = 250;
 /** The idle door (research pi-tricks §1b variant 4, "\u03b5"): on; PI_ZIP_IDLE_DOOR=0 is an emergency off switch, not a setting. */
 const idleDoorOn = () => process.env.PI_ZIP_IDLE_DOOR !== "0";
+/** A relay that pools accounts (sub2api, say) keeps a conversation on one account only when the request names it, as Claude Code's
+ *  metadata.user_id does; without it the relay hashes the newest cached text, so a typed prompt can land on another account and write
+ *  the whole prefix again. Claude Code's legacy form, made of the session id alone. PI_ZIP_STICKY=0 is an emergency off switch. */
+export const stickyUserId = (sid: string): string | undefined => process.env.PI_ZIP_STICKY === "0" || !/^[0-9a-f-]{36}$/i.test(sid) ? undefined
+	: `user_${createHash("sha256").update(sid).digest("hex")}_account__session_${sid}`;
 const idleOf = (ctx: Any): boolean => attempt(() => ctx?.isIdle?.() === true, false);
 /** The customInstructions pi-zip passes on its own ctx.compact() (Pi hands them to every session_before_compact handler as
  *  event.customInstructions). A handler that supplies its own summaries for every compaction (a model call, say) should return undefined
@@ -106,6 +112,8 @@ export class Zip implements ZipControl {
 	private lastReqMs = 0; // the real-time cache clock: newest request start or end
 	private reqMsBefore = 0; // the clock before the request in flight started: what a refused request gives back
 	private lastModelKey = ""; // provider/model of the newest request: a cache entry belongs to one model
+	private stickyKey: string | null = null; // the model the request in flight named its session to (stickyUserId)
+	private readonly unsticky = new Set<string>(); // models whose endpoint refused metadata.user_id: not sent again in this process
 	private settleIds: string[] = []; // entries the settle plan folded: only used to label a plan as prepared
 	private bg: Bg | null = null;
 	private mine: Artifact[] = []; // the pi-zip/summary records this process made (the branch has them once written)
@@ -194,19 +202,10 @@ export class Zip implements ZipControl {
 	}
 	/** The session id recall copies are written under: none without a session file (`pi --no-session` keeps the session in memory). */
 	private recallSid(ctx: Any): string {
-		try {
-			return typeof ctx?.sessionManager?.getSessionFile?.() === "string" ? this.sessionId(ctx) : "";
-		} catch {
-			return "";
-		}
+		return attempt(() => typeof ctx?.sessionManager?.getSessionFile?.() === "string", false) ? this.sessionId(ctx) : "";
 	}
 	private sessionId(ctx: Any): string {
-		try {
-			const sid = ctx?.sessionManager?.getSessionId?.();
-			return typeof sid === "string" ? sid : "";
-		} catch {
-			return "";
-		}
+		return attempt(() => { const sid = ctx?.sessionManager?.getSessionId?.(); return typeof sid === "string" ? sid : ""; }, "");
 	}
 
 	/** Folded tool outputs of the current branch by toolCallId -> handle (the transcript marks them). */
@@ -271,12 +270,7 @@ export class Zip implements ZipControl {
 	/** /zip output in the transcript (custom entry, never sent to the model). */
 	show(ctx: Any, data: NoticeData): boolean {
 		if (ctx?.mode !== "tui" || !this.entryRenderer) return false;
-		try {
-			this.pi.appendEntry(NOTICE_CUSTOM, data);
-			return true;
-		} catch {
-			return false;
-		}
+		return attempt(() => (this.pi.appendEntry(NOTICE_CUSTOM, data), true), false);
 	}
 
 	/** A state change as one transcript line ("ƶ pi-zip  paused  …"); each word once per session unless always. */
@@ -334,11 +328,7 @@ export class Zip implements ZipControl {
 
 	private branch(ctx: Any): Any[] {
 		if (this.frozen) return this.frozen.branch;
-		try {
-			return ctx.sessionManager.getBranch() as Any[];
-		} catch {
-			return [];
-		}
+		return attempt(() => ctx.sessionManager.getBranch() as Any[], []);
 	}
 
 	private reserve(ctx: Any): number {
@@ -1557,8 +1547,12 @@ export class Zip implements ZipControl {
 			this.ledger({ type: "cold_wire", tokens: Math.round(sizeOf(this.runPlan?.scale ?? UNIT, tok)), messages: p.messages.length, folds: this.runPlan && !this.runPlan.persisted ? this.runPlan.folds.length : 0, summary: !!this.runPlan?.cut, source: this.runPlan?.source ?? null });
 		}
 		if (this.off) return undefined; // strict no-op
-		const r = repairPayload(p);
-		if (!r) return undefined;
+		const uid = p && typeof p === "object" && p.metadata == null && this.model?.api === "anthropic-messages" && this.model.provider !== "github-copilot"
+			&& !this.unsticky.has(key) ? stickyUserId(this.sessionId(ctx)) : undefined;
+		if (uid && this.stickyKey !== key) this.ledger({ type: "sticky", key });
+		this.stickyKey = uid ? key : null; // the request a refusal answers
+		const q = uid ? { ...p, metadata: { user_id: uid } } : p, r = repairPayload(q);
+		if (!r) return uid ? q : undefined;
 		this.ledger({ type: "guard_repair", repaired: r.repaired });
 		return r.payload;
 	}
@@ -1570,6 +1564,10 @@ export class Zip implements ZipControl {
 		}
 		if (m?.role === "assistant" && m.stopReason !== "error" && m.stopReason !== "aborted") this.lastReqMs = Date.now(); // the response is complete: the entry was refreshed when it finished
 		else if (refused(m)) this.lastReqMs = this.reqMsBefore; // the provider refused the request: it touched no cache (cache.ts lastMessageMs reads the branch the same way)
+		if (refused(m) && this.stickyKey && /metadata|user_id/i.test(String(m.errorMessage ?? ""))) { // an endpoint that does not take it
+			this.unsticky.add(this.stickyKey);
+			this.ledger({ type: "sticky_off", key: this.stickyKey, error: String(m.errorMessage).slice(0, 200) });
+		}
 		if (m?.role === "user" && this.active()) {
 			// the first user message of a run is the prompt; later ones (steering, follow-up) are part of that run's turn. Pi does not mark them, we do.
 			if (this.runUserSeen++ > 0 && typeof m.timestamp === "number") this.steerTs.add(m.timestamp);

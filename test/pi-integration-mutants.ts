@@ -170,6 +170,31 @@ const mutants = [
 		check: "expect(received).toContain(expected)",
 		edit: (source: string) => rep(source, ` && !/summarized /.test(d.desc ?? "")`, ""),
 	},
+	// 0.4.9: metadata.user_id for a relay that pools accounts
+	{
+		name: "sticky-never-sent",
+		pattern: "a relay keeps the session",
+		check: "an Anthropic request names its session",
+		edit: (source: string) => rep(source, "const q = uid ? { ...p, metadata: { user_id: uid } } : p,", "const q = p,"),
+	},
+	{
+		name: "sticky-overwrites-their-metadata",
+		pattern: "a relay keeps the session",
+		check: "a request that names its own keeps it",
+		edit: (source: string) => rep(source, "p.metadata == null && ", ""),
+	},
+	{
+		name: "sticky-on-any-api",
+		pattern: "a relay keeps the session",
+		check: "another API is left alone",
+		edit: (source: string) => rep(source, 'this.model?.api === "anthropic-messages" && ', ""),
+	},
+	{
+		name: "sticky-refused-sent-again",
+		pattern: "a relay keeps the session",
+		check: "a refused metadata.user_id is not sent again",
+		edit: (source: string) => rep(source, "this.unsticky.add(this.stickyKey);", ""),
+	},
 ];
 const only = process.env.PZ_MUTANTS?.split(","); // run some by name
 for (const mutant of mutants.filter((m) => !only || only.includes(m.name))) {

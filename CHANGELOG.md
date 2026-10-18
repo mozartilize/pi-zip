@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.4.9
+
+- Relays that pool accounts keep a session on one account. Pi does not name the conversation in its requests, so a relay
+  such as sub2api picked the account from the newest cached text: on one relay 19.5% of typed prompts (and 11% of the
+  tool-result requests right after them) lost the whole cache, against 0.65% for the others. pi-zip now adds
+  `metadata.user_id` to Anthropic-messages requests that carry none, in Claude Code's legacy form built from the session id
+  alone. No extra call; an endpoint that refuses the field fails one request and is not sent it again in that process.
+  `PI_ZIP_STICKY=0` is an emergency off switch. See `docs/details.md` (FAQ, relays that pool accounts).
+
 ## 0.4.8
 
 - A zip line's two sizes are on one scale again. Once the request that carried the zip is answered, the size after is its
