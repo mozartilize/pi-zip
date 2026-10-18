@@ -11,7 +11,8 @@
   fails one request (Pi does not retry it; one that answered it before, two in a row): the model and its endpoint are then
   remembered in `sticky.json` next to the cache stats and not sent the field again, in any process.
   `PI_ZIP_STICKY=0` is an emergency off switch. See `docs/details.md` (FAQ, relays that pool accounts).
-- Some try/catch blocks of `src/run.ts` use the existing `attempt()` helper (no behaviour change).
+- Some try/catch blocks (`src/run.ts`, `src/recallfile.ts`, `src/placeholder.ts`) use the existing `attempt()` helper (no
+  behaviour change).
 
 ## 0.4.8
 
