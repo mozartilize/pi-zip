@@ -70,6 +70,12 @@ const idleDoorOn = () => process.env.PI_ZIP_IDLE_DOOR !== "0";
  *  the whole prefix again. Claude Code's legacy form, made of the session id alone. PI_ZIP_STICKY=0 is an emergency off switch. */
 export const stickyUserId = (sid: string): string | undefined => process.env.PI_ZIP_STICKY === "0" || !/^[0-9a-f-]{36}$/i.test(sid) ? undefined
 	: `user_${createHash("sha256").update(sid).digest("hex")}_account__session_${sid}`;
+/** Sent on an Anthropic-messages request without metadata; not to api.anthropic.com or Copilot (nothing pooled there), and not on one that
+ *  already speaks as Claude Code (Pi's OAuth path, a claude-cli user agent): a relay would take it for Claude Code and stop rewriting it. */
+const stickyFits = (m: Any, p: Any): boolean => !!p && typeof p === "object" && p.metadata == null && m?.api === "anthropic-messages"
+	&& m.provider !== "github-copilot" && !/^https?:\/\/api\.anthropic\.com/i.test(String(m.baseUrl ?? ""))
+	&& !Object.entries(m.headers ?? {}).some(([k, v]) => /^user-agent$/i.test(k) && /claude-cli/i.test(String(v)))
+	&& !/^You are Claude Code/.test(String(Array.isArray(p.system) ? p.system[0]?.text : (p.system ?? "")));
 const idleOf = (ctx: Any): boolean => attempt(() => ctx?.isIdle?.() === true, false);
 /** The customInstructions pi-zip passes on its own ctx.compact() (Pi hands them to every session_before_compact handler as
  *  event.customInstructions). A handler that supplies its own summaries for every compaction (a model call, say) should return undefined
@@ -113,7 +119,7 @@ export class Zip implements ZipControl {
 	private reqMsBefore = 0; // the clock before the request in flight started: what a refused request gives back
 	private lastModelKey = ""; // provider/model of the newest request: a cache entry belongs to one model
 	private stickyKey: string | null = null; // the model the request in flight named its session to (stickyUserId)
-	private readonly unsticky = new Set<string>(); // models whose endpoint refused metadata.user_id: not sent again in this process
+	private sticky: Record<string, unknown> | null = null; // stickyOf: model key -> "ok" (answered) | "off" (refused)
 	private settleIds: string[] = []; // entries the settle plan folded: only used to label a plan as prepared
 	private bg: Bg | null = null;
 	private mine: Artifact[] = []; // the pi-zip/summary records this process made (the branch has them once written)
@@ -289,23 +295,14 @@ export class Zip implements ZipControl {
 	welcome(ctx: Any) {
 		if (ctx?.mode !== "tui" || !this.entryRenderer || this.off || this.conflict) return;
 		const flag = `${dirname(process.env.PI_ZIP_CACHE_STATS || statsPath())}/welcomed`;
-		try {
-			if (existsSync(flag)) return;
-			mkdirSync(dirname(flag), { recursive: true });
-			writeFileSync(flag, new Date().toISOString() + "\n");
-		} catch {
-			return;
-		}
+		if (attempt(() => existsSync(flag) || (mkdirSync(dirname(flag), { recursive: true }), writeFileSync(flag, new Date().toISOString() + "\n"), false), true)) return;
 		this.stateLine(ctx, "on", "older context gets zipped when the savings pay for the rewrite · /zip");
 	}
 
 	ledger(rec: Record<string, unknown>) {
 		const path = process.env.PI_ZIP_LEDGER; // test only
 		if (!path) return;
-		try {
-			mkdirSync(dirname(path), { recursive: true });
-			appendFileSync(path, JSON.stringify({ ts: new Date().toISOString(), pid: process.pid, ...rec }) + "\n");
-		} catch {}
+		attempt(() => (mkdirSync(dirname(path), { recursive: true }), appendFileSync(path, JSON.stringify({ ts: new Date().toISOString(), pid: process.pid, ...rec }) + "\n")), undefined);
 	}
 
 	/** keep = a fold/summary notice: written to the session as a custom entry, so it stays in the transcript (also after a restart)
@@ -332,11 +329,7 @@ export class Zip implements ZipControl {
 	}
 
 	private reserve(ctx: Any): number {
-		try {
-			return reserveTokensFor(this.pi.getSettings?.(), ctx?.model);
-		} catch {
-			return reserveTokensFor(undefined, ctx?.model);
-		}
+		return attempt((): number | null => reserveTokensFor(this.pi.getSettings?.(), ctx?.model), null) ?? reserveTokensFor(undefined, ctx?.model);
 	}
 
 	/** The system prompt and the declared tools from Pi's API: only used when the transcript records no system message (plan.ts calibrate). */
@@ -369,11 +362,7 @@ export class Zip implements ZipControl {
 
 	/** The token scale (O, c) read from the branch: stateless, so a fresh process calibrates exactly like a long-lived one. */
 	scaleOf(ctx: Any, entries?: Any[]): Scale {
-		try {
-			return scaleOf(entries ?? ((ctx.sessionManager.buildSessionProjection() as Any)?.entries ?? []), this.branch(ctx), this.sysInfo(ctx), ctx?.model ? modelKey(ctx.model) : undefined);
-		} catch {
-			return UNIT;
-		}
+		return attempt(() => scaleOf(entries ?? ((ctx.sessionManager.buildSessionProjection() as Any)?.entries ?? []), this.branch(ctx), this.sysInfo(ctx), ctx?.model ? modelKey(ctx.model) : undefined), UNIT);
 	}
 
 	/** The token scale of model `key` ("provider/id"), read from the branch. */
@@ -406,6 +395,18 @@ export class Zip implements ZipControl {
 		const r = planOpts(entries, branch, env, this.lam(ctx), pending, pWarm, pause, cutAt, foldsOnly, ready);
 		r.o.rent = this.rent;
 		return r;
+	}
+
+	/** A model's metadata.user_id state, kept across processes (sticky.json next to the cache stats; other processes write it too). */
+	private stickyOf(key: string, set?: "ok" | "off"): unknown {
+		const path = `${dirname(process.env.PI_ZIP_CACHE_STATS || statsPath())}/sticky.json`;
+		const read = (): Record<string, unknown> => attempt(() => { const j = JSON.parse(readFileSync(path, "utf8")); return j && typeof j === "object" && !Array.isArray(j) ? j : {}; }, {});
+		this.sticky ??= read();
+		if (set && this.sticky[key] !== set) {
+			this.sticky = { ...read(), [key]: set };
+			attempt(() => (mkdirSync(dirname(path), { recursive: true }), writeFileSync(path, JSON.stringify(this.sticky))), undefined);
+		}
+		return this.sticky[key];
 	}
 
 	private entKey = "";
@@ -1547,8 +1548,7 @@ export class Zip implements ZipControl {
 			this.ledger({ type: "cold_wire", tokens: Math.round(sizeOf(this.runPlan?.scale ?? UNIT, tok)), messages: p.messages.length, folds: this.runPlan && !this.runPlan.persisted ? this.runPlan.folds.length : 0, summary: !!this.runPlan?.cut, source: this.runPlan?.source ?? null });
 		}
 		if (this.off) return undefined; // strict no-op
-		const uid = p && typeof p === "object" && p.metadata == null && this.model?.api === "anthropic-messages" && this.model.provider !== "github-copilot"
-			&& !this.unsticky.has(key) ? stickyUserId(this.sessionId(ctx)) : undefined;
+		const uid = stickyFits(this.model, p) && this.stickyOf(key) !== "off" ? stickyUserId(this.sessionId(ctx)) : undefined;
 		if (uid && this.stickyKey !== key) this.ledger({ type: "sticky", key });
 		this.stickyKey = uid ? key : null; // the request a refusal answers
 		const q = uid ? { ...p, metadata: { user_id: uid } } : p, r = repairPayload(q);
@@ -1564,9 +1564,12 @@ export class Zip implements ZipControl {
 		}
 		if (m?.role === "assistant" && m.stopReason !== "error" && m.stopReason !== "aborted") this.lastReqMs = Date.now(); // the response is complete: the entry was refreshed when it finished
 		else if (refused(m)) this.lastReqMs = this.reqMsBefore; // the provider refused the request: it touched no cache (cache.ts lastMessageMs reads the branch the same way)
-		if (refused(m) && this.stickyKey && /metadata|user_id/i.test(String(m.errorMessage ?? ""))) { // an endpoint that does not take it
-			this.unsticky.add(this.stickyKey);
-			this.ledger({ type: "sticky_off", key: this.stickyKey, error: String(m.errorMessage).slice(0, 200) });
+		const sk = this.stickyKey, err = String(m?.errorMessage ?? "");
+		if (sk && m?.role === "assistant" && m.stopReason !== "error" && m.stopReason !== "aborted" && this.stickyOf(sk) !== "ok") this.stickyOf(sk, "ok");
+		// a refusal that names the field, or the first 400 of a model that never answered it ("400 status code (no body)"; Pi does not retry)
+		if (sk && refused(m) && (/metadata|user_id/i.test(err) || (this.stickyOf(sk) !== "ok" && /^4(00|22)\b/.test(err) && !/too long|exceed/i.test(err)))) {
+			this.stickyOf(sk, "off");
+			this.ledger({ type: "sticky_off", key: sk, error: err.slice(0, 200) });
 		}
 		if (m?.role === "user" && this.active()) {
 			// the first user message of a run is the prompt; later ones (steering, follow-up) are part of that run's turn. Pi does not mark them, we do.
