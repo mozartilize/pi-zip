@@ -70,12 +70,11 @@ const idleDoorOn = () => process.env.PI_ZIP_IDLE_DOOR !== "0";
  *  the whole prefix again. Claude Code's legacy form, made of the session id alone. PI_ZIP_STICKY=0 is an emergency off switch. */
 export const stickyUserId = (sid: string): string | undefined => process.env.PI_ZIP_STICKY === "0" || !/^[0-9a-f-]{36}$/i.test(sid) ? undefined
 	: `user_${createHash("sha256").update(sid).digest("hex")}_account__session_${sid}`;
-/** Sent on an Anthropic-messages request without metadata; not to api.anthropic.com or Copilot (nothing pooled there), and not on one that
- *  already speaks as Claude Code (Pi's OAuth path, a claude-cli user agent): a relay would take it for Claude Code and stop rewriting it. */
+/** Sent on an Anthropic-messages request without metadata, not to Copilot, and not on one that already speaks as Claude Code (Pi's OAuth
+ *  system prompt; Zip.providerRequest also asks the registry for a claude-cli user agent or an OAuth key): a relay would take it for
+ *  Claude Code and stop rewriting it. Not to api.anthropic.com either: nothing is pooled there. */
 const stickyFits = (m: Any, p: Any): boolean => !!p && typeof p === "object" && p.metadata == null && m?.api === "anthropic-messages"
-	&& m.provider !== "github-copilot" && !/^https?:\/\/api\.anthropic\.com/i.test(String(m.baseUrl ?? ""))
-	&& !Object.entries(m.headers ?? {}).some(([k, v]) => /^user-agent$/i.test(k) && /claude-cli/i.test(String(v)))
-	&& !/^You are Claude Code/.test(String(Array.isArray(p.system) ? p.system[0]?.text : (p.system ?? "")));
+	&& m.provider !== "github-copilot" && !/^You are Claude Code/.test(String(Array.isArray(p.system) ? p.system[0]?.text : (p.system ?? "")));
 const idleOf = (ctx: Any): boolean => attempt(() => ctx?.isIdle?.() === true, false);
 /** The customInstructions pi-zip passes on its own ctx.compact() (Pi hands them to every session_before_compact handler as
  *  event.customInstructions). A handler that supplies its own summaries for every compaction (a model call, say) should return undefined
@@ -119,7 +118,9 @@ export class Zip implements ZipControl {
 	private reqMsBefore = 0; // the clock before the request in flight started: what a refused request gives back
 	private lastModelKey = ""; // provider/model of the newest request: a cache entry belongs to one model
 	private stickyKey: string | null = null; // the model the request in flight named its session to (stickyUserId)
-	private sticky: Record<string, unknown> | null = null; // stickyOf: model key -> "ok" (answered) | "off" (refused)
+	private sticky: Record<string, unknown> | null = null; // stickyOf: model key@base URL -> "ok" (answered) | "off" (refused)
+	private readonly stickyAuth = new Map<string, Promise<boolean>>(); // model key@base URL -> its auth speaks as Claude Code (resolved once)
+	private sticky400 = 0; // 400s in a row to requests that carried the field
 	private settleIds: string[] = []; // entries the settle plan folded: only used to label a plan as prepared
 	private bg: Bg | null = null;
 	private mine: Artifact[] = []; // the pi-zip/summary records this process made (the branch has them once written)
@@ -250,13 +251,9 @@ export class Zip implements ZipControl {
 	realSizeAfter(reqTs: number): number | undefined {
 		const memo = this.realMemo.get(reqTs);
 		if (memo && "real" in memo) return memo.real;
-		let sm: Any = null, n = -1;
-		try {
-			sm = this.liveCtx?.sessionManager;
-			n = typeof sm?.getEntryCount === "function" ? sm.getEntryCount() : -1;
-		} catch {
-			return undefined;
-		}
+		const got = attempt(() => { const sm: Any = this.liveCtx?.sessionManager; return { sm, n: typeof sm?.getEntryCount === "function" ? sm.getEntryCount() : -1 }; }, null);
+		if (!got) return undefined;
+		const { sm, n } = got;
 		if (memo && n >= 0 && memo.n === n) return undefined;
 		for (const e of attempt((): Any[] => sm?.getBranch?.() ?? [], [])) {
 			const m = e?.type === "message" ? e.message : null;
@@ -1547,14 +1544,25 @@ export class Zip implements ZipControl {
 			for (const m of p.messages) if (m?.role !== "system" && m?.role !== "developer") tok += tok4(JSON.stringify(m?.content ?? "")) + 8;
 			this.ledger({ type: "cold_wire", tokens: Math.round(sizeOf(this.runPlan?.scale ?? UNIT, tok)), messages: p.messages.length, folds: this.runPlan && !this.runPlan.persisted ? this.runPlan.folds.length : 0, summary: !!this.runPlan?.cut, source: this.runPlan?.source ?? null });
 		}
+		const m = this.model, sk = `${key}@${m?.baseUrl ?? ""}`, was = this.stickyKey;
+		this.stickyKey = null; // set again below when this request names its session: the request a refusal answers
 		if (this.off) return undefined; // strict no-op
-		const uid = stickyFits(this.model, p) && this.stickyOf(key) !== "off" ? stickyUserId(this.sessionId(ctx)) : undefined;
-		if (uid && this.stickyKey !== key) this.ledger({ type: "sticky", key });
-		this.stickyKey = uid ? key : null; // the request a refusal answers
-		const q = uid ? { ...p, metadata: { user_id: uid } } : p, r = repairPayload(q);
-		if (!r) return uid ? q : undefined;
-		this.ledger({ type: "guard_repair", repaired: r.repaired });
-		return r.payload;
+		const uid = stickyFits(m, p) && this.stickyOf(sk) !== "off" ? stickyUserId(this.sessionId(ctx)) : undefined;
+		if (!uid) return this.guarded(p, false);
+		// the headers, key and base URL Pi resolves for the request (models.json headers never reach ctx.model), once per model
+		if (!this.stickyAuth.has(sk)) this.stickyAuth.set(sk, Promise.resolve(attempt(() => ctx?.modelRegistry?.getApiKeyAndHeaders?.(m), null)).then((a: Any) =>
+			/claude-cli/i.test(JSON.stringify(a?.headers ?? {})) || /sk-ant-oat/.test(String(a?.apiKey ?? "")) || /^https?:\/\/api\.anthropic\.com/i.test(String(a?.baseUrl ?? m.baseUrl ?? "")), () => false));
+		return this.stickyAuth.get(sk)!.then((cc) => {
+			if (cc) return this.guarded(p, false);
+			if (was !== sk) this.ledger({ type: "sticky", key: sk });
+			this.stickyKey = sk;
+			return this.guarded({ ...p, metadata: { user_id: uid } }, true);
+		});
+	}
+	private guarded(p: Any, changed: boolean): Any {
+		const r = repairPayload(p);
+		if (r) this.ledger({ type: "guard_repair", repaired: r.repaired });
+		return r ? r.payload : changed ? p : undefined;
 	}
 
 	messageEnd(m: Any, ctx?: Any) {
@@ -1564,11 +1572,14 @@ export class Zip implements ZipControl {
 		}
 		if (m?.role === "assistant" && m.stopReason !== "error" && m.stopReason !== "aborted") this.lastReqMs = Date.now(); // the response is complete: the entry was refreshed when it finished
 		else if (refused(m)) this.lastReqMs = this.reqMsBefore; // the provider refused the request: it touched no cache (cache.ts lastMessageMs reads the branch the same way)
-		const sk = this.stickyKey, err = String(m?.errorMessage ?? "");
-		if (sk && m?.role === "assistant" && m.stopReason !== "error" && m.stopReason !== "aborted" && this.stickyOf(sk) !== "ok") this.stickyOf(sk, "ok");
-		// a refusal that names the field, or the first 400 of a model that never answered it ("400 status code (no body)"; Pi does not retry)
-		if (sk && refused(m) && (/metadata|user_id/i.test(err) || (this.stickyOf(sk) !== "ok" && /^4(00|22)\b/.test(err) && !/too long|exceed/i.test(err)))) {
+		const sk = this.stickyKey, err = String(m?.errorMessage ?? ""), ok = !!sk && this.stickyOf(sk) === "ok";
+		if (sk && m?.role === "assistant" && m.stopReason !== "error" && m.stopReason !== "aborted" && ((this.sticky400 = 0), !ok)) (this.stickyOf(sk, "ok"), this.ledger({ type: "sticky_ok", key: sk }));
+		// a refusal that names the field; a 400 ("400 status code (no body)" too; Pi does not retry it) to a model that never answered it,
+		// or the second in a row to one that did; a prompt too long does not count
+		const in400 = !!sk && refused(m) && /^4(00|22)\b/.test(err) && !/too long|exceed/i.test(err) && ++this.sticky400 >= (ok ? 2 : 1);
+		if (sk && refused(m) && (/metadata|user_id/i.test(err) || in400)) {
 			this.stickyOf(sk, "off");
+			this.sticky400 = 0;
 			this.ledger({ type: "sticky_off", key: sk, error: err.slice(0, 200) });
 		}
 		if (m?.role === "user" && this.active()) {

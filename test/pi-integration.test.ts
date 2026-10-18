@@ -1,7 +1,7 @@
 // Integration with Pi itself: the real SessionManager, the real ExtensionRunner (emitContext, emitBoundary) and the real
 // projection of persisted edits. test/helpers.ts' own projector is NOT used here, so Pi's behaviour decides what is right.
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { createEventBus, discoverAndLoadExtensions, ExtensionRunner, SessionManager, convertToLlm } from "@earendil-works/pi-coding-agent";
+import { createEventBus, discoverAndLoadExtensions, ExtensionRunner, ModelRegistry, ModelRuntime, SessionManager, convertToLlm } from "@earendil-works/pi-coding-agent";
 import { createHash } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -2310,8 +2310,17 @@ describe("a relay keeps the session on one account: metadata.user_id", () => {
 		expect((await send(r)).metadata, "the emergency switch turns it off").toBeUndefined();
 		delete process.env.PI_ZIP_STICKY;
 		expect((await send(r, { ...body(), system: [{ type: "text", text: "You are Claude Code, Anthropic's official CLI for Claude." }] })).metadata, "a request that speaks as Claude Code is left alone").toBeUndefined();
-		r.setModel({ ...MODEL, headers: { "User-Agent": "claude-cli/2.1.280" } });
+		// models.json headers and keys never reach ctx.model: Pi's own registry resolves them for the request
+		const dir = mkdtempSync(join(tmpdir(), "pz-sticky-models-")), def = { api: "anthropic-messages", baseUrl: "http://127.0.0.1:1", models: [{ id: "m", name: "m", reasoning: false, input: ["text"], contextWindow: 200000, maxTokens: 1000, cost: MODEL.cost }] };
+		writeFileSync(join(dir, "models.json"), JSON.stringify({ providers: { cc: { ...def, apiKey: "sk-test", headers: { "User-Agent": "claude-cli/2.1.280" } }, oauth: { ...def, apiKey: "sk-ant-oat01-test" }, plain: { ...def, apiKey: "sk-test" } } }));
+		const reg = new ModelRegistry(await ModelRuntime.create({ modelsPath: join(dir, "models.json"), authPath: join(dir, "auth.json"), refreshOnCreate: false }));
+		r.runner.createContext().modelRegistry.getApiKeyAndHeaders = (m: Any) => reg.getApiKeyAndHeaders(m);
+		r.setModel(reg.find("cc", "m"));
 		expect((await send(r)).metadata, "a claude-cli user agent is left alone").toBeUndefined();
+		r.setModel(reg.find("oauth", "m"));
+		expect((await send(r)).metadata, "an OAuth key is left alone").toBeUndefined();
+		r.setModel(reg.find("plain", "m"));
+		expect((await send(r)).metadata, "a relay from models.json names its session").toBeDefined();
 		r.setModel({ ...MODEL, baseUrl: "https://api.anthropic.com" });
 		expect((await send(r)).metadata, "api.anthropic.com is left alone").toBeUndefined();
 		r.setModel({ ...MODEL, provider: "github-copilot" });
@@ -2336,7 +2345,7 @@ describe("a relay keeps the session on one account: metadata.user_id", () => {
 		await next.shutdown();
 	});
 
-	test("a relay keeps the session: once an endpoint answered it, only a refusal that names it turns it off", async () => {
+	test("a relay keeps the session: once an endpoint answered it, a refusal that names it or a second 400 in a row turns it off", async () => {
 		const r = await rig(undefined, { start: false });
 		expect((await send(r)).metadata).toBeDefined();
 		await answer(r);
@@ -2345,6 +2354,14 @@ describe("a relay keeps the session on one account: metadata.user_id", () => {
 		expect((await send(r)).metadata, "a 400 after an answer keeps it").toBeDefined();
 		await refuse(r, "400 metadata: Extra inputs are not permitted");
 		expect((await send(r)).metadata, "a refused metadata.user_id is not sent again").toBeUndefined();
+		r.setModel({ ...MODEL, baseUrl: "http://127.0.0.1:2" }); // another endpoint for the same model: its own state
+		expect((await send(r)).metadata, "another endpoint has its own state").toBeDefined();
+		await answer(r);
+		await send(r);
+		await refuse(r, "400 status code (no body)");
+		await send(r);
+		await refuse(r, "400 status code (no body)");
+		expect((await send(r)).metadata, "the second 400 in a row after an answer turns it off").toBeUndefined();
 		await r.shutdown();
 	});
 });

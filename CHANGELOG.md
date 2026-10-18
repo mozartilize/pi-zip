@@ -7,8 +7,9 @@
   tool-result requests right after them) lost the whole cache, against 0.65% for the others. pi-zip now adds
   `metadata.user_id` to Anthropic-messages requests that carry none, in Claude Code's legacy form built from the session id
   alone; not for api.anthropic.com or Copilot, and not to a request that already speaks as Claude Code (Pi's OAuth path, a
-  `claude-cli` user agent). No extra call. An endpoint that refuses the field fails one request (Pi does not retry it): the
-  model is then remembered in `sticky.json` next to the cache stats and not sent the field again, in any process.
+  `claude-cli` user agent in the headers Pi resolves from models.json). No extra call. An endpoint that refuses the field
+  fails one request (Pi does not retry it; one that answered it before, two in a row): the model and its endpoint are then
+  remembered in `sticky.json` next to the cache stats and not sent the field again, in any process.
   `PI_ZIP_STICKY=0` is an emergency off switch. See `docs/details.md` (FAQ, relays that pool accounts).
 - Some try/catch blocks of `src/run.ts` use the existing `attempt()` helper (no behaviour change).
 
