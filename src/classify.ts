@@ -48,10 +48,8 @@ export function isReadOnlyBash(cmd: string): boolean {
 	return true;
 }
 
-/**
- * read: rereadable iff the file still exists and its bytes equal what the tool returned (unchanged since).
- * bash: rereadable iff read-only. grep/find/ls/glob: re-runnable queries. Everything else: not rereadable.
- */
+/** read: rereadable iff the file still exists and its bytes equal what the tool returned (unchanged since).
+ *  bash: rereadable iff read-only. grep/find/ls/glob: re-runnable queries. Everything else: not rereadable. */
 export function classifyRecoverability(tool: string, args: Any, rawText: string, cwd: string): Recover {
 	tool = String(tool ?? "").toLowerCase();
 	const a: Any = args ?? {};

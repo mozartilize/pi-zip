@@ -11,6 +11,7 @@ import { markFirstLine, measure, recallCallLine, renderCard, renderState, setMea
 export default function piZip(pi: ExtensionAPI) {
 	if (process.env.PI_ZIP_OFF === "1") return; // test only: behave exactly as if not installed (registers nothing)
 	const zip = new Zip(pi);
+	import("@earendil-works/pi-coding-agent").then((m: Any) => { zip.version.pi = String(m?.VERSION ?? ""); }, () => {}); // Pi's version, for the version entry
 	registerRecallTool(pi, zip); // stays registered even when off: earlier folds must stay recallable, and a tool-list change would bust the cache
 	registerZipCommand(pi, zip);
 	try {

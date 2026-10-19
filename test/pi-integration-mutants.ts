@@ -286,6 +286,19 @@ const mutants = [
 		check: "a compaction that goes in resets the count",
 		edit: (source: string) => rep(source, "this.nativeLate = entry ? 0 :", "this.nativeLate = entry ? this.nativeLate :"),
 	},
+	// 0.4.11: the version entry (offline evaluation reads which pi-zip and Pi a session ran)
+	{
+		name: "version-every-run",
+		pattern: "the version entry",
+		check: "one version entry per process and session",
+		edit: (source: string) => rep(source, "if (!s.done && !(s.done = true,", "if (!(s.done = true,"),
+	},
+	{
+		name: "version-never-on-change",
+		pattern: "the version entry",
+		check: "another pi-zip version writes its own entry",
+		edit: (source: string) => rep(source, "s.last?.v === d.v && s.last?.pi === d.pi", "!!s.last"),
+	},
 ];
 const only = process.env.PZ_MUTANTS?.split(","); // run some by name
 for (const mutant of mutants.filter((m) => !only || only.includes(m.name))) {
@@ -293,6 +306,7 @@ for (const mutant of mutants.filter((m) => !only || only.includes(m.name))) {
 	try {
 		const source = join(dir, "src");
 		cpSync(join(root, "src"), source, { recursive: true });
+		cpSync(join(root, "package.json"), join(dir, "package.json")); // src/run.ts reads its version from ../package.json
 		const file = join(source, (mutant as { file?: string }).file ?? "run.ts"), original = readFileSync(file, "utf8");
 		const changed = mutant.edit(original);
 		if (changed === original) throw new Error(`${mutant.name}: mutation site missing`);

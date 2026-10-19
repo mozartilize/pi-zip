@@ -21,12 +21,12 @@ import { fmtLife, type CardData, type ChartBin, type StateWord } from "./ui.ts";
 export const PLAN_CUSTOM = "pi-zip/plan";
 export const STATE_CUSTOM = "pi-zip/state";
 export const STEER_CUSTOM = "pi-zip/steer";
+export const VERSION_CUSTOM = "pi-zip/version", PZ_VERSION: string = attempt(() => String(JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).version), "?"); // the pi-zip and Pi versions a session ran from `since` (ms) on, for offline evaluation
 const WARM_WHY = "cache warm · worth it at this size";
 const fmtAway = (s: number) => (s < 90 ? `${Math.round(s)} s` : s < 5400 ? `${Math.round(s / 60)} min` : `${(Math.round(s / 360) / 10).toFixed(1)} h`);
 export const NOTICE_CUSTOM = "pi-zip/notice"; // a fold/summary notice kept in the transcript (rendered by index.ts, never sent to the model)
 export { checkEdits, SUMMARY_CUSTOM };
-/** Written by 0.3.x for a background summary nobody adopted: still read, so the totals of an older session stay honest. */
-const LEGACY_UNUSED_CUSTOM = "pi-zip/unused-summary";
+const LEGACY_UNUSED_CUSTOM = "pi-zip/unused-summary"; // written by 0.3.x for a background summary nobody adopted: still read, so older totals stay honest
 // Other context managers rewrite the view too (F14); two writers give unpredictable results, so we pause and keep only the Guard.
 const CONFLICT_RE = /billion-context|bc-pi|magic-context|smart-compact|hot-compact|context-prune|pi-vcc|context-mode|prefix-cache/i;
 
@@ -169,6 +169,7 @@ export class Zip implements ZipControl {
 	private inputs = 0;
 	private idleNat: { nat: NativeRun; note: Start["note"]; head: string; model: string } | null = null;
 	private ranHere = false; // a run of this process in this session: the idle door opens only after one
+	version = { v: PZ_VERSION, pi: "", since: Date.now(), last: null as Any, done: false }; // pi: set by index.ts; last: the session's newest version entry
 	private readyAtStart = new Set<string>(); // summaries ready when the run began: one taken at its turn_end was ready while the user was away
 	// the cache tier (PI_CACHE_RETENTION) of the current model's requests: the payload of its newest request when seen, else the
 	// provider-scoped env resolved once per run (research pi-tricks §3.1); null = nothing known, the process env decides (cache.ts)
@@ -467,6 +468,7 @@ export class Zip implements ZipControl {
 		this.ranHere = false;
 		this.idleNat = null;
 		const branch = this.branch(ctx);
+		Object.assign(this.version, { last: [...branch].reverse().find((en) => en?.type === "custom" && en.customType === VERSION_CUSTOM)?.data ?? null, since: Date.now(), done: false });
 		for (let i = branch.length - 1; i >= 0; i--) {
 			const en = branch[i];
 			if (en?.type === "custom" && en.customType === STATE_CUSTOM) {
@@ -683,6 +685,8 @@ export class Zip implements ZipControl {
 		this.promptStart = false;
 		this.inRun = false;
 		this.writeUnwritten();
+		const s = this.version, d = { v: s.v, pi: s.pi, since: s.since }; // at the end of the process's first run here, unless the newest entry says the same
+		if (!s.done && !(s.done = true, s.last?.v === d.v && s.last?.pi === d.pi)) attempt(() => this.pi.appendEntry(VERSION_CUSTOM, d), undefined);
 	}
 
 	/** The start of a run read from the branch now (Start without the native decision): at a prompt's idle input, or at the start of

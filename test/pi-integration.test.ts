@@ -2513,3 +2513,32 @@ describe("no UI (pi -p, json): the requests and the session of three scenarios h
 		await sleep(400);
 	});
 });
+
+describe("the version entry: the pi-zip and Pi versions a session ran, once per process and session, never on opening alone", () => {
+	const sleep = (ms: number) => new Promise((res) => setTimeout(res, ms));
+	const versions = (r: Any) => r.sm.getEntries().filter((e: Any) => e.type === "custom" && e.customType === "pi-zip/version").map((e: Any) => e.data);
+	const end = (r: Any) => r.runner.emit({ type: "agent_end", messages: [] } as Any);
+	const fileOf = (r: Any) => [r.sm.getHeader(), ...r.sm.getEntries()];
+	test("written at the end of the process's first run here; a restart on the same versions writes none, another pi-zip version its own", async () => {
+		const { VERSION } = await import("@earendil-works/pi-coding-agent");
+		const v = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).version;
+		const r = await rig(undefined, { tui: true });
+		await sleep(30); // index.ts reads Pi's version from Pi's module
+		expect(versions(r), "opening a session writes no version entry").toEqual([]);
+		const t0 = Date.now();
+		await end(r);
+		await end(r);
+		expect(versions(r), "one version entry per process and session").toEqual([{ v, pi: VERSION, since: expect.any(Number) }]);
+		expect(versions(r)[0].since).toBeLessThanOrEqual(t0);
+		expect(typeof VERSION === "string" && VERSION.length > 0).toBe(true);
+		const again = await rig(undefined, { file: fileOf(r), tui: true });
+		await sleep(30);
+		await end(again);
+		expect(versions(again), "a restart on the same versions writes none").toHaveLength(1);
+		const older = fileOf(r).map((e: Any) => (e.customType === "pi-zip/version" ? { ...e, data: { ...e.data, v: "0.0.1" } } : e));
+		const upgraded = await rig(undefined, { file: older, tui: true });
+		await sleep(30);
+		await end(upgraded);
+		expect(versions(upgraded).map((d: Any) => d.v), "another pi-zip version writes its own entry").toEqual(["0.0.1", v]);
+	});
+});
