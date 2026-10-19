@@ -58,11 +58,9 @@ const foreignCompaction = (e: Any): boolean => e?.type === "compaction" && !!e.f
 
 /** pi-zip's own compaction takes milliseconds: the summary is done. Pi runs every extension's session_before_compact handler for it, so
  *  one that is not finished by this deadline has another handler at work (writing its own summary, say): pi-zip cancels it then, so it
- *  can never land during the run, and the draft path takes the summary (the idle door's, only while no run is announced). */
+ *  can never land during the run, and the draft path takes the summary (the idle door's, only while no run is announced). Timing alone
+ *  never ends the native path (Pi's own work before pi-zip's handler grows with the branch: 50-380 ms at 40-55K entries): only a second miss in a row. */
 const nativeDeadlineMs = () => envInt("NATIVE_MS", 2_000);
-/** A compaction slower than this (or half the deadline) had another handler at work too: the native path ends for the process, so its
- *  work (a model call, say) is not paid for, and waited for, at every cold return. */
-const NATIVE_SLOW_MS = 250;
 /** The idle door (research pi-tricks §1b variant 4, "\u03b5"): on; PI_ZIP_IDLE_DOOR=0 is an emergency off switch, not a setting. */
 const idleDoorOn = () => process.env.PI_ZIP_IDLE_DOOR !== "0";
 /** A relay that pools accounts (sub2api, say) keeps a conversation on one account only when the request names it, as Claude Code's
@@ -155,8 +153,9 @@ export class Zip implements ZipControl {
 	/** What became of the native path for this run, for the notice (the session file alone says why a summary went the draft way). */
 	private nativeNote: { native: string; ms?: number; askMs?: number } | null = null;
 	// the native path ended for this process, and why: another extension took part in pi-zip's compaction (answered, cancelled or
-	// replaced it, or took its time), or Pi's compaction failed. Summaries then wait for a turn_end draft.
+	// replaced it, or missed the deadline twice in a row), or Pi's compaction failed. Summaries then wait for a turn_end draft.
 	private nativeOff: string | null = null;
+	private nativeLate = 0; // pi-zip's compactions cancelled at the deadline since the last one that went in
 	// this run's return went in through another extension's compaction (it answered pi-zip's): the run plan adds no summary on top of
 	// it (folds only, a summary only at Pi's compaction room), and the summary prepared for the context it replaced is discarded
 	private foreignRun = false;
@@ -897,21 +896,23 @@ export class Zip implements ZipControl {
 		// still pending at the deadline: cancel it now, before the run starts (Pi checks its abort signal right before it appends; at the idle
 		// door, no run was announced to pi-zip at the deadline, and only microtasks ran since)
 		if (res.late && !last) attempt(() => ctx.abort?.(), undefined);
-		// "another handler at work" is measured over the time other handlers can occupy: before ours (askMs) and, for handlers after ours, from
-		// our answer to the entry's own append (appendCompaction stamps it). Pi's work after the append (the refresh of its context, the
-		// projection and token estimate, session_compact, compaction_end and the chat rebuild) grows with the branch and is nobody's handler:
-		// on a 500K-token branch it alone can pass 250 ms.
+		// logged only: the time before ours (askMs: Pi's own preparation and earlier handlers) plus, for handlers after ours, our answer to the
+		// entry's own append (appendCompaction stamps it), without Pi's work after the append (context refresh, projection, chat rebuild).
 		const appendedAt = entry?.timestamp ? Date.parse(entry.timestamp) : NaN;
 		const handlerMs = entry && askMs !== null ? askMs + (Number.isFinite(appendedAt) && ask.askedWall ? Math.max(0, appendedAt - ask.askedWall) : 0) : ms;
+		// a slow compaction that went in ends nothing (on a large branch Pi's own work alone passed 250 ms, closing both doors for 12 h);
+		// a deadline miss cancels this one, and a second in a row ends the native path (a handler at work at every compaction)
+		this.nativeLate = entry ? 0 : res.late && !last ? this.nativeLate + 1 : this.nativeLate;
+		const lateWhy = ask.answered ? `Pi's compaction was not done ${deadline} ms after pi-zip answered` : `another session_before_compact handler ran before pi-zip's for ${deadline} ms`;
 		const off = entry
-			? added.length > 1 ? "another compaction went in as well" : handlerMs > Math.min(NATIVE_SLOW_MS, deadline / 2) ? `Pi's compaction spent ${handlerMs} ms in session_before_compact handlers: another handler at work` : null
+			? added.length > 1 ? "another compaction went in as well" : null
 			: last ? "another extension's compaction went in instead of pi-zip's"
-			: res.late ? (ask.answered ? `Pi's compaction was not done ${deadline} ms after pi-zip answered (cancelled)` : `another session_before_compact handler ran before pi-zip's (cancelled after ${deadline} ms)`)
+			: res.late ? (this.nativeLate >= 2 ? `${lateWhy}, twice in a row (cancelled)` : null)
 			: `Pi's compaction failed: ${res.err ?? "no compaction entry"}`;
 		if (off) this.endNative(off);
-		s.note = { native: entry && !off ? "ok" : (off ?? "failed"), ms, ...(askMs !== null ? { askMs } : {}) };
+		s.note = { native: entry && !off ? "ok" : (off ?? (res.late ? `${lateWhy} (cancelled)` : "failed")), ms, ...(askMs !== null ? { askMs } : {}) };
 		if (!entry?.id) {
-			this.ledger({ type: "native_fail", ms, askMs, handlerMs, answered: ask.answered, error: res.late ? "deadline" : (res.err ?? "no compaction entry"), foreign: !!last });
+			this.ledger({ type: "native_fail", ms, askMs, handlerMs, answered: ask.answered, error: res.late ? "deadline" : (res.err ?? "no compaction entry"), foreign: !!last, ...(res.late ? { late: this.nativeLate } : {}) });
 			if (last) {
 				// Another extension replaced this summary's prefix: discard it and use only folds for the first request.
 				this.discardBg("replaced");

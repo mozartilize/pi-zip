@@ -473,7 +473,7 @@ describe("one producer prepares the return with one timer", () => {
 		const r = await rig(done, COLD_TS(), { modelRegistry: { complete: mkComplete({ calls: 0 }) } }, { registerEntryRenderer: () => {} });
 		const settled = await settle(r);
 		await sleep(200);
-		const n = await comeBackNative(r, settled, { postMs: 600 }); // 600 ms of Pi's post-append refresh on a big branch: > NATIVE_SLOW_MS (250)
+		const n = await comeBackNative(r, settled, { postMs: 600 }); // 600 ms of Pi's post-append refresh on a big branch (0.4.9 ended the path past 250 ms)
 		await sleep(5);
 		const log = readFileSync(ledger, "utf8");
 		expect(log).not.toContain("native_off"); // old code: "Pi's compaction took 6xx ms: another session_before_compact handler at work"
@@ -484,16 +484,20 @@ describe("one producer prepares the return with one timer", () => {
 		rmSync(ledger, { force: true });
 	});
 
-	test("item 4(b): a handler that really is slow (before ours, or between ours and the append) still ends the native path", async () => {
+	test("a slow compaction that goes in ends nothing: 400 ms before pi-zip's answer (Pi's own work on 40-55K-entry branches reached 380 ms) keeps the native path", async () => {
 		const ledger = `/tmp/pz-native-${process.pid}-${Date.now()}-b.jsonl`;
 		process.env.PI_ZIP_LEDGER = ledger;
 		const r = await rig(done, COLD_TS(), { modelRegistry: { complete: mkComplete({ calls: 0 }) } }, { registerEntryRenderer: () => {} });
 		const settled = await settle(r);
 		await sleep(200);
-		await comeBackNative(r, settled, { beforeMs: 400 });
+		const n = await comeBackNative(r, settled, { beforeMs: 400 });
 		await sleep(5);
-		expect(readFileSync(ledger, "utf8")).toContain("native_off");
-		expect(noticeOf(r).native).toMatch(/spent \d+ ms in session_before_compact handlers: another handler at work/);
+		const log = readFileSync(ledger, "utf8");
+		expect(log).not.toContain("native_off"); // 0.4.9: "Pi's compaction spent 4xx ms in session_before_compact handlers: another handler at work"
+		expect(noticeOf(r)).toMatchObject({ native: "ok" });
+		expect(noticeOf(r).nativeAskMs).toBeGreaterThanOrEqual(390);
+		expect(n.answer.compaction).toBeTruthy();
+		expect(JSON.parse(log.trim().split("\n").find((l) => l.includes('"via":"native"'))!).handlerMs).toBeGreaterThanOrEqual(390);
 		rmSync(ledger, { force: true });
 	});
 
