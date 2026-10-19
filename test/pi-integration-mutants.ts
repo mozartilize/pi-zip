@@ -261,6 +261,31 @@ const mutants = [
 		check: "another endpoint has its own state",
 		edit: (source: string) => rep(source, "sk = `${key}@${m?.baseUrl ?? \"\"}`", "sk = key"),
 	},
+	// 0.4.10: timing alone never ends the native path (a slow compaction that went in; one deadline miss)
+	{
+		name: "native-slow-ends-path",
+		pattern: "a slow compaction that goes in ends nothing",
+		check: "a slow compaction that goes in keeps the native path",
+		edit: (source: string) => rep(source, '? added.length > 1 ? "another compaction went in as well" : null', '? added.length > 1 ? "another compaction went in as well" : handlerMs > 250 ? "slow" : null'),
+	},
+	{
+		name: "native-first-miss-ends-path",
+		pattern: "a deadline miss cancels that compaction only",
+		check: "one miss keeps the native path",
+		edit: (source: string) => rep(source, "this.nativeLate >= 2", "this.nativeLate >= 1"),
+	},
+	{
+		name: "native-misses-never-end-path",
+		pattern: "a deadline miss cancels that compaction only",
+		check: "a second miss in a row ends the native path",
+		edit: (source: string) => rep(source, "this.nativeLate >= 2", "this.nativeLate >= 99"),
+	},
+	{
+		name: "native-miss-count-not-reset",
+		pattern: "a compaction that goes in after a miss resets the count",
+		check: "a compaction that goes in resets the count",
+		edit: (source: string) => rep(source, "this.nativeLate = entry ? 0 :", "this.nativeLate = entry ? this.nativeLate :"),
+	},
 ];
 const only = process.env.PZ_MUTANTS?.split(","); // run some by name
 for (const mutant of mutants.filter((m) => !only || only.includes(m.name))) {

@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.4.10
+
+- A slow compaction no longer closes Pi's compaction path for the rest of the process. pi-zip read more than 250 ms between
+  asking Pi to compact and its entry going in as another extension's handler at work, and from then on applied no ready summary
+  at either door (the idle door, the typed prompt) until Pi restarted. On sessions of 40-55K entries Pi's own work before it asks
+  pi-zip's handler took 50-380 ms; on a 553 MB one it passed 250 ms once, and then for 12 hours, 21 returns after the cache expired rewrote the
+  whole context with a summary ready, and 19 summaries went unused (about $15-20). The notices of that session record the
+  timings (`nativeMs`, `nativeAskMs`). Now another extension's compaction going in, a failure, or a second deadline miss in a
+  row (2 s with nothing in) ends the path; a single miss cancels that compaction only, and a compaction that goes in resets the
+  count. One constant fewer, no extra call.
+
 ## 0.4.9
 
 - Relays that pool accounts keep a session on one account. Pi does not name the conversation in its requests, so a relay
