@@ -3,9 +3,10 @@
 ## 0.4.11
 
 - The session records which pi-zip and Pi versions it ran: a `pi-zip/version` custom entry (`v`, `pi`, `since`), written at
-  the end of the first run of a process in that session and only when the versions differ from the newest such entry. It never
-  reaches the model and changes no request. Until now a session's pi-zip version could only be guessed from release times, so
-  an offline evaluation could not attribute a request to the code that planned it. No extra call; src stays at 5,865 lines.
+  the end of a run only when the versions differ from the newest such entry on the branch (so a `/tree` move to a point before
+  it, or another session in the same process, gets its own entry). It never reaches the model and changes no request. Until
+  now a session's pi-zip version could only be guessed from release times, so an offline evaluation could not attribute a
+  request to the code that planned it. No extra call; src stays at 5,865 lines.
 
 ## 0.4.10
 

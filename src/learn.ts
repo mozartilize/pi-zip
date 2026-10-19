@@ -109,8 +109,7 @@ export function record(key: string, u: { explicit: boolean; total: number; gapS?
 	}
 	if (dirty) {
 		// entries of other models with no survival sample (n = 0: only a class, from a model tried once) are dropped, except an explicit
-		// class or measured call time: another live process may rely on them; the model being recorded
-		// keeps its own, so its class survives a restart while it is in use
+		// class or measured call time: another live process may rely on them; the model being recorded keeps its own, so its class survives a restart while it is in use
 		for (const [k, x] of Object.entries(f.models)) if (k !== key && !(x.n > 0) && x.cls !== "explicit" && !x.call) delete f.models[k];
 		try {
 			mkdirSync(dirname(path), { recursive: true });
