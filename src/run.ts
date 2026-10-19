@@ -58,8 +58,9 @@ const foreignCompaction = (e: Any): boolean => e?.type === "compaction" && !!e.f
 
 /** pi-zip's own compaction takes milliseconds: the summary is done. Pi runs every extension's session_before_compact handler for it, so
  *  one that is not finished by this deadline has another handler at work (writing its own summary, say): pi-zip cancels it then, so it
- *  can never land during the run, and the draft path takes the summary (the idle door's, only while no run is announced). Timing alone
- *  never ends the native path (Pi's own work before pi-zip's handler grows with the branch: 50-380 ms at 40-55K entries): only a second miss in a row. */
+ *  can never land during the run, and the draft path takes the summary (the idle door's, only while no run is announced). A compaction
+ *  that goes in never ends the native path however slow (Pi's own work before pi-zip's handler grows with the branch: 50-380 ms at
+ *  40-55K entries); a single miss neither. Two in a row do (Pi's own work past the deadline twice counts too: PI_ZIP_NATIVE_MS). */
 const nativeDeadlineMs = () => envInt("NATIVE_MS", 2_000);
 /** The idle door (research pi-tricks §1b variant 4, "\u03b5"): on; PI_ZIP_IDLE_DOOR=0 is an emergency off switch, not a setting. */
 const idleDoorOn = () => process.env.PI_ZIP_IDLE_DOOR !== "0";
@@ -826,9 +827,9 @@ export class Zip implements ZipControl {
 	 * §1b, variant 1): ctx.compact() with session_before_compact answering pi-zip's summary and pi-zip's own tokensBefore (the notice's
 	 * "before", provider scale), so Pi's "[compaction] Compacted from N tokens" shows that number. It takes milliseconds: the summary is
 	 * done. The run plan folds the resulting projection; a closed native door defers the summary to turn_end.
-	 * Pi runs every extension's session_before_compact handler for it (the last answer wins, a cancel stops it): unless pi-zip's own
-	 * entry is the one that went in, fast, the native path ends for the process (endNative). A compaction not finished by the deadline
-	 * is cancelled first (at the idle door, while no run is announced), and a summary prepared for a context another extension's compaction has replaced is never used (its head is gone).
+	 * Pi runs every extension's session_before_compact handler for it (the last answer wins, a cancel stops it): another extension's
+	 * compaction going in, or a failure, ends the native path for the process (endNative). A compaction not finished by the deadline is
+	 * cancelled (at the idle door, while no run is announced); the second such miss in a row ends the path too, and a summary prepared for a context another extension's compaction has replaced is never used (its head is gone).
 	 */
 	private async nativeSummary(ctx: Any, e: Any, s: Start, door: "input" | "idle" = "input"): Promise<void> {
 		const branch = this.branch(ctx);
