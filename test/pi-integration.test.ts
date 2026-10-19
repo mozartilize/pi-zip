@@ -1890,16 +1890,21 @@ for (const order of ORDERS) describe(`the idle door: a ready summary goes in whi
 		}
 	});
 
+	/** Polls until Pi's compactions have all ended and pi-zip's native ask is closed (a fixed sleep raced the 400 ms handler). */
+	const compactsDone = async (r: Any, n: number) => {
+		for (let i = 0; i < 150 && (r.compactCalls.n < n || r.compactCalls.ended < r.compactCalls.n || r.zip.nativeAsk); i++) await sleep(20);
+	};
+
 	test("a deadline miss cancels that compaction only: the door asks again, and only a second miss in a row ends the native path", async () => {
 		process.env.PI_ZIP_NATIVE_MS = "150";
 		try {
 			const { r, led } = await coldRig({ foreign: { at: "before", on: async () => { await sleep(400); return undefined; } } });
-			await sleep(600);
+			await compactsDone(r, 1);
 			expect([r.compactCalls.n, r.compactions.length]).toEqual([1, 0]);
 			expect(r.zip.nativeOff, "one miss keeps the native path").toBeNull();
 			expect(led).toContainEqual(expect.objectContaining({ type: "native_fail", error: "deadline", late: 1 }));
 			r.zip.armDoor(r.zip.liveCtx, true);
-			await sleep(600);
+			await compactsDone(r, 2);
 			expect([r.compactCalls.n, r.compactions.length]).toEqual([2, 0]);
 			expect(r.zip.nativeOff ?? "", "a second miss in a row ends the native path").toMatch(/before pi-zip's for 150 ms, twice in a row/);
 			expect(led).toContainEqual(expect.objectContaining({ type: "native_off" }));
@@ -1913,10 +1918,10 @@ for (const order of ORDERS) describe(`the idle door: a ready summary goes in whi
 		try {
 			let n = 0;
 			const { r } = await coldRig({ foreign: { at: "before", on: async () => { if (n++ === 0) await sleep(400); return undefined; } } });
-			await sleep(600);
+			await compactsDone(r, 1);
 			expect([r.compactions.length, r.zip.nativeLate]).toEqual([0, 1]);
 			r.zip.armDoor(r.zip.liveCtx, true);
-			await sleep(300);
+			await compactsDone(r, 2);
 			expect(r.compactions.length).toBe(1);
 			expect([r.zip.nativeLate, r.zip.nativeOff], "a compaction that goes in resets the count").toEqual([0, null]);
 		} finally {
@@ -1926,7 +1931,7 @@ for (const order of ORDERS) describe(`the idle door: a ready summary goes in whi
 
 	test("a slow compaction that goes in ends nothing (a 553 MB session: Pi's work before pi-zip's ask passed 250 ms and closed both doors for 12 h)", async () => {
 		const { r, led } = await coldRig({ foreign: { at: "before", on: async () => { await sleep(400); return undefined; } } });
-		await sleep(600);
+		await compactsDone(r, 1);
 		expect(r.compactions.length).toBe(1);
 		expect(r.compactions[0].details).toMatchObject({ by: "pi-zip", via: "native", door: "idle" });
 		expect(r.zip.nativeOff, "a slow compaction that goes in keeps the native path").toBeNull();
