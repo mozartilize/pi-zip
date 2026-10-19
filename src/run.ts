@@ -169,7 +169,7 @@ export class Zip implements ZipControl {
 	private inputs = 0;
 	private idleNat: { nat: NativeRun; note: Start["note"]; head: string; model: string } | null = null;
 	private ranHere = false; // a run of this process in this session: the idle door opens only after one
-	version = { v: PZ_VERSION, pi: "", since: Date.now(), last: null as Any, done: false }; // pi: set by index.ts; last: the session's newest version entry
+	version = { v: PZ_VERSION, pi: "", since: Date.now(), last: null as Any }; // pi: set by index.ts; last: the newest version entry on this branch
 	private readyAtStart = new Set<string>(); // summaries ready when the run began: one taken at its turn_end was ready while the user was away
 	// the cache tier (PI_CACHE_RETENTION) of the current model's requests: the payload of its newest request when seen, else the
 	// provider-scoped env resolved once per run (research pi-tricks §3.1); null = nothing known, the process env decides (cache.ts)
@@ -226,7 +226,9 @@ export class Zip implements ZipControl {
 		const branch = this.branch(ctx);
 		const byId = new Map(branch.map((e: Any) => [e?.id, e]));
 		this.foldedCalls.clear();
+		this.version.last = null; // and the newest version entry: /tree may have moved to a branch another version ran
 		for (const e of branch) {
+			if (e?.type === "custom" && e.customType === VERSION_CUSTOM) this.version.last = e.data;
 			const ph = String(e?.replacement?.content?.[0]?.text ?? "");
 			if (e?.type !== "context_edit" || !ph.startsWith(PH_MARK)) continue;
 			const h = handleFor(e.targetId);
@@ -468,7 +470,7 @@ export class Zip implements ZipControl {
 		this.ranHere = false;
 		this.idleNat = null;
 		const branch = this.branch(ctx);
-		Object.assign(this.version, { last: [...branch].reverse().find((en) => en?.type === "custom" && en.customType === VERSION_CUSTOM)?.data ?? null, since: Date.now(), done: false });
+		this.version.since = Date.now(); // index.ts then calls refreshFolded, which reads the newest version entry
 		for (let i = branch.length - 1; i >= 0; i--) {
 			const en = branch[i];
 			if (en?.type === "custom" && en.customType === STATE_CUSTOM) {
@@ -685,8 +687,8 @@ export class Zip implements ZipControl {
 		this.promptStart = false;
 		this.inRun = false;
 		this.writeUnwritten();
-		const s = this.version, d = { v: s.v, pi: s.pi, since: s.since }; // at the end of the process's first run here, unless the newest entry says the same
-		if (!s.done && !(s.done = true, s.last?.v === d.v && s.last?.pi === d.pi)) attempt(() => this.pi.appendEntry(VERSION_CUSTOM, d), undefined);
+		const s = this.version, d = { v: s.v, pi: s.pi, since: s.since }; // at the end of a run, unless the newest entry on this branch says the same
+		if (!(s.last?.v === d.v && s.last?.pi === d.pi)) attempt(() => this.pi.appendEntry(VERSION_CUSTOM, (s.last = d)), undefined);
 	}
 
 	/** The start of a run read from the branch now (Start without the native decision): at a prompt's idle input, or at the start of
@@ -1168,8 +1170,7 @@ export class Zip implements ZipControl {
 			opts: (entries, cutAt, foldsOnly, ready) => this.opts(ctx, false, entries, this.pWarm, this.pause, cutAt, foldsOnly, ready),
 		});
 		// no warm edit on the request right after an edited one (no back-to-back warm rewrites); the summary the plan wants is still
-		// produced. A summary Pi's compaction already put in the session (nativeSummary skips such a return, so only defensively) is
-		// never dropped here: the run plan below carries it
+		// produced. A summary Pi's compaction already put in the session (nativeSummary skips such a return, so only defensively) is never dropped here: the run plan below carries it
 		// R14: context() finalizes this transition after cancellation and actual application are checked.
 		// Selected edits keep paid rent until they go out; no-edit requests earn rent only if they proceed.
 		const rentNext = !d.p || nat ? d.rentNext : this.rent;

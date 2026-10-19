@@ -290,14 +290,32 @@ const mutants = [
 	{
 		name: "version-every-run",
 		pattern: "the version entry",
-		check: "one version entry per process and session",
-		edit: (source: string) => rep(source, "if (!s.done && !(s.done = true,", "if (!(s.done = true,"),
+		check: "one version entry while the versions stay the same",
+		edit: (source: string) => rep(source, "appendEntry(VERSION_CUSTOM, (s.last = d))", "appendEntry(VERSION_CUSTOM, d)"),
 	},
 	{
 		name: "version-never-on-change",
 		pattern: "the version entry",
 		check: "another pi-zip version writes its own entry",
 		edit: (source: string) => rep(source, "s.last?.v === d.v && s.last?.pi === d.pi", "!!s.last"),
+	},
+	{
+		name: "version-pi-ignored",
+		pattern: "the version entry",
+		check: "another Pi version writes its own entry",
+		edit: (source: string) => rep(source, "s.last?.v === d.v && s.last?.pi === d.pi", "s.last?.v === d.v"),
+	},
+	{
+		name: "version-stale-branch",
+		pattern: "the version entry",
+		check: "the branch /tree moved to gets its own entry",
+		edit: (source: string) => rep(source, "this.version.last = null; //", "//"),
+	},
+	{
+		name: "version-never-read",
+		pattern: "the version entry",
+		check: "a restart on the same versions writes none",
+		edit: (source: string) => rep(source, "customType === VERSION_CUSTOM) this.version.last = e.data;", "customType === VERSION_CUSTOM) void 0;"),
 	},
 ];
 const only = process.env.PZ_MUTANTS?.split(","); // run some by name
