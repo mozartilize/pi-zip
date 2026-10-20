@@ -780,7 +780,8 @@ export function plan(entries: Any[], o: PlanOpts): { f: PlanResult; c: PlanResul
 			target = coldCap; // stay at the working-size cap; chasing the last fold's overshoot takes later hot folds
 			est = ctxEst - savings();
 			choose();
-			p.judged = { folds: [...folds], ctxAfterFolds: p.ctxAfterFolds - c * (savings() - before) };
+			// The original overshoot helped pay for this rewrite. Never spend that saving on a ranking preference.
+			if (savings() >= before) p.judged = { folds: [...folds], ctxAfterFolds: p.ctxAfterFolds - c * (savings() - before) };
 		}
 		const carried = new Set((o.carriedFolds ?? []).map((t) => t.entryId));
 		const foldLeft = q.f.folds.some((t) => !carried.has(t.entryId));
