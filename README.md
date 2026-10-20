@@ -44,7 +44,7 @@ Live A/B runs on the same coding tasks (4 task templates × 4 seeds, the user aw
 Known limits:
 
 - **GLM** (an automatic prefix cache that outlives its declared 5 minutes): v0.1 cost about 1.2× BC live. v0.2 learns the real cache lifetime (offline 0.95–0.97× v0.1); not yet verified live.
-- **Long autonomous runs** (one prompt, hundreds of tool calls, e.g. sub-agents): roughly on par with BC, not better. Inside a running turn an output is only folded once it is 60 requests old.
+- **Long autonomous runs** (one prompt, hundreds of tool calls, e.g. sub-agents): roughly on par with BC, not better. By default, an output inside a running turn is only folded once it is 60 requests old. The optional judge only reorders folds the planner already allows; it does not fold a younger protected output.
 - **Tool allowlists** (`pi --tools read,bash`, sub-agent launchers): Pi then hides `zip_recall`. With `read`, `grep` or `bash` allowed, pi-zip folds as usual and points the model at a recall file instead. With none of them, it folds only outputs the model can re-read. Add `zip_recall` to the list to get the tool itself.
 - **Short sessions** with small contexts have little to save.
 
@@ -101,6 +101,27 @@ Every notice, the chart's rules and the size scale are described in [docs/detail
 | `/zip quiet` | toggle the per-turn notice (folding continues) |
 
 `off` and `quiet` are remembered per session. In `-p` / json mode `/zip` prints plain text to stderr.
+
+## Ledger
+
+Every decision is also written as one JSON line per event, in a file per Pi session: `~/.pi/agent/pi-zip/logs/<session>.log` (`PI_ZIP_CACHE_STATS` and `PI_CODING_AGENT_DIR` move it like the learned cache data). This is the only place a failure that never reaches the terminal shows up: the `error` of a `judge` record (a refused call, a reply that does not parse), a `summary` call that failed, a fold that refused, an edit another extension made. Nothing reads it back; pi-zip never depends on it.
+
+- `PI_ZIP_LEDGER=/path/to/file` writes that file instead, and `PI_ZIP_LEDGER=off` (or `0`) writes nothing.
+- A session file that grew past 8 MB is rotated at the next session start: the old one stays as `<name>.1`.
+
+## Optional background judge
+
+  Set `PI_ZIP_JUDGE=1` to enable a background model that ranks tool outputs. It is off by default. The planner still decides what may be folded. The judge only changes the order inside that set.
+
+  - `PI_ZIP_JUDGE_MODEL=provider/id` selects an available model. Add `:level` (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`) to request a thinking level, for example `github-copilot/gpt-6-luna:low`; an id that itself ends in such a suffix matches whole first. The level is sent only when the model advertises it. With no explicit level, or no capability metadata, the request sends no thinking level and Pi keeps the provider default. Otherwise, pi-zip chooses the lowest input-price model on the current provider with at least a 32K context window. If none is available, the judge stays off for that session.
+  - `PI_ZIP_JUDGE_MAX_TOKENS=16384` caps the judge output, thinking included. The cap also stays within the model output limit and the context room left after the input. Each `judge` ledger record logs `maxTokens`, `stopReason`, `outputTokens` and `reasoningTokens` for tuning. It also logs why the call ran: `reqCount`, `eligible`, `foldedHit` and `scopeChanged`. It logs the input size: `known`, `folded`, `evidence` and `inputTokens`. A parsed reply adds `diag`: raw C/H/N/U letters, malformed, foreign, missing, duplicate and bad-evidence lines, and up to 10 N lines with their outcome (`need`, `live`, `toolEvidence`, `uncited`, `badEvidence`). A reply that does not parse keeps its first 300 characters as `replyHead`. A `judge_hint` record shows each distinct hint outcome: a note sent (`shown`, `skipped`), a note dropped for lack of room, or valid N handles that were blocked as `old`, `notFolded`, `recalled`, `hinted` or `uncited`.
+  - `PI_ZIP_JUDGE_AGE=10` is the minimum age before a live output is scored. It does not let the judge fold a protected output early. `PI_ZIP_INTURN_AGE=0` still disables age-based folding.
+  - Labels are `C` (fold sooner), `H` (current work), `N` (a folded output the current work names), and `U` (not enough information). A label does not change rent, summary production or cache prices.
+  - A valid `N` can add one short lookup note to a request that is already going out, naming at most three handles. It does not restore the original, start a run, or send a steer. The note requires `zip_recall`. Each handle is noted at most once per session.
+
+  The judge receives the task prompt, output labels and key lines, plus recent user and assistant text. Recall calls and earlier lookup notes are not evidence. Choosing a different provider explicitly sends this data to that provider. Calls use Pi's existing model credentials and can consume quota or incur charges. Only one judge call runs at a time. Errors retain the previous verdicts, which expire after 20 requests or when the latest user request changes. Two consecutive failures stop calls for the current run.
+
+  `/zip` adds judge call cost, unknown-label and error counts for this process. Judge verdicts and counters do not survive a restart. Hint dedup is stored in the session and is not sent to the model.
 
 ## Recall
 

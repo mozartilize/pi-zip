@@ -16,9 +16,9 @@ export const INTURN_AGE = 60;
 
 const PROTECT_USER_TURNS = 2; // the latest user turn and the one before it are never summarised; their outputs fold only after a pause (previous turn, re-readable) or when old enough (INTURN_AGE)
 
-/** A summary call is priced as the call summary.ts makes (its narrative): uncached input of the prefix the narrative reads plus the
- *  previous summary's narrative it merges (an upper bound: summary.ts PREV_NARRATIVE_CHARS; the previous summary's lists are not sent,
- *  code carries them forward), plus output of at most the narrative budget. */
+/** A summary call is priced as the call summary.ts makes (its narrative): uncached input of the prefix slice since the previous
+ *  summary (neither the previous summary's lists nor its narrative epochs are sent: code carries both forward unchanged), plus
+ *  output of at most the narrative budget. */
 /** The narrative's token budget (chars/4), summary.ts buildCut: clamp(planned - skeleton, 300, NARRATIVE_MAX). */
 export const NARRATIVE_MAX = 4000;
 /** The narrative call's output cap (summary.ts narrative): room above the budget, which is what the prompt asks for and the law
@@ -437,6 +437,7 @@ export const settings = () => ({
 	coldCap: envInt("COLD_CAP", 40_000), // cold: fold, then summarise, down to this many real tokens of the whole context, but never below O + half of it (coldTarget)
 	foldMin: envInt("FOLD_MIN", 500), // outputs below this many tokens are never folded
 	keepLines: envInt("KEEP_LINES", 8),
+	judgeAge: Math.max(1, envInt("JUDGE_AGE", 10)), // minimum age before the judge scores a live output; not a permission to fold earlier
 	inturnAge: envInt("INTURN_AGE", INTURN_AGE), // outputs (any class) of the protected turns at least this many assistant requests old may fold; 0 = never
 });
 
@@ -508,7 +509,7 @@ export function buildBlocks(contextEntries: Any[], steerIds?: Set<string>): Bloc
 			if (!(src.id && steerIds?.has(src.id)) && !starter) userTurn++;
 			starter = false;
 			afterAnswer = false;
-		} else if (msgs.some((m) => m?.role === "custom")) {
+		} else if (msgs.some((m) => m?.role === "custom" && m.customType !== "pi-zip/need")) {
 			if (afterAnswer) { userTurn++; starter = true; afterAnswer = false; }
 		} else if (kind === "assistant" || kind === "toolResult") starter = false;
 		// a run ends at its final answer, and also at a request that failed or was aborted (Esc): a custom message after either starts
@@ -592,7 +593,10 @@ export interface RunPlan {
 	ready?: "away" | "background"; // its summary was written in the background: before this warm return ("away"), or while the run went on
 }
 
+export type Verdict = "cold" | "warm" | "hot" | "need";
+
 export interface PlanOpts {
+	verdicts?: ReadonlyMap<string, Verdict>;
 	keep?: number; // real tokens in Pi's kept tail, measured on the unedited view
 	rent?: number; // removable tokens rented since the last applied edit or cold decision
 	justEdited?: boolean; // the immediately preceding request carried a rewrite
@@ -622,6 +626,7 @@ export interface PlanOpts {
 }
 
 export interface PlanResult {
+	judged?: { folds: FoldTarget[]; ctxAfterFolds: number }; // alternate folds, applied only AFTER the unchanged law accepts this plan
 	blocks: Block[];
 	calls: Calls;
 	folds: FoldTarget[];
@@ -659,7 +664,7 @@ export const contentKeyOf = (content: Any): string => {
  *  old. If the folds cannot reach W, one summary: the first cut from the one reaching W whose summary pays with its call, and with
  *  which the whole plan pays (folds inside the prefix are void). Then the whole plan must pay. P(warm) enters only the law (o.law), so
  *  a lower P never plans less. The target never exceeds Pi's compaction room. null: nothing to plan, or the law refuses. */
-export function plan(entries: Any[], o: PlanOpts): { f: PlanResult; c: PlanResult | null; a: PlanResult | null } | null {
+export function plan(entries: Any[], o: PlanOpts): { f: PlanResult; c: PlanResult | null; a: PlanResult | null; stuck?: boolean } | null {
 	const s = settings();
 	// limits are in real tokens; the plan works in content estimate units (real = O + c x estimate), so they are converted once, here.
 	// The cold cap is on the whole context, but leaves at least half of itself for the conversation above O (coldTarget): a cap the
@@ -681,6 +686,7 @@ export function plan(entries: Any[], o: PlanOpts): { f: PlanResult; c: PlanResul
 	const foldMin = o.foldMin ?? s.foldMin;
 	const keepLines = o.keepLines ?? s.keepLines;
 	const inturnAge = o.inturnAge ?? s.inturnAge;
+	let judging = false, target = coldCap, minIdx = 0;
 	const blocks = buildBlocks(entries, o.steerIds);
 	if (!blocks.length) return null;
 	const userTurns = countUserTurns(blocks) + (o.promptPending && !openStarter(blocks) ? 1 : 0); // the upcoming prompt is a new user turn (unless it joins an open starter)
@@ -741,12 +747,15 @@ export function plan(entries: Any[], o: PlanOpts): { f: PlanResult; c: PlanResul
 	// the eligible outputs, class by class, each biggest first, until the view is at the working size: inside one rewrite a fold beyond
 	// it would hide work for no saving the law asked for
 	let est = ctxEst - savings();
+	const verdict = (b: Block) => o.verdicts?.get(handleFor(b.entryId!));
+	const rank = (b: Block) => ({ cold: 0, warm: 1, hot: 2, need: 3 }[verdict(b) ?? "warm"]);
 	const take = (list: Block[], tag: string) => {
-		for (const b of list.sort((x, y) => y.tokens - x.tokens)) {
-			if (est <= coldCap) return;
+		for (const b of list.filter((b) => b.idx >= minIdx).sort((x, y) => (judging ? rank(x) - rank(y) : 0) || y.tokens - x.tokens)) {
+			if (est <= target) return;
 			if (addFold(b, tag)) est -= b.tokens - (tokOverride.get(b.idx) ?? 0);
 		}
 	};
+	const choose = () => {
 	// outputs of the user turns before the previous one
 	take(blocks.filter((b) => foldable(b) && !protectedTurn(b)), trig);
 	// the protected window = the new prompt + the previous user turn; after a pause (or a model switch) the user comes back to a cache
@@ -755,6 +764,29 @@ export function plan(entries: Any[], o: PlanOpts): { f: PlanResult; c: PlanResul
 	// in-turn: outputs of the protected turns that are many requests old, whatever their recoverability class (every fold stays
 	// recallable). Age = assistant requests since the call was issued (the newest outputs, age < inturnAge, always stay).
 	if (inturnAge > 0) take(blocks.filter((b) => foldable(b) && protectedTurn(b) && b.age >= inturnAge), `${trig}(inturn)`);
+	};
+	choose();
+	// Rent, production, cuts and the permission to rewrite always use the original plan. Reorder only its accepted folds.
+	const capReal = coldTarget(o.coldCap ?? s.coldCap, O, room);
+	const finish = (q: { f: PlanResult; c: PlanResult | null; a: PlanResult | null }, cutsLeft = false) => {
+		if (o.verdicts?.size) for (const p of [q.f, q.a]) {
+			if (!p || !p.folds.length) continue;
+			const before = p.folds.reduce((n, t) => n + t.entryTokens - t.phTokens, 0);
+			folds.splice(0, folds.length, ...(o.carriedFolds ?? []));
+			tokOverride.clear();
+			for (const t of folds) tokOverride.set(blocks.findIndex((b) => b.entryId === t.entryId), t.phTokens);
+			judging = true;
+			minIdx = p.cutIdx ?? 0;
+			target = coldCap; // stay at the working-size cap; chasing the last fold's overshoot takes later hot folds
+			est = ctxEst - savings();
+			choose();
+			p.judged = { folds: [...folds], ctxAfterFolds: p.ctxAfterFolds - c * (savings() - before) };
+		}
+		const carried = new Set((o.carriedFolds ?? []).map((t) => t.entryId));
+		const foldLeft = q.f.folds.some((t) => !carried.has(t.entryId));
+		// Over the cap with nothing left to fold or cut. A price, rent, or back-to-back deferral of a fold or cut that still exists is not this case.
+		return !q.c && !q.a && !foldLeft && !cutsLeft && q.f.ctxAfterFolds > capReal ? { ...q, stuck: true as const } : q;
+	};
 	const ctxAfterFolds = ctxEst - savings();
 	// what no summary can remove (besides O): the protected turns (after their folds) and the previous summary, which the next one
 	// carries forward; the cap is never chased below it (a context that is mostly this floor would be re-summarised for nothing)
@@ -773,12 +805,12 @@ export function plan(entries: Any[], o: PlanOpts): { f: PlanResult; c: PlanResul
 		...(atRoom ? { atRoom } : {}), ...(atRoomUnedited ? { atRoomUnedited } : {}),
 	});
 	const f = result(null);
-	if (!sumTrigger) return { f, c: null, a: null };
+	if (!sumTrigger) return finish({ f, c: null, a: null });
 	let acc = 0;
 	for (const b of blocks) { pre[b.idx] = acc; acc += tokOverride.get(b.idx) ?? b.tokens; }
 	const limit = blocks.findIndex(protectedTurn), cuts: number[] = [];
 	for (let i = minCut; i < blocks.length && (limit < 0 || i <= limit); i++) if (isCutBlock(blocks[i])) cuts.push(i);
-	if (!cuts.length) return { f, c: null, a: null };
+	if (!cuts.length) return finish({ f, c: null, a: null });
 	const cw = cuts.findIndex((k) => ctxAfterFolds - pre[k] + S(pre[k]) <= coldCap);
 	const first = cw < 0 ? cuts.length - 1 : cw;
 	const paying = cuts.slice(first).find((k) => {
@@ -791,7 +823,7 @@ export function plan(entries: Any[], o: PlanOpts): { f: PlanResult; c: PlanResul
 	const bound = paying ?? cuts[first], ready = new Set(o.ready ?? []);
 	const readySize = (k: number) => o.readySizes?.[blocks[k].entryId!] ?? S(pre[k]);
 	const have = cuts.filter((k) => k <= bound && ready.has(blocks[k].entryId!) && pre[k] >= 2 * readySize(k)).pop();
-	return { f, c: paying === undefined ? null : result(paying), a: have === undefined ? null : result(have, readySize(have)) };
+	return finish({ f, c: paying === undefined ? null : result(paying), a: have === undefined ? null : result(have, readySize(have)) }, true);
 }
 
 /** Select from the planner's tuple: production uses the plain law; application uses G_{1/10} and takes only READY summaries. */
@@ -806,9 +838,10 @@ export function selectPlan(q: ReturnType<typeof plan>, o: PlanOpts): PlanResult 
 		return t.ok && (p.cutIdx !== null || p.folds.length > 0);
 	};
 	const a = o.cutAt === undefined ? q.a : q.a?.firstKeptEntryId === o.cutAt ? q.a : null;
-	if (a && !o.deferSummary && test(a, true)) return a;
+	const judged = (p: PlanResult) => p.judged ? { ...p, ...p.judged, judged: undefined } : p;
+	if (a && !o.deferSummary && test(a, true)) return judged(a);
 	if (!o.application && !o.foldsOnly && o.cutAt === undefined && q.c) return q.c;
-	return test(q.f) ? q.f : null;
+	return test(q.f) ? judged(q.f) : null;
 }
 
 /** Compatibility projection for planner callers; the decision core also reads the unfiltered tuple for rent and production. */

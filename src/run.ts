@@ -2,7 +2,7 @@
 // turn_end, the producer and its timer for the summary (F12). The decisions themselves are pure functions in core.ts.
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createHash } from "node:crypto";
-import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { lastMessageMs, lastPrompt, modelKey, payloadRetention, refused, ttlFor, type ColdInfo } from "./cache.ts";
 import { agentDir, curve, describe, lawPrices, loadStats, pWarm, record, sample, statsPath, GAP_EDGES, type Entry } from "./learn.ts";
@@ -14,6 +14,8 @@ import { handleFor, PH_MARK, RECALL_TOOL } from "./placeholder.ts";
 import { branchOutputs, recalledHandlesFromBranch, resolveHandlesInBranch } from "./recall.ts";
 import { cleanupRecall, commandNamesRecall, fileRecallFor, materialize, parseRecallPath, recallRoot, recallRootShown, rewriteCommand, sidDir, type FileRecall } from "./recallfile.ts";
 import { buildCut } from "./summary.ts";
+import { Judge, HINT_CUSTOM, citesWork, latestProjectedUser, latestUserText, requestOpen } from "./judge.ts";
+import { coldTarget, compactionRoom, settings, toolCallIndex } from "./plan.ts";
 import { type Any, attempt, COMMIT_CUSTOM, envInt, PRODUCT, textOf, tok4, tokensOf } from "./util.ts";
 import { pendingSummary, replayGrowth } from "./state.ts";
 import { fmtLife, type CardData, type ChartBin, type StateWord } from "./ui.ts";
@@ -23,6 +25,8 @@ export const STATE_CUSTOM = "pi-zip/state";
 export const STEER_CUSTOM = "pi-zip/steer";
 export const VERSION_CUSTOM = "pi-zip/version", PZ_VERSION: string = attempt(() => String(JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).version), "?"); // the pi-zip and Pi versions a session ran from `since` (ms) on, for offline evaluation
 const WARM_WHY = "cache warm · worth it at this size";
+/** Size at which a session's ledger file is rotated to `<name>.1` at the next session start (a long session writes a few KB per turn). */
+const LEDGER_MAX = 8 << 20;
 const fmtAway = (s: number) => (s < 90 ? `${Math.round(s)} s` : s < 5400 ? `${Math.round(s / 60)} min` : `${(Math.round(s / 360) / 10).toFixed(1)} h`);
 export const NOTICE_CUSTOM = "pi-zip/notice"; // a fold/summary notice kept in the transcript (rendered by index.ts, never sent to the model)
 export { checkEdits, SUMMARY_CUSTOM };
@@ -108,6 +112,10 @@ export class Zip implements ZipControl {
 	conflict: string | null = null;
 	readonly stats = new Stats();
 	readonly recalled = new Set<string>();
+	private judge = new Judge((rec) => this.ledger(rec));
+	private judgeReq = 0;
+	private judgePrompt = "";
+	private stuckNoted = false;
 	private cold = false;
 	private coldReason = "";
 	private runChecked = true; // the first request of the run has been looked at
@@ -295,10 +303,31 @@ export class Zip implements ZipControl {
 		this.stateLine(ctx, "on", "older context gets zipped when the savings pay for the rewrite · /zip");
 	}
 
+	/** One line per decision, for the failures that never reach the terminal (a judge call that errored, a fold that refused, a foreign
+	 *  edit). On by default, one file per Pi session: `PI_ZIP_LEDGER` names the file itself (tests, one-off research) or `off`/`0` keeps
+	 *  nothing. `<stats dir>/logs/<session>.log` starts empty once the previous file passed LEDGER_MAX bytes and becomes `<name>.1`. */
+	ledgerSid = "";
+	ledgerOn(): boolean { return process.env.PI_ZIP_LEDGER !== "off" && process.env.PI_ZIP_LEDGER !== "0"; }
+	private ledgerPath(): string {
+		const env = process.env.PI_ZIP_LEDGER;
+		if (env) return env;
+		const sid = (this.ledgerSid || process.env.PI_SESSION_ID || `pid-${process.pid}`).replace(/[^\w.-]/g, "_");
+		return join(dirname(statsPath()), "logs", `${sid}.log`);
+	}
+	private ledgerReady = "";
 	ledger(rec: Record<string, unknown>) {
-		const path = process.env.PI_ZIP_LEDGER; // test only
-		if (!path) return;
-		attempt(() => (mkdirSync(dirname(path), { recursive: true }), appendFileSync(path, JSON.stringify({ ts: new Date().toISOString(), pid: process.pid, ...rec }) + "\n")), undefined);
+		if (!this.ledgerOn()) return;
+		const path = this.ledgerPath();
+		attempt(() => {
+			if (this.ledgerReady !== path) { mkdirSync(dirname(path), { recursive: true }); this.ledgerReady = path; }
+			appendFileSync(path, JSON.stringify({ ts: new Date().toISOString(), pid: process.pid, ...rec }) + "\n");
+		}, undefined);
+	}
+	/** A named file is the caller's own; the session file is capped so a long session cannot fill the disk, and the previous one is kept. */
+	private rotateLedger() {
+		if (process.env.PI_ZIP_LEDGER) return;
+		const path = this.ledgerPath();
+		attempt(() => { if (statSync(path).size > LEDGER_MAX) renameSync(path, `${path}.1`); }, undefined);
 	}
 
 	/** keep = a fold/summary notice: written to the session as a custom entry, so it stays in the transcript (also after a restart)
@@ -390,6 +419,7 @@ export class Zip implements ZipControl {
 		}
 		const r = planOpts(entries, branch, env, this.lam(ctx), pending, pWarm, pause, cutAt, foldsOnly, ready);
 		r.o.rent = this.rent;
+		if (this.inRun && this.active()) r.o.verdicts = this.judge.labels(this.judgeReq, latestProjectedUser(entries));
 		return r;
 	}
 
@@ -425,7 +455,7 @@ export class Zip implements ZipControl {
 	 *  Nothing is decided from it. */
 	private foreignSeen = new Set<string>();
 	private logForeign(ctx: Any, where: string) {
-		if (!process.env.PI_ZIP_LEDGER || this.off) return; // the ledger is the only reader
+		if (!this.ledgerOn() || this.off) return; // the ledger is the only reader
 		for (const e of this.branch(ctx)) {
 			if (typeof e?.id !== "string" || this.foreignSeen.has(e.id)) continue;
 			let rec: Record<string, unknown> | null = null;
@@ -459,6 +489,12 @@ export class Zip implements ZipControl {
 
 	// ---- events ----------------------------------------------------------------------------------------------
 	sessionStart(ctx: Any) {
+		this.judge.stop();
+		this.judge = new Judge((rec) => this.ledger(rec));
+		this.ledgerSid = this.sessionId(ctx); // this session's ledger file, before the first record names it
+		this.rotateLedger();
+		this.judgeReq = 0;
+		this.judgePrompt = "";
 		this.liveCtx = ctx;
 		this.start = null; // a decision carried for a run of the session before is never handed to a run of this one
 		this.startKind = null;
@@ -477,6 +513,7 @@ export class Zip implements ZipControl {
 		}
 		for (const en of branch) if (en?.type === "custom" && en.customType === STEER_CUSTOM && Array.isArray(en.data?.ids)) for (const id of en.data.ids) if (typeof id === "string") this.steerIds.add(id);
 		for (const h of recalledHandlesFromBranch(branch)) this.recalled.add(h);
+		for (const en of branch) if (en?.type === "custom" && en.customType === HINT_CUSTOM && Array.isArray(en.data?.handles)) this.judge.restoreHinted(en.data.handles);
 		this.model = ctx?.model;
 		this.ttlNoticed = false;
 		this.restoreState(branch);
@@ -573,6 +610,7 @@ export class Zip implements ZipControl {
 	}
 
 	shutdown() {
+		this.judge.stop();
 		this.cancelTimer();
 		this.cancelDoor();
 		this.ranHere = false; // a door reading its clock now never arms again
@@ -638,6 +676,7 @@ export class Zip implements ZipControl {
 	/** before_agent_start: the prompt's run (its input carried the decision), or on Pi 1.2.0 a run an extension's message starts
 	 *  (messageType "custom"), which begins here, once, as a driven run. */
 	async beforeAgentStart(ctx: Any, e?: Any): Promise<void> {
+		this.judgePrompt = typeof e?.prompt === "string" ? e.prompt : "";
 		this.runStarts++;
 		if (e?.messageType === "custom") {
 			this.start = null;
@@ -679,6 +718,7 @@ export class Zip implements ZipControl {
 	private promptStart = false;
 
 	agentEnd() {
+		this.judge.stop();
 		this.startKind = null;
 		this.promptStart = false;
 		this.inRun = false;
@@ -710,6 +750,9 @@ export class Zip implements ZipControl {
 	private async beginRun(ctx: Any, viaPrompt: boolean, carried: Start | null = null): Promise<void> {
 		this.liveCtx = ctx;
 		this.inRun = true;
+		this.stuckNoted = false;
+		this.judge.startRun();
+		if (!this.judgePrompt) this.judgePrompt = textOf([...this.branch(ctx)].reverse().find((e) => e.message?.role === "user")?.message?.content);
 		this.cancelTimer(); // the user is back: nothing is started behind their back any more
 		this.cancelDoor();
 		this.ranHere = true;
@@ -1136,9 +1179,38 @@ export class Zip implements ZipControl {
 				const live = plan.folds.filter((t) => applied.has(t.entryId));
 				this.noticeFor(ctx, plan, live, plan.cut ?? plan.native ?? null, plan.ctxBefore, sizeOf(plan.scale, (out?.messages ?? e.messages).filter((m: Any) => m.role !== "system").reduce((n: number, m: Any) => n + wireTokensOf(m), 0)));
 			}
+			const hinted = this.withHint(out?.messages ?? e.messages, ctx);
+			if (hinted) return { messages: hinted };
 			return out ? { messages: out.messages } : undefined;
 		}
-		return undefined;
+		const hinted = this.withHint(e.messages, ctx);
+		return hinted ? { messages: hinted } : undefined;
+	}
+
+	/** One lookup note on the request already going out. A miss is kept; the note is not a steer and does not mark a recall. */
+	private withHint(messages: Any[], ctx: Any): Any[] | null {
+		if (!this.judge.enabled || !this.inRun || this.recallMode !== "tool" || requestOpen(messages)) return null;
+		try {
+			const entries = ((ctx?.sessionManager?.buildSessionProjection?.() as Any)?.entries ?? []) as Any[];
+			const blocks = buildBlocks(entries, this.steerIds);
+			const folded = new Set<string>([...this.foldedCalls.values(), ...blocks.filter((b) => b.ours && b.entryId).map((b) => handleFor(b.entryId!))]);
+			const resolvable = new Set(resolveHandlesInBranch(this.branch(ctx), [...folded]).items.filter((it) => it.text != null).map((it) => it.handle));
+			const cwd = (ctx?.cwd as string) ?? process.cwd();
+			const hint = this.judge.proposeHints({ folded: resolvable, recalled: this.recalled, reqCount: this.judgeReq, scope: latestUserText(blocks), cited: (h, loc) => citesWork(blocks, h, loc, cwd) });
+			if (!hint) return null;
+			const msg = { role: "user", content: hint.text };
+			const sc = this.scaleOf(ctx, entries);
+			const body = messages.filter((m) => m?.role !== "system").reduce((n: number, m: Any) => n + wireTokensOf(m), 0);
+			const room = compactionRoom(ctx?.model, this.reserve(ctx));
+			if (room !== null && sizeOf(sc, body + wireTokensOf(msg)) > room) { this.judge.hintNote({ shown: hint.shown, dropped: "room" }); return null; }
+			this.judge.hintNote({ shown: hint.shown, skipped: hint.skipped });
+			this.judge.commitHints(hint.shown, hint.skipped);
+			attempt(() => this.pi.appendEntry(HINT_CUSTOM, { handles: [...hint.shown, ...hint.skipped] }), undefined);
+			return [...messages, msg];
+		} catch (err) {
+			this.ledger({ type: "error", where: "judge_hint", error: errText(err) });
+			return null;
+		}
 	}
 
 	/** While the user waits for a summary, Pi's working line says what for. */
@@ -1206,6 +1278,7 @@ export class Zip implements ZipControl {
 
 	/** Settle writes pending artifact records and prepares another return in every mode. */
 	async settle(e: Any, ctx: Any): Promise<Any> {
+		this.judge.stop();
 		this.inRun = false;
 		const recs = this.drafts();
 		this.want("settle", ctx, undefined, e.context.contextEntries);
@@ -1333,6 +1406,11 @@ export class Zip implements ZipControl {
 		try {
 			const fresh = this.collectSteer(e); // marked before anything is validated: a steering message is part of its turn
 			const out = await this.onTurnEnd(e, ctx);
+			try {
+				this.judgeBoundary(e, ctx, out);
+			} catch (err) {
+				this.ledger({ type: "error", where: "judge", error: errText(err) }); // never drop this turn's edits for an optional hint
+			}
 			const previousRent = rentOf(this.branch(ctx));
 			const recs = [...this.drafts(), ...(this.rent !== previousRent ? [{ type: "custom", customType: "pi-zip/rent", data: { rent: this.rent } }] : [])]; // summaries recorded during the run, after the turn's edits (a compaction goes first)
 			if (!fresh.length && !recs.length) return out;
@@ -1342,6 +1420,14 @@ export class Zip implements ZipControl {
 			this.ledger({ type: "error", where: "turn_end", error: errText(err) });
 			return undefined;
 		}
+	}
+
+	private judgeBoundary(e: Any, ctx: Any, out: Any) {
+		if (!this.judge.enabled || !this.inRun || !this.active() || e.message?.stopReason !== "toolUse") return;
+		const entries = e.context.contextEntries, blocks = buildBlocks(entries, this.steerIds);
+		const sc = this.scaleOf(ctx, entries);
+		this.judge.maybeRun(ctx, blocks, toolCallIndex(blocks), this.judgePrompt, this.judgeReq,
+			sizeOf(sc, blocks.reduce((n, b) => n + b.tokens, 0)), coldTarget(settings().coldCap, sc.O, compactionRoom(ctx.model, this.reserve(ctx))));
 	}
 
 	/** Steering and follow-up user messages (typed during a run) are not new user turns; Pi does not mark them, so we persist the ids. */
@@ -1388,6 +1474,11 @@ export class Zip implements ZipControl {
 		const d = decideTurnEnd({ failed, justEdited: this.justEdited, pWarm: pIn, ready: this.ready(branch), entries: ents, runPlan, opts: (cutAt, foldsOnly, ready) => this.opts(ctx, false, ents, pIn, false, cutAt, foldsOnly, ready) });
 		if (runPlan) runPlan.folds = d.runPlan!.folds;
 		if (d.kind === "none") return runPlan ? this.commit(e, ctx, runPlan, o) : undefined;
+		const carriedWork = !!(runPlan && (runPlan.folds.length || runPlan.cut || runPlan.native));
+		if (d.stuck && !d.room && !d.produce && !carriedWork && !(d.p && (d.p.folds.length || d.p.cutIdx != null)) && !this.quiet && !this.stuckNoted) {
+			this.stuckNoted = true;
+			this.notify(ctx, `${PRODUCT}: context is still over the working size, and no further fold or summary is available`);
+		}
 		if (d.kind === "b2b") this.ledger({ type: "b2b_skip", where: "turn_end" });
 		else {
 			for (const n of d.notes) this.ledger(n);
@@ -1513,6 +1604,9 @@ export class Zip implements ZipControl {
 
 	/** Pi's model_select (/model, cycling, restore): a switch in the middle of a run is not seen by any run start. */
 	modelSelect(model: Any) {
+		this.judge.stop();
+		this.judge.verdicts.clear();
+		if (this.inRun) this.judge.startRun();
 		if (model) this.model = model;
 	}
 
@@ -1535,7 +1629,7 @@ export class Zip implements ZipControl {
 			this.retention = { key, tier: seen, src: "payload" };
 			this.ledger({ type: "retention", ...this.retention });
 		}
-		if (process.env.PI_ZIP_LEDGER && this.cold && !this.wireLedgered && p && Array.isArray(p.messages)) {
+		if (this.ledgerOn() && this.cold && !this.wireLedgered && p && Array.isArray(p.messages)) {
 			this.wireLedgered = true; // proof that the FIRST request after a cold return is already small (real scale: O + c x the wire's content)
 			let tok = 0;
 			for (const m of p.messages) if (m?.role !== "system" && m?.role !== "developer") tok += tok4(JSON.stringify(m?.content ?? "")) + 8;
@@ -1563,6 +1657,7 @@ export class Zip implements ZipControl {
 	}
 
 	messageEnd(m: Any, ctx?: Any) {
+		if (m?.role === "assistant" && m.stopReason !== "error" && m.stopReason !== "aborted") this.judgeReq++;
 		if (this.promptStart) {
 			this.promptStart = false;
 			if (m?.role === "custom" && ctx) void this.drivenStart(ctx); // the agent_start was a driven run's: its start of run, now
@@ -1641,7 +1736,7 @@ export class Zip implements ZipControl {
 			} else if (e?.type === "custom" && e.customType === LEGACY_UNUSED_CUSTOM) usd += Number(e.data?.usd) || 0;
 			else if (e?.type === "custom" && e.customType === SUMMARY_CUSTOM && (e.data?.cut ? e.data.cut.llmOk === false : e.data?.lost === "failed")) [failed, failedLast] = [failed + 1, e];
 			else if (e?.type === "custom" && e.customType === NOTICE_CUSTOM && e.data?.v === 2 && !e.data?.kind) last = e;
-			else if (e?.type === "message" && e.message?.role === "toolResult" && (e.message?.toolName === RECALL_TOOL || fileRecalls.has(e.message?.toolCallId))) recalls++;
+			else if (e?.type === "message" && e.message?.role === "toolResult" && !e.message.isError && (e.message?.toolName === RECALL_TOOL || fileRecalls.has(e.message?.toolCallId))) recalls++;
 		}
 		// chars/4 of the folded text, on the provider's scale: x c of the model that folded it (folded outputs are content)
 		let folded = 0;
@@ -1687,6 +1782,7 @@ export class Zip implements ZipControl {
 		return {
 			state, stateNote: state === "paused" ? `${this.conflict} also manages context` : state === "off" ? "/zip on to resume" : state === "reread-only" ? rereadWhy : undefined,
 			model: key || undefined, life, ...(bins.length ? { bins, s1, s2, usually } : {}), folds: t.folds, foldedTokens: fmtK(t.folded), summaries: t.summaries, summaryUsd: t.usd, recalls: t.recalls, last, quiet: this.quiet,
+			...(this.judge.enabled ? { judge: { ...this.judge.stats } } : {}),
 			...(t.failed ? { failed: t.failed, failedWhy } : {}),
 			...(file ? { unzip: `from files in ${recallRootShown()} (a tool allowlist hides zip_recall)` } : {}),
 		};
@@ -1698,12 +1794,13 @@ export class Zip implements ZipControl {
 		const cache = !key ? "" : `\ncache ${key}: ${pr.src === "class" ? `${pr.cls} (from usage)` : "class unknown until the first response (explicit ratios meanwhile)"}` +
 			`, read ${+pr.r.toFixed(4)} / write ${+pr.w.toFixed(4)} / output ${+pr.out.toFixed(4)} x input (class ratios)` +
 			`, ${describe(ent, ttl / 1000)}, growth ${(this.g / 1000).toFixed(1)}K/request`;
-		return `${PRODUCT}: ${state}, cache TTL ${Math.round(ttl / 1000)} s, ${this.quiet ? "notices off, " : ""}${this.sessionTotals(ctx)}${cache}`;
+		return `${PRODUCT}: ${state}, cache TTL ${Math.round(ttl / 1000)} s, ${this.quiet ? "notices off, " : ""}${this.sessionTotals(ctx)}${cache}${this.judge.enabled ? `\njudge ${this.judge.stats.calls} calls $${this.judge.stats.costUsd.toFixed(4)} · ${this.judge.stats.unknown} unknown · ${this.judge.stats.errors} errors` : ""}`;
 	}
 	statsLine = (ctx?: Any) => `${PRODUCT} ${this.sessionTotals(ctx)} (tokens on the provider's scale, calibrated from this session's usage)`;
 	setOff(off: boolean): string {
 		this.off = off;
-		if (off) { this.runPlan = null; this.runEdits = false; this.cancelTimer(); this.cancelDoor(); this.discardBg("off"); }
+		if (!off && this.inRun) this.judge.startRun();
+		if (off) { this.judge.stop(); this.runPlan = null; this.runEdits = false; this.cancelTimer(); this.cancelDoor(); this.discardBg("off"); }
 		this.persistState();
 		return off ? `${PRODUCT}: off. Nothing is folded or summarised and requests are left untouched; earlier folds stay recallable (/zip on to resume)` : `${PRODUCT}: on`;
 	}

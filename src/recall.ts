@@ -228,9 +228,21 @@ export function searchPoolOf(branch: Any[], grep: string): number | undefined {
 	return undefined;
 }
 
-/** Handles the model already recalled in this branch (F4: never refold them). */
+/** Handles the model already recalled in this branch (F4: never refold them). A failed or unanswered zip_recall does not count. */
 export function recalledHandlesFromBranch(branch: Any[]): Set<string> {
 	const out = new Set<string>();
+	const recallResult = new Map<string, Any>();
+	for (const en of branch) {
+		const m = en?.type === "message" ? en.message : null;
+		if (m?.role === "toolResult" && m.toolName === RECALL_TOOL && m.toolCallId) recallResult.set(m.toolCallId, m);
+	}
+	const recalled = (id: string, handle: string) => {
+		const res = recallResult.get(id);
+		if (!res || res.isError) return false;
+		const sections = res.details?.sections;
+		if (!Array.isArray(sections)) return true;
+		return sections.some((s: Any) => s?.handle === handle && !s.missing);
+	};
 	for (const en of branch) {
 		const m = en?.type === "message" ? en.message : null;
 		if (m?.role !== "assistant" || !Array.isArray(m.content)) continue;
@@ -238,8 +250,8 @@ export function recalledHandlesFromBranch(branch: Any[]): Set<string> {
 			if (c?.type !== "toolCall") continue;
 			const a: Any = c.arguments ?? {};
 			if (c.name === RECALL_TOOL) {
-				if (typeof a.handle === "string" && a.handle.trim()) out.add(a.handle.trim());
-				if (Array.isArray(a.handles)) for (const h of a.handles) if (typeof h === "string" && h.trim()) out.add(h.trim());
+				if (typeof a.handle === "string" && a.handle.trim() && recalled(c.id, a.handle.trim())) out.add(a.handle.trim());
+				if (Array.isArray(a.handles)) for (const h of a.handles) if (typeof h === "string" && h.trim() && recalled(c.id, h.trim())) out.add(h.trim());
 			} else if (c.name === "bash") {
 				for (const h of commandRecallHandles(a.command)) out.add(h); // file recall: a shell reading a recall file
 			} else if (c.name === "read" || c.name === "grep") {
@@ -312,7 +324,8 @@ export function registerRecallTool(pi: ExtensionAPI, hooks: RecallHooks) {
 			try {
 				const { items, entryIds } = resolveHandlesInBranch(ctx.sessionManager.getBranch() as Any[], handles);
 				const out = recallSections(items, { grep, range, offset, limit });
-				hooks.onRecall(handles, items.reduce((a, it) => a + (it.text?.length ?? 0), 0), entryIds);
+				const ok = items.flatMap((it, i) => it.text == null ? [] : [[handles[i], entryIds[i]] as const]);
+				hooks.onRecall(ok.map(([h]) => h), items.reduce((a, it) => a + (it.text?.length ?? 0), 0), ok.map(([, id]) => id));
 				return { content: [{ type: "text", text: out.text }], details: { handles, resolved: out.ok, missing: out.missing, sections: out.sections }, isError: out.ok === 0 };
 			} catch (err) {
 				return { content: [{ type: "text", text: `${RECALL_TOOL} failed: ${err instanceof Error ? err.message : String(err)}` }], details: {}, isError: true };

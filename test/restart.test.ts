@@ -2,9 +2,9 @@
 // are rebuilt from the session (RD, B2B). Each test builds a live process from real responses and a fresh
 // one from the branch those responses left, and compares what they know.
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { G0 } from "../src/plan.ts";
 import { replayGrowth } from "../src/state.ts";
 import { Zip } from "../src/run.ts";
@@ -139,5 +139,40 @@ describe("a refused request does not move the cache clock (GC)", () => {
 		z.providerRequest({ payload: {} });
 		z.messageEnd(resp(30_000, T0 + 2, { stopReason: "error" }));
 		expect(z.lastReqMs).toBeGreaterThan(before);
+	});
+});
+
+// The judge's errors (a refused call, a reply that does not parse) and the law's refusals are only visible in the ledger, so it is
+// on by default now: one file per session, named after the session, next to the learned cache data.
+describe("the ledger is on by default, one file per session", () => {
+	const saved = process.env.PI_ZIP_LEDGER;
+	const ctxOf = (sid: string) => fakeCtx([], { branch: [], model: MODEL, sessionManager: { getBranch: () => [], buildSessionProjection: () => ({ entries: [] }), getSessionId: () => sid } }).ctx;
+	const rows = (path: string) => existsSync(path) ? readFileSync(path, "utf8").trim().split("\n").map((l) => JSON.parse(l)) : [];
+	const logDir = () => join(dirname(process.env.PI_ZIP_CACHE_STATS!), "logs");
+	beforeEach(() => { delete process.env.PI_ZIP_LEDGER; });
+	afterEach(() => { if (saved === undefined) delete process.env.PI_ZIP_LEDGER; else process.env.PI_ZIP_LEDGER = saved; });
+
+	test("no PI_ZIP_LEDGER: each session writes its own file under the stats directory", () => {
+		const { pi } = fakePi();
+		const z = new Zip(pi) as Any;
+		z.sessionStart(ctxOf("sess-a"));
+		const a = rows(join(logDir(), "sess-a.log"));
+		expect(a[0].type).toBe("session_start");
+		z.sessionStart(ctxOf("sess-b"));
+		expect(rows(join(logDir(), "sess-b.log"))[0].type).toBe("session_start");
+		expect(rows(join(logDir(), "sess-a.log")).length).toBe(a.length); // the second session did not write into the first one
+	});
+
+	test("PI_ZIP_LEDGER=off keeps nothing, and a named file is written exactly where it says", () => {
+		const { pi } = fakePi();
+		const z = new Zip(pi) as Any;
+		process.env.PI_ZIP_LEDGER = "off";
+		z.sessionStart(ctxOf("sess-c"));
+		expect(existsSync(join(logDir(), "sess-c.log"))).toBe(false);
+		const own = join(logDir(), "named.jsonl");
+		process.env.PI_ZIP_LEDGER = own;
+		z.sessionStart(ctxOf("sess-c"));
+		expect(rows(own)[0].type).toBe("session_start");
+		expect(existsSync(join(logDir(), "sess-c.log"))).toBe(false);
 	});
 });
