@@ -192,7 +192,7 @@ export function decideEdits(x: { at: "native" | "run" | "turn_end"; justEdited: 
 	const rentNext = p || x.pWarm < 0.5 ? 0 : (o.rent ?? 0) + Math.max(0, saved - carriedSavings);
 	const notes: Note[] = q?.a && x.at === "run" ? [{ type: "defer", key: q.a.firstKeptEntryId }] : [];
 	if (p?.cutIdx != null && q?.c && p.firstKeptEntryId !== q.c.firstKeptEntryId) notes.push({ type: "pin", where: x.at, from: q.c.firstKeptEntryId, to: p.firstKeptEntryId, ok: true });
-	return { kind: b2b ? "b2b" as const : "plan" as const, o, cal, p, notes, produce: p?.cutIdx != null ? null : produce, rentNext };
+	return { kind: b2b ? "b2b" as const : "plan" as const, o, cal, p, notes, produce: p?.cutIdx != null ? null : produce, rentNext, ...(q?.stuck ? { stuck: true as const } : {}) };
 
 }
 

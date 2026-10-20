@@ -121,6 +121,16 @@ Eligibility also requires an output larger than 500 chars/4 tokens and a placeho
 
 The room credit is zero below room. At or above it, $\eta=[(1+\kappa)X+\text{out}\,S+\kappa(B-X+S)]/(X-S)$ when $X>S$, otherwise zero. Here $X=\max(0,B-\text{keep})$, $S=\min(\max(X/10,1{,}000),8{,}000)$ without the previous-summary floor, and keep is the complete message tail covering Pi's 20K recent tokens. This estimates Pi's own compaction price for the room it would free. A ready summary passed over today stays available while its range is still the prefix; finished summaries are persisted, and each compaction consumes one produced call.
 
+## Optional judge
+
+With `PI_ZIP_JUDGE=1`, a separate background call classifies tool outputs as `C`, `H`, `N` or `U`. The default planner still computes rent, summary cuts, production and rewrite permission without these labels. Only after selection passes the existing law does the planner substitute ranked folds: cold, warm, hot, then need. The replacement must save at least as many tokens as the original folds, including the last fold's overshoot. Carried placeholders stay byte-identical. Summary cuts and their prefix accounting stay unchanged. A cold label does not lower the protected-turn age.
+
+The judge uses Pi's model registry, with at most one call in flight and a 30-second timeout. Planning never waits for it. An explicit thinking level is sent only when the model advertises support; otherwise the provider default is kept. Session changes discard verdicts. Run end, model changes, shutdown and `/zip off` abort the call. Failed calls retain previous verdicts until their 20-request expiry or the latest user request changes. Two consecutive failures stop calls for the rest of the run.
+
+The catalogue keeps immutable rows in insertion order. Ages and live, folded or unavailable status go in a changing suffix, followed by the latest user request and recent work. Recall traffic is not evidence. A valid `N` may add one lookup note to a request that is already going out. That note is not a session user entry, never starts a run, and never replaces an original output in place. Handles named by a note are remembered in a custom entry that is not sent to the model.
+
+The proofs and measurements below describe the default policy, not judge classification quality or its additional API cost.
+
 ## What is proved
 
 The numbered claims correspond to T1-T10. Lean 4 + Mathlib machine-checks **T2, T3, T4 (i)(ii)(iv), and T5 (i)(ii)(iv)(v)**. **T5(v) as first stated was refuted; the corrected form with persistence through the first guarded edit was proved.** The recorded gate is:

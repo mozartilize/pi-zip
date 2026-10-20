@@ -69,6 +69,7 @@ export interface CardData {
 	recalls: number;
 	last?: string; // "10:50  folded 12 old outputs · cache cold (away 47 min)"
 	quiet: boolean;
+	judge?: { calls: number; costUsd: number; unknown: number; errors: number };
 	unzip?: string; // how the model gets folded outputs back, when it is not zip_recall (file recall under a tool allowlist)
 	failed?: number; // summary calls of this session whose narrative failed (each still a summary: the fallback)
 	failedWhy?: string; // "07:10 narrative hit the token cap": when and why the newest one failed
@@ -183,6 +184,7 @@ export function cardText(c: CardData): string[] {
 	if (c.model) rows.push(["cache", hasChart(c) ? `each dot is one time you came back · ${captionPlain(c)}` : `${idle(c) || "expires after ~5 min idle"} · ${NO_DATA}`]);
 	const n = (x: number, one: string, many = one + "s") => `${x} ${x === 1 ? one : many}`;
 	rows.push(["session", `${c.folds} zipped ~${c.foldedTokens}  ·  ${n(c.summaries, "summary", "summaries")}${c.summaryUsd > 0 ? ` $${c.summaryUsd.toFixed(2)}` : ""}  ·  ${n(c.recalls, "unzip")}`]);
+	if (c.judge) rows.push(["judge", `${c.judge.calls} calls $${c.judge.costUsd.toFixed(4)} · ${c.judge.unknown} unknown · ${c.judge.errors} errors`]);
 	if (c.last) rows.push(["last", c.last]);
 	if (c.failed) rows.push(["errors", `${n(c.failed, "narrative call")} failed${c.failedWhy ? ` · last ${clean(c.failedWhy).replace(/\s+/g, " ").trim()}` : ""}`]); // a provider's message: one line
 	if (c.unzip) rows.push(["unzip", c.unzip]);

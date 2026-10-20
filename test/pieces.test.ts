@@ -425,12 +425,25 @@ describe("recall", () => {
 		const bad = await def.execute("t", {}, undefined, undefined, ctx);
 		expect(bad.isError).toBe(true);
 		expect(bad.content[0].text).toContain("grep alone");
+		const miss = await def.execute("t", { handle: "zzzzzzzzzz" }, undefined, undefined, ctx);
+		expect(miss.isError).toBe(true);
+		expect(seen.at(-1)[0]).toEqual([]);
+		const hit = await def.execute("t", { handles: [handleFor("e1"), "zzzzzzzzzz"] }, undefined, undefined, ctx);
+		expect(hit.isError).toBe(false);
+		expect(seen.at(-1)[0]).toEqual([handleFor("e1")]);
 		expect(def.description).toContain("grep alone searches every earlier tool output");
 	});
-	test("the recalled set is rebuilt from zip_recall calls in the branch (and only those)", () => {
+	test("the recalled set keeps successful zip_recall results only", () => {
 		const call = (id: string, name: string, args: object) => ({ type: "message", id, message: { role: "assistant", content: [{ type: "toolCall", id: "t" + id, name, arguments: args }] } });
-		const set = recalledHandlesFromBranch([call("1", "zip_recall", { handle: "aaaaaaaaaa" }), call("2", "zip_recall", { handles: ["bbbbbbbbbb", "cccccccccc"] }), call("3", "other", { handle: "dddddddddd" })]);
-		expect([...set].sort()).toEqual(["aaaaaaaaaa", "bbbbbbbbbb", "cccccccccc"]);
+		const res = (id: string, isError: boolean, sections: object[]) => ({ type: "message", id: "r" + id, message: { role: "toolResult", toolCallId: "t" + id, toolName: "zip_recall", isError, content: [], details: { sections } } });
+		const set = recalledHandlesFromBranch([
+			call("1", "zip_recall", { handle: "aaaaaaaaaa" }), res("1", false, [{ handle: "aaaaaaaaaa" }]),
+			call("2", "zip_recall", { handles: ["bbbbbbbbbb", "cccccccccc"] }), res("2", false, [{ handle: "bbbbbbbbbb" }, { handle: "cccccccccc", missing: true }]),
+			call("3", "other", { handle: "dddddddddd" }),
+			call("4", "zip_recall", { handle: "eeeeeeeeee" }), res("4", true, [{ handle: "eeeeeeeeee", missing: true }]),
+			call("5", "zip_recall", { handle: "ffffffffff" }),
+		]);
+		expect([...set].sort()).toEqual(["aaaaaaaaaa", "bbbbbbbbbb"]);
 	});
 });
 

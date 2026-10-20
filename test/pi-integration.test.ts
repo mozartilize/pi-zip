@@ -281,7 +281,9 @@ async function rig(setup: (sm: SessionManager) => void = populate, opts: RigOpts
 		if (order === "1.2") busy = true;
 		const r = order === "1.2"
 			? await runner.emit({ type: "before_agent_start", messageType: "user", prompt: text, systemPromptOptions: { cwd: CWD } } as Any)
-			: await runner.emitBeforeAgentStart(text, undefined, { cwd: CWD } as Any);
+			: runner.emitBeforeAgentStart.length === 2
+				? await runner.emitBeforeAgentStart({ messageType: "user", prompt: text }, { cwd: CWD })
+				: await (runner.emitBeforeAgentStart as Any)(text, undefined, { cwd: CWD });
 		await o.afterStart?.();
 		busy = !o.fail;
 		if (!o.fail) await runner.emit({ type: "agent_start" } as Any);
