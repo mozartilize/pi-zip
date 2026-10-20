@@ -152,7 +152,8 @@ export function branchOutputs(branch: Any[]): Array<RecallItem & { text: string;
 	return out;
 }
 
-/** Resolve handles against the session branch: exact originals. */
+/** Resolve handles against the session branch: exact originals of tool outputs, and of user requests (a summary quotes a very long
+ *  request with its middle left out and names its handle). */
 export function resolveHandlesInBranch(branch: Any[], handles: string[]): { items: RecallItem[]; entryIds: (string | null)[] } {
 	const items: RecallItem[] = handles.map((h) => ({ handle: h, text: null, tool: null }));
 	const entryIds: (string | null)[] = handles.map(() => null);
@@ -162,6 +163,18 @@ export function resolveHandlesInBranch(branch: Any[], handles: string[]): { item
 		const { entryId, ...it } = o;
 		items[k] = it;
 		entryIds[k] = entryId;
+	}
+	if (entryIds.every((id) => id !== null)) return { items, entryIds };
+	let turn = 0;
+	for (const en of branch) {
+		const msg = en?.type === "message" ? en.message : null;
+		if (msg?.role !== "user") continue;
+		turn++;
+		if (!en.id) continue;
+		const k = handles.indexOf(handleFor(en.id));
+		if (k < 0 || entryIds[k] !== null) continue;
+		items[k] = { handle: handles[k], text: textOf(msg.content), tool: null, label: "user request", turn };
+		entryIds[k] = en.id;
 	}
 	return { items, entryIds };
 }
@@ -252,6 +265,7 @@ export function registerRecallTool(pi: ExtensionAPI, hooks: RecallHooks) {
 			"listed with a handle in a pi-zip summary. Whenever you need what such an output said, recall it first: it is instant, free and has no side effects, " +
 			"while re-running a command or re-reading a file costs a step and may give a different result. Never guess the content of a folded output. " +
 			"Pass its handle (10 characters, from the block's marker line or the summary; handles stay valid after later summaries or compaction), or several with handles. " +
+			"A summary that quotes a very long user request with its middle left out names that request's handle too: recall returns the whole request. " +
 			'For a part, add grep (case-insensitive regular expression; matching lines with line numbers) or range (e.g. "120-240"). ' +
 			"No handle at hand? grep alone searches every earlier tool output of the session and labels each match with its output's handle and command. " +
 			"Large results come in pages of characters: when a page says more is left, call again with offset.",
