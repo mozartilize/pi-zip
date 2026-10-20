@@ -1205,7 +1205,7 @@ export class Zip implements ZipControl {
 			if (room !== null && sizeOf(sc, body + wireTokensOf(msg)) > room) { this.judge.hintNote({ shown: hint.shown, dropped: "room" }); return null; }
 			this.judge.hintNote({ shown: hint.shown, skipped: hint.skipped });
 			this.judge.commitHints(hint.shown, hint.skipped);
-			attempt(() => this.pi.appendEntry(HINT_CUSTOM, { handles: [...hint.shown, ...hint.skipped] }), undefined);
+			attempt(() => this.pi.appendEntry(HINT_CUSTOM, { handles: hint.shown }), undefined);
 			return [...messages, msg];
 		} catch (err) {
 			this.ledger({ type: "error", where: "judge_hint", error: errText(err) });

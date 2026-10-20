@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
-import { Judge, judgeInput, parseVerdict, judgeModelRef, judgeReasoning, hintText, requestOpen, locatorOf, citesWork, latestUserText, JUDGE_SYSTEM, NEED_CUSTOM, type EvidenceSpan } from "../src/judge.ts";
+import { Judge, judgeInput, parseVerdict, judgeModelRef, judgeReasoning, hintText, requestOpen, locatorOf, citesWork, latestUserText, JUDGE_SYSTEM, NEED_CUSTOM, CATALOGUE_TOKENS, type EvidenceSpan } from "../src/judge.ts";
 import { buildBlocks, countUserTurns, plan, planContext, toolCallIndex, UNIT, type PlanOpts } from "../src/plan.ts";
 import { checkEdits, decideEdits } from "../src/core.ts";
 import { handleFor, PH_MARK } from "../src/placeholder.ts";
@@ -61,6 +61,22 @@ describe("judge input and parser", () => {
 		expect(c.catalogue.size).toBe(14);
 	});
 
+	test("thousands of outputs fit a hard catalogue budget, prioritizing citations and folded originals", () => {
+		const entries = longTurn(2500, { chars: 800 });
+		entries.push(U("lookup", `check ${h(1)}`));
+		const folded = project(entries, [{ type: "context_edit", targetId: "r2", replacement: { content: [{ type: "text", text: "[folded by pi-zip]" }] } }]);
+		const blocks = buildBlocks(folded);
+		const input = judgeInput(blocks, toolCallIndex(blocks), "task", 6000, undefined, 2500);
+		const catalogue = input.prefix.split("Catalogue:\n")[1];
+		const state = input.text.split("Current state:\n")[1].split("\nLatest request:")[0];
+		expect(tok4(catalogue + state)).toBeLessThanOrEqual(CATALOGUE_TOKENS);
+		expect(input.manifest.size).toBeLessThan(2500);
+		for (const handle of [h(1), h(2), h(2500)]) expect(input.manifest.has(handle)).toBe(true);
+		const next = judgeInput([], new Map(), "task", 6000, input.catalogue, 2501);
+		expect(next.catalogue.size).toBe(0);
+		expect(next.text).not.toContain("unavailable");
+	});
+
 	test("lines only: a repeated handle is unknown, a live N is hot, a cited folded N is need", () => {
 		const ev: EvidenceSpan[] = [{ id: "E1", role: "user", locators: ["/tmp/proj/a.ts"], handles: ["aaaaaaaaaa"] }];
 		const known = new Set(["aaaaaaaaaa", "bbbbbbbbbb", "cccccccccc"]);
@@ -102,6 +118,21 @@ describe("judge input and parser", () => {
 });
 
 describe("judge folds keep the existing decision", () => {
+	test("mixed verdicts cannot spend the original plan's overshoot", () => {
+		const entries = longTurn(72);
+		for (const [id, chars] of [["r1", 140_000], ["r2", 84_000], ["r3", 44_000]] as const) {
+			entries.find((e) => e.sourceEntry.id === id)!.messages[0].content = [{ type: "text", text: "x".repeat(chars) }];
+		}
+		const size = buildBlocks(entries).reduce((n, b) => n + b.tokens, 0);
+		for (const c of [1, 2]) {
+			const opts = plannerOpts(entries, { scale: { ...UNIT, O: 1000, c }, coldCap: 1000 + c * (size - 29_000) });
+			const original = planContext(entries, opts)!;
+			expect(original.folds.map((f) => f.entryId)).toEqual(["r1"]);
+			const judged = planContext(entries, { ...opts, verdicts: new Map([[h(1), "hot"], [h(2), "cold"], [h(3), "cold"]]) })!;
+			expect(judged.folds).toEqual(original.folds);
+			expect(judged.ctxAfterFolds).toBe(original.ctxAfterFolds);
+		}
+	});
 	test("cold at age 59 does not open an early fold; age 60 stays inside the normal rule", () => {
 		const entries = longTurn(72), opts = plannerOpts(entries);
 		const blocks = buildBlocks(entries);
@@ -127,10 +158,10 @@ describe("judge folds keep the existing decision", () => {
 		const entries = longTurn(72), opts = plannerOpts(entries);
 		const old = buildBlocks(entries).filter((b) => b.kind === "toolResult" && b.age >= 60);
 		const verdicts = new Map(old.map((b) => [handleFor(b.entryId!), "hot" as const]));
-		verdicts.delete(h(2));
+		verdicts.delete(h(12));
 		const v = new Map<string, "cold" | "hot" | "need">([...verdicts, [h(64), "cold"], [h(1), "need"]]);
 		const p = planContext(entries, { ...opts, verdicts: v })!;
-		expect(p.folds[0].entryId).toBe("r2");
+		expect(p.folds[0].entryId).toBe("r12");
 		expect(p.folds.some((f) => f.entryId === "r64")).toBe(false); // age 9
 		const all = planContext(entries, { ...opts, coldCap: 4000, verdicts: v })!;
 		expect(all.folds.at(-1)!.entryId).toBe("r1");
@@ -164,6 +195,18 @@ describe("judge folds keep the existing decision", () => {
 });
 
 describe("background judge", () => {
+	test("one exact folded handle triggers without a locator or five eligible outputs", async () => {
+		const r = rig();
+		const entries = longTurn(1);
+		entries.push(U("lookup", `check output ${h(1)}`));
+		const folded = project(entries, [{ type: "context_edit", targetId: "r1", replacement: { content: [{ type: "text", text: "[folded by pi-zip]" }] } }]);
+		const blocks = buildBlocks(folded);
+		r.run(24, blocks);
+		await r.judge.running;
+		expect(r.calls).toHaveLength(1);
+		expect(r.records[0]).toMatchObject({ eligible: 0, foldedHit: true });
+		expect(r.calls[0][1].messages[0].content[0].text).not.toContain('"locator"');
+	});
 	test("thresholds, request/output cadence, one in-flight call, cheapest same-provider model", async () => {
 		const d = deferred(), r = rig(() => d.promise);
 		r.ctx.modelRegistry.getAvailable = () => [{ ...model, provider: "foreign", cost: { input: 0 } }, { ...model, id: "expensive", cost: { input: 9 } }, model];
@@ -424,9 +467,14 @@ describe("Zip integration", () => {
 		expect(first.messages.at(-1).content).toContain(wanted[2]);
 		expect(first.messages.at(-1).content).not.toContain(wanted[3]);
 		expect(zip.recalled).toEqual(recalled);
-		expect(appended.some((e) => e.t === "pi-zip/hinted" && e.d.handles.length === 5)).toBe(true);
+		expect(appended.filter((e) => e.t === "pi-zip/hinted").map((e) => e.d.handles)).toEqual([wanted.slice(0, 3)]);
 		const second = await zip.context({ messages: [{ role: "user", content: "continue" }] }, ctx);
-		expect(second).toBeUndefined();
+		expect(second.messages.at(-1).content).toContain(wanted[3]);
+		expect(second.messages.at(-1).content).toContain(wanted[4]);
+		expect(second.messages.at(-1).content).not.toContain(wanted[0]);
+		expect(appended.filter((e) => e.t === "pi-zip/hinted").map((e) => e.d.handles)).toEqual([wanted.slice(0, 3), wanted.slice(3)]);
+		const third = await zip.context({ messages: [{ role: "user", content: "continue" }] }, ctx);
+		expect(third).toBeUndefined();
 		zip.shutdown();
 	});
 
