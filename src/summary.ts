@@ -4,7 +4,7 @@ import { randomUUID } from "node:crypto";
 import { blockTime, cdDirOf, clipMid, distinctLines, handleFor, keyTexts, outcomeHint, RECALL_TOOL, shortArgs, strippableCdDirs, whenLabel } from "./placeholder.ts";
 import { type Block, type Cut, type PlanResult, NARRATIVE_CALL_MAX, NARRATIVE_MAX, settings, toolCallIndex } from "./plan.ts";
 import { type FileRecall, fileRecallHow } from "./recallfile.ts";
-import { type Any, clamp, clip, envInt, fmtWhen, textOf, tok4 } from "./util.ts";
+import { type Any, attempt, clamp, clip, envInt, fmtWhen, textOf, tok4 } from "./util.ts";
 
 export const SUMMARY_MARK = "[summary of earlier conversation by pi-zip]";
 const POLICY_BLOCK_RE = /violate|terms of service|usage polic|content polic|acceptable use/i;
@@ -154,6 +154,7 @@ export interface ParsedSummary {
 	table: Items;
 	narrative: string[]; // model-written text and free text, oldest first
 	narrativeAt?: string; // a narrative carried forward unchanged (its call failed) says when it was written
+	epochs?: StructuredNarrative; // the narrative in the append-only format (current state + epochs); absent for older formats and free text
 	cmdDirs: string[]; // the shared `cd <dir>` prefixes the command rows leave out (oldest first)
 }
 
@@ -174,6 +175,13 @@ const USERS_HEAD = "## User requests (verbatim, oldest first, continuation lines
 /** Heading once older requests in the middle are shortened (USERS budget): those lines start with SHORT_MARK. */
 const USERS_HEAD_SHORT = "## User requests (oldest first, continuation lines indented; the first and the newest verbatim, lines starting with ≈ shortened to their start)";
 const SHORT_MARK = "≈ ";
+/** The omission marker of a long request names its handle after this text (requestText); a shortened line keeps that handle. */
+const OMITTED_REQ_HANDLE = " (handle ";
+const OMITTED_REQ_RE = /\[… middle of this request omitted \(handle ([0-9a-z]{10})\)/;
+const shortHandle = (t: string): string => {
+	const h = OMITTED_REQ_RE.exec(t)?.[1];
+	return h ? ` (whole request: handle ${h})` : "";
+};
 const USER_INDENT = "   ";
 const OMIT_ROW = /^\[… (\d+) [^\]]*?(?:omitted|not listed)[^\]]*…\]$/;
 const COVERS_ROW = /^Covers \d+ earlier messages\./;
@@ -246,7 +254,11 @@ export function parseSummary(text: string | null): ParsedSummary {
 		else if (key === "table") take(out.table, (l) => TABLE_ROW.test(l));
 		else if (key === "narr" || key === "free") {
 			const t = lines.join("\n").trim();
-			if (t && !t.startsWith("(unavailable")) out.narrative.push(t);
+			if (t && !t.startsWith("(unavailable")) {
+				out.narrative.push(t);
+				const s = key === "narr" ? parseEpochNarrative(t) : null;
+				if (s) out.epochs = s;
+			}
 		}
 	}
 	out.files.rows = [...files.values()];
@@ -375,7 +387,7 @@ function mergeUsers(prev: Items, now: string[]): { lines: string[]; omitted: num
 	}
 	used = 0;
 	for (; k >= 0 && !keep.has(k); k--) {
-		const l = all[k].t.startsWith(SHORT_MARK) ? all[k].t : SHORT_MARK + clip(all[k].t, SHORT_CHARS);
+		const l = all[k].t.startsWith(SHORT_MARK) ? all[k].t : SHORT_MARK + clip(all[k].t, SHORT_CHARS) + shortHandle(all[k].t);
 		if (used + l.length + 8 > BUDGET.usersShort) break;
 		used += l.length + 8;
 		keep.set(k, l);
@@ -391,19 +403,64 @@ function mergeUsers(prev: Items, now: string[]): { lines: string[]; omitted: num
 	}
 	return { lines, omitted: Math.max(0, (all.at(-1)?.n ?? 0) - keep.size) };
 }
-/**
- * The narrative call's word budget for a narrative budget of this many tokens. A merge (a previous narrative given) asks for at most
- * MERGE_WORDS: given an old narrative to carry, the model writes about 1.55x its budget (S6 chain probe: 2,349 words for 1,500, 1,547 for
- * 1,000), and the merged narrative stays near the size of the narrative plus earlier-narrative excerpt it replaces.
- */
-const narrativeWords = (budgetTokens: number, merge: boolean) => Math.round(clamp(budgetTokens * 0.6, 120, merge ? MERGE_WORDS : 1500));
-const MERGE_WORDS = 1000;
-/** The previous summary's narrative the narrative call merges is at most PREV_CHARS_PER_WORD characters per word of the call's budget,
- *  PREV_NARRATIVE_CHARS in all: what a merge writes (1.55 x 1,000 words x ~7.7 chars), so a merged narrative passes whole to the next merge.
- *  A longer one (Pi's own free-text summary, an older summary's narrative and its earlier excerpt) is sent as its head and its tail, so
- *  the chain cannot grow. */
-const PREV_CHARS_PER_WORD = 12;
-export const PREV_NARRATIVE_CHARS = MERGE_WORDS * PREV_CHARS_PER_WORD;
+
+// ---------------------------------------------------------------------------------------------------------------
+// Append-only narrative (billion-context §3.2, §3.6, §4.2; pi-vcc's volatile/durable split). The narrative call reads ONLY the
+// conversation since the previous summary, never the previous narrative, and writes two parts: the decisions and durable facts of
+// that part (an epoch, appended once and then carried by code byte for byte) and the current state and open todos (volatile:
+// replaced by every summary). Re-summarising the whole narrative at every cut re-compressed early facts once per summary (retention
+// ~rho^k after k summaries); an epoch is compressed once when written. Only when the epochs pass their budget are two neighbouring
+// epochs of the same tier, the oldest such pair, merged by one small call (an LSM-style tier merge): a fact is re-compressed about
+// log2(k) times over k summaries, and the newest epochs are never touched.
+// ---------------------------------------------------------------------------------------------------------------
+
+/** One epoch: the decisions and durable facts of one part of the conversation (or of neighbouring parts, once consolidated). */
+export interface EpochBlock {
+	id: string; // "Epoch 3", or "Epochs 1–2" once consolidated
+	turns: string; // the user requests it covers: "requests 9–12", "request 5", "within request 5"
+	timestamp: string; // when its part of the conversation ended (local MM-DD HH:MM), a range once consolidated
+	durableProse: string;
+	tokens: number; // chars/4 of its heading and prose
+	first?: number; // number of the first epoch it covers (0 = the narrative of an older-format or foreign summary, carried verbatim)
+	last?: number;
+	level?: number; // tier: 1 = written once from its own part; n = the result of tier merges n-1 deep
+	note?: string; // "not written: <why>", "earlier narrative, carried verbatim; ..."
+}
+
+/** The narrative of a summary in the append-only format. */
+export interface StructuredNarrative {
+	activeState: string; // volatile: current state and open todos, replaced by every summary
+	activeAt?: string; // when it was written (local MM-DD HH:MM)
+	activeStale?: string; // set when it was carried forward because a new one could not be written: why
+	epochs: EpochBlock[]; // durable: append-only, oldest first
+}
+
+/** Budget of the epochs (tokens); over it, tier merges run. The narrative budget of the cut lowers it, never below EPOCH_CAP_MIN. */
+export const MAX_NARRATIVE_TOKENS = envInt("SUM_NARRATIVE_TOKENS", 2500);
+const EPOCH_CAP_MIN = 1000;
+/** Words the narrative call is asked for: the epoch's decisions and durable facts, and the current state and open todos. */
+export const EPOCH_WORDS = envInt("SUM_EPOCH_WORDS", 250);
+export const ACTIVE_WORDS = envInt("SUM_ACTIVE_WORDS", 150);
+/** Tier merges one summary may run (each a small call over two epochs). */
+export const MAX_MERGES_PER_CUT = 3;
+/** A part of the reply is clipped (head and tail) at this many characters per word asked: ~1.6x a reply at its budget (~7.7 chars a word). */
+const CHARS_PER_WORD = 12;
+/** An older-format or foreign narrative becomes Epoch 0, carried verbatim up to this many characters (its head and its tail). */
+const LEGACY_CHARS = MAX_NARRATIVE_TOKENS * 2;
+
+/** The words of a narrative call for a narrative budget of this many tokens: decisions and durable facts, and the current state. */
+export function epochWords(budgetTokens: number): { durable: number; active: number } {
+	const all = EPOCH_WORDS + ACTIVE_WORDS;
+	const total = Math.round(clamp(budgetTokens * 0.6, 120, all));
+	const durable = Math.round((total * EPOCH_WORDS) / all);
+	return { durable, active: total - durable };
+}
+/** The epochs' token budget for a narrative budget of this many tokens (the current state's share left out). */
+export const epochCap = (budgetTokens: number) => clamp(budgetTokens - Math.ceil(epochWords(budgetTokens).active * 1.5), EPOCH_CAP_MIN, MAX_NARRATIVE_TOKENS);
+
+/** The previous summary's narrative a migration reads is at most PREV_NARRATIVE_CHARS: a longer one (Pi's own free-text summary, an
+ *  older summary's narrative and its earlier excerpt) is kept as its head and its tail, so nothing it carries can grow. */
+export const PREV_NARRATIVE_CHARS = 12_000;
 
 function excerpt(text: string, max: number, head = 0): string {
 	if (text.length <= max) return text;
@@ -418,7 +475,7 @@ function excerpt(text: string, max: number, head = 0): string {
 	return (h ? h + "\n" : "") + "[… middle of the narrative omitted …]\n" + t;
 }
 
-/** The narrative part of a previous summary, as the next narrative call reads it. */
+/** The narrative part of a previous summary in an older format (or free text). */
 export interface PrevNarrative {
 	text: string; // bounded by PREV_NARRATIVE_CHARS
 	foreign: boolean; // the previous summary is free text (Pi's own compaction or another extension's), not pi-zip's sections
@@ -427,26 +484,275 @@ export interface PrevNarrative {
 
 /**
  * The previous summary's narrative only (not its lists): the model-written sections of pi-zip's summary (an older summary's carried
- * excerpt included, so the first merge also settles what that excerpt said), or the whole text of a free-text summary. null: none.
- * `at` = the previous summary's timestamp (ms), used when the text does not say when its narrative was written.
+ * excerpt included), or the whole text of a free-text summary. null: none. `at` = the previous summary's timestamp (ms), used when
+ * the text does not say when its narrative was written. A narrative in an older format becomes Epoch 0 of the next one (legacyNarrative).
  */
 export function previousNarrative(text: string | null, at?: number, maxChars = PREV_NARRATIVE_CHARS): PrevNarrative | null {
 	const p = parseSummary(text);
 	const t = p.narrative.join("\n\n").trim();
 	if (!t) return null;
-	const when = p.narrativeAt ?? (at && at > 0 ? fmtWhen(at) : undefined);
+	const when = p.narrativeAt ?? p.epochs?.activeAt ?? (at && at > 0 ? fmtWhen(at) : undefined);
 	const max = Math.min(maxChars, PREV_NARRATIVE_CHARS);
 	return { text: excerpt(t, max, Math.floor(max / 4)), foreign: !p.structured, ...(when ? { at: when } : {}) };
 }
 
+const DURABLE_HEAD = "### Decisions and durable facts (append-only epochs, oldest first: each written once from its own part of the conversation and not rewritten; only the oldest are consolidated, when over budget)";
+const ACTIVE_PREFIX = "### Current state and open todos (";
+const activeHead = (s: StructuredNarrative) =>
+	ACTIVE_PREFIX +
+	(s.activeStale
+		? `carried forward from the summary of ${s.activeAt ?? "an earlier time"}; possibly stale: a new one could not be written: ${s.activeStale})`
+		: `as of ${s.activeAt ?? "the end of the summarised part"}; replaced by each new summary)`);
+const EPOCH_HEAD = /^#### Epochs? (\d+)(?:–(\d+))? · (.*)$/;
+const TIER = /^consolidated, tier (\d+)$/;
+/** One line of a heading: no newlines, and no " · " (the heading's field separator). */
+const oneLine = (s: string) => s.replace(/\s+/g, " ").replace(/·/g, "-").trim();
+export const epochHead = (e: EpochBlock) => `#### ${e.id} · ${e.turns} · ${e.timestamp}${(e.level ?? 1) > 1 ? ` · consolidated, tier ${e.level}` : ""}${e.note ? ` · ${e.note}` : ""}`;
+
+function epochNum(e: EpochBlock, hi = false): number {
+	const v = hi ? (e.last ?? e.first) : (e.first ?? e.last);
+	if (v !== undefined) return v;
+	const m = [...e.id.matchAll(/\d+/g)].map((x) => Number(x[0]));
+	return (hi ? m.at(-1) : m[0]) ?? 1;
+}
+
+export function mkEpoch(first: number, last: number, turns: string, timestamp: string, level: number, durableProse: string, note?: string): EpochBlock {
+	const e: EpochBlock = { id: first === last ? `Epoch ${first}` : `Epochs ${first}–${last}`, first, last, turns: oneLine(turns), timestamp: oneLine(timestamp) || "time unknown", level, durableProse, tokens: 0, ...(note ? { note: oneLine(note) } : {}) };
+	e.tokens = tok4(epochHead(e) + "\n" + durableProse);
+	return e;
+}
+const epochTokens = (eps: EpochBlock[]) => eps.reduce((a, e) => a + (e.tokens || tok4(epochHead(e) + "\n" + e.durableProse)) + 1, 0);
+
+/**
+ * Model-written text as it may sit inside the narrative section: a markdown heading becomes a bold line, so nothing the model writes
+ * can start a summary section (`## Errors`), an epoch (`#### Epoch`) or the current state; the summary mark line goes.
+ */
+function prose(t: string): string {
+	return t
+		.split("\n")
+		.map((l) => { const m = /^\s{0,3}#{1,6}\s+(.*?)[\s#]*$/.exec(l); return m ? (m[1] ? `**${m[1]}**` : "") : l; })
+		.filter((l) => l.trim() !== SUMMARY_MARK)
+		.join("\n")
+		.replace(/\n{3,}/g, "\n\n")
+		.trim();
+}
+/** A part of a reply clipped to its word budget (head and tail kept). */
+const clipPart = (t: string, words: number) => excerpt(t, Math.max(200, words * CHARS_PER_WORD), Math.floor(Math.max(200, words * CHARS_PER_WORD) / 3));
+
+const MARK_LINE = /^[\s#*_>`-]*(DECISIONS|ACTIVE)\b[\s#*_:`-]*$/i;
+const ACTIVE_TOPIC = /current state|state of the work|open todo|todos|next step|blocker|in.flight|active|status/i;
+/**
+ * The two parts of a narrative reply: decisions and durable facts, and the current state and open todos. Reads the marker lines the
+ * prompt asks for; a reply without them is split by its headings (the older four headings included); a reply with neither is all durable.
+ */
+export function parseNarrativeReply(text: string): { durable: string; active: string } {
+	const lines = text.split("\n");
+	const d: string[] = [], a: string[] = [];
+	const marked = lines.some((l) => MARK_LINE.test(l));
+	let cur = d;
+	for (const l of lines) {
+		const m = MARK_LINE.exec(l);
+		if (marked) {
+			if (m) cur = m[1].toUpperCase() === "ACTIVE" ? a : d;
+			else cur.push(l);
+			continue;
+		}
+		const h = /^\s{0,3}#{1,6}\s+(.*)$/.exec(l);
+		if (h) cur = ACTIVE_TOPIC.test(h[1]) ? a : d;
+		cur.push(l);
+	}
+	const none = (t: string) => (!t || /^\(?none\.?\)?\.?$/i.test(t) ? NONE_ROW : t);
+	return { durable: none(prose(d.join("\n"))), active: prose(a.join("\n")) };
+}
+
+/** The narrative section's body: the current state first, then the epochs, oldest first (bounded to `maxTokens` when given). */
+export function formatNarrative(data: StructuredNarrative, maxTokens = Infinity): string {
+	const parts: string[] = [];
+	if (data.activeState.trim()) parts.push(`${activeHead(data)}\n${data.activeState.trim()}`);
+	const epochs = maxTokens < Infinity ? boundEpochs(data.epochs, maxTokens) : data.epochs;
+	if (epochs.length) parts.push([DURABLE_HEAD, ...epochs.map((e) => `${epochHead(e)}\n${e.durableProse}`)].join("\n"));
+	return parts.join("\n");
+}
+
+/** A narrative section's body in the append-only format, or null (an older format or free text). */
+export function parseEpochNarrative(text: string): StructuredNarrative | null {
+	const lines = text.split("\n");
+	if (!lines.some((l) => l.startsWith(DURABLE_HEAD.slice(0, 35)) || l.startsWith(ACTIVE_PREFIX))) return null;
+	const out: StructuredNarrative = { activeState: "", epochs: [] };
+	const active: string[] = [];
+	let mode: "none" | "active" | "durable" = "none";
+	let cur: { m: RegExpExecArray; lines: string[] } | null = null;
+	const close = () => {
+		if (!cur) return;
+		const [, a, b, rest] = cur.m;
+		const [turns = "", timestamp = "", ...more] = rest.split(" · ");
+		let level = 1;
+		const notes: string[] = [];
+		for (const x of more) { const t = TIER.exec(x); if (t) level = Number(t[1]); else notes.push(x); }
+		out.epochs.push(mkEpoch(Number(a), Number(b ?? a), turns, timestamp, level, cur.lines.join("\n").trim(), notes.join(" - ") || undefined));
+		cur = null;
+	};
+	for (const l of lines) {
+		if (l.startsWith(ACTIVE_PREFIX)) {
+			close();
+			mode = "active";
+			const at = /(?:as of|from the summary of) ([^;)]+)/.exec(l)?.[1];
+			const stale = /could not be written: (.*)\)$/.exec(l)?.[1];
+			if (at && at !== "an earlier time" && at !== "the end of the summarised part") out.activeAt = at;
+			if (stale) out.activeStale = stale;
+			continue;
+		}
+		if (l.startsWith(DURABLE_HEAD.slice(0, 35))) { close(); mode = "durable"; continue; }
+		const m = mode === "durable" ? EPOCH_HEAD.exec(l) : null;
+		if (m) { close(); cur = { m, lines: [] }; continue; }
+		if (mode === "active") active.push(l);
+		else if (cur) cur.lines.push(l);
+	}
+	close();
+	out.activeState = active.join("\n").trim();
+	return out;
+}
+
+/** The request numbers an epoch covers: the previous summary numbered requests up to `last`; this part adds `added`. */
+export const turnsLabel = (last: number, added: number) => (added > 1 ? `requests ${last + 1}–${last + added}` : added === 1 ? `request ${last + 1}` : last > 0 ? `within request ${last}` : "no user request");
+const lastRequestNo = (u: Items) => Math.max(u.omitted + u.items.length, u.nums?.at(-1) ?? 0);
+
+/** An older-format or foreign narrative becomes Epoch 0, carried verbatim (head and tail of a long one); its state may be stale. */
+function legacyNarrative(prev: string | null, prevAt: number, lastReq: number): StructuredNarrative {
+	const p = previousNarrative(prev, prevAt, LEGACY_CHARS);
+	if (!p) return { activeState: "", epochs: [] };
+	const what = p.foreign ? "the earlier summary (another summariser's)" : "the earlier narrative";
+	return { activeState: "", epochs: [mkEpoch(0, 0, lastReq ? turnsLabel(0, lastReq) : "the earlier conversation", p.at ?? "time unknown", 1, prose(p.text), `${what}, carried verbatim; its state and todos are possibly stale`)] };
+}
+
+function joinTurns(a: EpochBlock, b: EpochBlock): string {
+	const nums = (t: string) => [...t.matchAll(/\d+/g)].map((m) => Number(m[0]));
+	const n = [...nums(a.turns), ...nums(b.turns)];
+	if (!n.length) return a.turns === b.turns ? a.turns : `${a.turns}, ${b.turns}`;
+	const lo = Math.min(...n), hi = Math.max(...n);
+	const range = lo === hi ? `request ${lo}` : `requests ${lo}–${hi}`;
+	return nums(a.turns).length ? range : `${a.turns}, ${range}`;
+}
+function joinTime(a: EpochBlock, b: EpochBlock): string {
+	const start = a.timestamp.split(" – ")[0], end = b.timestamp.split(" – ").at(-1)!;
+	return start === end ? start : `${start} – ${end}`;
+}
+const wordCount = (t: string) => t.split(/\s+/).filter(Boolean).length;
+
+/** The pair a tier merge takes: the oldest two neighbouring historical epochs of the same tier, leaving the newest epoch untouched. */
+export function pickPair(eps: EpochBlock[]): number {
+	const limit = eps.length > 2 ? eps.length - 1 : eps.length;
+	for (let i = 0; i + 1 < limit; i++) if ((eps[i].level ?? 1) === (eps[i + 1].level ?? 1)) return i;
+	return 0;
+}
+
+/** One tier merge: two neighbouring epochs into one by a small call (about 0.6x their words, capped at EPOCH_WORDS). */
+async function mergeEpochs(a: EpochBlock, b: EpochBlock, ctx: Any, signal?: AbortSignal): Promise<Narrative & { block?: EpochBlock }> {
+	const words = clamp(Math.round(0.6 * wordCount(a.durableProse + " " + b.durableProse)), 120, EPOCH_WORDS);
+	const prompt =
+		[a, b].map((e) => `<epoch heading="${epochHead(e).slice(5).replace(/"/g, "'")}">\n${e.durableProse}\n</epoch>`).join("\n\n") +
+		`\n\nThese are two consecutive epochs of the decisions and durable facts recorded for one coding session, oldest first. Merge them into ONE block: ` +
+		`keep every decision with its rationale, every constraint or ruling of the user, and every exact path, identifier, value and result the work may still ` +
+		`depend on; where the later epoch supersedes the earlier one, keep only the later; drop only what is plainly obsolete. Add nothing that is not in them, ` +
+		`and do not mention the epochs or the merge. Output only the merged text, as short markdown bullets without headings. Stay under about ${words} words. Do not call tools.`;
+	const r = await complete(ctx, prompt, signal);
+	if (!r.ok || !r.text) return r;
+	const maxChars = Math.min(words * CHARS_PER_WORD, Math.max(400, Math.floor((a.durableProse.length + b.durableProse.length) * 0.75)));
+	const body = excerpt(prose(r.text) || NONE_ROW, maxChars, Math.floor(maxChars / 3));
+	return { ...r, block: mkEpoch(epochNum(a, false), epochNum(b, true), joinTurns(a, b), joinTime(a, b), Math.max(a.level ?? 1, b.level ?? 1) + 1, body) };
+}
+
+/**
+ * Tier merges of historical epochs until the epochs fit `target` tokens, at most MAX_MERGES_PER_CUT calls (the newest epoch stays untouched).
+ * A merge that fails leaves its pair as it was (the next summary tries again); the epochs are never lost to a failed call.
+ */
+export async function consolidateEpochs(epochs: EpochBlock[], ctx: Any, target: number, signal?: AbortSignal): Promise<{ epochs: EpochBlock[]; costUsd: number; usage?: Any; merges: number; error?: string }> {
+	let eps = [...epochs], costUsd = 0, merges = 0, usage: Any, error: string | undefined;
+	while (eps.length > 2 && epochTokens(eps) > target && merges < MAX_MERGES_PER_CUT) {
+		const i = pickPair(eps);
+		const r = await mergeEpochs(eps[i], eps[i + 1], ctx, signal);
+		merges++;
+		costUsd += r.costUsd;
+		usage = addUsage(usage, r.usage);
+		if (!r.block) { error = r.error ?? "merge failed"; break; }
+		eps = [...eps.slice(0, i), r.block, ...eps.slice(i + 2)];
+	}
+	return { epochs: eps, costUsd, merges, ...(usage ? { usage } : {}), ...(error ? { error } : {}) };
+}
+
+/**
+ * The hard bound when tier merges could not run. Reserve the newest epoch verbatim when it fits; only historical epochs are joined.
+ * An individually oversized epoch is clipped before reserving it. Headings, separators and omission markers count toward the bound.
+ */
+export function boundEpochs(epochs: EpochBlock[], hard: number): EpochBlock[] {
+	if (!epochs.length || epochTokens(epochs) <= hard) return [...epochs];
+	const fit = (e: EpochBlock, budget: number): EpochBlock[] => {
+		if (epochTokens([e]) <= budget) return [e];
+		const chars = Math.floor((budget - 1) * 4) - epochHead(e).length - 1;
+		if (chars < 0) return []; // even the heading cannot fit
+		const markerChars = "\n[… middle of the narrative omitted …]\n".length;
+		const max = Math.max(0, chars - markerChars);
+		const body = max > 0 ? excerpt(e.durableProse, max, Math.floor(max / 3)).slice(0, chars) : "";
+		return [mkEpoch(epochNum(e, false), epochNum(e, true), e.turns, e.timestamp, e.level ?? 1, body, e.note)];
+	};
+	const last = epochs.at(-1)!;
+	const newest = fit(last, epochTokens([last]) > hard && epochs.length > 1 ? Math.floor(hard / 2) : hard);
+	const room = hard - epochTokens(newest);
+	let history = epochs.slice(0, -1);
+	while (history.length > 1 && epochTokens(history) > room) {
+		const i = pickPair(history);
+		const a = history[i], b = history[i + 1];
+		history = [...history.slice(0, i), mkEpoch(epochNum(a, false), epochNum(b, true), joinTurns(a, b), joinTime(a, b), Math.max(a.level ?? 1, b.level ?? 1) + 1, `${a.durableProse}\n${b.durableProse}`, "joined without a model call; its middle may be omitted"), ...history.slice(i + 2)];
+	}
+	if (history.length === 1) history = fit(history[0], room);
+	return [...history, ...newest];
+}
+
+/** Token usage of two calls added up (cost included). */
+function addUsage(a: Any, b: Any): Any {
+	if (!b) return a;
+	const out: Any = a ? { ...a, cost: { ...(a.cost ?? {}) } } : { cost: {} };
+	const { cost, ...tokens } = b;
+	for (const [k, v] of Object.entries(tokens)) out[k] = (Number(out[k]) || 0) + (Number(v) || 0);
+	for (const [k, v] of Object.entries(cost ?? {})) out.cost[k] = (Number(out.cost[k]) || 0) + (Number(v) || 0);
+	return out;
+}
+
 const list = (title: string, m: { kept: string[]; omitted: number }, marker: string): string[] => [title, m.kept.length ? [...(m.omitted ? [`[… ${m.omitted} ${marker} …]`] : []), ...m.kept].join("\n") : NONE_ROW];
+
+/** A user request as the summary quotes it: verbatim, the middle of a very long one left out. The marker names the request's handle
+ *  (recall returns user requests by handle, like tool outputs) so the model can read the whole request again. */
+function requestText(content: Any, entryId?: string, file?: FileRecall): string {
+	const t = textOf(content).trim();
+	if (t.length <= 3000) return t;
+	const h = entryId ? handleFor(entryId) : null;
+	const how = !h ? "" : `${OMITTED_REQ_HANDLE}${h}): ${file ? `${file.dir}/${h}.txt holds it whole` : `${RECALL_TOOL} returns it whole`}`;
+	return t.slice(0, 2000) + `\n[… middle of this request omitted${how} …]\n` + t.slice(-800);
+}
+
+/**
+ * The user requests a branch holds before the entry `firstId`, oldest first, or null when the branch does not hold that entry.
+ * A summary another summariser wrote (Pi's own compaction, say) keeps no list of requests; compaction never deletes entries, so the
+ * branch still holds every request that summary took out of the view, and they are quoted from there, numbered from the session's first.
+ */
+export function earlierRequests(branch: Any[], firstId: string | undefined, file?: FileRecall): string[] | null {
+	const end = firstId ? branch.findIndex((e) => e?.id === firstId) : -1;
+	if (end < 0) return null;
+	const out: string[] = [];
+	for (const e of branch.slice(0, end)) {
+		if (e?.type !== "message" || e.message?.role !== "user") continue;
+		const t = requestText(e.message.content, e.id, file);
+		if (t) out.push(t);
+	}
+	return out;
+}
 
 /**
  * The deterministic part of a summary: user words verbatim, files, commands, other calls, errors and a handle index, each section
  * merged from the previous summary `previous` (any format) and this prefix. `tableText` = the folded-outputs table the caller will
- * append, so the index does not repeat its handles.
+ * append, so the index does not repeat its handles. `earlier` = the requests before this prefix when `previous` keeps no list of them.
  */
-export function skeleton(prefix: Block[], previous: string | null, tableText = "", file?: FileRecall): { text: string; users: number } {
+export function skeleton(prefix: Block[], previous: string | null, tableText = "", file?: FileRecall, earlier?: string[]): { text: string; users: number } {
 	const calls = toolCallIndex(prefix);
 	const results = new Map<string, Block>();
 	for (const b of prefix) if (b.kind === "toolResult") results.set(b.msg.toolCallId, b);
@@ -461,8 +767,8 @@ export function skeleton(prefix: Block[], previous: string | null, tableText = "
 	const shared = strippableCdDirs(bashCommands(prefix), parseSummary(previous).cmdDirs);
 	for (const b of prefix) {
 		if (b.kind === "user") {
-			const t = textOf(b.msg.content).trim();
-			if (t) users.push(t.length > 3000 ? t.slice(0, 2000) + "\n[… middle of this request omitted …]\n" + t.slice(-800) : t);
+			const t = requestText(b.msg.content, b.entryId, file);
+			if (t) users.push(t);
 		}
 		if (b.kind !== "assistant") continue;
 		for (const c of b.msg.content ?? []) {
@@ -495,7 +801,8 @@ export function skeleton(prefix: Block[], previous: string | null, tableText = "
 	}
 	const prev = parseSummary(previous);
 	// user requests: previous (older) then new, the first and the newest verbatim, the ones between shortened, numbered over the session
-	const mu = mergeUsers(prev.users, users);
+	// (`earlier`: the requests before this prefix, quoted from the session when the previous summary keeps no list of them)
+	const mu = mergeUsers(earlier ? { items: earlier, omitted: 0 } : prev.users, users);
 	// files: a path touched again moves to the newest end with its newest handles
 	const merged = new Map<string, FileRow>(prev.files.rows.map((r) => [r.path, r]));
 	for (const [path, ops] of files) {
@@ -563,47 +870,17 @@ export const EFFORT_REFUSED_RE = /(?:'none'|"none"|reasoning|effort)[^\n]{0,80}n
 const lowEffort = new Set<string>(); // provider/model keys that need an explicit effort: the next narrative asks for "low" at once
 
 /**
- * Narrative sections written by the current model in a separate, uncached call. Never throws. `previous` = the previous summary's
- * narrative: the call merges it with what the prefix adds into ONE narrative (newer values replace older ones, finished todos go,
- * durable facts stay), so no stale copy of an earlier narrative is carried next to the new one.
+ * One summariser call (the narrative, or a tier merge of two epochs) to the current model, separate and uncached. Never throws; one
+ * retry, none for a refusal by policy, a reply cut at the cap or an abort.
  */
-export async function narrative(prefix: Block[], ctx: Any, budgetTokens: number, ownSignal?: AbortSignal, previous: PrevNarrative | null = null): Promise<Narrative> {
+async function complete(ctx: Any, prompt: string, ownSignal?: AbortSignal): Promise<Narrative> {
 	const t0 = Date.now();
 	const model = ctx.model;
 	if (!model) return { text: null, ok: false, ms: 0, costUsd: 0, error: "no current model" };
 	const cap = Math.min(NARRATIVE_CALL_MAX, Number(model.maxTokens) > 0 ? Number(model.maxTokens) : NARRATIVE_CALL_MAX);
-	const msgs = prefix
-		.filter((b) => b.kind !== "summary")
-		.map((b) => {
-			const m = b.raw && !(b.edited && !b.ours) ? b.raw : b.msg; // the summariser reads the unfolded originals
-			return m.role === "assistant" ? { ...m, content: (m.content ?? []).filter((c: Any) => c?.type !== "thinking") } : m;
-		});
 	let lastErr = "", costUsd = 0;
 	let usage: Any;
 	try {
-		const conv = await serialize(msgs);
-		const words = narrativeWords(budgetTokens, !!previous);
-		const prev = previous
-			? `<previous-narrative${previous.at ? ` written="${previous.at}"` : ""}>\n${previous.text}\n</previous-narrative>\n\n`
-			: "";
-		const merge = previous
-			? `The <previous-narrative> block is the narrative of the ${previous.foreign ? "earlier summary (written by another summariser)" : "previous summary"}: it covers everything before this conversation. ` +
-				`Write ONE updated narrative for the whole session, merging it with what the conversation adds: where the conversation gives a newer value ` +
-				`(a version, id, pid, count, status, plan, path), keep only the newer one; drop todos that are done or obsolete; keep the durable facts of the ` +
-				`previous narrative (paths, identifiers, rulings, results the work still depends on) unless the conversation superseded them. ` +
-				`Write the current state only; do not mention the previous narrative or list what changed.\n`
-			: "";
-		const prompt =
-			prev +
-			`<conversation>\n${conv}\n</conversation>\n\n` +
-			`Write the NARRATIVE part of a context summary for this conversation. A separate deterministic section already lists the user's ` +
-			`requests, files touched, commands with exit codes and errors, so do NOT repeat those. When you refer to a specific tool output, name it by its ` +
-			`tool and exact command or path so that look-alike runs stay distinguishable; never merge similar runs into one. Output only these markdown sections:\n` +
-			`## Decisions and rationale\n## Current state of the work\n## Open todos / next steps\n## Key facts to remember (exact values, paths, identifiers, results the work still depends on)\n` +
-			merge +
-			`Be concrete and keep exact paths, names and numbers. Stay under about ${words} words` +
-			(previous ? ` (a hard limit: the previous narrative and the conversation together say more, so compress: keep what the work still depends on, drop how it got there and whatever is finished)` : "") +
-			`. Do not call tools.`;
 		const signals: AbortSignal[] = [AbortSignal.timeout(240_000)];
 		// a background summary has its own signal (nothing is running, so the run's signal would be stale); a summary the user waits for follows the run's (Esc)
 		const outer = ownSignal ?? ctx.signal;
@@ -620,12 +897,7 @@ export async function narrative(prefix: Block[], ctx: Any, budgetTokens: number,
 					{ maxTokens: cap, signal, cacheRetention: "none", sessionId: randomUUID(), ...(low ? { reasoningEffort: "low" } : {}) },
 				);
 				costUsd += Number(res.usage?.cost?.total) || 0;
-				if (res.usage) {
-					const { cost, ...tokens } = res.usage;
-					usage ??= { cost: {} };
-					for (const [k, v] of Object.entries(tokens)) usage[k] = (Number(usage[k]) || 0) + (Number(v) || 0);
-					for (const [k, v] of Object.entries(cost ?? {})) usage.cost[k] = (Number(usage.cost[k]) || 0) + (Number(v) || 0);
-				}
+				if (res.usage) usage = addUsage(usage, res.usage);
 				if (res.stopReason === "aborted" || signal.aborted) return { text: null, ok: false, ms: Date.now() - t0, costUsd, usage, error: "narrative aborted" };
 				if (res.stopReason === "error") throw new Error(res.errorMessage || "provider error");
 				if (res.stopReason === "length") throw new Error(CAP_ERR);
@@ -649,13 +921,54 @@ export async function narrative(prefix: Block[], ctx: Any, budgetTokens: number,
 	return { text: null, ok: false, ms: Date.now() - t0, costUsd, usage, error: lastErr };
 }
 
+/**
+ * The narrative of this prefix only, written by the current model in a separate, uncached call. Never throws. The call never reads
+ * the previous narrative: it writes the decisions and durable facts of this part (the epoch buildCut appends) and the current state
+ * and open todos (which replace the previous ones). `durable`/`active` = the reply's two parts.
+ */
+export async function narrative(prefix: Block[], ctx: Any, budgetTokens: number, ownSignal?: AbortSignal, _previous: Any = null): Promise<Narrative & { durable?: string; active?: string }> {
+	const t0 = Date.now();
+	if (!ctx.model) return { text: null, ok: false, ms: 0, costUsd: 0, error: "no current model" };
+	const msgs = prefix
+		.filter((b) => b.kind !== "summary")
+		.map((b) => {
+			const m = b.raw && !(b.edited && !b.ours) ? b.raw : b.msg; // the summariser reads the unfolded originals
+			return m.role === "assistant" ? { ...m, content: (m.content ?? []).filter((c: Any) => c?.type !== "thinking") } : m;
+		});
+	let conv: string;
+	try {
+		conv = await serialize(msgs);
+	} catch (err) {
+		return { text: null, ok: false, ms: Date.now() - t0, costUsd: 0, error: err instanceof Error ? err.message : String(err) };
+	}
+	const w = epochWords(budgetTokens);
+	const prompt =
+		`<conversation>\n${conv}\n</conversation>\n\n` +
+		`Write the NARRATIVE part of a context summary for this conversation slice. It is the newest increment of a longer session: earlier increments ` +
+		`are summarised already and kept as immutable epochs, so summarize ONLY what this conversation slice accomplished. A separate deterministic ` +
+		`section already lists the user's requests, files touched, commands with exit codes and errors, so do NOT repeat those. When you refer to a ` +
+		`specific tool output, name it by its tool and exact command or path so that look-alike runs stay distinguishable; never merge similar runs ` +
+		`into one. Output format:\n` +
+		`---DECISIONS---\n` +
+		`(durable: any architecture decisions, rationale, design choices, API contracts, user constraints or rulings, root causes found, and durable ` +
+		`facts settled in this slice — exact values, paths, identifiers, results later work depends on; <= ${w.durable} words; write (none) if none)\n` +
+		`---ACTIVE---\n` +
+		`(volatile: the current active state of the work and immediate open todos, next steps or blockers at the end of this slice; <= ${w.active} words)\n` +
+		`Be concrete and keep exact paths, names and numbers. Stay under about ${w.durable + w.active} words in all. Do not call tools.`;
+	const r = await complete(ctx, prompt, ownSignal);
+	if (!r.ok || !r.text) return { ...r, ms: Date.now() - t0 };
+	return { ...r, ms: Date.now() - t0, ...parseNarrativeReply(r.text) };
+}
+
 /** The cold summary (skeleton + narrative + handle table) for a planned cut. */
 export async function buildCut(p: PlanResult, ctx: Any, signal?: AbortSignal): Promise<Cut> {
 	const { foldMin, keepLines } = settings();
 	const t0 = performance.now();
 	const prefix = p.blocks.slice(0, p.cutIdx!);
 	const prev = prefix[0]?.kind === "summary" ? String(prefix[0].msg.summary ?? "") || null : null;
-	const shared = strippableCdDirs(bashCommands(prefix.filter((b) => b.kind !== "summary")), parseSummary(prev).cmdDirs);
+	const prevParsed = parseSummary(prev);
+	const slice = prefix.filter((b) => b.kind !== "summary");
+	const shared = strippableCdDirs(bashCommands(slice), prevParsed.cmdDirs);
 	const texts: string[] = [];
 	const keyLists: string[][] = [];
 	const rows: HandleRow[] = prefix
@@ -673,7 +986,7 @@ export async function buildCut(p: PlanResult, ctx: Any, signal?: AbortSignal): P
 	// rows of one tool that would show the same key line (the first line of every status report, say): each shows the first of its
 	// lines that none of the others has, nor a row of that tool the previous summary's table already shows
 	const prevHints = new Map<string, string[]>();
-	for (const l of parseSummary(prev).table.items) {
+	for (const l of prevParsed.table.items) {
 		const m = TABLE_ROW.exec(l);
 		if (m) prevHints.set(m[2], [...(prevHints.get(m[2]) ?? []), (m[5] ?? "").split(" · ").pop() ?? ""]);
 	}
@@ -688,18 +1001,55 @@ export async function buildCut(p: PlanResult, ctx: Any, signal?: AbortSignal): P
 	}
 	const file = p.fileRecall; // zip_recall hidden by an allowlist: the summary names the recall files instead
 	const table = handleTable(rows, prev, file);
-	const sk = skeleton(prefix.filter((b) => b.kind !== "summary"), prev, table ?? "", file);
+	// a previous summary that is not pi-zip's has no request list: its requests are quoted again from the session branch
+	const earlier = prev && !prevParsed.structured
+		? earlierRequests(attempt(() => ctx?.sessionManager?.getBranch?.() ?? [], []), slice.find((b) => b.entryId)?.entryId, file) ?? undefined
+		: undefined;
+	const sk = skeleton(slice, prev, table ?? "", file, earlier);
 	const nb = clamp(p.summaryTokensPlanned - tok4(sk.text), 300, NARRATIVE_MAX);
 	const prevAt = prefix[0]?.kind === "summary" ? Number(prefix[0].msg.timestamp) || 0 : 0;
-	const prevNarr = previousNarrative(prev, prevAt, narrativeWords(nb, true) * PREV_CHARS_PER_WORD);
-	const nar = await narrative(prefix, ctx, nb, signal, prevNarr);
+	const prevReq = earlier ? earlier.length : lastRequestNo(prevParsed.users);
+	const prevStruct = prevParsed.epochs ?? legacyNarrative(prev, prevAt, prevReq);
+	const prevWhen = prevParsed.narrativeAt ?? prevStruct.activeAt ?? (prevAt > 0 ? fmtWhen(prevAt) : undefined);
+	let lastAt = 0;
+	for (const b of slice) {
+		const bt = blockTime(b);
+		if (bt && bt > lastAt) lastAt = bt;
+	}
+	const nowWhen = lastAt > 0 ? fmtWhen(lastAt) : undefined;
+	const nar = await narrative(prefix, ctx, nb, signal);
+	let costUsd = nar.costUsd;
+	let usage = nar.usage;
 	let text = sk.text;
 	const how = file ? `read an output's file by its handle (${file.dir}/<handle>.txt)` : `${RECALL_TOOL} an output by its handle`;
-	// a narrative over its budget keeps its head and its tail (the key facts come last), not just its head
-	if (nar.ok && nar.text) text += `\n## Narrative (model-written)\n${excerpt(nar.text, nb * 6, Math.floor((nb * 6) / 3))}`;
-	// no new narrative: the previous one is carried whole (up to the narrative's own budget), marked as possibly stale, with its time
-	else if (prevNarr) text += `\n${narrCarriedHead(prevNarr.at, clip(nar.error ?? "n/a", 120))}\n${excerpt(prevNarr.text, nb * 6, Math.floor((nb * 6) / 4))}`;
-	else text += `\n## Narrative\n(unavailable: ${nar.error ?? "n/a"}; rely on the sections above and ${how} rather than re-running or re-reading)`;
+	const cap = epochCap(nb);
+	if (nar.ok && nar.text) {
+		const w = epochWords(nb);
+		const durable = clipPart(nar.durable ?? prose(nar.text), w.durable);
+		const active = nar.active ? clipPart(nar.active, w.active) : "";
+		const nextNum = (prevStruct.epochs.length ? epochNum(prevStruct.epochs.at(-1)!, true) : 0) + 1;
+		const ep = mkEpoch(nextNum, nextNum, turnsLabel(prevReq, sk.users), nowWhen ?? "time unknown", 1, durable || NONE_ROW);
+		const cons = await consolidateEpochs([...prevStruct.epochs, ep], ctx, cap, signal);
+		costUsd += cons.costUsd;
+		usage = addUsage(usage, cons.usage);
+		const cur: StructuredNarrative = {
+			activeState: active,
+			...(nowWhen ? { activeAt: nowWhen } : {}),
+			epochs: boundEpochs(cons.epochs, cap),
+		};
+		text += `\n## Narrative (model-written)\n${formatNarrative(cur)}`;
+	} else if (prevStruct.epochs.length > 0 || prevStruct.activeState.trim()) {
+		const stale = clip(nar.error ?? "n/a", 120);
+		const carried: StructuredNarrative = {
+			activeState: prevStruct.activeState,
+			...(prevWhen ? { activeAt: prevWhen } : {}),
+			activeStale: stale,
+			epochs: boundEpochs(prevStruct.epochs, cap),
+		};
+		text += `\n${narrCarriedHead(prevWhen, stale)}\n${formatNarrative(carried)}`;
+	} else {
+		text += `\n## Narrative\n(unavailable: ${nar.error ?? "n/a"}; rely on the sections above and ${how} rather than re-running or re-reading)`;
+	}
 	if (table) text += "\n" + table;
 	return {
 		firstKeptEntryId: p.blocks[p.cutIdx!].entryId!,
@@ -710,8 +1060,8 @@ export async function buildCut(p: PlanResult, ctx: Any, signal?: AbortSignal): P
 		summaryTokens: tok4(text),
 		llmOk: nar.ok,
 		llmError: nar.error ?? null,
-		costUsd: nar.costUsd,
-		usage: nar.usage,
+		costUsd,
+		usage,
 		ms: Math.round(performance.now() - t0),
 	};
 }

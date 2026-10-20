@@ -3,7 +3,29 @@
 import { describe, expect, test } from "bun:test";
 import { buildBlocks, NARRATIVE_CALL_MAX, NARRATIVE_MAX, toolCallIndex } from "../src/plan.ts";
 import { handleFor } from "../src/placeholder.ts";
-import { BUDGET, buildCut, FIRST_REQUESTS, handleRowsOf, handleTable, parseSummary, PREV_NARRATIVE_CHARS, previousNarrative, narrative, skeleton, TABLE_ROWS, EFFORT_REFUSED_RE } from "../src/summary.ts";
+import { resolveHandlesInBranch } from "../src/recall.ts";
+import {
+	ACTIVE_WORDS,
+	BUDGET,
+	buildCut,
+	boundEpochs,
+	consolidateEpochs,
+	mkEpoch,
+	EPOCH_WORDS,
+	EFFORT_REFUSED_RE,
+	FIRST_REQUESTS,
+	formatNarrative,
+	handleRowsOf,
+	handleTable,
+	MAX_NARRATIVE_TOKENS,
+	narrative,
+	parseEpochNarrative,
+	parseSummary,
+	PREV_NARRATIVE_CHARS,
+	previousNarrative,
+	skeleton,
+	TABLE_ROWS,
+} from "../src/summary.ts";
 import { A, R, U, type Any } from "./helpers.ts";
 
 const tcall = (id: string, name: string, args: Any) => {
@@ -101,61 +123,67 @@ describe("sectioned carry-forward: nested summaries, 4 levels deep", () => {
 		expect(files.some((l) => l.startsWith("- src/mod1_2.ts"))).toBe(true);
 	});
 
-	test("narrative: ONE merged narrative; the previous one goes to the call as its own block (narrative only, not the lists), never into the summary", async () => {
+	test("narrative: append-only epochs keep every earlier decision and key fact verbatim; volatile state and todos are replaced at each cut; the call never reads the previous narrative", async () => {
 		const prompts: string[] = [];
 		const texts = await chain(4, prompts);
 		const last = texts[3];
-		expect(last).toContain("KEYFACT-4: value-4");
-		expect(last).not.toContain("Earlier narrative");
-		expect(last).not.toContain("KEYFACT-3"); // what the model did not keep is gone: no stale copy next to the new narrative
-		expect(last.match(/^## Key facts to remember/gm)).toHaveLength(1);
-		expect(last.match(/## Narrative \(model-written\)/g)).toHaveLength(1);
-		expect(prevBlockOf(prompts[0])).toBeNull(); // the first summary has nothing to merge
-		for (let L = 2; L <= 4; L++) {
-			const block = prevBlockOf(prompts[L - 1])!;
-			expect(block).toBe(narrativeFor(L - 1)); // exactly the previous narrative ...
-			expect(block).not.toContain("REQ-"); // ... not its request list, commands or tables
-			expect(block).not.toContain("## Commands run");
-			expect(block).not.toContain("## Folded outputs");
-			expect(prompts[L - 1]).toContain("Write ONE updated narrative");
-			expect(prompts[L - 1]).toMatch(/keep only the newer one/);
-			expect(prompts[L - 1]).toMatch(/drop todos that are done or obsolete/);
+		for (let L = 1; L <= 4; L++) {
+			expect(last).toContain(`#### Epoch ${L} · requests ${(L - 1) * 4 + 1}–${L * 4}`);
+			expect(last).toContain(`DECISION-${L}: chose plan ${L}.`);
+			expect(last).toContain(`KEYFACT-${L}: value-${L}`);
+			expect(prevBlockOf(prompts[L - 1])).toBeNull();
+			expect(prompts[L - 1]).not.toContain("KEYFACT-");
+			expect(prompts[L - 1]).not.toContain("DECISION-");
+			expect(prompts[L - 1]).toContain("---DECISIONS---");
+			expect(prompts[L - 1]).toContain("---ACTIVE---");
 		}
+		expect(last).toContain("TODO-4: finish 4");
+		expect(last).toContain("state line for level 4");
+		for (let L = 1; L <= 3; L++) {
+			expect(last).not.toContain(`TODO-${L}: finish ${L}`); // volatile: replaced by the newest slice's active state
+			expect(last).not.toContain(`state line for level ${L}`);
+		}
+		expect(last).not.toContain("Earlier narrative");
+		expect(last.match(/## Narrative \(model-written\)/g)).toHaveLength(1);
 		expect(last).not.toContain("## Earlier summary (carried forward)");
 	});
 
-	test("an older summary with an 'Earlier narrative' excerpt: excerpt and narrative are merged by the call, and the excerpt is not carried", async () => {
+	test("an older summary with an 'Earlier narrative' excerpt: excerpt and narrative become Epoch 0 verbatim without re-sending to the model, and the heading is not carried", async () => {
 		const old = (await chain(1))[0] + "";
-		const withExcerpt = old.replace("\n## Narrative (model-written)\n", "\n## Earlier narrative (excerpt of the previous summary, newest part)\nKey facts: npm latest 0.2.8\n## Narrative (model-written)\n");
+		const legacy = old.slice(0, old.indexOf("\n## Narrative (model-written)\n")) +
+			"\n## Earlier narrative (excerpt of the previous summary, newest part)\nKey facts: npm latest 0.2.8\n## Narrative (model-written)\nKEYFACT-1: value-1" +
+			old.slice(old.indexOf("\n## Folded outputs"));
 		const prompts: string[] = [];
-		const t = await cutOver(2, withExcerpt, prompts);
-		expect(prevBlockOf(prompts[0])).toContain("npm latest 0.2.8");
-		expect(prevBlockOf(prompts[0])).toContain("KEYFACT-1");
-		expect(t).not.toContain("0.2.8");
+		const t = await cutOver(2, legacy, prompts);
+		expect(prevBlockOf(prompts[0])).toBeNull();
+		expect(t).toContain("#### Epoch 0 · requests 1–4");
+		expect(t).toContain("npm latest 0.2.8");
+		expect(t).toContain("KEYFACT-1: value-1");
+		expect(t).toContain("#### Epoch 1 · requests 5–8");
+		expect(t).toContain("KEYFACT-2: value-2");
 		expect(t).not.toContain("Earlier narrative");
 	});
 
-	test("a merge asks for at most 1,000 words and says the limit is hard; a narrative over its budget keeps its head and its tail (the key facts)", async () => {
+	test("each increment asks for a bounded epoch + active word budget; a reply over its budget keeps its head and its tail (the key facts)", async () => {
 		const prompts: string[] = [];
 		const first = await cutOver(1, null, prompts);
 		const entries = [summaryEntry(first), ...level(2), U("keep2", "kept"), A("keepA2")];
 		const blocks = buildBlocks(entries);
-		const long = "## Decisions and rationale\nHEAD-DECISION\n" + "a sentence of the current state of the work.\n".repeat(2000) + "## Key facts to remember\nTAIL-KEYFACT: 42";
+		const long = "## Decisions and rationale\nHEAD-DECISION\n" + "a sentence of the durable decisions of the work.\n".repeat(2000) + "## Key facts to remember\nTAIL-KEYFACT: 42";
 		const complete = async (_m: Any, c: Any, options: Any) => (expect(options.maxTokens).toBe(NARRATIVE_CALL_MAX), prompts.push(c.messages[0].content[0].text), { stopReason: "stop", content: [{ type: "text", text: long }], usage: { cost: { total: 0 } } });
 		const p: Any = { blocks, calls: toolCallIndex(blocks), cutIdx: blocks.findIndex((b) => b.entryId === "keep2"), prefixTokens: 50_000, summaryTokensPlanned: 40_000, sumTrigger: "cold" };
 		const t = (await buildCut(p, { model: { id: "m" }, modelRegistry: { complete } } as Any)).text;
-		expect(Number(/under about (\d+) words/.exec(prompts[0])![1])).toBe(1500); // no previous narrative: the old budget
-		expect(Number(/under about (\d+) words/.exec(prompts[1])![1])).toBe(1000);
-		expect(prompts[1]).toContain("a hard limit");
+		expect(Number(/under about (\d+) words/.exec(prompts[0])![1])).toBe(EPOCH_WORDS + ACTIVE_WORDS);
+		expect(Number(/under about (\d+) words/.exec(prompts[1])![1])).toBe(EPOCH_WORDS + ACTIVE_WORDS);
 		expect(t).toContain("HEAD-DECISION");
 		expect(t).toContain("TAIL-KEYFACT: 42");
 		expect(t).toContain("[… middle of the narrative omitted …]");
 		const narr = t.slice(t.indexOf("## Narrative (model-written)"), t.indexOf("\n## Folded outputs"));
-		expect(narr.length).toBeLessThanOrEqual(4000 * 6 + 100); // the narrative budget's clip (4,000 tokens x 6)
-		expect(narr.length).toBeGreaterThan(20_000);
+		expect(narr.length).toBeLessThanOrEqual(MAX_NARRATIVE_TOKENS * 4);
+		expect(parseSummary(t).epochs!.epochs).toHaveLength(2);
 	});
 
-	test("the previous narrative sent is bounded (head and tail of a longer one), so the chain cannot grow without limit", () => {
+	test("the previous narrative read by a legacy migration is bounded (head and tail of a longer one), so Epoch 0 cannot grow without limit", () => {
 		const huge = "[summary of earlier conversation by pi-zip]\n## User requests (verbatim, oldest first)\n1. x\n## Narrative (model-written)\nHEAD-FACT\n" + "middle line of an endless narrative\n".repeat(3000) + "TAIL-FACT";
 		const p = previousNarrative(huge)!;
 		expect(p.text.length).toBeLessThanOrEqual(PREV_NARRATIVE_CHARS + 100);
@@ -165,7 +193,7 @@ describe("sectioned carry-forward: nested summaries, 4 levels deep", () => {
 		expect(p.foreign).toBe(false);
 	});
 
-	test("narrative call failed after an earlier summary: the previous narrative is carried whole, marked possibly stale, with its time; the next call merges it", async () => {
+	test("narrative call failed after an earlier summary: the previous narrative is carried whole, marked possibly stale, with its time; the next call appends a new epoch after it", async () => {
 		const t1 = await cutOver(1, null);
 		const at = Date.UTC(2026, 9, 11, 2, 31);
 		const entries = [{ sourceEntry: { id: "comp", type: "compaction" }, messages: [{ role: "compactionSummary", summary: t1, tokensBefore: 0, timestamp: at }] }, ...level(2), U("keep2", "kept"), A("keepA2")];
@@ -178,9 +206,10 @@ describe("sectioned carry-forward: nested summaries, 4 levels deep", () => {
 		expect(cut.text).toContain("KEYFACT-1: value-1");
 		expect(cut.text).not.toContain("(unavailable");
 		const prompts: string[] = [];
-		await cutOver(3, cut.text, prompts);
-		expect(prevBlockOf(prompts[0])).toContain("KEYFACT-1: value-1");
-		expect(prompts[0]).toContain('<previous-narrative written="10-11 02:31 UTC">');
+		const t3 = await cutOver(3, cut.text, prompts);
+		expect(prevBlockOf(prompts[0])).toBeNull();
+		expect(t3).toContain("KEYFACT-1: value-1");
+		expect(t3).toContain("KEYFACT-3: value-3");
 	});
 
 	test("no narrative (model call failed): the fallback line points at recall by handle, like the header, not at re-reading", async () => {
@@ -351,7 +380,7 @@ describe("old formats and foreign summaries", () => {
 		expect(previousNarrative(outer)!.text).toContain("KEYFACT-MID");
 	});
 
-	test("a native Pi compaction summary (free text) goes to the narrative call as the previous narrative (head and tail if long); the fallback carries it", async () => {
+	test("a native Pi compaction summary (free text) becomes Epoch 0 verbatim (head and tail if long) without re-sending to the model; the fallback carries it", async () => {
 		const native = "## Goal\nGOAL-LINE ship the synthetic feature\n## Progress\n" + "progress line\n".repeat(900) + "## Next Steps\nNEXT-STEP do the final thing\n<read-files>\nsrc/x.ts\n</read-files>";
 		const p = parseSummary(native);
 		expect(p.structured).toBe(false);
@@ -360,10 +389,11 @@ describe("old formats and foreign summaries", () => {
 		expect(t).not.toContain("GOAL-LINE"); // not an excerpt in the skeleton any more
 		const prompts: string[] = [];
 		const merged = await cutOver(1, native, prompts);
-		const block = prevBlockOf(prompts[0])!;
-		expect(block).toContain("GOAL-LINE");
-		expect(block).toContain("NEXT-STEP do the final thing");
-		expect(prompts[0]).toContain("earlier summary (written by another summariser)");
+		expect(prevBlockOf(prompts[0])).toBeNull();
+		expect(merged).toContain("#### Epoch 0 · the earlier conversation");
+		expect(merged).toContain("GOAL-LINE");
+		expect(merged).toContain("NEXT-STEP do the final thing");
+		expect(merged).toContain("#### Epoch 1 · requests 1–4");
 		expect(merged).toContain("KEYFACT-1");
 		const huge = native.replace("progress line\n".repeat(900), "progress line\n".repeat(4000));
 		expect(previousNarrative(huge)!.text.length).toBeLessThanOrEqual(PREV_NARRATIVE_CHARS + 100);
@@ -376,6 +406,57 @@ describe("old formats and foreign summaries", () => {
 		expect(cut.text).toContain("GOAL-LINE");
 		expect(cut.text).toContain("NEXT-STEP do the final thing");
 		expect(cut.text).toContain("possibly stale");
+	});
+
+	test("after a summary that is not pi-zip's, the requests it took out of the view are quoted from the session branch and numbered from the first", async () => {
+		const native = "## Goal\nGOAL-LINE ship it";
+		const early = [U("e1", "FIRST-ASK review the plan"), A("ea1"), U("e2", "SECOND-ASK add the fixtures\nsecond line"), A("ea2")];
+		const after = [...level(1), U("keep1", "kept"), A("keepA1")];
+		const cutWith = async (prev: string, branch: Any[]) => {
+			const blocks = buildBlocks([summaryEntry(prev), ...after]);
+			const p: Any = { blocks, calls: toolCallIndex(blocks), cutIdx: blocks.findIndex((b) => b.entryId === "keep1"), prefixTokens: 50_000, summaryTokensPlanned: 7000, sumTrigger: "cold" };
+			const complete = async () => ({ stopReason: "stop", content: [{ type: "text", text: narrativeFor(1) }], usage: { cost: { total: 0 } } });
+			return (await buildCut(p, { model: { id: "m" }, modelRegistry: { complete }, sessionManager: { getBranch: () => branch } } as Any)).text;
+		};
+		const branch = [...early.map((e) => e.sourceEntry), { id: "comp", type: "compaction", summary: native }, ...after.map((e) => e.sourceEntry)];
+		const t = await cutWith(native, branch);
+		expect(t).toContain("1. FIRST-ASK review the plan");
+		expect(t).toContain("2. SECOND-ASK add the fixtures\n   second line");
+		expect(t).toMatch(/^3\. (≈ )?REQ-1-1 /m);
+		expect(t).toContain("#### Epoch 0 · requests 1–2");
+		expect(t).toContain("#### Epoch 1 · requests 3–6");
+		expect(t).toContain("GOAL-LINE"); // Pi's text is still carried as Epoch 0
+		// the summary's first kept entry is not on this branch: nothing is quoted, numbering starts over as before
+		const other = await cutWith(native, early.map((e) => e.sourceEntry));
+		expect(other).not.toContain("FIRST-ASK");
+		expect(other).toMatch(/^1\. (≈ )?REQ-1-1 /m);
+		// a pi-zip summary keeps its own list: the branch is not read
+		const ours = await cutOver(1, null);
+		const next = await cutWith(ours, branch);
+		expect(next).not.toContain("FIRST-ASK");
+		expect(next).toMatch(/^1\. (≈ )?REQ-1-1 /m);
+	});
+
+	test("a very long request is quoted head and tail; the marker names its handle, and recall returns the whole request", () => {
+		const body = Array.from({ length: 5000 }, (_, i) => `line ${i} MID-${i}`).join("\n");
+		const h = handleFor("long");
+		const blocks = buildBlocks([U("long", body), A("la"), U("u2", "short ask"), A("a2")]);
+		const sk = skeleton(blocks, null).text;
+		expect(sk).toContain(`[… middle of this request omitted (handle ${h}): zip_recall returns it whole …]`);
+		expect(sk).toContain("line 0 MID-0");
+		expect(sk).toContain("line 4999 MID-4999");
+		expect(sk).not.toContain("MID-2500");
+		const branch = [U("long", body), A("la"), R("r1", "c1", 10)].map((e) => e.sourceEntry);
+		const { items, entryIds } = resolveHandlesInBranch(branch, [h, "zzzzzzzzzz"]);
+		expect(items[0].text).toBe(body);
+		expect(items[0].label).toBe("user request");
+		expect(entryIds).toEqual(["long", null]);
+		expect(skeleton(blocks, null, "", { dir: "~/.cache/pi-zip/recall/S", read: true, grep: true, bash: true }).text)
+			.toContain(`(handle ${h}): ~/.cache/pi-zip/recall/S/${h}.txt holds it whole …]`);
+		// once the request is shortened to one line between the first and the newest, the handle stays on that line
+		const many = [U("x1", "first"), A("xa1"), U("x2", "second"), A("xa2"), U("long", body), A("la"), ...Array.from({ length: 6 }, (_, i) => [U(`n${i}`, "N".repeat(900)), A(`na${i}`)]).flat()];
+		const text = skeleton(buildBlocks(many), null).text;
+		expect(text).toMatch(new RegExp(`^3\\. ≈ line 0 MID-0.*\\(whole request: handle ${h}\\)$`, "m"));
 	});
 
 	test("empty, '(none)'-only, null and a bare mark all merge into an empty-but-valid summary", () => {
@@ -498,5 +579,141 @@ describe("narrative cost survives unsuccessful responses", () => {
 		expect(n.costUsd).toBe(0.05);
 		expect(n.usage).toEqual({ input: 30, output: 6, totalTokens: 36, cost: { input: 0.03, output: 0.02, total: 0.05 } });
 		expect(calls).toBe(2);
+	});
+});
+
+describe("append-only narrative epochs (billion-context §3.2, §3.6, §4.2; pi-vcc volatile/durable split)", () => {
+	test("oversized replies stay bounded on the first and second cut, without a tier merge", async () => {
+		let prev: string | null = null;
+		for (let i = 1; i <= 2; i++) {
+			// A summary persisted before budget enforcement can already contain an oversized epoch.
+			if (prev) {
+				const old = parseSummary(prev).epochs!.epochs[0].durableProse;
+				prev = prev.replace(old, "legacy constraint\n".repeat(2000));
+			}
+			const blocks = buildBlocks([...(prev ? [summaryEntry(prev)] : []), U(`u${i}`, "request"), A(`a${i}`), U("keep", "kept")]);
+			let calls = 0;
+			const complete = async () => {
+				calls++;
+				return { stopReason: "stop", content: [{ type: "text", text: `---DECISIONS---\nHEAD-${i}\n` + "specific constraint abcdefghijklmnopqrstuvwxyz\n".repeat(600) + `TAIL-${i}\n---ACTIVE---\nworking` }] };
+			};
+			prev = (await buildCut({ blocks, calls: toolCallIndex(blocks), cutIdx: blocks.length - 1, prefixTokens: 50_000, summaryTokensPlanned: 7000 } as Any, { model: { id: "m" }, modelRegistry: { complete } })).text;
+			const epochs = parseSummary(prev).epochs!.epochs;
+			expect(calls).toBe(1);
+			expect(epochs).toHaveLength(i);
+			expect(epochs.reduce((n, e) => n + Math.ceil((`#### ${e.id} · ${e.turns} · ${e.timestamp}\n${e.durableProse}`).length / 4) + 1, 0)).toBeLessThanOrEqual(MAX_NARRATIVE_TOKENS);
+			expect(epochs.at(-1)!.durableProse).toContain(`HEAD-${i}`);
+			expect(epochs.at(-1)!.durableProse).toContain(`TAIL-${i}`);
+		}
+	});
+
+	test("fallback reserves the newest epoch verbatim, including after a failed tier merge", async () => {
+		const old = mkEpoch(1, 1, "request 1", "time unknown", 1, "old record\n".repeat(900));
+		const recent = mkEpoch(2, 2, "request 2", "time unknown", 1, "NEW_HEAD\n" + "new record\n".repeat(150) + "NEW_TAIL");
+		const cases = [[old, recent]];
+		const middle = mkEpoch(2, 2, "request 2", "time unknown", 1, "middle record\n".repeat(500));
+		const newest = mkEpoch(3, 3, "request 3", "time unknown", 1, recent.durableProse);
+		const failed = await consolidateEpochs([old, middle, newest], {}, 1000);
+		expect(failed.error).toBeDefined();
+		expect(failed.merges).toBe(1);
+		cases.push(failed.epochs);
+		for (const input of cases) {
+			const result = boundEpochs(input, 1000);
+			expect(result.at(-1)).toEqual(input.at(-1));
+			expect(result).toHaveLength(2);
+			expect(result.reduce((n, e) => n + e.tokens + 1, 0)).toBeLessThanOrEqual(1000);
+			expect(formatNarrative({ activeState: "", epochs: result })).toContain("middle of the narrative omitted");
+		}
+		expect(old.durableProse).toBe("old record\n".repeat(900));
+	});
+
+	test("an individually oversized epoch counts heading and omission marker toward the cap", () => {
+		const old = mkEpoch(1, 1, "request 1", "time unknown", 1, "HEAD\n" + "long record\n".repeat(2000) + "TAIL");
+		const [bounded] = boundEpochs([old], 1000);
+		expect(bounded.tokens + 1).toBeLessThanOrEqual(1000);
+		expect(bounded.durableProse).toContain("HEAD");
+		expect(bounded.durableProse).toContain("TAIL");
+	});
+	test("1. deterministic preservation test: 6 consecutive compaction cuts keep Fact A..Fact F verbatim in Epoch 1..Epoch 6 without re-summarizing", async () => {
+		const facts = ["Fact A: adopted SQLite v3", "Fact B: token bucket 100 req/min", "Fact C: SIGTERM 5s flush", "Fact D: OAuth2 PKCE flow", "Fact E: append-only steer injection", "Fact F: zero-copy ring buffer"];
+		let prev: string | null = null;
+		const prompts: string[] = [];
+		for (let i = 0; i < 6; i++) {
+			const entries = [...(prev ? [summaryEntry(prev)] : []), U(`u-${i}`, `turn ${i + 1} request`), A(`a-${i}`), U(`keep-${i}`, "kept"), A(`keepA-${i}`)];
+			const blocks = buildBlocks(entries);
+			const p: Any = { blocks, calls: toolCallIndex(blocks), cutIdx: blocks.findIndex((b) => b.entryId === `keep-${i}`), prefixTokens: 50_000, summaryTokensPlanned: 7000, sumTrigger: "cold" };
+			const reply = `---DECISIONS---\n- ${facts[i]}\n---ACTIVE---\n- Active state at cut ${i + 1}`;
+			const complete = async (_m: Any, c: Any) => (prompts.push(c.messages[0].content[0].text), { stopReason: "stop", content: [{ type: "text", text: reply }], usage: { cost: { total: 0 } } });
+			prev = (await buildCut(p, { model: { id: "m" }, modelRegistry: { complete } } as Any)).text;
+		}
+		expect(prompts).toHaveLength(6);
+		for (const pr of prompts) expect(pr).not.toContain("<previous-narrative");
+		const parsed = parseSummary(prev!);
+		expect(parsed.epochs?.epochs).toHaveLength(6);
+		for (let i = 0; i < 6; i++) {
+			expect(parsed.epochs!.epochs[i].id).toBe(`Epoch ${i + 1}`);
+			expect(parsed.epochs!.epochs[i].durableProse).toBe(`- ${facts[i]}`);
+		}
+		expect(prev!).toContain("#### Epoch 1 · request 1");
+		expect(prev!).toContain("- Fact A: adopted SQLite v3");
+	});
+
+	test("2. budget enforcement test: a 15-cut marathon session bounds total narrative tokens under MAX_NARRATIVE_TOKENS via Tier-2+ epoch compaction while keeping recent epochs untouched", async () => {
+		let prev: string | null = null;
+		let tierMerges = 0;
+		for (let i = 1; i <= 15; i++) {
+			const entries = [...(prev ? [summaryEntry(prev)] : []), U(`u-${i}`, `req ${i}`), A(`a-${i}`), U(`keep-${i}`, "kept"), A(`keepA-${i}`)];
+			const blocks = buildBlocks(entries);
+			const p: Any = { blocks, calls: toolCallIndex(blocks), cutIdx: blocks.findIndex((b) => b.entryId === `keep-${i}`), prefixTokens: 50_000, summaryTokensPlanned: 7000, sumTrigger: "cold" };
+			const complete = async (_m: Any, c: Any) => {
+				const prompt: string = c.messages[0].content[0].text;
+				if (prompt.includes("<epoch heading=")) {
+					tierMerges++;
+					const kept = [...prompt.matchAll(/MARATHON-FACT-\d+/g)].map((m) => m[0]);
+					return { stopReason: "stop", content: [{ type: "text", text: `- consolidated ${kept.join(", ")}: ` + "condensed architectural record ".repeat(25) }], usage: { cost: { total: 0.001 } } };
+				}
+				const prose = `- MARATHON-FACT-${i}: ` + `detailed architectural constraint and invariant for epoch ${i} `.repeat(32);
+				return { stopReason: "stop", content: [{ type: "text", text: `---DECISIONS---\n${prose}\n---ACTIVE---\n- Working on step ${i}` }], usage: { cost: { total: 0.002 } } };
+			};
+			prev = (await buildCut(p, { model: { id: "m" }, modelRegistry: { complete } } as Any)).text;
+		}
+		expect(tierMerges).toBeGreaterThan(0);
+		const parsed = parseSummary(prev!)!;
+		const totalEpochTokens = parsed.epochs!.epochs.reduce((a, e) => a + e.tokens + 1, 0);
+		expect(totalEpochTokens).toBeLessThanOrEqual(MAX_NARRATIVE_TOKENS);
+		expect(parsed.epochs!.epochs[0].level).toBeGreaterThanOrEqual(2);
+		expect(parsed.epochs!.epochs.at(-1)!.id).toBe("Epoch 15");
+		expect(parsed.epochs!.epochs.at(-1)!.level).toBe(1);
+		expect(parsed.epochs!.epochs.at(-1)!.durableProse).toContain("MARATHON-FACT-15:");
+		expect(parsed.epochs!.epochs.at(-2)!.id).toBe("Epoch 14");
+		expect(parsed.epochs!.epochs.at(-2)!.level).toBe(1);
+		expect(parsed.epochs!.epochs.at(-2)!.durableProse).toContain("MARATHON-FACT-14:");
+		expect(prev!).toContain("MARATHON-FACT-1"); // preserved inside the consolidated archive epoch
+	});
+
+	test("3. volatile invalidation test: an error/blocker in Active State during cut 2 is completely wiped out in cut 3 while cut 2's durable decision survives", async () => {
+		const replies = [
+			"---DECISIONS---\n- DECISION-CUT-1: use Bun test runner\n---ACTIVE---\n- Initial setup complete",
+			"---DECISIONS---\n- DECISION-CUT-2: lock schema at v3\n---ACTIVE---\n- BLOCKER-CUT-2: broken token refresh race in src/auth/session.ts:84",
+			"---DECISIONS---\n- DECISION-CUT-3: fixed race with mutex\n---ACTIVE---\n- Clean active state: all 42 auth tests passing",
+		];
+		let prev: string | null = null;
+		for (let i = 0; i < 3; i++) {
+			const entries = [...(prev ? [summaryEntry(prev)] : []), U(`u-${i}`, `req ${i + 1}`), A(`a-${i}`), U(`keep-${i}`, "kept"), A(`keepA-${i}`)];
+			const blocks = buildBlocks(entries);
+			const p: Any = { blocks, calls: toolCallIndex(blocks), cutIdx: blocks.findIndex((b) => b.entryId === `keep-${i}`), prefixTokens: 50_000, summaryTokensPlanned: 7000, sumTrigger: "cold" };
+			const complete = async () => ({ stopReason: "stop", content: [{ type: "text", text: replies[i] }], usage: { cost: { total: 0 } } });
+			prev = (await buildCut(p, { model: { id: "m" }, modelRegistry: { complete } } as Any)).text;
+			if (i === 1) expect(prev).toContain("BLOCKER-CUT-2");
+		}
+		expect(prev!).not.toContain("BLOCKER-CUT-2");
+		expect(prev!).not.toContain("Initial setup complete");
+		expect(prev!).toContain("Clean active state: all 42 auth tests passing");
+		expect(prev!).toContain("DECISION-CUT-1: use Bun test runner");
+		expect(prev!).toContain("DECISION-CUT-2: lock schema at v3");
+		expect(prev!).toContain("DECISION-CUT-3: fixed race with mutex");
+		const roundTrip = parseEpochNarrative(formatNarrative(parseSummary(prev!).epochs!))!;
+		expect(roundTrip.activeState).toContain("Clean active state: all 42 auth tests passing");
+		expect(roundTrip.epochs.map((e) => e.id)).toEqual(["Epoch 1", "Epoch 2", "Epoch 3"]);
 	});
 });

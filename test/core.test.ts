@@ -265,6 +265,8 @@ describe("core: decide", () => {
 		const p = planContext(entries, opts().o)!;
 		const cut = await buildCut(p, { cwd: ".", model, modelRegistry: { complete: async () => ({ stopReason: "stop", content: [{ type: "text", text: "## Decisions\n" + "detail ".repeat(4000) }] }) } });
 		expect(cut.llmOk).toBe(true);
+		// Simulate an oversized persisted/foreign summary; the narrative writer now bounds oversized model replies.
+		cut.summaryTokens = p.summaryTokensPlanned + 4000;
 		expect(cut.summaryTokens).toBeGreaterThan(p.summaryTokensPlanned);
 		const estimatedAfter = p.ctxAfterFolds - p.prefixTokens + p.summaryTokensPlanned;
 		expect(estimatedAfter).toBeLessThan(model.contextWindow - e.reserve);
