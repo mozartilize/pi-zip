@@ -429,7 +429,7 @@ export interface EpochBlock {
 
 /** The narrative of a summary in the append-only format. */
 export interface StructuredNarrative {
-	activeState: string; // volatile: current state and open todos, replaced by every summary
+	activeState: string; // volatile: current state and open todos, reconciled with the next slice
 	activeAt?: string; // when it was written (local MM-DD HH:MM)
 	activeStale?: string; // set when it was carried forward because a new one could not be written: why
 	epochs: EpochBlock[]; // durable: append-only, oldest first
@@ -441,6 +441,8 @@ const EPOCH_CAP_MIN = 1000;
 /** Words the narrative call is asked for: the epoch's decisions and durable facts, and the current state and open todos. */
 export const EPOCH_WORDS = envInt("SUM_EPOCH_WORDS", 250);
 export const ACTIVE_WORDS = envInt("SUM_ACTIVE_WORDS", 150);
+/** Only the bounded active state is re-read; durable epochs never enter the narrative call. */
+export const ACTIVE_INPUT_TOKENS = 500;
 /** Tier merges one summary may run (each a small call over two epochs). */
 export const MAX_MERGES_PER_CUT = 3;
 /** A part of the reply is clipped (head and tail) at this many characters per word asked: ~1.6x a reply at its budget (~7.7 chars a word). */
@@ -646,8 +648,8 @@ export function pickPair(eps: EpochBlock[]): number {
 	return 0;
 }
 
-/** One tier merge: two neighbouring epochs into one by a small call (about 0.6x their words, capped at EPOCH_WORDS). */
-async function mergeEpochs(a: EpochBlock, b: EpochBlock, ctx: Any, signal?: AbortSignal): Promise<Narrative & { block?: EpochBlock }> {
+/** Shared by execution and the planner's cost reserve; merge calls have a word-sized cap, not the narrative's 16K cap. */
+function mergeSpec(a: EpochBlock, b: EpochBlock) {
 	const words = clamp(Math.round(0.6 * wordCount(a.durableProse + " " + b.durableProse)), 120, EPOCH_WORDS);
 	const prompt =
 		[a, b].map((e) => `<epoch heading="${epochHead(e).slice(5).replace(/"/g, "'")}">\n${e.durableProse}\n</epoch>`).join("\n\n") +
@@ -655,11 +657,39 @@ async function mergeEpochs(a: EpochBlock, b: EpochBlock, ctx: Any, signal?: Abor
 		`keep every decision with its rationale, every constraint or ruling of the user, and every exact path, identifier, value and result the work may still ` +
 		`depend on; where the later epoch supersedes the earlier one, keep only the later; drop only what is plainly obsolete. Add nothing that is not in them, ` +
 		`and do not mention the epochs or the merge. Output only the merged text, as short markdown bullets without headings. Stay under about ${words} words. Do not call tools.`;
-	const r = await complete(ctx, prompt, signal);
-	if (!r.ok || !r.text) return r;
 	const maxChars = Math.min(words * CHARS_PER_WORD, Math.max(400, Math.floor((a.durableProse.length + b.durableProse.length) * 0.75)));
-	const body = excerpt(prose(r.text) || NONE_ROW, maxChars, Math.floor(maxChars / 3));
-	return { ...r, block: mkEpoch(epochNum(a, false), epochNum(b, true), joinTurns(a, b), joinTime(a, b), Math.max(a.level ?? 1, b.level ?? 1) + 1, body) };
+	return { prompt, maxChars, maxTokens: Math.max(1024, words * 12) };
+}
+const mergeBlock = (a: EpochBlock, b: EpochBlock, body: string) => mkEpoch(epochNum(a, false), epochNum(b, true), joinTurns(a, b), joinTime(a, b), Math.max(a.level ?? 1, b.level ?? 1) + 1, body);
+
+/** One tier merge: two neighbouring epochs into one by a small call. */
+async function mergeEpochs(a: EpochBlock, b: EpochBlock, ctx: Any, signal?: AbortSignal): Promise<Narrative & { block?: EpochBlock }> {
+	const spec = mergeSpec(a, b);
+	const r = await complete(ctx, spec.prompt, signal, spec.maxTokens);
+	if (!r.ok || !r.text) return r;
+	const body = excerpt(prose(r.text) || NONE_ROW, spec.maxChars, Math.floor(spec.maxChars / 3));
+	return { ...r, block: mergeBlock(a, b, body) };
+}
+
+export interface MergeWork { inputTokens: number; outputTokens: number; merges: number }
+
+/** Conservative reserve before writing the newest epoch: simulate tier selection with maximum-sized replies, not hoped-for shrinkage. */
+export function estimateMergeWork(previous: string | null, budgetTokens: number, scale = 1, model?: Any): MergeWork {
+	const prev = parseSummary(previous);
+	const struct = prev.epochs ?? legacyNarrative(previous, 0, lastRequestNo(prev.users));
+	const work: MergeWork = { inputTokens: 0, outputTokens: 0, merges: 0 };
+	// The new epoch is never merged on this cut. Reserve its largest permitted body and a heading allowance.
+	let eps = [...struct.epochs, mkEpoch(999999, 999999, "requests 999999–999999", "time unknown", 1, "x".repeat(EPOCH_WORDS * CHARS_PER_WORD + 128))];
+	while (eps.length > 2 && epochTokens(eps) > epochCap(budgetTokens) && work.merges < MAX_MERGES_PER_CUT) {
+		const i = pickPair(eps), a = eps[i], b = eps[i + 1], spec = mergeSpec(a, b);
+		work.inputTokens += Math.ceil(scale * tok4(NARRATIVE_SYSTEM + spec.prompt)) + 256;
+		work.outputTokens += Math.min(spec.maxTokens, Number(model?.maxTokens) > 0 ? Number(model.maxTokens) : spec.maxTokens);
+		work.merges++;
+		// Clipping can add an omission marker; maximum word density also reserves the next merge's largest output cap.
+		const body = "x ".repeat(Math.ceil((spec.maxChars + 80) / 2));
+		eps = [...eps.slice(0, i), mergeBlock(a, b, body), ...eps.slice(i + 2)];
+	}
+	return work;
 }
 
 /**
@@ -840,7 +870,7 @@ export function skeleton(prefix: Block[], previous: string | null, tableText = "
 	}
 	const index = handleIndex(now, previous, out.join("\n") + "\n" + tableText, INDEX_TOKENS, file);
 	if (index) out.push(index);
-	// the previous narrative is not carried here: the narrative call merges it into one (buildCut), or the fallback carries it whole
+	// buildCut carries durable epochs and reconciles active state separately from these deterministic lists.
 	return { text: out.join("\n"), users: users.length };
 }
 
@@ -873,11 +903,11 @@ const lowEffort = new Set<string>(); // provider/model keys that need an explici
  * One summariser call (the narrative, or a tier merge of two epochs) to the current model, separate and uncached. Never throws; one
  * retry, none for a refusal by policy, a reply cut at the cap or an abort.
  */
-async function complete(ctx: Any, prompt: string, ownSignal?: AbortSignal): Promise<Narrative> {
+async function complete(ctx: Any, prompt: string, ownSignal?: AbortSignal, outputCap = NARRATIVE_CALL_MAX): Promise<Narrative> {
 	const t0 = Date.now();
 	const model = ctx.model;
 	if (!model) return { text: null, ok: false, ms: 0, costUsd: 0, error: "no current model" };
-	const cap = Math.min(NARRATIVE_CALL_MAX, Number(model.maxTokens) > 0 ? Number(model.maxTokens) : NARRATIVE_CALL_MAX);
+	const cap = Math.min(outputCap, Number(model.maxTokens) > 0 ? Number(model.maxTokens) : outputCap);
 	let lastErr = "", costUsd = 0;
 	let usage: Any;
 	try {
@@ -922,11 +952,10 @@ async function complete(ctx: Any, prompt: string, ownSignal?: AbortSignal): Prom
 }
 
 /**
- * The narrative of this prefix only, written by the current model in a separate, uncached call. Never throws. The call never reads
- * the previous narrative: it writes the decisions and durable facts of this part (the epoch buildCut appends) and the current state
- * and open todos (which replace the previous ones). `durable`/`active` = the reply's two parts.
+ * The narrative of this prefix, written by the current model in a separate, uncached call. Never throws. Durable epochs are not
+ * re-read. Only the bounded previous active state is reconciled against this slice. `durable`/`active` = the reply's two parts.
  */
-export async function narrative(prefix: Block[], ctx: Any, budgetTokens: number, ownSignal?: AbortSignal, _previous: Any = null): Promise<Narrative & { durable?: string; active?: string }> {
+export async function narrative(prefix: Block[], ctx: Any, budgetTokens: number, ownSignal?: AbortSignal, previousActive = ""): Promise<Narrative & { durable?: string; active?: string }> {
 	const t0 = Date.now();
 	if (!ctx.model) return { text: null, ok: false, ms: 0, costUsd: 0, error: "no current model" };
 	const msgs = prefix
@@ -942,7 +971,9 @@ export async function narrative(prefix: Block[], ctx: Any, budgetTokens: number,
 		return { text: null, ok: false, ms: Date.now() - t0, costUsd: 0, error: err instanceof Error ? err.message : String(err) };
 	}
 	const w = epochWords(budgetTokens);
+	const previous = excerpt(previousActive, ACTIVE_INPUT_TOKENS * 4 - 80, ACTIVE_INPUT_TOKENS * 2);
 	const prompt =
+		(previous ? `<previous-active-state>\n${previous}\n</previous-active-state>\n\n` : "") +
 		`<conversation>\n${conv}\n</conversation>\n\n` +
 		`Write the NARRATIVE part of a context summary for this conversation slice. It is the newest increment of a longer session: earlier increments ` +
 		`are summarised already and kept as immutable epochs, so summarize ONLY what this conversation slice accomplished. A separate deterministic ` +
@@ -953,7 +984,9 @@ export async function narrative(prefix: Block[], ctx: Any, budgetTokens: number,
 		`(durable: any architecture decisions, rationale, design choices, API contracts, user constraints or rulings, root causes found, and durable ` +
 		`facts settled in this slice — exact values, paths, identifiers, results later work depends on; <= ${w.durable} words; write (none) if none)\n` +
 		`---ACTIVE---\n` +
-		`(volatile: the current active state of the work and immediate open todos, next steps or blockers at the end of this slice; <= ${w.active} words)\n` +
+		`(volatile: reconcile the previous active state with this slice. Carry forward every still-open todo, next step and blocker, even if not ` +
+		`mentioned in this slice. Remove an item only when this slice provides evidence that it was completed or superseded; silence is not completion. ` +
+		`Update changed status and add new open work. Do not copy the previous active state into DECISIONS. <= ${w.active} words)\n` +
 		`Be concrete and keep exact paths, names and numbers. Stay under about ${w.durable + w.active} words in all. Do not call tools.`;
 	const r = await complete(ctx, prompt, ownSignal);
 	if (!r.ok || !r.text) return { ...r, ms: Date.now() - t0 };
@@ -1017,8 +1050,10 @@ export async function buildCut(p: PlanResult, ctx: Any, signal?: AbortSignal): P
 		if (bt && bt > lastAt) lastAt = bt;
 	}
 	const nowWhen = lastAt > 0 ? fmtWhen(lastAt) : undefined;
-	const nar = await narrative(prefix, ctx, nb, signal);
-	let costUsd = nar.costUsd;
+	const mergeWork = p.mergeWork ?? estimateMergeWork(prev, nb, p.scale?.c ?? 1, ctx.model);
+	const predictedMergeCostUsd = (mergeWork.inputTokens * (Number(ctx.model?.cost?.input) || 0) + mergeWork.outputTokens * (Number(ctx.model?.cost?.output) || 0)) / 1e6;
+	const nar = await narrative(prefix, ctx, nb, signal, prevStruct.activeState);
+	let costUsd = nar.costUsd, actualMergeCostUsd = 0;
 	let usage = nar.usage;
 	let text = sk.text;
 	const how = file ? `read an output's file by its handle (${file.dir}/<handle>.txt)` : `${RECALL_TOOL} an output by its handle`;
@@ -1026,10 +1061,11 @@ export async function buildCut(p: PlanResult, ctx: Any, signal?: AbortSignal): P
 	if (nar.ok && nar.text) {
 		const w = epochWords(nb);
 		const durable = clipPart(nar.durable ?? prose(nar.text), w.durable);
-		const active = nar.active ? clipPart(nar.active, w.active) : "";
+		const active = clipPart(nar.active || prevStruct.activeState, w.active);
 		const nextNum = (prevStruct.epochs.length ? epochNum(prevStruct.epochs.at(-1)!, true) : 0) + 1;
 		const ep = mkEpoch(nextNum, nextNum, turnsLabel(prevReq, sk.users), nowWhen ?? "time unknown", 1, durable || NONE_ROW);
 		const cons = await consolidateEpochs([...prevStruct.epochs, ep], ctx, cap, signal);
+		actualMergeCostUsd = cons.costUsd;
 		costUsd += cons.costUsd;
 		usage = addUsage(usage, cons.usage);
 		const cur: StructuredNarrative = {
@@ -1061,6 +1097,7 @@ export async function buildCut(p: PlanResult, ctx: Any, signal?: AbortSignal): P
 		llmOk: nar.ok,
 		llmError: nar.error ?? null,
 		costUsd,
+		...(mergeWork.merges > 0 ? { predictedMergeCostUsd, actualMergeCostUsd } : {}),
 		usage,
 		ms: Math.round(performance.now() - t0),
 	};

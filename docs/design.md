@@ -129,6 +129,12 @@ The judge uses Pi's model registry, with at most one call in flight and a 30-sec
 
 Retained catalogue rows keep their bytes and insertion order. Rows without a live or folded original are removed. Catalogue rows and their changing state share a hard 12K chars/4-token budget: current exact-handle or locator references take priority, then folded originals, then newest live outputs. Eviction can change the cached prefix. The latest user request and a bounded recent-work tail follow. An exact folded-handle citation can trigger a call even without five eligible live outputs. Recall traffic is not evidence. A valid `N` may add a lookup note with at most three handles to a request already going out. Only handles actually shown are remembered in the session; unshown handles remain eligible within the verdict's 20-request lifetime. A note never starts a run or replaces an original output in place.
 
+## Narrative continuity and production cost
+
+Durable epochs are appended from each new slice and merged only when over budget. The narrative call also receives at most 500 chars/4 tokens of previous active state, not the durable epochs. It must retain open work unless the new slice shows completion or supersession. If it omits the active section, the previous state is retained. This reconciliation is model-written, not a deterministic guarantee of semantic fidelity.
+
+The production gate reserves tier-merge cost as well as the narrative call and bounded active-state input. It simulates tier selection with maximum-sized merged replies, at the smallest possible narrative budget, for at most three calls. Each merge has its own word-sized output cap (normally 1024–3000 tokens), bounded by the model limit. A ready summary's calls remain sunk cost and are not priced again. The ledger's `summary_merge_cost` record reports `predicted_merge_cost` and `actual_merge_cost` in USD; predictions use the model's listed input/output prices and actuals use provider-reported charges.
+
 The proofs and measurements below describe the default policy, not judge classification quality or its additional API cost.
 
 ## What is proved

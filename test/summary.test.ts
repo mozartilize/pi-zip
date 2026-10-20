@@ -1,11 +1,15 @@
 // Sectioned carry-forward of the previous summary (synthetic sessions only): merge, dedupe, oldest dropped first with a count,
 // old formats and Pi's own free-text compaction summaries.
 import { describe, expect, test } from "bun:test";
-import { buildBlocks, NARRATIVE_CALL_MAX, NARRATIVE_MAX, toolCallIndex } from "../src/plan.ts";
+import { buildBlocks, NARRATIVE_CALL_MAX, NARRATIVE_MAX, plan, toolCallIndex, UNIT } from "../src/plan.ts";
+import { lawPrices } from "../src/learn.ts";
+import { tok4 } from "../src/util.ts";
 import { handleFor } from "../src/placeholder.ts";
 import { resolveHandlesInBranch } from "../src/recall.ts";
 import {
 	ACTIVE_WORDS,
+	ACTIVE_INPUT_TOKENS,
+	estimateMergeWork,
 	BUDGET,
 	buildCut,
 	boundEpochs,
@@ -26,7 +30,7 @@ import {
 	skeleton,
 	TABLE_ROWS,
 } from "../src/summary.ts";
-import { A, R, U, type Any } from "./helpers.ts";
+import { A, AX, R, U, type Any } from "./helpers.ts";
 
 const tcall = (id: string, name: string, args: Any) => {
 	const m = { role: "assistant", content: [{ type: "text", text: "x" }, { type: "toolCall", id: `c-${id}`, name, arguments: args }] };
@@ -62,7 +66,15 @@ async function cutOver(L: number, previous: string | null, prompts: string[] = [
 	const entries = [...(previous ? [summaryEntry(previous)] : []), ...level(L), U(`keep${L}`, "kept"), A(`keepA${L}`)];
 	const blocks = buildBlocks(entries);
 	const cutIdx = blocks.findIndex((b) => b.entryId === `keep${L}`);
-	const complete = async (_m: Any, c: Any, options: Any) => (expect(options.maxTokens).toBe(NARRATIVE_CALL_MAX), prompts.push(c.messages[0].content[0].text), { stopReason: "stop", content: [{ type: "text", text: narrativeFor(L) }], usage: { cost: { total: 0 } } });
+	const complete = async (_m: Any, c: Any, options: Any) => {
+		expect(options.maxTokens).toBe(NARRATIVE_CALL_MAX);
+		const prompt = c.messages[0].content[0].text;
+		prompts.push(prompt);
+		// The stub follows the active-state reconciliation contract; this checks wiring, not live model fidelity.
+		const pending = /<previous-active-state>\n([\s\S]*?)\n<\/previous-active-state>/.exec(prompt)?.[1].match(/TODO-\d+: finish \d+/g) ?? [];
+		const text = narrativeFor(L).replace(`TODO-${L}: finish ${L}`, [`TODO-${L}: finish ${L}`, ...pending].join("\n"));
+		return { stopReason: "stop", content: [{ type: "text", text }], usage: { cost: { total: 0 } } };
+	};
 	const p: Any = { blocks, calls: toolCallIndex(blocks), cutIdx, prefixTokens: 50_000, summaryTokensPlanned: 7000, sumTrigger: "cold" };
 	return (await buildCut(p, { model: { id: "m" }, modelRegistry: { complete } } as Any)).text;
 }
@@ -123,7 +135,7 @@ describe("sectioned carry-forward: nested summaries, 4 levels deep", () => {
 		expect(files.some((l) => l.startsWith("- src/mod1_2.ts"))).toBe(true);
 	});
 
-	test("narrative: append-only epochs keep every earlier decision and key fact verbatim; volatile state and todos are replaced at each cut; the call never reads the previous narrative", async () => {
+	test("narrative: durable epochs stay verbatim; only bounded active state is reconciled and unresolved todos survive", async () => {
 		const prompts: string[] = [];
 		const texts = await chain(4, prompts);
 		const last = texts[3];
@@ -140,7 +152,8 @@ describe("sectioned carry-forward: nested summaries, 4 levels deep", () => {
 		expect(last).toContain("TODO-4: finish 4");
 		expect(last).toContain("state line for level 4");
 		for (let L = 1; L <= 3; L++) {
-			expect(last).not.toContain(`TODO-${L}: finish ${L}`); // volatile: replaced by the newest slice's active state
+			expect(last).toContain(`TODO-${L}: finish ${L}`);
+			expect(prompts[L]).toContain(`TODO-${L}: finish ${L}`);
 			expect(last).not.toContain(`state line for level ${L}`);
 		}
 		expect(last).not.toContain("Earlier narrative");
@@ -583,6 +596,85 @@ describe("narrative cost survives unsuccessful responses", () => {
 });
 
 describe("append-only narrative epochs (billion-context §3.2, §3.6, §4.2; pi-vcc volatile/durable split)", () => {
+	test("unmentioned work is carried until the new slice explicitly completes or supersedes it", async () => {
+		const todo = "deploy production after QA approval";
+		let previous: string | null = null;
+		for (const [i, slice] of ["investigate failures", "debug unrelated parser", `QA approved; completed: ${todo}`].entries()) {
+			const blocks = buildBlocks([...(previous ? [summaryEntry(previous)] : []), U(`u${i}`, slice), A(`a${i}`), U("keep", "kept")]);
+			const complete = async (_m: Any, context: Any) => {
+				const prompt: string = context.messages[0].content[0].text;
+				expect(prompt).toContain("silence is not completion");
+				if (i > 0) expect(prompt).toContain(`<previous-active-state>\n- ${todo}\n</previous-active-state>`);
+				expect(prompt).not.toContain("DURABLE-SECRET");
+				return { stopReason: "stop", content: [{ type: "text", text: `---DECISIONS---\nDURABLE-SECRET\n---ACTIVE---\n${i < 2 ? "- " + todo : "- deploy complete"}` }] };
+			};
+			previous = (await buildCut({ blocks, calls: toolCallIndex(blocks), cutIdx: blocks.length - 1, prefixTokens: 50_000, summaryTokensPlanned: 7000 } as Any,
+				{ model: { id: "m" }, modelRegistry: { complete } })).text;
+			const active = parseSummary(previous).epochs!.activeState;
+			if (i < 2) expect(active).toContain(todo); else expect(active).not.toContain(todo);
+		}
+	});
+
+	test("previous active input is bounded, and an omitted ACTIVE reply does not erase pending work", async () => {
+		let sent = "";
+		await narrative(buildBlocks([U("u", "work")]), { model: { id: "m" }, modelRegistry: { complete: async (_m: Any, c: Any) => {
+			sent = c.messages[0].content[0].text;
+			return { stopReason: "stop", content: [{ type: "text", text: "---DECISIONS---\nnew fact" }] };
+		} } }, 1000, undefined, "HEAD TODO\n" + "old status\n".repeat(2000) + "TAIL TODO");
+		const active = /<previous-active-state>\n([\s\S]*?)\n<\/previous-active-state>/.exec(sent)![1];
+		expect(tok4(active)).toBeLessThanOrEqual(ACTIVE_INPUT_TOKENS);
+		expect(active).toContain("HEAD TODO");
+		expect(active).toContain("TAIL TODO");
+		const prev = "## Narrative\n" + formatNarrative({ activeState: "open deploy TODO", epochs: [mkEpoch(1, 1, "request 1", "time unknown", 1, "old fact")] });
+		const blocks = buildBlocks([summaryEntry(prev), U("u", "unrelated"), A("a"), U("keep", "kept")]);
+		const result = await buildCut({ blocks, calls: toolCallIndex(blocks), cutIdx: blocks.length - 1, prefixTokens: 50_000, summaryTokensPlanned: 7000 } as Any,
+			{ model: { id: "m" }, modelRegistry: { complete: async () => ({ stopReason: "stop", content: [{ type: "text", text: "---DECISIONS---\nnew fact" }] }) } });
+		expect(parseSummary(result.text).epochs!.activeState).toBe("open deploy TODO");
+	});
+
+	test("tier merge reserve can veto ROI that the narrative call alone would pass", () => {
+		const previous = "## Narrative\n" + formatNarrative({ activeState: "deploy after QA", epochs: Array.from({ length: 5 }, (_, i) =>
+			mkEpoch(i + 1, i + 1, `request ${i + 1}`, "time unknown", i === 0 ? 2 : 1, "constraint value ".repeat(200))) });
+		const entries = [summaryEntry(previous), U("u2", "continue"), AX("bulk", 100_000), U("u3", "next"), A("a3"), U("u4", "last"), A("a4")];
+		const trace: Any[] = [], pr = lawPrices("automatic", false), g = 1000;
+		const q = plan(entries, { cwd: "/tmp", scale: UNIT, coldCap: 10_000, law: { pr, pWarm: 1, g }, trace });
+		expect(q!.c).toBeNull();
+		const t = trace.find((t) => t.where === "summary");
+		const work = estimateMergeWork(previous, 300);
+		expect(work.merges).toBe(3);
+		expect(work.outputTokens).toBe(9000); // three word-sized 3000-token caps, not three 16K narrative caps
+		const gain = pr.r * (t.B - t.A) ** 2 / (2 * g);
+		expect(gain).toBeLessThan(t.K);
+		expect(gain).toBeGreaterThan(t.K - (pr.w * work.inputTokens + pr.out * work.outputTokens));
+		expect(estimateMergeWork(null, 300).merges).toBe(0);
+		expect(estimateMergeWork(previous, 300, 1, { maxTokens: 700 }).outputTokens).toBe(2100);
+	});
+
+	test("merge calls have their own output cap and report predicted and actual costs", async () => {
+		const previous = "## Narrative\n" + formatNarrative({ activeState: "pending", epochs: Array.from({ length: 5 }, (_, i) =>
+			mkEpoch(i + 1, i + 1, `request ${i + 1}`, "time unknown", 1, "constraint value ".repeat(200))) });
+		const blocks = buildBlocks([summaryEntry(previous), U("u", "new work"), A("a"), U("keep", "kept")]);
+		let merges = 0, mergeCost = 0;
+		const complete = async (_m: Any, c: Any, options: Any) => {
+			const prompt: string = c.messages[0].content[0].text;
+			const merge = prompt.includes("<epoch heading=");
+			if (merge) {
+				merges++;
+				expect(options.maxTokens).toBeGreaterThanOrEqual(1024);
+				expect(options.maxTokens).toBeLessThanOrEqual(3000);
+			} else expect(options.maxTokens).toBe(NARRATIVE_CALL_MAX);
+			const cost = merge ? (tok4(c.systemPrompt + prompt) + 256 + 4 * options.maxTokens) / 1e6 : 0.01;
+			if (merge) mergeCost += cost;
+			return { stopReason: "stop", content: [{ type: "text", text: merge ? "- consolidated record" : "---DECISIONS---\nnew fact\n---ACTIVE---\npending" }], usage: { cost: { total: cost } } };
+		};
+		const p: Any = { blocks, calls: toolCallIndex(blocks), cutIdx: blocks.length - 1, prefixTokens: 50_000, summaryTokensPlanned: 1000 };
+		const cut = await buildCut(p, { model: { id: "m", cost: { input: 1, output: 4 } }, modelRegistry: { complete } });
+		expect(merges).toBeGreaterThan(0);
+		expect(cut.actualMergeCostUsd).toBeCloseTo(mergeCost);
+		expect(cut.predictedMergeCostUsd!).toBeGreaterThanOrEqual(mergeCost);
+		expect(cut.costUsd).toBeCloseTo(0.01 + mergeCost);
+		expect(cut.usage.cost.total).toBeCloseTo(cut.costUsd);
+	});
 	test("oversized replies stay bounded on the first and second cut, without a tier merge", async () => {
 		let prev: string | null = null;
 		for (let i = 1; i <= 2; i++) {

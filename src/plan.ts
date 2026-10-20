@@ -6,6 +6,7 @@ import { type Any, COMMIT_CUSTOM, PRODUCT, clamp, envInt, piTokensOf, textOf, to
 import { PH_MARK } from "./placeholder.ts";
 import { lawPrices, MIN_EXPECT, type Prices } from "./learn.ts";
 import { commandNamesRecall, parseRecallPath, type FileRecall } from "./recallfile.ts";
+import { ACTIVE_INPUT_TOKENS, estimateMergeWork, type MergeWork } from "./summary.ts";
 
 /** Default age, in assistant requests, from which ANY foldable output (every recoverability class) inside the protected user turns may
  *  still be folded. A sub-agent session is one user turn with hundreds of tool rounds, so without this its candidate set is empty for
@@ -16,9 +17,8 @@ export const INTURN_AGE = 60;
 
 const PROTECT_USER_TURNS = 2; // the latest user turn and the one before it are never summarised; their outputs fold only after a pause (previous turn, re-readable) or when old enough (INTURN_AGE)
 
-/** A summary call is priced as the call summary.ts makes (its narrative): uncached input of the prefix slice since the previous
- *  summary (neither the previous summary's lists nor its narrative epochs are sent: code carries both forward unchanged), plus
- *  output of at most the narrative budget. */
+/** Summary production is priced as the narrative call over the new slice and bounded previous active state, plus a conservative
+ *  reserve for tier merges. The previous summary's lists and durable epochs are not sent to the narrative call. */
 /** The narrative's token budget (chars/4), summary.ts buildCut: clamp(planned - skeleton, 300, NARRATIVE_MAX). */
 export const NARRATIVE_MAX = 4000;
 /** The narrative call's output cap (summary.ts narrative): room above the budget, which is what the prompt asks for and the law
@@ -566,7 +566,9 @@ export interface Cut {
 	summaryTokens: number;
 	llmOk: boolean;
 	llmError: string | null;
-	costUsd: number; // what the narrative model call cost (0 when unknown)
+	costUsd: number; // all summariser calls, including tier merges (0 when unknown)
+	predictedMergeCostUsd?: number;
+	actualMergeCostUsd?: number;
 	usage?: Any;
 	ms: number; // total production time (the narrative model call included)
 	prepared?: boolean; // written in the background (a pi-zip/summary entry): its cost was counted when it was produced
@@ -634,6 +636,7 @@ export interface PlanResult {
 	firstKeptEntryId: string | null;
 	prefixTokens: number; // content estimate units (x c = real), like summaryTokensPlanned
 	summaryTokensPlanned: number;
+	mergeWork?: MergeWork; // reserved tier-merge input/output tokens for production, not a ready summary's sunk cost
 	sumTrigger: "cold" | "valve" | null;
 	scale: Scale;
 	ctxTokens: number; // real: O + c x content
@@ -792,6 +795,12 @@ export function plan(entries: Any[], o: PlanOpts): { f: PlanResult; c: PlanResul
 	// what no summary can remove (besides O): the protected turns (after their folds) and the previous summary, which the next one
 	// carries forward; the cap is never chased below it (a context that is mostly this floor would be re-summarised for nothing)
 	const prevSum = blocks[0]?.kind === "summary" ? blocks[0].tokens : 0;
+	// The skeleton can leave as little as 300 narrative tokens. Reserve merges at that smallest possible epoch budget.
+	const mergeWork: MergeWork = prevSum && !o.foldsOnly && ctxAfterFolds > coldCap
+		? estimateMergeWork(String(blocks[0].msg.summary ?? ""), 300, c, o.model)
+		: { inputTokens: 0, outputTokens: 0, merges: 0 };
+	const mergeCall = law.pr.w * mergeWork.inputTokens + law.pr.out * mergeWork.outputTokens;
+	const activeInput = prevSum ? c * (ACTIVE_INPUT_TOKENS + 128) : 0;
 	const atRoom = room !== null && real(ctxAfterFolds) >= room;
 	const atRoomUnedited = room !== null && real(ctxEst) >= room;
 	const sumTrigger: "cold" | "valve" | null = !o.foldsOnly && ctxAfterFolds > coldCap ? trig : null;
@@ -801,7 +810,7 @@ export function plan(entries: Any[], o: PlanOpts): { f: PlanResult; c: PlanResul
 	const result = (pick: number | null, summary = pick === null ? 0 : S(pre[pick])): PlanResult => ({
 		blocks, calls, folds: pick === null ? [...folds] : folds.filter((t) => blocks.findIndex((b) => b.entryId === t.entryId) >= pick || o.carriedFolds?.some((u) => u.entryId === t.entryId)),
 		cutIdx: pick, firstKeptEntryId: pick === null ? null : blocks[pick].entryId, prefixTokens: pick === null ? 0 : pre[pick],
-		summaryTokensPlanned: summary, sumTrigger, scale: o.scale ?? UNIT,
+		summaryTokensPlanned: summary, ...(pick !== null ? { mergeWork } : {}), sumTrigger, scale: o.scale ?? UNIT,
 		ctxTokens: real(ctxEst), ctxAfterFolds: real(ctxAfterFolds), userTurns, ...(o.fileRecall ? { fileRecall: o.fileRecall } : {}),
 		...(atRoom ? { atRoom } : {}), ...(atRoomUnedited ? { atRoomUnedited } : {}),
 	});
@@ -817,7 +826,7 @@ export function plan(entries: Any[], o: PlanOpts): { f: PlanResult; c: PlanResul
 	const paying = cuts.slice(first).find((k) => {
 		const X = c * pre[k], Sr = c * S(pre[k]);
 		if (X < 2 * Sr) return false;
-		const call = law.pr.w * c * Math.max(0, pre[k] - prevSum) + law.pr.out * Math.min(c * S(pre[k]), NARRATIVE_MAX);
+		const call = law.pr.w * (c * Math.max(0, pre[k] - prevSum) + activeInput) + law.pr.out * Math.min(c * S(pre[k]), NARRATIVE_MAX) + mergeCall;
 		return gate("summary", X, Sr, null, call, Sr, undefined, undefined, false, blocks[k].entryId ?? undefined)
 			&& gate("plan", real(ctxEst), real(ctxAfterFolds - pre[k] + S(pre[k])), room, call, real(ctxAfterFolds - pre[k] + S(pre[k])), undefined, true);
 	});
