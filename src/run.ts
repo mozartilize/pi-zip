@@ -1355,6 +1355,7 @@ export class Zip implements ZipControl {
 		const usd = c.llmOk || c.costUsd > 0 ? c.costUsd : estimated;
 		this.stats.summaryUsd += usd;
 		this.record({ head, key, cut: c, usd, ...(c.llmOk || c.costUsd > 0 ? {} : { estimated: true }) });
+		this.ledger({ type: "summary_merge_cost", key, predicted_merge_cost: c.predictedMergeCostUsd ?? 0, actual_merge_cost: c.actualMergeCostUsd ?? 0, unit: "USD" });
 	}
 
 	/** Write the summary for `p` in the background (its own abort signal: nothing is running, so the run's would be stale). Nothing
