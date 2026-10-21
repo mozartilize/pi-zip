@@ -111,7 +111,7 @@ Every decision is also written as one JSON line per event, in a file per Pi sess
 
 ## Lookup cue
 
-When a new request names an earlier output by its handle, or by the same full path or URL that a call used, its first request ends with one short note. The note names at most three of those outputs and asks the model to recall them with `zip_recall` instead of repeating the call. The match is exact and needs no model call. Outputs that a compaction took out of the view count too. An output shown in full, or a path whose newest call was an edit, gets no note. The note is not saved in the session. Each note writes a `lookup_hint` ledger record. `PI_ZIP_LOOKUP=0` turns it off.
+When a new request names an earlier output by its handle, or by the same full path or URL that a call used, its first request ends with one short note. The note names at most three of those outputs and asks the model to recall them with `zip_recall` instead of repeating the call. The match is exact and needs no model call. Outputs that a compaction took out of the view count too. An output shown in full, or a path whose newest call was an `edit` or `write`, gets no note. The note is not saved in the session. Each note writes a `lookup_hint` ledger record. `PI_ZIP_LOOKUP=0` turns it off.
 
 ## Optional background judge
 

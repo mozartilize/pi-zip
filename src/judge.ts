@@ -76,9 +76,9 @@ export function locatorOf(args: Any, cwd: string): string | null {
 /** Full paths and URLs written in prose, normalized like locatorOf. */
 export function pathsIn(text: string, cwd: string): string[] {
 	const out: string[] = [];
-	const re = /(?:^|[\s"'`(])((?:https?:\/\/\S+)|(?:\/|\.\.?\/)[^\s"'`),]+|(?:[\w.-]+\/)+[\w.-]+)/g;
+	const re = /(?:^|[\s"'`([<])((?:https?:\/\/[^\s"'`),\]>]+)|(?:\/|\.\.?\/)[^\s"'`),\]>]+|(?:[\w.-]+\/)+[\w.-]+)/g;
 	for (const m of text.matchAll(re)) {
-		const raw = m[1].replace(/[.,:;]+$/, "");
+		const raw = m[1].replace(/[.,:;?!]+$/, "");
 		const loc = /^https?:\/\//i.test(raw) ? raw : (!raw.includes("/") && !raw.includes("\\")) ? null : normalize(isAbsolute(raw) ? raw : resolve(cwd || ".", raw));
 		if (loc && !out.includes(loc)) out.push(loc);
 	}
@@ -86,7 +86,7 @@ export function pathsIn(text: string, cwd: string): string[] {
 }
 
 /** Tools that change the file at their path. */
-const WRITERS = new Set(["edit", "write"]);
+export const WRITERS = new Set(["edit", "write"]);
 
 const stable = (v: Any): string => (Array.isArray(v) ? `[${v.map(stable).join(",")}]`
 	: v && typeof v === "object" ? `{${Object.keys(v).sort().map((k) => `${JSON.stringify(k)}:${stable(v[k])}`).join(",")}}` : JSON.stringify(v) ?? "null");
@@ -254,24 +254,8 @@ export function latestProjectedUser(entries: readonly Any[]): string {
 
 /** Recent user or assistant prose names this handle or the same full path or URL. A basename, a longer path, or an older turn does not. */
 export function citesWork(blocks: readonly Block[], handle: string, locator: string | null, cwd: string): boolean {
-	let remaining = 6000 * 4;
-	for (let i = blocks.length - 1; i >= 0 && remaining > 0; i--) {
-		const b = blocks[i];
-		if (b.msg?.role === "custom") continue;
-		let prose = "";
-		if (b.kind === "user") prose = textOf(b.msg.content);
-		else if (b.kind === "assistant") {
-			const content = b.msg.content;
-			prose = typeof content === "string" ? content : (content ?? []).filter((c: Any) => c?.type === "text" || c?.type === "thinking").map((c: Any) => c.text ?? c.thinking ?? "").join("\n");
-		} else if (b.kind === "toolResult") {
-			remaining -= Math.min(1200, textOf(b.msg.content).length);
-			continue;
-		} else continue;
-		remaining -= prose.length;
-		if (handleTokens(prose).includes(handle)) return true;
-		if (locator && pathsIn(prose, cwd).includes(locator)) return true;
-	}
-	return false;
+	const refs = workReferences(blocks, cwd);
+	return refs.handles.has(handle) || (!!locator && refs.locators.has(locator));
 }
 
 /** Longest evidence row for one assistant message, in characters; tool results use 1200. */
@@ -566,7 +550,7 @@ export function requestOpen(messages: readonly Any[]): boolean {
 }
 
 /** Latest explicit references in the same bounded work window as the judge input. Never learn from recall echoes. */
-function workReferences(blocks: Block[], cwd: string) {
+function workReferences(blocks: readonly Block[], cwd: string) {
 	const handles = new Map<string, string>(), locators = new Map<string, string>();
 	let remaining = 24_000;
 	for (let i = blocks.length - 1; i >= 0 && remaining > 0; i--) {

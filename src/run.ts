@@ -1243,17 +1243,21 @@ export class Zip implements ZipControl {
 	 * model can repeat a call. `live` = outputs this request shows in full (a fold applied to this very request makes an output not live).
 	 */
 	private lookupCue(scope: string, messages: Any[], blocks: Block[], ctx: Any, cwd: string): { text: string; shown: string[]; via: string[] } | null {
-		if (scope !== this.lookup.scope) {
-			this.lookup = { scope, pending: [] };
-			if (!scope) return null;
-			const entryOf = new Map<string, string>();
-			for (const b of blocks) if (b.kind === "toolResult" && b.entryId && b.msg.toolCallId) entryOf.set(b.msg.toolCallId, b.entryId);
-			const live = new Set<string>();
-			for (const m of messages) {
-				const id = m?.role === "toolResult" && !textOf(m.content).startsWith(PH_MARK) ? entryOf.get(m.toolCallId) : undefined;
-				if (id) live.add(handleFor(id));
-			}
-			this.lookup.pending = lookupRefs(scope, this.branch(ctx), cwd, live);
+		const fresh = scope !== this.lookup.scope;
+		if (fresh) this.lookup = { scope, pending: [] };
+		if (!scope || (!fresh && !this.lookup.pending.length)) return null;
+		const entryOf = new Map<string, string>();
+		for (const b of blocks) if (b.kind === "toolResult" && b.entryId && b.msg.toolCallId) entryOf.set(b.msg.toolCallId, b.entryId);
+		const live = new Set<string>();
+		for (const m of messages) {
+			const id = m?.role === "toolResult" && !textOf(m.content).startsWith(PH_MARK) ? entryOf.get(m.toolCallId) : undefined;
+			if (id) live.add(handleFor(id));
+		}
+		const current = lookupRefs(scope, this.branch(ctx), cwd, live);
+		if (fresh) this.lookup.pending = current;
+		else {
+			const valid = new Set(current.map((r) => r.handle));
+			this.lookup.pending = this.lookup.pending.filter((r) => valid.has(r.handle) && !this.recalled.has(r.handle));
 		}
 		const pending = this.lookup.pending;
 		if (!pending.length) return null;

@@ -1,5 +1,5 @@
 // Lookup cue for a new user request: earlier tool outputs the request names exactly. No model call and no context-pressure gate.
-import { hintText, locatorOf, pathsIn } from "./judge.ts";
+import { hintText, locatorOf, pathsIn, WRITERS } from "./judge.ts";
 import { handleFor, handleTokens, MIN_FOLD_CHARS, RECALL_TOOL, shortArgs } from "./placeholder.ts";
 import { textOf, type Any } from "./util.ts";
 
@@ -12,8 +12,9 @@ export const LOOKUP_TAIL = ". Recall them with zip_recall instead of repeating t
  * Earlier tool outputs that the request text names, read from the session branch. The branch keeps entries that a compaction took out
  * of the view, so those outputs count too.
  * - A handle counts when the text writes it exactly.
- * - A full path or URL counts only through the newest call on that locator, and only when that call returned a recallable output
- *   (no error, at least MIN_FOLD_CHARS). An edit after a read makes the read stale, so the locator gets no cue.
+ * - A full path or URL counts only through the newest call on that locator, and only when that call was not an edit or write and
+ *   returned a recallable output (no error, at least MIN_FOLD_CHARS). An edit or write after a read makes the read stale, so the
+ *   locator gets no cue even when the edit or write output itself is long.
  * Outputs in `live` (shown in full in this request) and zip_recall results never count. Handles come first, then locators, each in text order.
  */
 export function lookupRefs(text: string, branch: readonly Any[], cwd: string, live: ReadonlySet<string>): LookupRef[] {
@@ -30,7 +31,9 @@ export function lookupRefs(text: string, branch: readonly Any[], cwd: string, li
 		const handle = handleFor(en.id), label = `${tool} ${shortArgs(call?.arguments)}`.trim();
 		if (wanted.has(handle)) byHandle.set(handle, { handle, label, via: "handle" });
 		const loc = wantedLoc.size ? locatorOf(call?.arguments, cwd) : null;
-		if (loc && wantedLoc.has(loc)) newest.set(loc, !msg.isError && textOf(msg.content).length >= MIN_FOLD_CHARS ? { handle, label, via: "locator" } : null);
+		if (loc && wantedLoc.has(loc)) {
+			newest.set(loc, !msg.isError && !WRITERS.has(tool) && textOf(msg.content).length >= MIN_FOLD_CHARS ? { handle, label, via: "locator" } : null);
+		}
 	}
 	const out: LookupRef[] = [];
 	for (const h of tokens) {

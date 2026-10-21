@@ -44,18 +44,37 @@ describe("lookupRefs", () => {
 		expect(lookupRefs(text, branchOf(entries), cwd, new Set([h3])).map((r) => r.handle)).toEqual([h1]);
 	});
 
-	test("a full path counts through the newest call on it; an edit after the read and a basename give no cue", () => {
+	test("a full path counts through the newest call on it; an edit or write after the read (even with a long result) and a basename give no cue", () => {
 		const read1 = round("1", "read", { path: "/app/src/a.ts" }, big("old"));
 		const read2 = round("2", "read", { path: "src/a.ts" }, big("new")); // relative to cwd: the same locator
-		const edit = round("3", "edit", { path: "/app/src/b.ts" }, "Successfully replaced 1 block(s).");
+		const edit = round("3", "edit", { path: "/app/src/b.ts" }, big("diff report >1000 chars"));
 		const readB = round("4", "read", { path: "/app/src/b.ts" }, big("b"));
 		const small = round("5", "read", { path: "/app/src/c.ts" }, "tiny");
-		const branch = branchOf([U("u1", "go"), ...read1, ...read2, ...readB, ...edit, ...small]);
-		const refs = lookupRefs("check /app/src/a.ts, /app/src/b.ts, /app/src/c.ts and a.ts", branch, cwd, new Set());
+		const readD = round("6", "read", { path: "/app/src/d.ts" }, big("d"));
+		const writeD = round("7", "write", { path: "/app/src/d.ts" }, big("wrote file report >1000 chars"));
+		const branch = branchOf([U("u1", "go"), ...read1, ...read2, ...readB, ...edit, ...small, ...readD, ...writeD]);
+		const refs = lookupRefs("check /app/src/a.ts, /app/src/b.ts, /app/src/c.ts, /app/src/d.ts and a.ts", branch, cwd, new Set());
 		expect(refs).toEqual([{ handle: handleFor("r2"), label: "read src/a.ts", via: "locator" }]);
+		expect(lookupRefs("what is in /app/src/b.ts?", branch, cwd, new Set())).toEqual([]);
+		expect(lookupRefs("what is in /app/src/d.ts?", branch, cwd, new Set())).toEqual([]);
+		// a later read after the edit or write establishes a new snapshot on that path
+		const rereadB = round("8", "read", { path: "/app/src/b.ts" }, big("b after edit"));
+		const rereadD = round("9", "read", { path: "/app/src/d.ts" }, big("d after write"));
+		const branchAfter = branchOf([U("u1", "go"), ...readB, ...edit, ...rereadB, ...readD, ...writeD, ...rereadD]);
+		expect(lookupRefs("what is in /app/src/b.ts and /app/src/d.ts?", branchAfter, cwd, new Set())).toEqual([
+			{ handle: handleFor("r8"), label: "read /app/src/b.ts", via: "locator" },
+			{ handle: handleFor("r9"), label: "read /app/src/d.ts", via: "locator" },
+		]);
 		// the newest read is shown in full: nothing to cue, and never the older read instead
 		expect(lookupRefs("check /app/src/a.ts", branch, cwd, new Set([handleFor("r2")]))).toEqual([]);
 		expect(lookupRefs("check /app/src/a.tsx and /app/src", branch, cwd, new Set())).toEqual([]); // a longer path or a parent is another locator
+		// URLs and paths inside parentheses, quotes or brackets still match their locator
+		const web = round("10", "fetch", { url: "https://example.com/api/v1/spec" }, big("spec"));
+		const withWeb = branchOf([U("u1", "go"), ...read2, ...web]);
+		expect(lookupRefs('see (https://example.com/api/v1/spec), "https://example.com/api/v1/spec" and [/app/src/a.ts]!', withWeb, cwd, new Set())).toEqual([
+			{ handle: handleFor("r10"), label: 'fetch {"url":"https://example.com/api/v1/spec"}', via: "locator" },
+			{ handle: handleFor("r2"), label: "read src/a.ts", via: "locator" },
+		]);
 	});
 
 	test("handles come first, a locator already named by its handle is not repeated, and the note holds at most three", () => {
@@ -122,6 +141,36 @@ describe("lookup cue on the first request", () => {
 			const out = await zip.context({ messages: flat(projected) }, ctx);
 			if (folded) expect(out.messages.at(-1).content).toContain(`bash make ${h}`);
 			else expect(out).toBeUndefined();
+			zip.shutdown();
+		}
+	});
+
+	test("a fourth reference waits for the second request unless the first request recalled, read or edited it", async () => {
+		const prompt = "compare /app/f1.ts, /app/f2.ts, /app/f3.ts and /app/f4.ts";
+		for (const action of ["untouched", "recalled", "edited", "reread"] as const) {
+			const old = [U("u1", "read all"), ...[1, 2, 3, 4].flatMap((i) => round(`${i}`, "read", { path: `/app/f${i}.ts` }, big(`f${i}`))), A("a1")];
+			const all: Any[] = [...old, U("u2", prompt)];
+			let projected = project(all, [{ type: "compaction", firstKeptEntryId: "u2", summary: "earlier work" }]);
+			const { pi } = fakePi();
+			const { ctx } = fakeCtx(projected, { branch: branchOf(all), cwd: "/app" });
+			ctx.sessionManager.getBranch = () => branchOf(all);
+			ctx.sessionManager.buildSessionProjection = () => ({ entries: projected });
+			const zip = new Zip(pi); zip.sessionStart(ctx); await startZip(zip, ctx, { prompt });
+			const first = await zip.context({ messages: flat(projected) }, ctx);
+			expect(first.messages.at(-1).content).toContain(handleFor("r1"));
+			expect(first.messages.at(-1).content).not.toContain(handleFor("r4"));
+			if (action === "recalled") zip.onRecall([handleFor("r4")], 1000, ["r4"]);
+			if (action === "edited") {
+				const step = round("5", "edit", { path: "/app/f4.ts" }, big("diff >1000 chars"));
+				all.push(...step, A("a2")); projected = [...projected, ...step, A("a2")];
+			}
+			if (action === "reread") {
+				const step = round("5", "read", { path: "/app/f4.ts" }, big("fresh f4"));
+				all.push(...step, A("a2")); projected = [...projected, ...step, A("a2")];
+			}
+			const second = await zip.context({ messages: flat(projected) }, ctx);
+			if (action === "untouched") expect(second.messages.at(-1).content).toContain(`read /app/f4.ts ${handleFor("r4")}`);
+			else expect(second).toBeUndefined();
 			zip.shutdown();
 		}
 	});
