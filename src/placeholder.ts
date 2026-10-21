@@ -6,12 +6,17 @@ import { type Any, attempt, clip, fmtWhen, textOf } from "./util.ts";
 
 export const PH_MARK = "[folded by pi-zip";
 export const RECALL_TOOL = "zip_recall";
-const MIN_FOLD_CHARS = 1000; // shorter outputs are never worth a placeholder
+export const MIN_FOLD_CHARS = 1000; // shorter outputs are never worth a placeholder
 
 /** Deterministic recall handle for a session entry id: 10-char base36 of sha256("pi-zip:"+id)[0..12). */
 export function handleFor(entryId: string): string {
 	const hex = createHash("sha256").update(`pi-zip:${entryId}`).digest("hex").slice(0, 12);
 	return BigInt("0x" + hex).toString(36).padStart(Math.ceil(48 / Math.log2(36)), "0").slice(-10);
+}
+
+/** Every handle-shaped token of a text (10 lowercase base36 characters, not inside a longer run of them), in one scan. */
+export function handleTokens(text: string): string[] {
+	return text.match(/(?<![0-9a-z])[0-9a-z]{10}(?![0-9a-z])/g) ?? [];
 }
 
 export interface KeyLine {
