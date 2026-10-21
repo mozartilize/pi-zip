@@ -317,6 +317,14 @@ const mutants = [
 		check: "a restart on the same versions writes none",
 		edit: (source: string) => rep(source, "customType === VERSION_CUSTOM) this.version.last = e.data;", "customType === VERSION_CUSTOM) void 0;"),
 	},
+	// 0.4.12: a usage entry that read the whole prefix (pi-aside's "aside") touches the cache
+	{
+		name: "aside-read-not-a-touch",
+		file: "cache.ts",
+		pattern: "an aside that read the main prefix",
+		check: "an aside that read the whole prefix keeps the cache warm",
+		edit: (source: string) => rep(source, '(en.kind === "cache_warm" || readPrefix(en, resp))', 'en.kind === "cache_warm"'),
+	},
 ];
 const only = process.env.PZ_MUTANTS?.split(","); // run some by name
 for (const mutant of mutants.filter((m) => !only || only.includes(m.name))) {

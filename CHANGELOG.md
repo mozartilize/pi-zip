@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.4.12
+
+- A side question no longer makes pi-zip think the cache went cold. Extensions such as pi-aside answer a side question on
+  the main conversation's cached prefix, which keeps that cache alive, and record the request in the session with Pi's own
+  usage entry. pi-zip only counted the main conversation's requests and Pi's idle cache refreshes, so a prompt typed a few
+  minutes after an aside, but more than the cache lifetime after the last main reply, was planned as a cold return: it
+  rewrote a prefix that was still cached (about $0.70 on a 150K-token session). Now any usage entry in the session counts as
+  a cache refresh when it read at least everything the last main reply had cached, on the same provider and model. A smaller
+  read, another model's request, or an entry without usage counts for nothing, as before; Pi's own refreshes count as before.
+  Expect fewer rewrites after asides. What pi-zip learns about how long your provider keeps its cache now counts from the
+  aside too, so a cache an aside kept warm is no longer taken for a provider that keeps its cache longer. pi-zip does not
+  depend on pi-aside: it reads only Pi's entry format. No new setting, no extra call; src is 5,862 lines (5,865 before).
+
 ## 0.4.11
 
 - The session records which pi-zip and Pi versions it ran: a `pi-zip/version` custom entry (`v`, `pi`, `since`), written at

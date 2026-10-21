@@ -136,7 +136,9 @@ pub enum Tool {
 /// the model for the next prompt, `Restart` is a fresh pi process on the same session, `Foreign` is a compaction another extension
 /// writes between runs, `Compact` is Pi's own compaction (its threshold, an overflow or /compact; between runs or mid-run), `Edit`
 /// is another extension's context_edit of the oldest output the model still sees (anywhere). The away timer and Pi's cache
-/// warming are not environment events: the clock fires them.
+/// warming are not environment events: the clock fires them. `Aside` is a side question between runs (pi-aside): one request on
+/// the newest main prefix, on the current model, that reads what the cache still holds and refreshes it, persisted as Pi's usage
+/// entry `{ type: "usage", kind: "aside" }` (sessionManager.appendUsage); it adds nothing to the conversation.
 /// `Drive` starts a run the way an extension's message does (`sendCustomMessage(..., { triggerTurn: true })`: on Pi 1.2.0 a
 /// before_agent_start with messageType "custom", on 1.1.0 none; agent_start, the custom message appended, the first request; never
 /// Pi's input event): pi-runway's owed-drive,
@@ -159,6 +161,7 @@ pub enum Event {
     Compact,
     Edit,
     BoundaryEdit,
+    Aside,
 }
 impl Event {
     /// Events that start a run: a prompt, or a custom message that triggers a turn.
@@ -167,7 +170,7 @@ impl Event {
     }
     /// Events that happen outside a run and belong to the run they precede.
     pub fn is_special(&self) -> bool {
-        matches!(self, Event::Switch | Event::Restart | Event::Foreign { .. } | Event::Wait { .. } | Event::Compact | Event::Edit | Event::BoundaryEdit)
+        matches!(self, Event::Switch | Event::Restart | Event::Foreign { .. } | Event::Wait { .. } | Event::Compact | Event::Edit | Event::BoundaryEdit | Event::Aside)
     }
 }
 
@@ -239,6 +242,7 @@ impl fmt::Display for Event {
             Event::Compact => write!(f, "compact"),
             Event::Edit => write!(f, "edit"),
             Event::BoundaryEdit => write!(f, "boundaryedit"),
+            Event::Aside => write!(f, "aside"),
         }
     }
 }
@@ -339,6 +343,7 @@ impl Trace {
                 "compact" => events.push(Event::Compact),
                 "edit" => events.push(Event::Edit),
                 "boundaryedit" => events.push(Event::BoundaryEdit),
+                "aside" => events.push(Event::Aside),
                 "switch" => events.push(Event::Switch),
                 "restart" => events.push(Event::Restart),
                 "foreign" => events.push(Event::Foreign { size: w.get(1).map(|s| num(s)).transpose()?.unwrap_or(2000) }),

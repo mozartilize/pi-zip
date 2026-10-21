@@ -87,6 +87,10 @@ pub fn special(name: &str) -> Option<Vec<Event>> {
         "drive" => vec![Event::Drive { gap: 3_600 }, Event::Call { tool: Tool::Npm, size: MID }, Event::Say { size: 100 }],
         "drive-warm" => vec![Event::Drive { gap: 60 }, Event::Call { tool: Tool::Npm, size: MID }, Event::Say { size: 100 }],
         "drive-restart" => vec![Event::Drive { gap: 3_600 }, Event::Call { tool: Tool::Npm, size: MID }, Event::Say { size: 100 }, Event::Restart],
+        // a side question (pi-aside) 4.5 minutes after the run, while the cache is warm (the prompt follows the family's gap: past
+        // the TTL since the last response, inside it since the aside), and one an hour after it, at a cache already gone
+        "aside" => vec![Event::Wait { gap: 270 }, Event::Aside],
+        "aside-late" => vec![Event::Wait { gap: 3_600 }, Event::Aside],
         _ => return None,
     })
 }
@@ -180,13 +184,13 @@ pub fn standard_suite() -> Vec<Family> {
         Family { worlds: vec![w("explicit"), w("glm")], depth: 4, gaps: vec![60, 330, 3600], bodies: vec![Body::Q, Body::P, Body::B, Body::C], specials: vec![] },
         // depth 5, short and long gaps only (the window slides over five user turns)
         Family { worlds: vec![w("explicit")], depth: 5, gaps: vec![60, 3600], bodies: vec![Body::Q, Body::P, Body::B], specials: vec![] },
-        // depth 3 with one special event, growth and recall bodies
+        // depth 3 with one special event, growth and recall bodies; a side question (pi-aside) at a warm or a gone cache
         Family {
             worlds: vec![w("explicit")],
             depth: 3,
             gaps: vec![60, 270, 3600],
             bodies: vec![Body::Q, Body::P, Body::BB, Body::R],
-            specials: vec![sp("switch"), sp("restart"), sp("foreign")],
+            specials: vec![sp("switch"), sp("restart"), sp("foreign"), sp("aside"), sp("aside-late")],
         },
         // depth 3: steering and failing runs, a restart or a switch at the return, Pi's own compaction, another extension's edit
         Family {
@@ -272,7 +276,13 @@ pub fn random_trace(rng: &mut Rng) -> Trace {
     // runs an extension's message starts and custom messages riding with a prompt are drawn from a second stream seeded from this one's
     // state (not advancing it): the rest of every trace is what the same seed drew before they existed
     let mut aux = Rng::new(rng.0.rotate_left(29) ^ 0xA076_1D64_78BD_642F);
+    // side questions (pi-aside) between runs from a third stream, for the same reason
+    let mut side = Rng::new(rng.0.rotate_left(43) ^ 0xE703_7ED1_A0B4_28DB);
     for k in 0..runs {
+        if k > 0 && side.chance(0.08) {
+            events.push(Event::Wait { gap: side.log(30.0, 1_800.0) });
+            events.push(Event::Aside);
+        }
         if k > 0 {
             if rng.chance(0.05) {
                 events.push(Event::Switch);
@@ -377,7 +387,7 @@ pub fn normalize(mut t: Trace) -> Trace {
     let mut open = false;
     for e in t.events {
         match e {
-            Event::Prompt { .. } | Event::Drive { .. } | Event::Switch | Event::Restart | Event::Foreign { .. } | Event::Wait { .. } => {
+            Event::Prompt { .. } | Event::Drive { .. } | Event::Switch | Event::Restart | Event::Foreign { .. } | Event::Wait { .. } | Event::Aside => {
                 if open {
                     out.push(Event::Say { size: 100 });
                     open = false;

@@ -907,3 +907,35 @@ context counts the tool call's own tokens at the calibrated scale. The live row 
 * Option (b) lets the context grow while warm until the room once the budget is spent; on the replays that costs nothing measurable,
   but the request stays bigger than the law wanted for that stretch.
 * The TUI evidence above predates the review fixes (P2 #5 now applies the folds priced with a warm native summary).
+
+## 0.4.12: side questions (pi-aside) as cache touches
+
+The bridge models `aside`: a side question between runs, one request on the newest main prefix and the current model, recorded
+as a refresh of the world's cache (it reads what is held and rewrites it) and persisted as Pi's `appendUsage("aside", ...)`.
+Specials `aside` (270 s after a run, at a warm cache) and `aside-late` (an hour after, at a gone cache) join the depth-3 switch /
+restart / foreign family; 8% of random runs after the first are preceded by one (a third stream). 39,228 traces.
+
+`--suite standard --random 3000 --seed 1 --workers 26` (`out/v0412`, shrink 20; `out/v0411` = v0.4.11's src, shrink 0), trace by trace:
+
+| property | v0.4.11 | 0.4.12 | fixed | new |
+|---|---|---|---|---|
+| A1, EN, OC, A3, I1, RD, RC, PW, B2B, MP, NT, WL, NA, TR, WB, PC, RDr, MPr, LW, G, W | 0 | 0 | | |
+| A2 / A2r | 3 / 3 | 3 / 3 | 0 | 0 |
+| NR | 54 | 53 | 2 | 1 (window slide, folds: an existing class, a path shift) |
+| GC | 85 | 79 | 6 | 0 |
+| MH | 1 | 1 | 0 | 0 |
+
+Every GC failure has a side question in it (the 32 exhaustive ones are all `aside-late`; the 47 random ones were regenerated
+with `gen` and each contains one). Without side questions GC is 0 on both. The class, found here, is in v0.4.11 too: a side
+question at a gone cache reads nothing, so it is no touch for pi-zip, but it rewrote the prefix; the next main request finds the
+cache alive after a gap past the TTL, and the learned survival records that as the provider keeping its cache (`run.ts learn`,
+`cache_sample` alive at 3,660 s), so a later return past the TTL is planned warm (P 0.8) at a gone cache (shrunk:
+`prompt; call npm 1K; say 100; wait +1h; aside; prompt +60s; say 100; prompt +1h; say 100`). Whether such a write serves the main
+request depends on the provider (an automatic prefix cache: yes; an explicit one: only if the side request put a breakpoint at
+the end of the main prefix). Not fixed in 0.4.12. The 6 GC traces 0.4.12 fixes are the warm case: v0.4.11 learned survival from
+a return the side question had kept warm. `traces/gc-aside.trace` and `tests/bridge.rs an_aside_that_read_the_prefix_is_a_touch`
+pin the rule: after a side question that read the whole prefix the return is planned warm and is no pause (v0.4.11: cold, a
+pause, and the previous turn's re-readable output folded at a warm cache); after one at a gone cache, cold. No property fails on
+v0.4.11 there: the spec asks that a gone cache be planned cold, not that a warm one be planned warm.
+
+`cargo test --release`: 10 unit + 6 bridge + 41 mutants pass.

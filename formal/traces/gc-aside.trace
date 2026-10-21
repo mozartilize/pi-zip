@@ -1,0 +1,17 @@
+# 0.4.12: a side question (pi-aside) 4.5 minutes after a run reads the whole prefix and refreshes the cache. The prompt a minute
+# later is 330 s after the last response but 60 s after the aside: the world's cache is warm. 0.4.11 counted only responses and
+# Pi's cache_warm entries: it planned that return cold (P = 0, a pause) and folded the previous turn's re-readable 50K output
+# at a warm cache. 0.4.12 plans it warm, no pause: the output stays. The aside an hour later finds the cache gone and rewrites it
+# (it reads nothing): no touch for pi-zip, which plans that return cold.
+world explicit known ttl=300 true=300 survival=none c=1 sys=3000 window=200000 native interactive
+prompt
+call cat 50K
+say 100
+wait +270s
+aside
+prompt +60s
+say 100
+wait +1h
+aside
+prompt +60s
+say 100

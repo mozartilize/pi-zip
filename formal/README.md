@@ -77,13 +77,19 @@ say 100
   drafted by a preceding turn_end handler; applied to Pi's preview before pi-zip runs), `drive +gap`
   (a run an extension's message starts, as Pi 1.1.0 `sendCustomMessage(..., { triggerTurn: true })` -> `_runAgentPrompt` does:
   `agent_start`, the custom message appended, the first request, **no** `before_agent_start`; a new user turn), `nextturn` (a
-  custom message Pi stores right after a prompt: a nextTurn message or a `before_agent_start` handler's message; the prompt's turn).
+  custom message Pi stores right after a prompt: a nextTurn message or a `before_agent_start` handler's message; the prompt's turn),
+  `aside` (0.4.12: a side question between runs, as pi-aside 0.3.0 asks it: one request that re-sends the newest main prefix on
+  the current model, reads what the provider still holds and refreshes it, persisted only as Pi's own
+  `sessionManager.appendUsage("aside", provider, model, usage, note)` entry; no message, no hook).
   The away timer and Pi's cache refreshes are not events: the clock fires them. `formal/coverage/coverage.ts` maps recorded
   sessions onto these events and lists what they cannot express (TRIAGE.md, round 4).
 * **Blocks** (session entries): kind, size, user turn, recoverability (re-readable, not re-readable, a recall result), the
   request that issued them; at each request each block is visible, folded or summarised, and recalled or not.
-* **Cache**: per model, a response (not a refused request) or a refresh at t keeps the prefix until t + the kept TTL. Warm/cold at
-  a request is a fact of this clock; what pi-zip *believed* (P(warm), cold, past TTL) is observed separately.
+* **Cache**: per model, a response (not a refused request) or a refresh at t keeps the prefix until t + the kept TTL; a refresh is
+  Pi's warmer's or a side question's (`aside`), which reads the prefix if it is still held and rewrites it otherwise. Warm/cold at
+  a request is a fact of this clock; what pi-zip *believed* (P(warm), cold, past TTL) is observed separately. No property asks
+  that a warm cache be believed warm (survival the provider has not shown may be priced cold): `traces/gc-aside.trace` and
+  `tests/bridge.rs` pin that a side question which read the whole prefix is a touch for pi-zip (0.4.12), one at a gone cache not.
 * **Requests**: each goes to the provider as a real Anthropic-shaped payload (system blocks, tools, `tool_use` / `tool_result`
   pairs, errored and aborted messages dropped as pi-ai does, the tier's `cache_control`), through pi-zip's
   `before_provider_request` (its request repair, `guard.ts`, and its payload-tier reading run on it).
@@ -187,7 +193,7 @@ in rc030 are other candidate-set effects (TRIAGE.md).
 * **exhaustive families** (`pz-formal count`): depth-4 runs over gaps {60 s, 330 s, 1 h} × bodies {quick answer, 60K prose,
   30K command output, 30K re-readable output} in an explicit and a GLM-like world (13,824 traces); depth 5 over {60 s, 1 h} ×
   {quick, prose, command} (3,888); depth 3 over {60 s, 270 s, 1 h} × {quick, prose, two 25K outputs, recall} with one switch,
-  restart or foreign compaction placed before any run (4,032); depth 3 over {60 s, 1 h} × {quick, prose, command, a steered run,
+  restart or foreign compaction, or a side question 270 s or an hour after the previous run, placed before any run (6,336); depth 3 over {60 s, 1 h} × {quick, prose, command, a steered run,
   a run whose last request fails} with a restart after an hour away, a switch after 4 minutes away, Pi's own compaction or
   another extension's edit before any run (4,500); depth 3 over {60 s, 330 s, 1 h, 2 h} × {quick, prose, re-readable, recall}
   on the 1-hour tier, with recall through files, in reread-only mode and with Pi's idle cache warming (4,096); depth 3 over
@@ -197,8 +203,9 @@ in rc030 are other candidate-set effects (TRIAGE.md).
   outputs 100 to 40K log-uniform, gaps from seconds to hours across the TTL; steering, failed and aborted requests, Pi's
   compaction and other extensions' edits mid-run and between runs, restarts and switches at the return; random worlds including
   the 1-hour tier, both allowlist modes and idle cache warming; 12% of the runs after the first started by an extension's message,
-  10% of the prompts with a nextTurn message, drawn from a second stream so the rest of each trace is what the seed drew before);
-* 36,924 traces and about 308,000 requests per source (33,340 before round 4); one minimal counterexample is kept per (property, mechanism) and shrunk
+  10% of the prompts with a nextTurn message, drawn from a second stream so the rest of each trace is what the seed drew before;
+  8% of the runs after the first preceded by a side question 30 s to 30 min after the previous run, from a third stream);
+* 39,228 traces per source (36,924 before 0.4.12's side questions, 33,340 before round 4); one minimal counterexample is kept per (property, mechanism) and shrunk
   greedily (drop runs, events, specials; round sizes and gaps to canonical values; move the world to the default);
 * **per-trace verdicts** (`--verdicts FILE`): one JSON line per trace with the class of every property it fails, so two runs
   (two sources, or a source and a mutant) can be compared trace by trace where the counts would hide a change.
@@ -350,7 +357,7 @@ cargo test && cargo clippy --all-targets
 
 `check` options: `--suite standard|quick|none`, `--family 'worlds=explicit,glm depth=4 gaps=60,330,3600 bodies=q,p,b,c
 specials=switch,restart,foreign'` (worlds: explicit glm fresh tools small claude print long file reread warming slow; bodies: q p b c
-bb r s f n; specials: switch restart foreign late-restart late-switch compact edit drive drive-warm drive-restart), `--random N --seed S`, `--only A2,MP`,
+bb r s f n; specials: switch restart foreign late-restart late-switch compact edit drive drive-warm drive-restart aside aside-late), `--random N --seed S`, `--only A2,MP`,
 `--shrink ROUNDS` (0 = no shrinking), `--workers W`, `--verdicts FILE` (per-trace verdicts, JSON lines), `--plan-opts JSON`,
 `--pi DIR` (another pi-coding-agent). A standard check without shrinking takes about 3 minutes for 33,340 traces on 28 cores.
 
