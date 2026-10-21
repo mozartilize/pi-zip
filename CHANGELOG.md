@@ -8,6 +8,9 @@
   prefix-read clock. The rule uses branch order, including equal timestamps, survives restarts, and accepts any usage kind
   with the existing real provider/model identities. Partial reads and incomplete usage reports conservatively lose that
   interval; cache class and growth still learn. No new setting or API call; the cost formula and planner are unchanged.
+- Survival snapshots belong to each main assistant context, so Pi's streaming cache refreshes cannot replace the censor,
+  gap, prefix expectation or edit state while the main response is still running. Refresh payloads still receive repair
+  and relay metadata guarding; a refused main request retains successful intervening warm touches.
 
 ## 0.4.12
 

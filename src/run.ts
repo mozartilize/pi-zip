@@ -1105,7 +1105,7 @@ export class Zip implements ZipControl {
 
 
 	async context(e: Any, ctx: Any): Promise<Any> {
-		if (!this.active()) return undefined;
+		if (!this.active()) return void this.requestStart(ctx);
 		if (this.starting) await this.starting; // agent_start's start-of-run handling of a driven run
 		if (ctx?.signal?.aborted) return undefined;
 		const first = !this.runChecked;
@@ -1136,9 +1136,9 @@ export class Zip implements ZipControl {
 				const live = plan.folds.filter((t) => applied.has(t.entryId));
 				this.noticeFor(ctx, plan, live, plan.cut ?? plan.native ?? null, plan.ctxBefore, sizeOf(plan.scale, (out?.messages ?? e.messages).filter((m: Any) => m.role !== "system").reduce((n: number, m: Any) => n + wireTokensOf(m), 0)));
 			}
-			return out ? { messages: out.messages } : undefined;
 		}
-		return undefined;
+		this.requestStart(ctx);
+		return out ? { messages: out.messages } : undefined;
 	}
 
 	/** While the user waits for a summary, Pi's working line says what for. */
@@ -1267,9 +1267,7 @@ export class Zip implements ZipControl {
 
 	/** Pi's idle warming is a cache touch, never a producer wake or an answer to Pi's decision. */
 	cacheWarmingDecision(e: Any, ctx: Any): undefined {
-		if (e?.action === "warm") {
-			this.lastReqMs = Date.now();
-		}
+		if (e?.action === "warm") this.lastReqMs = Date.now();
 		this.want("timer", ctx);
 		if (e?.action === "warm") this.armDoor(ctx, false); // the touch moved the door's moments
 		return undefined;
@@ -1516,7 +1514,8 @@ export class Zip implements ZipControl {
 		if (model) this.model = model;
 	}
 
-	providerRequest(e: Any, ctx?: Any): Any {
+	/** Main context preparation owns this snapshot; Pi's warmer replays payload hooks without another context transform. */
+	private requestStart(ctx: Any) {
 		// the request goes to the session's current model: a /model in the middle of a run switches it without a run start, and a
 		// request booked under the run's first model would make every later turn_end see a "model switch" (P(warm) = 0: any edit is free)
 		if (ctx?.model) this.model = ctx.model;
@@ -1529,7 +1528,9 @@ export class Zip implements ZipControl {
 		this.lastReqMs = now;
 		this.lastModelKey = key;
 		this.stats.readSavedTokens += this.stats.activeSaved;
-		const p: Any = e.payload;
+	}
+	providerRequest(e: Any, ctx?: Any): Any {
+		const m = ctx?.model ?? this.model, key = modelKey(m), p: Any = e.payload;
 		const seen = payloadRetention(p); // what this very request asked the provider for: it wins over any environment
 		if (seen && key && (seen !== this.retention?.tier || this.retention?.key !== key || this.retention?.src !== "payload")) {
 			this.retention = { key, tier: seen, src: "payload" };
@@ -1541,7 +1542,7 @@ export class Zip implements ZipControl {
 			for (const m of p.messages) if (m?.role !== "system" && m?.role !== "developer") tok += tok4(JSON.stringify(m?.content ?? "")) + 8;
 			this.ledger({ type: "cold_wire", tokens: Math.round(sizeOf(this.runPlan?.scale ?? UNIT, tok)), messages: p.messages.length, folds: this.runPlan && !this.runPlan.persisted ? this.runPlan.folds.length : 0, summary: !!this.runPlan?.cut, source: this.runPlan?.source ?? null });
 		}
-		const m = this.model, sk = `${key}@${m?.baseUrl ?? ""}`, was = this.stickyKey;
+		const sk = `${key}@${m?.baseUrl ?? ""}`, was = this.stickyKey;
 		this.stickyKey = null; // set again below when this request names its session: the request a refusal answers
 		if (this.off) return undefined; // strict no-op
 		const uid = stickyFits(m, p) && this.stickyOf(sk) !== "off" ? stickyUserId(this.sessionId(ctx)) : undefined;
@@ -1568,7 +1569,7 @@ export class Zip implements ZipControl {
 			if (m?.role === "custom" && ctx) void this.drivenStart(ctx); // the agent_start was a driven run's: its start of run, now
 		}
 		if (m?.role === "assistant" && m.stopReason !== "error" && m.stopReason !== "aborted") this.lastReqMs = Date.now(); // the response is complete: the entry was refreshed when it finished
-		else if (refused(m)) this.lastReqMs = this.reqMsBefore; // the provider refused the request: it touched no cache (cache.ts lastMessageMs reads the branch the same way)
+		else if (refused(m)) this.lastReqMs = Math.max(this.reqMsBefore, lastMessageMs(requestBranch(this.branch(ctx ?? this.liveCtx)))); // the provider refused the request: it touched no cache (cache.ts lastMessageMs reads the branch the same way)
 		const sk = this.stickyKey, err = String(m?.errorMessage ?? ""), ok = !!sk && this.stickyOf(sk) === "ok";
 		if (sk && m?.role === "assistant" && m.stopReason !== "error" && m.stopReason !== "aborted" && ((this.sticky400 = 0), !ok)) (this.stickyOf(sk, "ok"), this.ledger({ type: "sticky_ok", key: sk }));
 		// a refusal that names the field; a 400 ("400 status code (no body)" too; Pi does not retry it) to a model that never answered it,
