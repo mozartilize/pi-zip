@@ -78,7 +78,7 @@ export const refused = (m: Any): boolean => {
  *  response that ran before it, on m's provider and model (the one that answered, as Pi names it): it refreshed m's cache entry. */
 const readPrefix = (en: Any, m: Any): boolean => {
 	const prefix = (Number(m?.usage?.cacheRead) || 0) + (Number(m?.usage?.cacheWrite) || 0);
-	return prefix > 0 && (Number(en.usage?.cacheRead) || 0) >= prefix && en.provider === m.provider && (en.model === m.model || en.model === m.responseModel);
+	return prefix > 0 && typeof en.model === "string" && en.model.trim().length > 0 && (Number(en.usage?.cacheRead) || 0) >= prefix && en.provider === m.provider && (en.model === m.model || en.model === m.responseModel);
 };
 
 /**

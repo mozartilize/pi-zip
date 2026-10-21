@@ -11,7 +11,10 @@
   read, another model's request, or an entry without usage counts for nothing, as before; Pi's own refreshes count as before.
   Expect fewer rewrites after asides. What pi-zip learns about how long your provider keeps its cache now counts from the
   aside too, so a cache an aside kept warm is no longer taken for a provider that keeps its cache longer. pi-zip does not
-  depend on pi-aside: it reads only Pi's entry format. No new setting, no extra call; src is 5,862 lines (5,865 before).
+  depend on pi-aside: it reads only Pi's entry format. Qualifying usage refreshes also count during a long tool call and
+  before each survival sample. The background-summary timer rechecks the current deadline and plan when it fires, so a
+  recent refresh postpones the call; the idle compaction door likewise rereads the clock and rearms. Missing or empty model
+  names never match a response's absent model alias. No new setting, no extra call; src is 5,854 lines (5,865 before).
 
 ## 0.4.11
 

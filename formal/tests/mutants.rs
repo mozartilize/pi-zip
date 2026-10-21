@@ -217,7 +217,7 @@ fn na_native_door_takes_a_ready_summary() {
 #[test]
 fn one_call_and_one_timer() {
     let trace = lines(&["world explicit known ttl=300 true=300 survival=none c=1 sys=3000 window=200000 nonative interactive slow", "prompt", "say 300K", "prompt +1h", "say 100", "prompt +1h", "call npm 100", "say 100"]);
-    caught("producer-overlap", "run.ts", "if (p) this.startBg(p, ctx);", "if (p) { this.startBg(p, ctx); this.bg = null; this.startBg(p, ctx); }", "OC", &trace);
+    caught("producer-overlap", "run.ts", "if (!futureOnly && (!this.bg || this.bg.aborted)) this.startBg(w.p, ctx);", "if (!futureOnly && (!this.bg || this.bg.aborted)) { this.startBg(w.p, ctx); this.bg = null; this.startBg(w.p, ctx); }", "OC", &trace);
     let warming = trace.replace("interactive slow", "interactive warming");
     caught("producer-timers", "run.ts", "if (!decision) this.cancelTimer();", "void 0;", "OC", &warming);
     caught("producer-writes", "run.ts", "this.timer = null;\n\t\t\t\t\tif (gen !== this.timerGen ||", "this.timer = null; this.pi.appendEntry(\"pi-zip/summary\", {});\n\t\t\t\t\tif (gen !== this.timerGen ||", "OC", &trace);

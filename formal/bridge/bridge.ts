@@ -970,7 +970,7 @@ async function runTrace(tr: Any): Promise<Any> {
 			drafts: ours.map((d: Any) => (d.type === "context_edit" ? { type: d.type, target: d.targetId } : d.type === "compaction" ? { type: d.type, firstKept: d.firstKeptEntryId } : { type: d.type, customType: d.customType })),
 			persistOk, teValve: (!committedSent || !!boundaryCut) && ours.some((d: Any) => d.type === "context_edit" || d.type === "compaction"), runRoom: committedSent && !!roomCut,
 			// the narrative model calls since the previous request's turn_end (away, at the previous turn_end, in this run plan)
-			narr: narrativeCalls.slice(ncSeen, nc1).filter((c) => c.phase !== "probe").map((c) => ({ input: c.input, output: c.output, away: c.phase === "away" })),
+			narr: narrativeCalls.slice(ncSeen, nc1).filter((c) => c.phase !== "probe").map((c) => ({ input: c.input, output: c.output, away: c.phase === "away", at: (c.at - T0) / 1000 })),
 			waitRun: narrativeCalls.slice(nc0, nc1).filter((c) => c.phase === "present").length,
 			waitTe: narrativeCalls.slice(nc1).filter((c) => c.phase === "present").length,
 			grids: [...(runStart ? nativeGrids : []), ...planGrids, ...teGrids],

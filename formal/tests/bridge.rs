@@ -65,6 +65,18 @@ fn an_aside_that_read_the_prefix_is_a_touch() {
     assert!(run.st[3].believed_cold && run.st[3].pause, "after the aside at a gone cache: {:?}", run.st[3]);
 }
 
+/// A touch just before the producer's old deadline postpones production until the new deadline.
+#[test]
+fn a_usage_touch_postpones_the_producer() {
+    let Some(run) = replay(&src(), "producer-touch.trace") else { return };
+    let early: Vec<_> = run.obs.ticks.iter().take(6).flat_map(|t| &t.narr).collect();
+    assert!(early.is_empty(), "no summary before the refreshed deadline: {early:?}");
+    assert!(run.obs.ticks[5].warm);
+    let late = &run.obs.ticks[6];
+    assert!(!late.narr.is_empty(), "the postponed producer eventually runs");
+    assert!(late.narr.iter().all(|c| c.at >= run.obs.ticks[5].t1 + 300.0));
+}
+
 /// A native artifact has already paid for its call, even though the native door emits no `take` ledger record.
 #[test]
 fn native_application_prices_the_spent_call_at_zero() {

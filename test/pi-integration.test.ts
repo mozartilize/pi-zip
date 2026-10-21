@@ -2008,6 +2008,40 @@ for (const order of ORDERS) describe(`the idle door: a ready summary goes in whi
 		expect(r.zip.doorNext(r.zip.liveCtx, r.sm.getBranch(), Date.now())).toBeNull(); // nothing changes after the TTL
 	});
 
+	test("the idle door re-reads a usage touch at its old deadline and rearms", async () => {
+		const realSet = globalThis.setTimeout, realNow = Date.now;
+		const callbacks = new Map<Any, { fire: () => Any; due: number }>();
+		(globalThis as Any).setTimeout = (fn: () => Any, ms: number) => {
+			const handle = realSet(fn, ms);
+			callbacks.set(handle, { fire: fn, due: Date.now() + ms });
+			return handle;
+		};
+		let r: Any;
+		try {
+			const ready = await coldRig({ file: shiftedFile(0, 9000) }, (r: Any) => {
+				r.zip.nativeSummary = async () => undefined; // decline application so the next moment is observable
+				const response = r.sm.getBranch().filter((e: Any) => e.message?.role === "assistant").at(-1);
+				response.message.usage = { ...usage, cacheRead: 150_000 };
+			});
+			r = ready.r;
+			const old = callbacks.get(r.zip.doorTimer)!;
+			expect(old).toBeTruthy();
+			clearTimeout(r.zip.doorTimer);
+			(r.sm as Any).appendUsage("another-extension", "p", "m", { ...usage, cacheRead: 150_000 });
+			(r.sm.getBranch().at(-1) as Any).timestamp = new Date(old.due - 100).toISOString();
+			Date.now = () => old.due + 1;
+			old.fire();
+			await r.zip.door;
+			expect(ready.led.filter((e: Any) => e.type === "idle_door").at(-1)).toMatchObject({ taken: false, pWarm: 1, gapS: 0 });
+			expect(callbacks.get(r.zip.doorTimer)!.due).toBe(old.due - 100 + 2_000);
+			expect(r.compactCalls.n).toBe(0);
+		} finally {
+			globalThis.setTimeout = realSet;
+			Date.now = realNow;
+			await r?.shutdown();
+		}
+	});
+
 	test("a run that starts before the door's next moment closes it: nothing is compacted behind it, and its own turn_end decides", async () => {
 		const asked: number[] = [];
 		const { r, led } = await coldRig({ file: shiftedFile(0, 9000) }, (r: Any) => {
@@ -2057,6 +2091,68 @@ describe("an aside that read the main prefix keeps the cache warm (pi-aside)", (
 		await r.shutdown();
 		return cold;
 	};
+	test("the producer deadline moves after a qualifying usage touch without a hook", async () => {
+		const realSet = globalThis.setTimeout, realNow = Date.now;
+		let now = realNow();
+		const callbacks = new Map<Any, { fire: () => Any; due: number }>();
+		Date.now = () => now;
+		(globalThis as Any).setTimeout = (fn: () => Any, ms: number) => {
+			const handle = realSet(fn, ms);
+			callbacks.set(handle, { fire: fn, due: now + ms });
+			return handle;
+		};
+		let r: Awaited<ReturnType<typeof rig>> | undefined;
+		try {
+			const file = shiftedFile(0, 9000);
+			file.filter((e) => e.message?.role === "assistant").at(-1)!.message.usage = { ...usage, cacheRead: 100_000, cacheWrite: 50_000 };
+			r = await rig(undefined, { file, tui: true, native: false, idle: false, start: false });
+			const old = callbacks.get(r.zip.timer)!;
+			expect(old).toBeTruthy();
+			clearTimeout(r.zip.timer);
+			now = old.due - 10_000;
+			(r.sm as Any).appendUsage("another-extension", "p", "m", { ...usage, cacheRead: 150_000 });
+			(r.sm.getBranch().at(-1) as Any).timestamp = new Date(now).toISOString();
+			now = old.due + 1;
+			await old.fire();
+			expect(r.zip.bg, "a fresh touch postpones the producer deadline").toBeNull();
+			const next = callbacks.get(r.zip.timer)!;
+			expect(next.due).toBeGreaterThan(now);
+			expect(next.due - old.due).toBeCloseTo(old.due - (file.filter((e) => e.message?.role === "assistant").at(-1)!.message.timestamp) - 10_000, 0);
+			clearTimeout(r.zip.timer);
+			now = next.due + 1;
+			await next.fire();
+			expect(r.zip.bg).toBeTruthy();
+			await r.zip.bg.promise;
+			expect(r.narrativeCalls).toHaveLength(1);
+		} finally {
+			globalThis.setTimeout = realSet;
+			Date.now = realNow;
+			await r?.shutdown();
+		}
+	});
+
+	test("in-run usage refreshes both the turn clock and survival sample", async () => {
+		const r = await rig(undefined, { file: withAside("p", "m", 149_999) });
+		const realNow = Date.now, start = realNow();
+		try {
+			Date.now = () => start;
+			r.zip.providerRequest({ payload: { messages: [] } }, r.zip.liveCtx);
+			r.sm.appendMessage({ ...asst([call("long-tool")], "toolUse"), timestamp: start, usage: { ...usage, cacheRead: 150_000 } });
+			r.sm.appendMessage({ ...result("long-tool", "done"), timestamp: start + 398_000 });
+			(r.sm as Any).appendUsage("another-extension", "p", "m", { ...usage, cacheRead: 150_000 });
+			(r.sm.getBranch().at(-1) as Any).timestamp = new Date(start + 399_000).toISOString();
+			Date.now = () => start + 409_000;
+			const source = process.env.PI_ZIP_TEST_SRC ?? fileURLToPath(new URL("../src", import.meta.url));
+			const { inRunClock } = await import(join(source, "core.ts"));
+			expect(inRunClock(r.sm.getBranch(), { model: MODEL }, Date.now(), { reqMs: start, modelKey: "p/m" }), "the in-run clock keeps a qualifying usage touch").toMatchObject({ cold: false, gapS: 10, pause: false });
+			r.zip.providerRequest({ payload: { messages: [] } }, r.zip.liveCtx);
+			expect(r.zip.pending.gapS, "survival samples from the newest usage touch").toBe(10);
+		} finally {
+			Date.now = realNow;
+			await r.shutdown();
+		}
+	});
+
 	test("an aside that read the main prefix: the prompt after it plans warm; a smaller read or another model's does not count", async () => {
 		expect(await coldAt(withAside("p", "m", 150_000)), "an aside that read the whole prefix keeps the cache warm").toBe(false);
 		expect(await coldAt(withAside("p", "m", 149_999)), "an aside that read less is no touch").toBe(true);

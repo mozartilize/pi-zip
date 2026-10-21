@@ -44,6 +44,16 @@ describe("core: clock", () => {
 		expect(inRunClock(br, l, T0 + 401_000, { reqMs: T0 + 1000, modelKey: "p/m" })).toMatchObject({ cold: true, pWarm: 0, pause: false });
 		expect(inRunClock(br, l, T0 + 2000, { reqMs: T0 + 1000, modelKey: "p/m" })).toMatchObject({ cold: false, pWarm: 1, pause: false });
 	});
+	test("inRunClock keeps kind-agnostic usage touches among trailing tool and user messages", () => {
+		const response = asst("a1", T0 + 1000, { usage: { cacheRead: 100, cacheWrite: 50 } });
+		const br = [response, msg("t1", "toolResult", T0 + 390_000),
+			{ type: "usage", kind: "another-extension", provider: "p", model: "m", usage: { cacheRead: 150 }, timestamp: new Date(T0 + 400_000).toISOString() },
+			msg("u2", "user", T0 + 409_000)];
+		const last = { reqMs: T0 + 1000, modelKey: "p/m" };
+		expect(inRunClock(br, { model: MODEL }, T0 + 410_000, last)).toMatchObject({ cold: false, gapS: 10, pause: false });
+		br[2].usage.cacheRead = 149;
+		expect(inRunClock(br, { model: MODEL }, T0 + 410_000, last)).toMatchObject({ cold: true, gapS: 409, pause: false });
+	});
 	test("learned survival decides, not the declared TTL: a cache read in full at 600 s is warm past 300 s", () => {
 		const bins: Record<string, [number, number]> = {};
 		for (const b of [3, 4, 5, 6, 7, 8, 9]) bins[b] = [8, 0];

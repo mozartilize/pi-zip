@@ -80,12 +80,11 @@ export function checkEdits(blocks: Block[], userTurns: number, folds: FoldTarget
 export const clock = (branch: Any[], lam: Pick<Learned, "model" | "ent" | "tier">, nowMs: number, last: { reqMs: number; modelKey: string } = { reqMs: 0, modelKey: "" }): ColdInfo =>
 	detectCold(lam.model, last.reqMs, branch, nowMs, last.modelKey, (g, prior) => pWarm(lam.ent, g, prior), lam.tier);
 
-/** P(warm) inside a run, at a turn_end: the same learned curve, at the gap since the newest response (the last touch of the cache;
- *  the tool results after it touched nothing), so a long tool call counts as the absence it is. Never a pause (nobody left). */
+/** P(warm) inside a run: trailing tool/user messages touch nothing; usage entries can refresh the cache. Never a pause. */
 export function inRunClock(branch: Any[], lam: Pick<Learned, "model" | "ent" | "tier">, nowMs: number, last: { reqMs: number; modelKey: string }): ColdInfo {
 	let n = branch.length;
 	while (n > 0 && !(branch[n - 1]?.type === "message" && branch[n - 1].message?.role === "assistant")) n--;
-	return { ...clock(branch.slice(0, n), lam, nowMs, last), pause: false };
+	return { ...clock(branch.filter((e, i) => i < n || e?.type !== "message"), lam, nowMs, last), pause: false };
 }
 
 /** The head of the projection the branch builds: the id of its newest compaction, "" before any. */
