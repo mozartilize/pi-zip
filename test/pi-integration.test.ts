@@ -2039,6 +2039,32 @@ describe("the notice's why line says the cache was judged cold, as the warm one 
 	});
 });
 
+// 0.4.12: pi-aside persists each side request through Pi's own sessionManager.appendUsage("aside", ...); its read of the main prefix
+// refreshed the main cache. A return right after it is warm (0.4.11 judged it cold by the hours-old response and rewrote a warm prefix).
+describe("an aside that read the main prefix keeps the cache warm (pi-aside)", () => {
+	/** A session whose newest main response (hours old) cached 150K tokens, then an aside written by Pi's appendUsage just now. */
+	const withAside = (provider: string, model: string, cacheRead: number) => {
+		const sm = SessionManager.inMemory(CWD);
+		populate(sm);
+		sm.appendMessage(user("request 7", 100));
+		sm.appendMessage({ ...asst([{ type: "text", text: "done 7" }], "stop", 101), usage: { ...usage, cacheRead: 100_000, cacheWrite: 50_000 } });
+		(sm as Any).appendUsage("aside", provider, model, { ...usage, input: 40, cacheRead, cacheWrite: 0 }, "pi-aside tier=fork");
+		return [sm.getHeader() as Any, ...sm.getEntries()];
+	};
+	const coldAt = async (file: Any[]) => {
+		const r = await rig(undefined, { file });
+		const cold = r.zip.cold; // the run start's clock (rig: PI_ZIP_TTL_SECS=300, so the TTL decides)
+		await r.shutdown();
+		return cold;
+	};
+	test("an aside that read the main prefix: the prompt after it plans warm; a smaller read or another model's does not count", async () => {
+		expect(await coldAt(withAside("p", "m", 150_000)), "an aside that read the whole prefix keeps the cache warm").toBe(false);
+		expect(await coldAt(withAside("p", "m", 149_999)), "an aside that read less is no touch").toBe(true);
+		expect(await coldAt(withAside("p", "m2", 150_000)), "another model's aside is no touch").toBe(true);
+		expect(await coldAt(withAside("q", "m", 150_000)), "another provider's aside is no touch").toBe(true);
+	});
+});
+
 // Round 5: the incident (0.3.0, a warm prompt 1 min 48 s after a run that ended at 111.5K; the user waited 39 s for a summary, which went in
 // as a draft whose "Compacted from N" Pi took from the post-summary request). Rule A and the background production against Pi's own session and draft code.
 for (const order of ORDERS) describe(`round 5 on real Pi: rule A starts the warm summary early, nobody waits for it while the cache is warm (Pi ${order} order)`, () => {

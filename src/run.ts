@@ -184,9 +184,6 @@ export class Zip implements ZipControl {
 	 *  "reread" = none of those either: only re-readable outputs fold. */
 	recallMode: "tool" | "file" | "reread" = "tool";
 	private recallTools = { read: false, grep: false, bash: false };
-	get recallOk(): boolean {
-		return this.recallMode === "tool";
-	}
 	/** index.ts registered the transcript renderer for NOTICE_CUSTOM (Pi versions without registerEntryRenderer fall back to a status line). */
 	entryRenderer = false;
 	private coldWhy = ""; // the expanded notice's "why now" for this run

@@ -631,6 +631,66 @@ describe("the cache clock ignores a request the provider refused (GC)", () => {
 	});
 });
 
+// 0.4.12: pi-aside persists each side request with Pi's sessionManager.appendUsage("aside", provider, model, usage, note): a read of
+// the main prefix that refreshed the main cache. Any usage entry counts when it read at least the newest response's cacheable prefix
+// (cacheRead + cacheWrite) on that response's provider and model; Pi's cache_warm entries count as before, unconditionally.
+describe("a usage entry that read the whole prefix touches the cache (pi-aside)", () => {
+	const m = (role: string, t: number, over: Record<string, unknown> = {}) => ({ type: "message", id: `${role}${t}`, message: { role, timestamp: t, ...over } });
+	const resp = (t: number, over: Record<string, unknown> = {}) => m("assistant", t, { provider: "p", model: "m", stopReason: "stop", usage: { input: 10, cacheRead: 100_000, cacheWrite: 50_000 }, ...over });
+	const used = (t: number, kind: string, usage: unknown, over: Record<string, unknown> = {}) =>
+		({ type: "usage", id: `u${t}`, timestamp: new Date(t).toISOString(), kind, provider: "p", model: "m", ...(usage === undefined ? {} : { usage }), ...over });
+	const base = [m("user", 1000), resp(2000)];
+	test("an aside that read the full prefix (cacheRead >= the response's cacheRead + cacheWrite) is a touch; one more is too", () => {
+		expect(lastMessageMs([...base, used(200_000, "aside", { input: 50, cacheRead: 150_000, cacheWrite: 0 })])).toBe(200_000);
+		expect(lastMessageMs([...base, used(200_000, "aside", { input: 50, cacheRead: 150_400, cacheWrite: 300 })])).toBe(200_000);
+		expect(lastMessageMs([...base, used(200_000, "anything", { cacheRead: 150_000 })])).toBe(200_000); // whatever its kind
+		// a return 100 s after the aside, 298 s after the response: warm by the aside, cold without it
+		const model = { provider: "p", id: "m", promptCache: { short: 300 } };
+		expect(detectCold(model, 0, [...base, used(200_000, "aside", { cacheRead: 150_000 })], 400_000)).toMatchObject({ cold: false, pause: false });
+		expect(detectCold(model, 0, [...base, used(200_000, "aside", { cacheRead: 149_999 })], 400_000)).toMatchObject({ cold: true, pause: true });
+	});
+	test("an aside that read less than the prefix is no touch", () => {
+		expect(lastMessageMs([...base, used(200_000, "aside", { input: 50, cacheRead: 149_999, cacheWrite: 0 })])).toBe(2000);
+		expect(lastMessageMs([...base, used(200_000, "aside", { input: 150_000, cacheRead: 0, cacheWrite: 150_000 })])).toBe(2000); // a rewrite is not a read
+	});
+	test("an aside on another provider or model is no touch: a cache entry belongs to one provider and model; the model that answered counts", () => {
+		const u = { cacheRead: 150_000 };
+		expect(lastMessageMs([...base, used(200_000, "aside", u, { provider: "q" })])).toBe(2000);
+		expect(lastMessageMs([...base, used(200_000, "aside", u, { model: "m2" })])).toBe(2000);
+		// the response reports the model that answered (responseModel), and so does the usage entry (as Pi's cache warmer writes it)
+		expect(lastMessageMs([m("user", 1000), resp(2000, { responseModel: "m-2025" }), used(200_000, "aside", u, { model: "m-2025" })])).toBe(200_000);
+		expect(lastMessageMs([m("user", 1000), resp(2000, { responseModel: "m-2025" }), used(200_000, "aside", u)])).toBe(200_000);
+	});
+	test("a missing usage, missing fields, or no response that ran before it: no touch, never a throw", () => {
+		expect(lastMessageMs([...base, used(200_000, "aside", undefined)])).toBe(2000);
+		expect(lastMessageMs([...base, used(200_000, "aside", null)])).toBe(2000);
+		expect(lastMessageMs([...base, used(200_000, "aside", {})])).toBe(2000);
+		expect(lastMessageMs([...base, used(200_000, "aside", { cacheRead: "lots" })])).toBe(2000);
+		expect(lastMessageMs([m("user", 1000), used(200_000, "aside", { cacheRead: 150_000 })])).toBe(1000); // no response: nothing to compare with
+		expect(lastMessageMs([m("user", 1000), resp(2000, { usage: undefined }), used(200_000, "aside", { cacheRead: 150_000 })])).toBe(2000); // a response with no usage caches nothing known
+		expect(lastMessageMs([m("user", 1000), resp(2000, { usage: { input: 10 } }), used(200_000, "aside", { cacheRead: 0 })])).toBe(2000); // nothing cached, nothing read
+		const { provider: _p, ...noProvider } = used(200_000, "aside", { cacheRead: 150_000 });
+		expect(lastMessageMs([...base, noProvider])).toBe(2000);
+	});
+	test("the prefix is the newest response that ran: a later error or abort does not replace it", () => {
+		const errored = m("assistant", 3000, { provider: "p", model: "m", stopReason: "error", usage: { input: 5, cacheRead: 10, cacheWrite: 0 } });
+		const aborted = m("assistant", 3000, { provider: "p", model: "m", stopReason: "aborted", usage: { input: 5, cacheRead: 10, cacheWrite: 0 } });
+		expect(lastMessageMs([...base, m("user", 2500), errored, used(200_000, "aside", { cacheRead: 100 })])).toBe(3000);
+		expect(lastMessageMs([...base, m("user", 2500), aborted, used(200_000, "aside", { cacheRead: 100 })])).toBe(3000);
+		expect(lastMessageMs([...base, m("user", 2500), errored, used(200_000, "aside", { cacheRead: 150_000 })])).toBe(200_000);
+		// a newer, larger response raises the bar
+		const bigger = resp(4000, { usage: { input: 10, cacheRead: 150_000, cacheWrite: 20_000 } });
+		expect(lastMessageMs([...base, m("user", 3000), bigger, used(200_000, "aside", { cacheRead: 150_000 })])).toBe(4000);
+	});
+	test("cache_warm is unchanged: Pi's own refresh is a touch whatever it read, wrote or names", () => {
+		expect(lastMessageMs([...base, used(200_000, "cache_warm", { cacheRead: 150_000 })])).toBe(200_000);
+		expect(lastMessageMs([...base, used(200_000, "cache_warm", { cacheRead: 0, cacheWrite: 150_000 })])).toBe(200_000); // a refresh that rewrote it
+		expect(lastMessageMs([...base, used(200_000, "cache_warm", undefined)])).toBe(200_000);
+		expect(lastMessageMs([...base, used(200_000, "cache_warm", { cacheRead: 150_000 }, { provider: "q", model: "x" })])).toBe(200_000);
+		expect(lastMessageMs([m("user", 1000), used(200_000, "cache_warm", undefined)])).toBe(200_000);
+	});
+});
+
 describe("observed TTL tier", () => {
 	const a = (cacheWrite: number, cacheWrite1h?: number, extra: Record<string, unknown> = {}) => ({
 		type: "message",

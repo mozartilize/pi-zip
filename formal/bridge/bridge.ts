@@ -1193,6 +1193,16 @@ async function runTrace(tr: Any): Promise<Any> {
 					await closeRun(ev);
 					if (lastResp) await advance((e.gap ?? 60) * 1000);
 					break;
+				case "aside": {
+					// a side question between runs (pi-aside 0.3.0): one request that re-sends the newest main prefix on the current model,
+					// reads what the provider still holds and refreshes it (the world's cache, as Pi's warmer's refresh does), persisted as
+					// pi-aside persists it: Pi's sessionManager.appendUsage("aside", provider, model, usage, note). No message, no hook.
+					await closeRun(ev);
+					if (!lastResp) break;
+					const m = refreshResponse(models[mi]);
+					sm.appendUsage("aside", m.provider, m.model, m.usage, "pi-aside tier=fork");
+					break;
+				}
 				case "switch":
 					await closeRun(ev);
 					mi = 1 - mi;

@@ -5,7 +5,7 @@ use pz_formal::model::{Run, Trace};
 use pz_formal::spec::all;
 use std::path::Path;
 
-fn verdicts(src: &Path, file: &str) -> Option<Vec<(&'static str, bool)>> {
+fn replay(src: &Path, file: &str) -> Option<Run> {
     if std::process::Command::new("bun").arg("--version").output().is_err() || !src.join("plan.ts").exists() || !src.join("../node_modules").exists() {
         eprintln!("skipped: bun or {} not available", src.display());
         return None;
@@ -15,7 +15,11 @@ fn verdicts(src: &Path, file: &str) -> Option<Vec<(&'static str, bool)>> {
     let pool = Pool::new(src, 1, None).unwrap();
     let obs = pool.run(std::slice::from_ref(&trace)).pop().unwrap();
     assert!(obs.ok, "bridge error: {:?}", obs.errors);
-    let run = Run::new(trace, obs);
+    Some(Run::new(trace, obs))
+}
+
+fn verdicts(src: &Path, file: &str) -> Option<Vec<(&'static str, bool)>> {
+    let run = replay(src, file)?;
     Some(all().into_iter().map(|p| (p.id, p.f.first_violation(&run).is_none())).collect())
 }
 
@@ -46,6 +50,19 @@ fn restart_with_a_summary_finished_or_running() {
             }
         }
     }
+}
+
+/// 0.4.12: a side question (pi-aside's usage entry) that read the whole prefix is a cache touch: the return a minute after it, 330 s
+/// after the last response, is planned warm and is no pause; one that found the cache gone (it read nothing) is no touch. Every
+/// property holds (no property fails on 0.4.11 here: it planned the first return cold at a warm cache, which the spec allows).
+#[test]
+fn an_aside_that_read_the_prefix_is_a_touch() {
+    let Some(run) = replay(&src(), "gc-aside.trace") else { return };
+    for p in all() {
+        assert!(p.f.first_violation(&run).is_none(), "gc-aside.trace: {} must hold", p.id);
+    }
+    assert!(run.st[2].warm && !run.st[2].believed_cold && !run.st[2].pause, "after the warm aside: {:?}", run.st[2]);
+    assert!(run.st[3].believed_cold && run.st[3].pause, "after the aside at a gone cache: {:?}", run.st[3]);
 }
 
 /// A native artifact has already paid for its call, even though the native door emits no `take` ledger record.
