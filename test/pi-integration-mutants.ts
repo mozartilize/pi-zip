@@ -342,7 +342,13 @@ const mutants = [
 		name: "survival-keeps-run-start-touch",
 		pattern: "in-run usage refreshes",
 		check: "survival samples from the newest usage touch",
-		edit: (source: string) => rep(source, 'Math.max(this.lastReqMs, lastMessageMs(this.branch(ctx ?? this.liveCtx)))', 'this.lastReqMs'),
+		edit: (source: string) => rep(source, 'Math.max(this.lastReqMs, lastMessageMs(requestBranch(this.branch(ctx ?? this.liveCtx))))', 'this.lastReqMs'),
+	},
+	{
+		name: "survival-counts-trailing-messages",
+		pattern: "in-run usage refreshes",
+		check: "survival samples from the newest usage touch",
+		edit: (source: string) => rep(source, 'lastMessageMs(requestBranch(this.branch(ctx ?? this.liveCtx)))', 'lastMessageMs(this.branch(ctx ?? this.liveCtx))'),
 	},
 ];
 const only = process.env.PZ_MUTANTS?.split(","); // run some by name

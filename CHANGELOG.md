@@ -14,7 +14,7 @@
   depend on pi-aside: it reads only Pi's entry format. Qualifying usage refreshes also count during a long tool call and
   before each survival sample. The background-summary timer rechecks the current deadline and plan when it fires, so a
   recent refresh postpones the call; the idle compaction door likewise rereads the clock and rearms. Missing or empty model
-  names never match a response's absent model alias. No new setting, no extra call; src is 5,854 lines (5,865 before).
+  names never match a response's absent model alias. No new setting, no extra call; src is 5,857 lines (5,865 before).
 
 ## 0.4.11
 

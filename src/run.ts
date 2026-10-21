@@ -7,7 +7,7 @@ import { dirname, join } from "node:path";
 import { lastMessageMs, lastPrompt, modelKey, payloadRetention, refused, ttlFor, type ColdInfo } from "./cache.ts";
 import { agentDir, curve, describe, lawPrices, loadStats, pWarm, record, sample, statsPath, GAP_EDGES, type Entry } from "./learn.ts";
 import { repairPayload } from "./guard.ts";
-import { candidateOf, decideEdits, checkEdits, clock, decideRun, inRunClock, want, decideTurnEnd, grow, headOf, planOpts, readyOf, rentOf, runPlanOf, scaleOf, unusedOf, valvePlanOf, SUMMARY_CUSTOM, type Artifact, type Avail, type Env, type Learned } from "./core.ts";
+import { candidateOf, decideEdits, checkEdits, clock, decideRun, inRunClock, requestBranch, want, decideTurnEnd, grow, headOf, planOpts, readyOf, rentOf, runPlanOf, scaleOf, unusedOf, valvePlanOf, SUMMARY_CUSTOM, type Artifact, type Avail, type Env, type Learned } from "./core.ts";
 import { fmtK, Stats, noticeDesc, noticeText, type NoticeAction, type NoticeData, type ZipControl } from "./notice.ts";
 import { applyPlanToMessages, buildBlocks, countUserTurns, G0, keepRecentTokensFor, piCanCompact, piContextTokens, reserveTokensFor, sizeOf, wireTokensOf, UNIT, type Block, type Cut, type FoldTarget, type PlanOpts, type PlanResult, type RunPlan, type Scale, type SysInfo } from "./plan.ts";
 import { handleFor, PH_MARK, RECALL_TOOL } from "./placeholder.ts";
@@ -1520,7 +1520,7 @@ export class Zip implements ZipControl {
 		// the request goes to the session's current model: a /model in the middle of a run switches it without a run start, and a
 		// request booked under the run's first model would make every later turn_end see a "model switch" (P(warm) = 0: any edit is free)
 		if (ctx?.model) this.model = ctx.model;
-		const now = Date.now(), key = modelKey(this.model), last = Math.max(this.lastReqMs, lastMessageMs(this.branch(ctx ?? this.liveCtx)));
+		const now = Date.now(), key = modelKey(this.model), last = Math.max(this.lastReqMs, lastMessageMs(requestBranch(this.branch(ctx ?? this.liveCtx))));
 		const edited = this.nextEdit !== null;
 		// the free cache signal: this response's cacheRead against what this request re-sent unchanged, after this gap (same model only)
 		this.pending = { gapS: last && (this.lastModelKey || this.prevKey) === key ? (now - last) / 1000 : -1, expect: edited ? this.nextEdit! : this.prevTotal, edited, key };
