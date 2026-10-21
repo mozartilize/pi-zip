@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { repairPayload } from "../src/guard.ts";
-import { detectCold, isColdByTtl, lastMessageMs, observedTier, payloadRetention, resolveTtl } from "../src/cache.ts";
+import { cacheActivity, detectCold, isColdByTtl, lastMessageMs, observedTier, payloadRetention, resolveTtl } from "../src/cache.ts";
 import { classifyRecoverability, isReadOnlyBash } from "../src/classify.ts";
 import { colorTail, fmtK, noticeText, renderNotice, splitDesc, type NoticeAction, type NoticeData } from "../src/notice.ts";
 import { clipMid, handleFor, makePlaceholder, makePlaceholderFor, outcomeHint, pickKeyLines, shortArgs } from "../src/placeholder.ts";
@@ -640,6 +640,21 @@ describe("a usage entry that read the whole prefix touches the cache (pi-aside)"
 	const used = (t: number, kind: string, usage: unknown, over: Record<string, unknown> = {}) =>
 		({ type: "usage", id: `u${t}`, timestamp: new Date(t).toISOString(), kind, provider: "p", model: "m", ...(usage === undefined ? {} : { usage }), ...over });
 	const base = [m("user", 1000), resp(2000)];
+	test("survival censoring follows branch order, including identical timestamps and forked suffixes", () => {
+		const write = used(2000, "any-package", { cacheWrite: 150_000 });
+		const read = used(2000, "any-other-package", { cacheRead: 150_000 });
+		expect(cacheActivity([...base, write])).toEqual({ ms: 2000, censored: true });
+		expect(cacheActivity([...base, write, read])).toEqual({ ms: 2000, censored: false });
+		expect(cacheActivity([...base, read, write])).toEqual({ ms: 2000, censored: true });
+		expect(cacheActivity([...base, write, resp(2000)])).toEqual({ ms: 2000, censored: false });
+		expect(cacheActivity([...base, write, m("user", 9000)])).toEqual({ ms: 9000, censored: true });
+		expect(cacheActivity(base)).toEqual({ ms: 2000, censored: false }); // sibling branch did not inherit the write
+		for (const over of [{ provider: "q" }, { model: "m2" }]) expect(cacheActivity([...base, { ...write, ...over }]).censored).toBe(false);
+		expect(cacheActivity([resp(2000, { responseModel: "real-id" }), { ...write, model: "real-id" }]).censored).toBe(true);
+		for (const u of [{ input: 150_000 }, { cacheRead: 75_000 }, {}, undefined]) expect(cacheActivity([...base, used(2000, "anything", u)]).censored).toBe(true);
+		expect(cacheActivity([...base, write, used(2000, "cache_warm", undefined)]).censored).toBe(false);
+	});
+
 	test("an aside that read the full prefix (cacheRead >= the response's cacheRead + cacheWrite) is a touch; one more is too", () => {
 		expect(lastMessageMs([...base, used(200_000, "aside", { input: 50, cacheRead: 150_000, cacheWrite: 0 })])).toBe(200_000);
 		expect(lastMessageMs([...base, used(200_000, "aside", { input: 50, cacheRead: 150_400, cacheWrite: 300 })])).toBe(200_000);

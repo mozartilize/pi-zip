@@ -967,3 +967,77 @@ Final repair validation: `~/.pi/durable-subagents/bin/pi-durable-subagents hold 
 `cargo test --release`: 10 unit, 7 bridge (one added), 41 mutants pass. r7-doors: typed, driven, midrun, idle and race all pass
 on Pi 1.1.0, 1.2.0 and 1.3.0; logs and isolated fixtures are in `/tmp/pz-0412-doors-2/`. Source: 5,862 at c18df84 to 5,857;
 plan.ts unchanged, no new setting. No tag, push or publication.
+
+## 0.4.13: censor survival across a possible side-request rewrite
+
+This repairs the cold-aside class documented above, without changing the oracle, trace classifications, protection windows,
+planner or cost formula. A side request can replace a dead prefix without reading it. The following main hit then proves
+that a cache exists now, not that the old cache survived the entire absence. Previously `run.ts learn` recorded that hit at
+3,660 s and a later genuinely cold return was planned warm at P = 0.80.
+
+`cache.ts cacheActivity` returns the existing touch time together with a censor flag. In branch order, any usage entry on
+the newest successful main response's real provider/model (including its existing responseModel identity) that does not
+qualify as a full-prefix read makes that interval ambiguous. It never advances the touch clock. `providerRequest` snapshots
+the flag with its gap and untouched-prefix expectation; `learn` records neither alive nor dead survival evidence for that
+interval. It still learns the cache class and session growth, and logs `cache_sample.censored` with `alive: null`.
+
+A later qualifying full-prefix read clears the flag and supplies its own observation origin. A successful main response
+also clears it, so the next clean interval learns normally. Pi's already-trusted `cache_warm` refresh retains its existing
+behavior. There is no usage-kind/package allowlist, new alias, user setting, or API call. Matching uses the same nonempty
+real model identity check as the 0.4.12 touch rule; different providers/models neither contaminate nor clear the interval.
+
+The flag is reconstructed from the current branch, not process-local timestamps or a remembered usage ID. Thus equal
+millisecond timestamps retain entry order, restarts preserve the decision, and abandoned sibling suffixes do not contaminate
+the current branch. `requestBranch` still excludes trailing unsent user/tool messages while preserving usage entries.
+A read followed by a possible rewrite at the same timestamp is censored; reversing those entries yields a clean interval.
+
+Deliberate conservative loss: every matching nonqualifying usage entry censors the next survival interval, even if it
+summarized unrelated content, read only part of the prefix, reports no write premium (automatic caching), or omits usage
+fields. Pi's usage entry does not prove where a side request's cache breakpoint was, so such a request cannot certify old
+prefix survival. Even an ensuing miss is discarded rather than inventing a dead observation at the old gap. An error/abort
+is not a new successful main-response baseline, so it can conservatively prolong censoring until a qualifying read or
+successful response. Unknown/missing identities never gain an invented match or a clock touch. Requests absent from the
+branch remain unobservable; this repair does not retroactively remove contaminated observations already persisted by older
+versions, nor infer provider-specific breakpoints from usage totals.
+
+`traces/gc-aside-rewrite.trace` pins the original GC failure on b213d10 and the repaired result. The side write's immediate
+return is still believed cold; the final actually cold return now stays cold. Every property passes on the repaired trace.
+The original `gc-aside.trace` and warm-touch assertions remain unchanged. Eight integration regressions (hit/miss, explicit
+persisted writes/automatic live writes, both Pi event orders) all fail on b213d10. Positive controls retain beyond-TTL
+survival learning after clean responses and full-prefix usage reads, ignore another model's write, and exclude unsent
+messages from the gap. Unit controls pin equal timestamps, responseModel, provider/model separation and branch suffixes.
+The focused `survival-ignores-possible-rewrite` integration mutant removes the learner's censor check and is caught by these
+regressions. Existing touch/gap mutants were retargeted only to the shared activity scan's new symbol sites.
+
+Validation on the final implementation: `bun test` 707 pass, 0 fail; TypeScript 5.9.3 `tsc --noEmit -p .` and build-check
+clean; all 55 integration mutants caught (one added). `cargo test --release --offline`: 10 unit, 8 bridge, 41 mutants pass.
+All five existing r7 doors (typed, driven, midrun, idle, race) pass on pinned Pi 1.1.0, 1.2.0 and 1.3.0, with isolated synthetic
+fixtures. Every test/measurement used the shared machine lease. The local r7 harness copy replaces process-kill cleanup
+with normal shell exit after `/quit`; its assertions and fixture generation are unchanged.
+
+Final standard comparison: 36,228 exhaustive + random 3,000, seed 1, shrink 0, configured workers 8; zero bridge errors.
+The frozen b213d10 baseline is reused from `<eval-root>/releases/0.4.12/formal-b213d10`: every checker source,
+bridge source and Cargo input is byte-identical to the final checker, and its exported candidate sources were verified
+against git b213d10. This avoids rerunning an unchanged expensive baseline. Both complete per-trace verdict files are kept;
+all 39,228 trace IDs and event counts align. The final measured source/package snapshot matches the candidate's source and
+package byte for byte; subsequent documentation/test additions do not change the measured checker or implementation.
+
+| property | b213d10 (0.4.12) | 0.4.13 | fixed traces | newly failing traces |
+|---|---:|---:|---:|---:|
+| GC | 79 | 0 | 79 | 0 |
+| A2 / A2r | 3 / 3 | 3 / 3 | 0 / 0 | 0 / 0 |
+| NR | 53 | 53 | 0 | 0 |
+| MH | 1 | 1 | 0 | 0 |
+| all other properties | 0 | 0 | 0 | 0 |
+
+Every newly failing trace by property: none. No remaining failure changes class or first-violation position. All 79 fixed GC
+trace IDs are enumerated in the local comparison JSON. The existing protected-window NR, calibration/A2 and MH classes remain
+outside this repair; this bounded result does not claim their resolution or measure live-provider economics.
+
+Evidence, exact commands, source/checker hashes, per-trace deltas, test logs and private synthetic door fixtures:
+`/tmp/pz-0413-evidence/` (mode 0700); integration mutant logs also remain in `formal/out/pi-integration-mutants/`.
+The worktree-local untracked dependency link is `node_modules -> /tmp/pz-048/node_modules`; nothing was installed.
+Source is 5,863 lines (5,857 at b213d10), below the 5,865 limit. `src/plan.ts` is byte-identical to v0.4.11:
+git blob `0fbfbd4db2fc0129354791d8d6e1fb94059e09e2`, SHA-256
+`2b3fa7a6e039352754e5980b251d95d408ed7f172375b2fb557238fba311213b`.
+This is a local review candidate only: independent owner review and release follow separately.

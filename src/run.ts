@@ -4,7 +4,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createHash } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { lastMessageMs, lastPrompt, modelKey, payloadRetention, refused, ttlFor, type ColdInfo } from "./cache.ts";
+import { cacheActivity, lastMessageMs, lastPrompt, modelKey, payloadRetention, refused, ttlFor, type ColdInfo } from "./cache.ts";
 import { agentDir, curve, describe, lawPrices, loadStats, pWarm, record, sample, statsPath, GAP_EDGES, type Entry } from "./learn.ts";
 import { repairPayload } from "./guard.ts";
 import { candidateOf, decideEdits, checkEdits, clock, decideRun, inRunClock, requestBranch, want, decideTurnEnd, grow, headOf, planOpts, readyOf, rentOf, runPlanOf, scaleOf, unusedOf, valvePlanOf, SUMMARY_CUSTOM, type Artifact, type Avail, type Env, type Learned } from "./core.ts";
@@ -144,7 +144,7 @@ export class Zip implements ZipControl {
 	private prevTotal = 0; // prompt size (input + cacheRead + cacheWrite) of the newest response, and its model
 	private prevKey = "";
 	private nextEdit: number | null = null; // the next request is the first to carry a new edit: its untouched prefix (real tokens)
-	private pending: { gapS: number; expect: number; edited: boolean; key: string } | null = null;
+	private pending: { censored: boolean; gapS: number; expect: number; edited: boolean; key: string } | null = null;
 	private rentHead = "";
 	private rent = 0; // R14: accumulated planned savings, persisted at each boundary
 	private justEdited = false; // the newest response answered a request that first carried an edit: the next request gets no warm edit
@@ -1520,10 +1520,10 @@ export class Zip implements ZipControl {
 		// the request goes to the session's current model: a /model in the middle of a run switches it without a run start, and a
 		// request booked under the run's first model would make every later turn_end see a "model switch" (P(warm) = 0: any edit is free)
 		if (ctx?.model) this.model = ctx.model;
-		const now = Date.now(), key = modelKey(this.model), last = Math.max(this.lastReqMs, lastMessageMs(requestBranch(this.branch(ctx ?? this.liveCtx))));
+		const now = Date.now(), key = modelKey(this.model), activity = cacheActivity(requestBranch(this.branch(ctx ?? this.liveCtx))), last = Math.max(this.lastReqMs, activity.ms);
 		const edited = this.nextEdit !== null;
 		// the free cache signal: this response's cacheRead against what this request re-sent unchanged, after this gap (same model only)
-		this.pending = { gapS: last && (this.lastModelKey || this.prevKey) === key ? (now - last) / 1000 : -1, expect: edited ? this.nextEdit! : this.prevTotal, edited, key };
+		this.pending = { censored: activity.censored, gapS: last && (this.lastModelKey || this.prevKey) === key ? (now - last) / 1000 : -1, expect: edited ? this.nextEdit! : this.prevTotal, edited, key };
 		this.nextEdit = null;
 		this.reqMsBefore = this.lastReqMs;
 		this.lastReqMs = now;
@@ -1597,8 +1597,8 @@ export class Zip implements ZipControl {
 		const cr = u.cacheRead ?? 0, cw = u.cacheWrite ?? 0, total = (u.input ?? 0) + cr + cw;
 		if (!(total > 0)) return;
 		const known = this.entKey === pend.key ? this.ent?.cls : undefined;
-		const alive = pend.gapS >= GAP_EDGES[0] ? sample(pend.expect, cr, total, pend.edited, cw > 0 ? "explicit" : known) : null;
-		if (pend.gapS >= GAP_EDGES[0]) this.ledger({ type: "cache_sample", gapS: Math.round(pend.gapS), expect: Math.round(pend.expect), cacheRead: cr, total, edited: pend.edited, alive });
+		const alive = !pend.censored && pend.gapS >= GAP_EDGES[0] ? sample(pend.expect, cr, total, pend.edited, cw > 0 ? "explicit" : known) : null;
+		if (pend.gapS >= GAP_EDGES[0]) this.ledger({ type: "cache_sample", gapS: Math.round(pend.gapS), expect: Math.round(pend.expect), cacheRead: cr, total, edited: pend.edited, censored: pend.censored, alive });
 		if (alive !== null || !known || (cw > 0 && known !== "explicit")) { // the file is touched only when there is something to learn
 			this.ent = record(pend.key, { explicit: cw > 0, total, gapS: pend.gapS, alive });
 			this.entKey = pend.key;

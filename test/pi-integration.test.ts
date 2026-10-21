@@ -2162,6 +2162,72 @@ describe("an aside that read the main prefix keeps the cache warm (pi-aside)", (
 	});
 });
 
+// 0.4.13: usage can replace a dead prefix without proving that the old prefix survived.
+for (const order of ORDERS) describe(`survival after a possible prefix rewrite (Pi ${order} order)`, () => {
+	for (const automatic of [false, true]) for (const hit of [false, true]) test(`possible prefix rewrite censors the old interval (${automatic ? "automatic, live" : "explicit, restart"}, ${hit ? "hit" : "miss"})`, async () => {
+		const realNow = Date.now, stats = process.env.PI_ZIP_CACHE_STATS;
+		process.env.PI_ZIP_CACHE_STATS = join(mkdtempSync(join(tmpdir(), "pz-rewrite-")), "stats.json");
+		delete process.env.PI_ZIP_TTL_SECS;
+		let now = realNow(), r: Awaited<ReturnType<typeof rig>> | undefined;
+		Date.now = () => now;
+		try {
+			const sm = SessionManager.inMemory(CWD);
+			sm.appendMessage({ ...asst([{ type: "text", text: "previous" }]), timestamp: now - 3_660_000, usage: { ...usage, cacheRead: automatic ? 150_000 : 100_000, cacheWrite: automatic ? 0 : 50_000 } });
+			const rewrite = (manager: SessionManager) => {
+				(manager as Any).appendUsage("unknown-package", "p", "m", { ...usage, input: automatic ? 150_000 : 0, cacheWrite: automatic ? 0 : 150_000 });
+				(manager.getBranch().at(-1) as Any).timestamp = new Date(now - 60_000).toISOString();
+			};
+			if (!automatic) rewrite(sm);
+			r = await rig(undefined, { file: [sm.getHeader() as Any, ...sm.getEntries()], pi: order });
+			if (automatic) rewrite(r.sm);
+			expect(r.zip.cold, "a write alone does not refresh the prefix-read clock").toBe(true);
+			const response = (read = true) => ({ ...asst([{ type: "text", text: "done" }]), timestamp: now, usage: { ...usage, input: !read && automatic ? 150_001 : 0, cacheRead: read ? 150_000 : 0, cacheWrite: automatic ? 0 : read ? 100 : 150_001 } });
+			r.zip.providerRequest({ payload: { messages: [] } }, r.zip.liveCtx);
+			expect(r.zip.pending.gapS).toBe(3660);
+			let m = response(hit);
+			r.sm.appendMessage(m);
+			r.zip.messageEnd(m);
+			expect(loadStats().models["p/m"]?.n ?? 0, "a rewritten prefix cannot teach survival across the old gap").toBe(0);
+			expect(loadStats().models["p/m"]?.cls).toBe(automatic ? "automatic" : "explicit"); // class learning still runs
+			now += 3_660_000;
+			await r.prompt();
+			expect(r.zip.cold, "a later truly cold return uses the TTL prior").toBe(true);
+			// A clean response interval still learns real beyond-TTL survival.
+			r.zip.providerRequest({ payload: { messages: [] } }, r.zip.liveCtx);
+			m = response(); r.sm.appendMessage(m); r.zip.messageEnd(m);
+			expect(loadStats().models["p/m"].n, "learning resumes after the main response").toBe(1);
+			expect(loadStats().models["p/m"].bins[15][0]).toBe(1);
+		} finally {
+			await r?.shutdown(); Date.now = realNow;
+			if (stats === undefined) delete process.env.PI_ZIP_CACHE_STATS; else process.env.PI_ZIP_CACHE_STATS = stats;
+		}
+	});
+	for (const other of [false, true]) test(`qualifying reads preserve survival learning (${other ? "different model write" : "same model read"})`, async () => {
+		const stats = process.env.PI_ZIP_CACHE_STATS, realNow = Date.now;
+		process.env.PI_ZIP_CACHE_STATS = join(mkdtempSync(join(tmpdir(), "pz-clean-read-")), "stats.json");
+		let r: Awaited<ReturnType<typeof rig>> | undefined;
+		const now = realNow(); Date.now = () => now;
+		try {
+			const sm = SessionManager.inMemory(CWD);
+			sm.appendMessage({ ...asst([{ type: "text", text: "previous" }]), timestamp: now - 3_660_000, usage: { ...usage, cacheWrite: 150_000 } });
+			r = await rig(undefined, { file: [sm.getHeader() as Any, ...sm.getEntries()], pi: order });
+			// A valid read or another model's write appended in the live process.
+			(r.sm as Any).appendUsage("any-kind", "p", other ? "another-model" : "m", { ...usage, cacheRead: other ? 0 : 150_000, cacheWrite: other ? 150_000 : 0 });
+			(r.sm.getBranch().at(-1) as Any).timestamp = new Date(now - 600_000).toISOString();
+			r.sm.appendMessage({ ...result("pending", "unsent"), timestamp: now - 10 });
+			r.sm.appendMessage({ ...user("pending"), timestamp: now - 1 });
+			r.zip.providerRequest({ payload: { messages: [] } }, r.zip.liveCtx);
+			expect(r.zip.pending.gapS).toBe(other ? 3660 : 600);
+			r.zip.messageEnd({ ...asst([{ type: "text", text: "done" }]), timestamp: now, usage: { ...usage, cacheRead: 150_000 } });
+			expect(loadStats().models["p/m"].n, "an uncontaminated interval still teaches survival").toBe(1);
+			expect(loadStats().models["p/m"].bins[other ? 15 : 10][0]).toBe(1);
+		} finally {
+			await r?.shutdown(); Date.now = realNow;
+			if (stats === undefined) delete process.env.PI_ZIP_CACHE_STATS; else process.env.PI_ZIP_CACHE_STATS = stats;
+		}
+	});
+});
+
 // Round 5: the incident (0.3.0, a warm prompt 1 min 48 s after a run that ended at 111.5K; the user waited 39 s for a summary, which went in
 // as a draft whose "Compacted from N" Pi took from the post-summary request). Rule A and the background production against Pi's own session and draft code.
 for (const order of ORDERS) describe(`round 5 on real Pi: rule A starts the warm summary early, nobody waits for it while the cache is warm (Pi ${order} order)`, () => {
