@@ -356,6 +356,12 @@ const mutants = [
 		check: "a rewritten prefix cannot teach survival across the old gap",
 		edit: (source: string) => rep(source, '!pend.censored && pend.gapS', 'pend.gapS'),
 	},
+	{
+		name: "warmer-overwrites-main-snapshot",
+		pattern: "real warmer overlap",
+		check: "main snapshot survives two real warmer refreshes",
+		edit: (source: string) => rep(rep(source, 'this.requestStart(ctx);\n\t\treturn out ?', 'return out ?'), 'providerRequest(e: Any, ctx?: Any): Any {', 'providerRequest(e: Any, ctx?: Any): Any { this.requestStart(ctx);'),
+	},
 ];
 const only = process.env.PZ_MUTANTS?.split(","); // run some by name
 for (const mutant of mutants.filter((m) => !only || only.includes(m.name))) {

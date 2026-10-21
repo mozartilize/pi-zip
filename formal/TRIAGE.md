@@ -977,7 +977,7 @@ that a cache exists now, not that the old cache survived the entire absence. Pre
 
 `cache.ts cacheActivity` returns the existing touch time together with a censor flag. In branch order, any usage entry on
 the newest successful main response's real provider/model (including its existing responseModel identity) that does not
-qualify as a full-prefix read makes that interval ambiguous. It never advances the touch clock. `providerRequest` snapshots
+qualify as a full-prefix read makes that interval ambiguous. It never advances the touch clock. The main context transform snapshots
 the flag with its gap and untouched-prefix expectation; `learn` records neither alive nor dead survival evidence for that
 interval. It still learns the cache class and session growth, and logs `cache_sample.censored` with `alive: null`.
 
@@ -1009,13 +1009,13 @@ messages from the gap. Unit controls pin equal timestamps, responseModel, provid
 The focused `survival-ignores-possible-rewrite` integration mutant removes the learner's censor check and is caught by these
 regressions. Existing touch/gap mutants were retargeted only to the shared activity scan's new symbol sites.
 
-Validation on the final implementation: `bun test` 707 pass, 0 fail; TypeScript 5.9.3 `tsc --noEmit -p .` and build-check
+Validation on 46dd866 before the owner overlap finding: `bun test` 707 pass, 0 fail; TypeScript 5.9.3 `tsc --noEmit -p .` and build-check
 clean; all 55 integration mutants caught (one added). `cargo test --release --offline`: 10 unit, 8 bridge, 41 mutants pass.
 All five existing r7 doors (typed, driven, midrun, idle, race) pass on pinned Pi 1.1.0, 1.2.0 and 1.3.0, with isolated synthetic
 fixtures. Every test/measurement used the shared machine lease. The local r7 harness copy replaces process-kill cleanup
 with normal shell exit after `/quit`; its assertions and fixture generation are unchanged.
 
-Final standard comparison: 36,228 exhaustive + random 3,000, seed 1, shrink 0, configured workers 8; zero bridge errors.
+46dd866 standard comparison (independently reviewed as sound evidence): 36,228 exhaustive + random 3,000, seed 1, shrink 0, configured workers 8; zero bridge errors.
 The frozen b213d10 baseline is reused from `<eval-root>/releases/0.4.12/formal-b213d10`: every checker source,
 bridge source and Cargo input is byte-identical to the final checker, and its exported candidate sources were verified
 against git b213d10. This avoids rerunning an unchanged expensive baseline. Both complete per-trace verdict files are kept;
@@ -1037,7 +1037,64 @@ outside this repair; this bounded result does not claim their resolution or meas
 Evidence, exact commands, source/checker hashes, per-trace deltas, test logs and private synthetic door fixtures:
 `/tmp/pz-0413-evidence/` (mode 0700); integration mutant logs also remain in `formal/out/pi-integration-mutants/`.
 The worktree-local untracked dependency link is `node_modules -> /tmp/pz-048/node_modules`; nothing was installed.
-Source is 5,863 lines (5,857 at b213d10), below the 5,865 limit. `src/plan.ts` is byte-identical to v0.4.11:
+Source at 46dd866 was 5,863 lines; the overlap repair is 5,864 (5,857 at b213d10), below the 5,865 limit. `src/plan.ts` is byte-identical to v0.4.11:
 git blob `0fbfbd4db2fc0129354791d8d6e1fb94059e09e2`, SHA-256
 `2b3fa7a6e039352754e5980b251d95d408ed7f172375b2fb557238fba311213b`.
 This is a local review candidate only: independent owner review and release follow separately.
+
+
+### Owner review repair: main requests own the learning snapshot
+
+The implementation review blocked 46dd866: Pi starts its warmer during the main stream, before the main assistant response
+ends. Refreshes replay the main request's options, including `onPayload`, so their `before_provider_request` callbacks could
+replace the main `pending` snapshot twice during a long response. A later `message_end` then consumed a refresh's censor,
+gap, untouched-prefix expectation, edit flag and model key. The original snapshot could be censored while the replacement
+was clean because the refresh itself persisted a `cache_warm` touch.
+
+The discriminator is the main-only context lifecycle, not a payload heuristic. `context_with_system` now books the main
+request after cancellation and plan application have been checked; `requestStart` stores the snapshot there. Payload hooks
+never replace or consume it. Pi's own main assistant `message_end` still consumes it once. No next-callback assumption is
+needed: even an old refresh that overlaps main preparation cannot claim the snapshot. The observation origin is main
+context preparation, before provider conversion/authentication, rather than a callback shared by main and refresh payloads.
+As before, this is a local request-start observation, not an assertion about the provider's physical cache-read instant.
+A request that throws before reaching the provider can leave an unused snapshot, but the next main context replaces it;
+error/abort responses cannot contribute a survival sample.
+
+Pinned Pi source citations (the referenced SDK and warmer files are byte-identical on Pi 1.1.0, 1.2.0 and 1.3.0):
+
+- `pi-agent-core/dist/agent-loop.js:260-275`: every main `streamAssistantResponse` transforms context before converting and
+  dispatching the request; tool continuations and retries use this path too.
+- `pi-coding-agent/dist/core/sdk.js:278-282` and `extensions/runner.js:1035-1042`: the main transform calls `emitContext`,
+  which dispatches `context_with_system`. `sdk.js:223-230` and `runner.js:1066-1078` expose only a payload at the provider hook;
+  no request identity is supplied there on these versions.
+- `sdk.js:262-272`: a main session request starts the warmer before invoking `modelRuntime.streamSimple`.
+- `cache-warmer.js:135-147` and `:237-250`: the warmer starts in phase `streaming` and calls `streamSimple` directly with
+  `{ ...run.options, maxTokens: 1, ... }`. It does not run the main context transform. Its successful result is an appended
+  `cache_warm` usage entry, not a main assistant `message_end`.
+
+These are public pinned build files under
+`<eval-root>/pi-builds/{1.1.0,1.2.0,1.3.0}/node_modules/@earendil-works/`;
+`overlap-review/pi-lifecycle-source-hashes.json` pins all cited files. `maxTokens == 1` is not used as a discriminator: a
+legitimate main request can also request one token.
+
+The associated state audit moved `nextEdit` consumption, `reqMsBefore`, main request-start `lastReqMs`, main `model` and
+`lastModelKey`, and read-savings accounting into the same main-only path. `justEdited` was already assigned only at main
+assistant completion, but now reads the correct snapshot. Warming decisions retain their independent live-clock refresh.
+Refusal rollback now includes persisted branch touches so a refused main call cannot erase an intervening successful warm.
+Provider payload repair, retention observation and relay metadata guarding continue to run for refreshes.
+
+The real-warmer overlap tests load each of the three pinned CacheWarmer implementations, use a synthetic clock/provider,
+and drive two actual refreshes at their scheduled 270-second delays during one main request. They cover censored hits,
+censored misses, an uncensored hour-gap control, edited-prefix expectations, and a refused main response after warming.
+They check the original snapshot object survives, no censored alive/dead sample is recorded, clean learning resumes,
+main rollback/savings/edit state is preserved, and orphan-result repair still applies to warming payloads. The focused
+`warmer-overwrites-main-snapshot` mutant returns ownership to the shared payload hook. Existing direct unit fixtures now
+explicitly prepare their main request; integration fixtures use Pi's context transform. All 15 overlap cases fail on
+46dd866 at the original-snapshot identity assertion, and the focused mutant is caught at that same assertion. Fixtures
+that synthesize a later cold return or a long tool gap now move their live clock together with the branch clock; their
+summary/fold and room-wait assertions are unchanged.
+
+Follow-up evidence is additive under `/tmp/pz-0413-evidence/overlap-review/`; the original 46dd866 evidence remains intact.
+Final-commit validation logs there record command exit statuses, including TypeScript, and `manifest.json` identifies the
+exact committed source and package, full test/mutant/door results and standard-suite per-trace comparison. The baseline
+continues to be the frozen b213d10 synthetic result above; no formal oracle or trace classification is changed.

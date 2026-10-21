@@ -789,6 +789,7 @@ describe("cache retention from the provider-scoped env and the request payload (
 			zip.sessionStart(ctx);
 			if (payload) {
 				await startZip(zip, ctx); // a run that sends one request with this payload ...
+				(zip as Any).requestStart(undefined);
 				zip.providerRequest({ payload });
 				zip.messageEnd({ role: "assistant", stopReason: "stop", usage: { input: 9000, cacheRead: 0, cacheWrite: 0 } });
 				(zip as Any).lastReqMs = Date.now() - gapS * 1000; // ... gapS ago

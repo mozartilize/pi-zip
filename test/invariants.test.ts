@@ -153,8 +153,10 @@ describe("I1 byte stability: every request of a run sends the same prefix, and i
 		// the cut lands at u3; the previous turn's re-readable output r5 (ls) folds by relax, in the kept part
 		const big = [U("u1", "one"), A("a1", ["c1"]), R("r1", "c1", 44_000), AX("a2", 120_000), U("u2", "two"), A("a3", ["c3"]), R("r3", "c3", 44_000), AX("a4", 120_000), U("u3", "three"), A("a5", ["c5"]), R("r5", "c5", 30_000), A("a5e"), U("u4", "back")];
 		const r = await rig(big, COLD_TS());
+		const zip = await zipOf(r);
 		r.ctx.modelRegistry = { complete: async () => ((r.ctx as Any).__done = true, { stopReason: "stop", content: [{ type: "text", text: "## Decisions\nnarrative" }], usage: { cost: { total: 0.01 } } }) };
 		await produced(r, big);
+		zip.lastReqMs = COLD_TS(); // a second cold return after the preparatory request
 		await r.prompt({});
 		const req1 = await r.fire("context_with_system", { messages: flat(big) });
 		expect(req1?.messages?.[0]?.role).not.toBe("compactionSummary");
@@ -683,9 +685,11 @@ describe("never wait: rule A starts early; a summary is used once ready; the one
 		const run = async (ageMs: number) => {
 			const st = { calls: 0, delay: 200 };
 			const r = await rig(done, WARM_TS(), { model: { provider: "p", id: "m", contextWindow: 176_576, cost: { cacheWrite: 3, cacheRead: 0.3 }, promptCache: { short: 300 } }, modelRegistry: { complete: mkComplete(st) } });
+			const zip = await zipOf(r);
 			const req = await prompt(r);
 			expect(req?.messages?.[0]?.role).not.toBe("compactionSummary"); // 0.3.1: the prompt waited (the request as it was was at the room)
 			const end = turnEnd([...back, ...tail], "r6");
+			zip.lastReqMs = Date.now() - ageMs; // the live and branch clocks describe the same synthetic tool gap
 			r.ctx.sessionManager.getBranch = () => branchOf(done, Date.now() - ageMs); // the newest response, as the in-run clock reads it
 			const t0 = Date.now();
 			const te = await r.fire("turn_end", { ...end, message: { ...end.message, timestamp: Date.now() - ageMs } });
