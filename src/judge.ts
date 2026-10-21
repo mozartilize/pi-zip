@@ -91,6 +91,124 @@ const WRITERS = new Set(["edit", "write"]);
 const stable = (v: Any): string => (Array.isArray(v) ? `[${v.map(stable).join(",")}]`
 	: v && typeof v === "object" ? `{${Object.keys(v).sort().map((k) => `${JSON.stringify(k)}:${stable(v[k])}`).join(",")}}` : JSON.stringify(v) ?? "null");
 
+export interface IndexedSlot {
+	kind: Block["kind"];
+	entryId: string | null;
+	handle: string | null;
+	locator: string | null;
+	callKey: string;
+	tool: string;
+	isError: boolean;
+	ours: boolean;
+	edited: boolean;
+	block: Block;
+}
+
+/**
+ * Incremental index of tool-result slots and deterministic supersession across tool boundaries.
+ * Appends touch only new tail blocks; prefix changes, rewinds, compactions or cwd switches rebuild from scratch.
+ */
+export class BoundaryIndex {
+	cwd = "";
+	slots: IndexedSlot[] = [];
+	readonly meta = new Map<string, IndexedSlot>();
+	readonly byCall = new Map<string, string[]>();
+	readonly byPath = new Map<string, string[]>();
+	readonly byLocator = new Map<string, Set<string>>();
+	readonly superseded = new Map<string, string>();
+	lastUserIdx = -1;
+	private duplicateHandle = false;
+
+	reset(cwd: string) {
+		this.cwd = cwd;
+		this.slots.length = 0;
+		this.meta.clear();
+		this.byCall.clear();
+		this.byPath.clear();
+		this.byLocator.clear();
+		this.superseded.clear();
+		this.lastUserIdx = -1;
+		this.duplicateHandle = false;
+	}
+
+	private appendBlock(i: number, b: Block, calls: Calls, cwd: string, newlySuperseded: string[]): string | null {
+		if (b.kind === "user") this.lastUserIdx = i;
+		if (b.kind !== "toolResult" || !b.entryId) {
+			this.slots.push({ kind: b.kind, entryId: b.entryId ?? null, handle: null, locator: null, callKey: "", tool: "", isError: false, ours: false, edited: Boolean(b.edited), block: b });
+			return null;
+		}
+		const call = calls.get(b.msg.toolCallId), tool = call?.name ?? b.msg.toolName ?? "";
+		if (tool === RECALL_TOOL) {
+			this.slots.push({ kind: b.kind, entryId: b.entryId, handle: null, locator: null, callKey: "", tool, isError: Boolean(b.msg?.isError), ours: Boolean(b.ours), edited: Boolean(b.edited), block: b });
+			return null;
+		}
+		const h = handleFor(b.entryId), loc = locatorOf(call?.args, cwd);
+		if (this.meta.has(h)) this.duplicateHandle = true;
+		const callKey = tool ? `${tool}\0${stable(call?.args ?? null)}` : "";
+		const isError = Boolean(b.msg?.isError), ours = Boolean(b.ours), edited = Boolean(b.edited);
+		const slot: IndexedSlot = { kind: b.kind, entryId: b.entryId, handle: h, locator: loc, callKey, tool, isError, ours, edited, block: b };
+		this.slots.push(slot);
+		this.meta.set(h, slot);
+		if (loc) {
+			let set = this.byLocator.get(loc);
+			if (!set) { set = new Set(); this.byLocator.set(loc, set); }
+			set.add(h);
+		}
+		if (!ours && tool) {
+			if (!isError) {
+				for (const old of this.byCall.get(callKey) ?? []) { this.superseded.set(old, h); newlySuperseded.push(old); }
+				this.byCall.set(callKey, []);
+				if (loc && WRITERS.has(tool)) {
+					for (const old of this.byPath.get(loc) ?? []) { this.superseded.set(old, h); newlySuperseded.push(old); }
+					this.byPath.set(loc, []);
+				}
+			}
+			this.byCall.get(callKey)?.push(h) ?? this.byCall.set(callKey, [h]);
+			if (loc) this.byPath.get(loc)?.push(h) ?? this.byPath.set(loc, [h]);
+		}
+		return h;
+	}
+
+	sync(blocks: readonly Block[], calls: Calls, cwd: string): { rebuilt: boolean; editedChanged: string[]; appended: string[]; newlySuperseded: string[] } {
+		const prevLen = this.slots.length;
+		let canAppend = !this.duplicateHandle && prevLen > 0 && cwd === this.cwd && blocks.length >= prevLen;
+		const editedChanged: string[] = [], appended: string[] = [], newlySuperseded: string[] = [];
+		if (canAppend) {
+			for (let i = 0; i < prevLen; i++) {
+				const b = blocks[i], s = this.slots[i];
+				if (b.kind !== s.kind || (b.entryId ?? null) !== s.entryId) { canAppend = false; break; }
+				if (b.kind === "toolResult" && s.entryId) {
+					if (!s.handle) { s.block = b; continue; }
+					if (Boolean(b.ours) !== s.ours || Boolean(b.msg?.isError) !== s.isError) { canAppend = false; break; }
+					const edited = Boolean(b.edited);
+					if (edited !== s.edited) { s.edited = edited; editedChanged.push(s.handle); }
+				}
+				s.block = b;
+			}
+		}
+		if (!canAppend) {
+			this.reset(cwd);
+			for (let i = 0; i < blocks.length; i++) {
+				const h = this.appendBlock(i, blocks[i], calls, cwd, newlySuperseded);
+				if (h) appended.push(h);
+			}
+			return { rebuilt: true, editedChanged, appended, newlySuperseded };
+		}
+		for (let i = prevLen; i < blocks.length; i++) {
+			const h = this.appendBlock(i, blocks[i], calls, cwd, newlySuperseded);
+			if (h) appended.push(h);
+		}
+		return { rebuilt: false, editedChanged, appended, newlySuperseded };
+	}
+}
+
+function diffMapKeys(a: ReadonlyMap<string, string>, b: ReadonlyMap<string, string>): string[] {
+	const out: string[] = [];
+	for (const [k, v] of a) if (b.get(k) !== v) out.push(k);
+	for (const k of b.keys()) if (!a.has(k)) out.push(k);
+	return out;
+}
+
 /**
  * Outputs that a later successful call made obsolete, mapped to the handle of that call. Exact rules only, no model:
  * - The same tool with the same arguments ran again: the newer output is the current one.
@@ -490,6 +608,10 @@ export class Judge {
 	private lastReq = -Infinity;
 	private sentTokens = new Map<string, number>();
 	private observed = new Map<string, string>();
+	private citedFolded = new Set<string>();
+	private prevRefs: { handles: Map<string, string>; locators: Map<string, string> } = { handles: new Map(), locators: new Map() };
+	private prevRecalled = new Set<string>();
+	private readonly index = new BoundaryIndex();
 	private controller: AbortController | null = null;
 	private pending: Promise<void> | null = null;
 	private pendingHandles = new Set<string>();
@@ -513,7 +635,7 @@ export class Judge {
 	restoreHinted(handles: Iterable<string>) { for (const h of handles) if (typeof h === "string") this.hinted.add(h); }
 	labels(reqCount: number, scope: string): ReadonlyMap<string, Verdict> | undefined {
 		if (!this.enabled || this.disabled || scope !== this.scope) return undefined;
-		const out = new Map([...this.verdicts].filter(([, x]) => reqCount - x.atReq <= 20).map(([h, x]) => [h, x.v]));
+		const out = new Map([...this.verdicts].filter(([, x]) => x.fixed || reqCount - x.atReq <= 20).map(([h, x]) => [h, x.v]));
 		return out.size ? out : undefined;
 	}
 
@@ -552,7 +674,8 @@ export class Judge {
 
 	maybeRun(ctx: Any, blocks: Block[], calls: Calls, firstPrompt: string, reqCount: number, contextTokens: number, coldCap: number, opts: PlanOpts = { cwd: ctx?.cwd ?? "" }) {
 		if (!this.enabled || !this.run || this.disabled) return;
-		const cwd = opts.cwd, scope = latestUserText(blocks);
+		const cwd = opts.cwd, synced = this.index.sync(blocks, calls, cwd);
+		const scope = this.index.lastUserIdx >= 0 ? textOf(blocks[this.index.lastUserIdx].msg.content) : "";
 		const scopeChanged = this.scope !== "\0" && scope !== this.scope;
 		let invalidatePending = scopeChanged;
 		if (scopeChanged) {
@@ -560,46 +683,71 @@ export class Judge {
 			this.consumed = true;
 		}
 		this.scope = scope;
-		const refs = workReferences(blocks, cwd), live = new Map<string, Block>(), citedFolded = new Set<string>();
+		const refs = workReferences(blocks, cwd);
 		const invalidate = (h: string) => { this.verdicts.delete(h); if (this.pendingHandles.has(h)) invalidatePending = true; };
-		for (const b of blocks) {
-			if (b.kind !== "toolResult" || !b.entryId || (calls.get(b.msg.toolCallId)?.name ?? b.msg.toolName) === RECALL_TOOL) continue;
-			const h = handleFor(b.entryId), loc = locatorOf(calls.get(b.msg.toolCallId)?.args, cwd);
-			live.set(h, b);
-			const reference = `${refs.handles.get(h) ?? ""}|${loc ? refs.locators.get(loc) ?? "" : ""}`;
-			const state = `${b.edited}|${reference}`;
+		const observe = (h: string, slot: IndexedSlot) => {
+			const reference = `${refs.handles.get(h) ?? ""}|${slot.locator ? refs.locators.get(slot.locator) ?? "" : ""}`;
+			const state = `${slot.edited}|${reference}`;
 			if ((this.observed.has(h) && this.observed.get(h) !== state) || opts.recalled?.has(h)) invalidate(h);
 			this.observed.set(h, state);
-			if (b.edited && reference !== "|" && !opts.recalled?.has(h) && !this.hinted.has(h)) citedFolded.add(h);
+			if (slot.edited && reference !== "|" && !opts.recalled?.has(h) && !this.hinted.has(h)) this.citedFolded.add(h);
+			else this.citedFolded.delete(h);
+		};
+		const touched = new Set<string>();
+		if (synced.rebuilt) {
+			this.citedFolded.clear();
+			for (const [h, slot] of this.index.meta) { touched.add(h); observe(h, slot); }
+			for (const h of new Set([...this.observed.keys(), ...this.verdicts.keys(), ...this.catalogue.keys()])) if (!this.index.meta.has(h)) {
+				invalidate(h); this.observed.delete(h); this.sentTokens.delete(h); this.catalogue.delete(h);
+			}
+		} else {
+			for (const h of synced.appended) touched.add(h);
+			for (const h of synced.editedChanged) touched.add(h);
+			for (const h of diffMapKeys(this.prevRefs.handles, refs.handles)) if (this.index.meta.has(h)) touched.add(h);
+			for (const loc of diffMapKeys(this.prevRefs.locators, refs.locators)) {
+				for (const h of this.index.byLocator.get(loc) ?? []) touched.add(h);
+			}
+			for (const h of opts.recalled ?? []) if (this.index.meta.has(h)) touched.add(h);
+			for (const h of this.prevRecalled) if (this.index.meta.has(h)) touched.add(h);
+			for (const h of touched) observe(h, this.index.meta.get(h)!);
+			for (const h of this.citedFolded) if (this.hinted.has(h)) this.citedFolded.delete(h);
 		}
-		for (const h of new Set([...this.observed.keys(), ...this.verdicts.keys(), ...this.catalogue.keys()])) if (!live.has(h)) {
-			invalidate(h); this.observed.delete(h); this.sentTokens.delete(h); this.catalogue.delete(h);
-		}
+		this.prevRefs = refs;
+		this.prevRecalled = new Set(opts.recalled ?? []);
 		if (invalidatePending) { this.generation++; this.controller?.abort(); }
 		// Superseded outputs are cold by rule, at every boundary and below every gate: no model call is needed or asked for them.
-		const superseded = supersededOutputs(blocks, calls, cwd);
-		for (const [h, v] of this.verdicts) if (v.fixed && !superseded.has(h)) this.verdicts.delete(h);
-		for (const h of superseded.keys()) {
-			const b = live.get(h);
-			if (b) this.verdicts.set(h, { v: "cold", atReq: reqCount, locator: locatorOf(calls.get(b.msg.toolCallId)?.args, cwd), nOk: false, fixed: true });
+		const superseded = this.index.superseded;
+		if (synced.rebuilt) {
+			for (const [h, v] of this.verdicts) if (v.fixed && !superseded.has(h)) this.verdicts.delete(h);
+		}
+		const fixedTargets = synced.rebuilt || scopeChanged
+			? superseded.keys()
+			: new Set([...synced.newlySuperseded, ...[...touched].filter((h) => superseded.has(h))]);
+		for (const h of fixedTargets) {
+			const slot = this.index.meta.get(h);
+			if (slot) this.verdicts.set(h, { v: "cold", atReq: reqCount, locator: slot.locator, nOk: false, fixed: true });
 		}
 		// Observe invalidations even below pressure/cadence gates and while a provider is still running.
 		if (this.pending || this.failures >= 2 || contextTokens < 0.8 * coldCap) return;
-		const stale = (h: string) => !this.verdicts.has(h) || reqCount - this.verdicts.get(h)!.atReq > 20;
+		const stale = (h: string) => !this.verdicts.has(h) || (!this.verdicts.get(h)!.fixed && reqCount - this.verdicts.get(h)!.atReq > 20);
+		const handleOf = (b: Block) => (b.idx !== undefined && this.index.slots[b.idx]?.entryId === b.entryId && this.index.slots[b.idx]?.handle) || handleFor(b.entryId!);
 		const eligible = [...new Set(foldCandidates(blocks, calls, opts).flat())]
-			.filter((b) => b.age >= this.judgeAge && stale(handleFor(b.entryId!)));
-		const selected = new Set([...citedFolded].filter(stale));
+			.filter((b) => b.age >= this.judgeAge && stale(handleOf(b)));
+		const selected = new Set([...this.citedFolded].filter(stale));
 		const foldedHit = selected.size > 0;
 		if (eligible.length < 5 && !foldedHit) return;
 		const growth = (handles: Iterable<string>) => {
 			let tokens = 0;
-			for (const h of handles) { const b = live.get(h)!; tokens += Math.max(0, tok4(textOf((b.raw ?? b.msg).content)) - (this.sentTokens.get(h) ?? 0)); }
+			for (const h of handles) {
+				const b = this.index.meta.get(h)?.block;
+				if (b) tokens += Math.max(0, tok4(textOf((b.raw ?? b.msg).content)) - (this.sentTokens.get(h) ?? 0));
+			}
 			return tokens;
 		};
 		// Reject cheap cadence misses before constructing any placeholders or catalogue rows.
-		if (reqCount - this.lastReq < 8 && growth(new Set([...selected, ...eligible.map((b) => handleFor(b.entryId!))])) < 10_000) return;
-		for (const b of eligible) if (foldPlaceholder(b, calls, opts)) selected.add(handleFor(b.entryId!));
-		const eligibleCount = selected.size - (foldedHit ? [...selected].filter((h) => citedFolded.has(h)).length : 0);
+		if (reqCount - this.lastReq < 8 && growth(new Set([...selected, ...eligible.map(handleOf)])) < 10_000) return;
+		for (const b of eligible) if (foldPlaceholder(b, calls, opts)) selected.add(handleOf(b));
+		const eligibleCount = selected.size - (foldedHit ? [...selected].filter((h) => this.citedFolded.has(h)).length : 0);
 		if (eligibleCount < 5 && !foldedHit) return;
 		const addedTokens = growth(selected);
 		if (reqCount - this.lastReq < 8 && addedTokens < 10_000) return;
@@ -612,7 +760,7 @@ export class Judge {
 		this.controller = controller; this.pendingHandles = input.manifest;
 		const meta = new Map([...input.manifest].map((h) => [h, { folded: input.folded.has(h), locator: input.catalogue.get(h)?.locator ?? null }]));
 		const why = { protocol: JUDGE_PROTOCOL, reqCount, superseded: superseded.size, eligible: eligibleCount, foldedHit, scopeChanged, known: input.manifest.size, folded: input.folded.size,
-			reused: [...this.verdicts].filter(([h, v]) => !input.manifest.has(h) && reqCount - v.atReq <= 20).length,
+			reused: [...this.verdicts].filter(([h, v]) => !input.manifest.has(h) && (v.fixed || reqCount - v.atReq <= 20)).length,
 			addedTokens, evidence: input.evidence.length, inputTokens: tok4(input.text + JUDGE_SYSTEM) };
 		this.pending = this.complete(ctx, input.text, input.manifest, input.evidence, meta, scope, reqCount, generation, controller, why)
 			.finally(() => { this.pending = null; this.pendingHandles = new Set(); if (this.controller === controller) this.controller = null; });
