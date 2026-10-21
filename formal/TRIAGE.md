@@ -939,3 +939,31 @@ pause, and the previous turn's re-readable output folded at a warm cache); after
 v0.4.11 there: the spec asks that a gone cache be planned cold, not that a warm one be planned warm.
 
 `cargo test --release`: 10 unit + 6 bridge + 41 mutants pass.
+
+### Repair after the review of c18df84
+
+Three reproduced findings are fixed: the producer timer reselects its deadline and plan from the live branch rather than
+using its captured gap; in-run clocks keep qualifying usage entries and survival reads the latest touch before each request;
+missing or empty model strings cannot match an absent responseModel alias. A shared requestBranch view removes only trailing
+non-assistant messages, keeping usage entries, so a tool result or the pending prompt cannot shorten the survival sample.
+The idle door already reads the current clock; new regressions under both Pi event orders pin its rearm after a usage touch.
+
+The producer, in-run, and missing-model regressions fail against c18df84. Four integration mutants cover a stale producer
+deadline, discarded in-run usage, survival using the old request clock, and survival incorrectly counting trailing messages.
+The producer regression allows sub-millisecond rounding when a fractional deadline becomes an ISO entry timestamp.
+
+The bridge now observes narrative call start times. On producer-touch.trace, c18df84 starts a summary at trace time 330 s,
+11 s after the usage touch. The repaired code makes no such call; it eventually starts at 645 s after the next main response's
+cache lifetime. A bridge assertion pins both the postponement and eventual production. The existing producer-overlap mutant
+now targets the shared production path after removal of the duplicated callback selection.
+
+This is bounded validation: the 39,228-trace table above describes the original 0.4.12 change, not these repairs. No new broad
+checker comparison was run. The alphabet cannot place a usage entry during a long tool call (call includes its tool result,
+wait ends the run); unit and real-Pi integration tests cover that case. The previously documented cold-cache rewrite/survival
+issue remains outside this repair. The owner's G11 replay must be rerun on the final repair commit.
+
+Final repair validation: `~/.pi/durable-subagents/bin/pi-durable-subagents hold machine --shared -- bun test`: 694 pass,
+0 fail (six added regressions); TypeScript 5 `tsc --noEmit -p .` clean; all 54 integration mutants caught (four added).
+`cargo test --release`: 10 unit, 7 bridge (one added), 41 mutants pass. r7-doors: typed, driven, midrun, idle and race all pass
+on Pi 1.1.0, 1.2.0 and 1.3.0; logs and isolated fixtures are in `/tmp/pz-0412-doors-2/`. Source: 5,862 at c18df84 to 5,857;
+plan.ts unchanged, no new setting. No tag, push or publication.

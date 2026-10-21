@@ -2117,7 +2117,7 @@ describe("an aside that read the main prefix keeps the cache warm (pi-aside)", (
 			expect(r.zip.bg, "a fresh touch postpones the producer deadline").toBeNull();
 			const next = callbacks.get(r.zip.timer)!;
 			expect(next.due).toBeGreaterThan(now);
-			expect(next.due - old.due).toBeCloseTo(old.due - (file.filter((e) => e.message?.role === "assistant").at(-1)!.message.timestamp) - 10_000, 0);
+			expect(Math.abs(next.due - old.due - (old.due - file.filter((e) => e.message?.role === "assistant").at(-1)!.message.timestamp - 10_000))).toBeLessThan(2); // ISO timestamps truncate sub-millisecond deadlines
 			clearTimeout(r.zip.timer);
 			now = next.due + 1;
 			await next.fire();
@@ -2138,9 +2138,10 @@ describe("an aside that read the main prefix keeps the cache warm (pi-aside)", (
 			Date.now = () => start;
 			r.zip.providerRequest({ payload: { messages: [] } }, r.zip.liveCtx);
 			r.sm.appendMessage({ ...asst([call("long-tool")], "toolUse"), timestamp: start, usage: { ...usage, cacheRead: 150_000 } });
-			r.sm.appendMessage({ ...result("long-tool", "done"), timestamp: start + 398_000 });
+			r.sm.appendMessage({ ...result("long-tool", "done"), timestamp: start + 408_000 });
 			(r.sm as Any).appendUsage("another-extension", "p", "m", { ...usage, cacheRead: 150_000 });
 			(r.sm.getBranch().at(-1) as Any).timestamp = new Date(start + 399_000).toISOString();
+			r.sm.appendMessage({ ...user("steer during the tool call"), timestamp: start + 408_500 });
 			Date.now = () => start + 409_000;
 			const source = process.env.PI_ZIP_TEST_SRC ?? fileURLToPath(new URL("../src", import.meta.url));
 			const { inRunClock } = await import(join(source, "core.ts"));
