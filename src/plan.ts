@@ -658,7 +658,7 @@ export function foldCandidates(blocks: Block[], calls: Calls, o: PlanOpts): [Blo
 	let start = 0;
 	for (const b of blocks) {
 		const pos = start; start += b.tokens;
-		if (b.kind !== "toolResult" || b.edited || !b.entryId || pos < head || o.recalled?.has(handleFor(b.entryId))) continue;
+		if (b.kind !== "toolResult" || b.edited || !b.entryId || pos < head || (o.recalled?.size ? o.recalled.has(handleFor(b.entryId)) : false)) continue;
 		const text = textOf((b.raw ?? b.msg).content);
 		if (tok4(text) <= (o.foldMin ?? s.foldMin)) continue;
 		const call = calls.get(b.msg.toolCallId), name = call?.name ?? b.msg.toolName;
@@ -677,7 +677,7 @@ export function foldCandidates(blocks: Block[], calls: Calls, o: PlanOpts): [Blo
 
 /** A useful, recallable replacement; ranking cannot bypass the planner's saving check. */
 export function foldPlaceholder(b: Block, calls: Calls, o: PlanOpts): { ph: string; phTok: number } | null {
-	if (!b.entryId || o.recalled?.has(handleFor(b.entryId))) return null;
+	if (!b.entryId || (o.recalled?.size ? o.recalled.has(handleFor(b.entryId)) : false)) return null;
 	const ph = makePlaceholderFor(b, calls, o.keepLines ?? settings().keepLines, !!o.rereadOnly, o.fileRecall);
 	if (ph === null) return null;
 	const phTok = tokensOf({ ...b.msg, content: [{ type: "text", text: ph }] });

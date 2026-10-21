@@ -1455,12 +1455,14 @@ export class Zip implements ZipControl {
 		if (!this.active()) return undefined;
 		try {
 			const fresh = this.collectSteer(e); // marked before anything is validated: a steering message is part of its turn
+			const blocks = buildBlocks(e.context?.contextEntries ?? [], this.steerIds);
+			for (const h of recalledHandlesFromBranch(this.branch(ctx))) this.recalled.add(h);
 			try {
-				this.judgeBoundary(e, ctx); // invalidate old advice before this boundary's planner reads it
+				this.judgeBoundary(e, ctx, blocks); // invalidate old advice before this boundary's planner reads it
 			} catch (err) {
 				this.ledger({ type: "error", where: "judge", error: errText(err) }); // never drop this turn's edits for an optional hint
 			}
-			const out = await this.onTurnEnd(e, ctx);
+			const out = await this.onTurnEnd(e, ctx, blocks);
 			const previousRent = rentOf(this.branch(ctx));
 			const recs = [...this.drafts(), ...(this.rent !== previousRent ? [{ type: "custom", customType: "pi-zip/rent", data: { rent: this.rent } }] : [])]; // summaries recorded during the run, after the turn's edits (a compaction goes first)
 			if (!fresh.length && !recs.length) return out;
@@ -1472,9 +1474,9 @@ export class Zip implements ZipControl {
 		}
 	}
 
-	private judgeBoundary(e: Any, ctx: Any) {
+	private judgeBoundary(e: Any, ctx: Any, blocks = buildBlocks(e.context.contextEntries, this.steerIds)) {
 		if (!this.judge.enabled || !this.inRun || !this.active() || e.message?.stopReason !== "toolUse") return;
-		const entries = e.context.contextEntries, blocks = buildBlocks(entries, this.steerIds);
+		const entries = e.context.contextEntries;
 		const { o, cal: sc } = this.opts(ctx, false, entries, 1, false);
 		this.judge.maybeRun(ctx, blocks, toolCallIndex(blocks), this.judgePrompt, this.judgeReq,
 			sizeOf(sc, blocks.reduce((n, b) => n + b.tokens, 0)), coldTarget(settings().coldCap, sc.O, compactionRoom(ctx.model, this.reserve(ctx))), o);
@@ -1494,23 +1496,20 @@ export class Zip implements ZipControl {
 		return ids;
 	}
 
-	private async onTurnEnd(e: Any, ctx: Any) {
+	private async onTurnEnd(e: Any, ctx: Any, prebuilt?: Block[]) {
 		const msg: Any = e.message;
 		const failed = msg?.stopReason === "error" || msg?.stopReason === "aborted";
 		const t0 = performance.now();
-		const blocks = buildBlocks(e.context.contextEntries, this.steerIds);
+		const blocks = prebuilt ?? buildBlocks(e.context.contextEntries, this.steerIds), branch = this.branch(ctx);
+		if (!prebuilt) for (const h of recalledHandlesFromBranch(branch)) this.recalled.add(h);
 		if (!blocks.length) return undefined;
 		const userTurns = countUserTurns(blocks);
 		const u = msg?.usage;
 		const usageTotal = u ? (u.input ?? 0) + (u.cacheRead ?? 0) + (u.cacheWrite ?? 0) : 0;
 		const o = { t0, blocks, userTurns, usageTotal };
 		// P(warm) in-run: the learned curve at the time since the newest response (a long tool call is an absence like any other)
-		const m = ctx?.model ?? this.model, branch = this.branch(ctx);
+		const m = ctx?.model ?? this.model;
 		const touch = Math.max(this.lastReqMs, msg?.stopReason === "error" ? 0 : Number(msg?.timestamp) || 0); // the response that ended this turn is the newest touch
-		// a recall made in this run by a built-in tool on a recall file (file recall) is in the branch only: zip_recall's own hook
-		// marks its handles at once, a read, grep or bash of a recall file would otherwise be folded again at this turn_end, by its
-		// decision or its room wait (RC)
-		for (const h of recalledHandlesFromBranch(branch)) this.recalled.add(h);
 		const clk = inRunClock(branch, { model: m, ent: this.entKey === modelKey(m) ? this.ent : undefined, tier: this.tier(m) }, Date.now(), { reqMs: touch, modelKey: this.lastModelKey });
 		const pIn = clk.pWarm;
 		// the notice's "why now" says what this decision assumed (P(warm) at this turn_end), not the run's start

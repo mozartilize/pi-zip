@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
-import { Judge, judgeInput, supersededOutputs, parseFacts, parseEvidence, parseVerdict, judgeModelRef, judgeReasoning, hintText, requestOpen, locatorOf, citesWork, latestUserText, JUDGE_SYSTEM, NEED_CUSTOM, CATALOGUE_TOKENS, type EvidenceSpan } from "../src/judge.ts";
+import { BoundaryIndex, Judge, judgeInput, supersededOutputs, parseFacts, parseEvidence, parseVerdict, judgeModelRef, judgeReasoning, hintText, requestOpen, locatorOf, citesWork, latestUserText, JUDGE_SYSTEM, NEED_CUSTOM, CATALOGUE_TOKENS, type EvidenceSpan } from "../src/judge.ts";
 import { buildBlocks, countUserTurns, foldCandidates, foldPlaceholder, plan, planContext, toolCallIndex, UNIT, type PlanOpts } from "../src/plan.ts";
 import { checkEdits, decideEdits } from "../src/core.ts";
 import { handleFor, PH_MARK } from "../src/placeholder.ts";
@@ -193,6 +193,103 @@ describe("evidence rows and supersession", () => {
 		// Without the repeat (pruned), the rule no longer holds and the fixed label goes.
 		r.run(41, r.blocks, 1000);
 		expect(r.judge.verdicts.get(h(1))?.fixed).toBeFalsy();
+	});
+
+	test("BoundaryIndex matches full supersededOutputs across append, rewind, prefix-cut, fold, error and cwd traces", () => {
+		let seed = 0x5eed1234;
+		const rand = (n: number) => {
+			seed = (seed + 0x6d2b79f5) | 0;
+			let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+			t ^= t + Math.imul(t ^ (t >>> 7), 61 | t);
+			return ((t ^ (t >>> 14)) >>> 0) % n;
+		};
+		const idx = new BoundaryIndex(), r = rig();
+		const tools = ["read", "edit", "write", "grep", "bash", "zip_recall"] as const;
+		const paths = ["/w/src/a.ts", "./src/a.ts", "/w/src/b.ts", "./src/b.ts", "/w/src/c.ts"] as const;
+		let rounds: Any[][] = [[U("u0", "trace")]], cwd = "/w", nextId = 1;
+		for (let step = 0; step < 120; step++) {
+			const op = rand(10);
+			if (op < 6 || rounds.length <= 2) {
+				const id = `t${nextId++}`, tool = tools[rand(tools.length)], p = paths[rand(paths.length)];
+				const flipKeys = rand(2) === 1, off = rand(3) * 20, isErr = rand(4) === 0;
+				const args = tool === "bash" ? { command: `test ${off}` }
+					: tool === "zip_recall" ? { handle: "aaaaaaaaaa" }
+					: flipKeys ? { offset: off, path: p } : { path: p, offset: off };
+				const pair = round(id, tool, args, isErr);
+				rounds.push(pair);
+			} else if (op === 6 && rounds.length > 3) {
+				rounds = rounds.slice(0, rounds.length - (1 + rand(Math.min(4, rounds.length - 2))));
+			} else if (op === 7 && rounds.length > 4) {
+				rounds = [rounds[0], ...rounds.slice(2 + rand(2))];
+			} else if (op === 8) {
+				cwd = cwd === "/w" ? "/w/sub" : "/w";
+			}
+			const bs = buildBlocks(rounds.flat());
+			if (op === 9 && bs.length > 2) {
+				const tr = bs.filter((b) => b.kind === "toolResult");
+				if (tr.length) {
+					const target = tr[rand(tr.length)];
+					target.edited = !target.edited;
+					if (rand(2) === 1) target.ours = target.edited;
+				}
+			}
+			const calls = toolCallIndex(bs);
+			idx.sync(bs, calls, cwd);
+			r.run(step + 1, bs, 1000, { cwd });
+			const oracle = Object.fromEntries(supersededOutputs(bs, calls, cwd));
+			expect(Object.fromEntries(idx.superseded)).toEqual(oracle);
+			const fixed = Object.fromEntries([...r.judge.verdicts].filter(([, v]) => v.fixed).map(([k, v]) => [k, v.v]));
+			expect(fixed).toEqual(Object.fromEntries(Object.keys(oracle).map((k) => [k, "cold"])));
+		}
+	});
+
+	test("incremental append boundaries preserve fixed verdicts across prefix fold, reference shifts, scope changes and >20-req TTL", async () => {
+		const r = rig(async () => textReply(`${h(1)} C E1\n${h(2)} H E1\n${h(3)} H E1\n${h(4)} H E1`));
+		// Round 4 reads a file with a path locator; round 25 repeats round 1 ("ls d1"), superseding h(1).
+		const entries = [...longTurn(24), A("a25", ["c25"]), R("r25", "c25", 0, "z".repeat(3000))];
+		((entries[7] as Any).messages[0].content[1]).name = "read";
+		((entries[7] as Any).messages[0].content[1]).arguments = { path: "/w/src/target.ts" };
+		((entries.at(-2) as Any).messages[0].content[1]).arguments = { command: "ls d1" };
+		let bs = buildBlocks(entries);
+		r.run(25, bs, 40_000, { inturnAge: 10 }); await r.judge.running;
+		expect(r.judge.verdicts.get(h(1))?.fixed).toBe(true);
+		expect(r.judge.verdicts.get(h(2))?.v).toBe("hot");
+		expect(r.judge.verdicts.get(h(3))?.v).toBe("hot");
+		expect(r.judge.verdicts.get(h(4))?.v).toBe("hot");
+
+		// 1. In-place prefix fold on an append boundary: h(1) is folded (edited flips, ours stays false) and h(2) is folded.
+		// h(2)'s live verdict must invalidate, while h(1)'s fixed cold verdict must survive its own invalidation.
+		entries.push(A("a26", ["c26"]), R("r26", "c26", 0, "z".repeat(3000)));
+		bs = buildBlocks(entries);
+		bs.find((b) => b.entryId === "r1")!.edited = true;
+		bs.find((b) => b.entryId === "r2")!.edited = true;
+		r.run(26, bs, 1000);
+		expect(r.judge.verdicts.get(h(2))).toBeUndefined();
+		expect(r.judge.verdicts.get(h(1))).toMatchObject({ v: "cold", fixed: true });
+
+		// 2. Tail prose cites unchanged prefix handle h(3), locator of h(4), and superseded handle h(1) on an append boundary:
+		// h(3) and h(4) live verdicts must invalidate; h(1)'s fixed cold verdict must still hold.
+		entries.push(A("a27", []));
+		(entries.at(-1) as Any).messages[0].content = [{ type: "text", text: `Inspect ${h(3)}, /w/src/target.ts and ${h(1)}` }];
+		bs = buildBlocks(entries);
+		bs.find((b) => b.entryId === "r1")!.edited = true;
+		bs.find((b) => b.entryId === "r2")!.edited = true;
+		r.run(27, bs, 1000);
+		expect(r.judge.verdicts.get(h(3))).toBeUndefined();
+		expect(r.judge.verdicts.get(h(4))).toBeUndefined();
+		expect(r.judge.verdicts.get(h(1))).toMatchObject({ v: "cold", fixed: true });
+
+		// 3. Advancing >20 requests without new superseding calls must not expire fixed cold verdicts in labels() or stale().
+		r.run(60, bs, 1000);
+		expect(r.judge.labels(60, latestUserText(bs))?.get(h(1))).toBe("cold");
+
+		// 4. Appending a new user turn (scopeChanged on an append boundary) clears model verdicts but restores fixed supersession verdicts.
+		entries.push(U("u2", "next task"));
+		bs = buildBlocks(entries);
+		bs.find((b) => b.entryId === "r1")!.edited = true;
+		bs.find((b) => b.entryId === "r2")!.edited = true;
+		r.run(61, bs, 1000);
+		expect(r.judge.labels(61, "next task")?.get(h(1))).toBe("cold");
 	});
 });
 
