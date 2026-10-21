@@ -325,6 +325,25 @@ const mutants = [
 		check: "an aside that read the whole prefix keeps the cache warm",
 		edit: (source: string) => rep(source, '(en.kind === "cache_warm" || readPrefix(en, resp))', 'en.kind === "cache_warm"'),
 	},
+	{
+		name: "producer-keeps-stale-touch-deadline",
+		pattern: "producer deadline moves",
+		check: "a fresh touch postpones the producer deadline",
+		edit: (source: string) => rep(source, 'this.want("timer", ctx); // re-read touches, deadline and plan after the timer (or an aborted call) waited', 'this.startBg(w.p, ctx);'),
+	},
+	{
+		name: "in-run-clock-drops-usage",
+		file: "core.ts",
+		pattern: "in-run usage refreshes",
+		check: "the in-run clock keeps a qualifying usage touch",
+		edit: (source: string) => rep(source, 'branch.filter((e, i) => i < n || e?.type !== "message")', 'branch.slice(0, n)'),
+	},
+	{
+		name: "survival-keeps-run-start-touch",
+		pattern: "in-run usage refreshes",
+		check: "survival samples from the newest usage touch",
+		edit: (source: string) => rep(source, 'Math.max(this.lastReqMs, lastMessageMs(this.branch(ctx ?? this.liveCtx)))', 'this.lastReqMs'),
+	},
 ];
 const only = process.env.PZ_MUTANTS?.split(","); // run some by name
 for (const mutant of mutants.filter((m) => !only || only.includes(m.name))) {

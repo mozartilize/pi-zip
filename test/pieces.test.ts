@@ -661,6 +661,12 @@ describe("a usage entry that read the whole prefix touches the cache (pi-aside)"
 		expect(lastMessageMs([m("user", 1000), resp(2000, { responseModel: "m-2025" }), used(200_000, "aside", u, { model: "m-2025" })])).toBe(200_000);
 		expect(lastMessageMs([m("user", 1000), resp(2000, { responseModel: "m-2025" }), used(200_000, "aside", u)])).toBe(200_000);
 	});
+	test("a missing or empty model never matches a missing responseModel alias", () => {
+		for (const model of [undefined, null, "", " ", 0]) {
+			expect(lastMessageMs([...base, used(200_000, "other-kind", { cacheRead: 150_000 }, { model })])).toBe(2000);
+		}
+		expect(lastMessageMs([resp(2000, { model: undefined }), used(200_000, "other-kind", { cacheRead: 150_000 }, { model: undefined })])).toBe(2000);
+	});
 	test("a missing usage, missing fields, or no response that ran before it: no touch, never a throw", () => {
 		expect(lastMessageMs([...base, used(200_000, "aside", undefined)])).toBe(2000);
 		expect(lastMessageMs([...base, used(200_000, "aside", null)])).toBe(2000);

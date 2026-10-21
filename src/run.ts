@@ -143,7 +143,6 @@ export class Zip implements ZipControl {
 	private deltas: number[] = [];
 	private prevTotal = 0; // prompt size (input + cacheRead + cacheWrite) of the newest response, and its model
 	private prevKey = "";
-	private branchLastMs = 0; // the branch clock at run start (a fresh process knows the gap from the session)
 	private nextEdit: number | null = null; // the next request is the first to carry a new edit: its untouched prefix (real tokens)
 	private pending: { gapS: number; expect: number; edited: boolean; key: string } | null = null;
 	private rentHead = "";
@@ -747,7 +746,6 @@ export class Zip implements ZipControl {
 			if (moved) this.ledger({ type: "start_dropped", reason: `${moved} changed after the idle door`, native: true });
 			else [s.nat, s.note] = [door.nat, door.note];
 		}
-		this.branchLastMs = lastMessageMs(branch);
 		this.readyAtStart = new Set(readyOf(branch, this.mine).map((a) => a.key));
 		if (!this.prevKey) ({ key: this.prevKey, total: this.prevTotal } = lastPrompt(branch)); // fresh process: the session's newest response
 		const { cold, reason, ttl, pWarm: p, src, gapS, pause } = s.clk;
@@ -1244,7 +1242,7 @@ export class Zip implements ZipControl {
 			if (!w) return;
 			const delay = w.start - now;
 			this.ledger({ type: "want", at, key: w.p.firstKeptEntryId, start: w.start, gapS: w.gapS, timerMs: Math.max(0, Math.round(delay)) });
-			if (delay <= 0 && (decision || at === "settle")) {
+			if (delay <= 0) {
 				if (!futureOnly && (!this.bg || this.bg.aborted)) this.startBg(w.p, ctx);
 				// After the warm start, ask the same rule for the pause's deadline.
 				if (at === "settle") this.want("timer", ctx, undefined, view);
@@ -1260,12 +1258,7 @@ export class Zip implements ZipControl {
 						await this.bg.promise;
 						if (gen !== this.timerGen || this.inRun || !this.active()) return;
 					}
-					this.loadEnt(modelKey(ctx.model));
-					const current = ctx.sessionManager.buildSessionProjection().entries, gap = w.gapS!;
-					const p = candidateOf(current, (cutAt, foldsOnly, ready) => this.opts(ctx, true, current,
-						process.env.PI_ZIP_TTL_SECS ? (gap <= ttlMs / 1000 ? 1 : 0) : pWarm(this.ent, gap, ttlMs / 1000).p,
-						true, cutAt, foldsOnly, ready), [], "timer").r.p;
-					if (p) this.startBg(p, ctx);
+					this.want("timer", ctx); // re-read touches, deadline and plan after the timer (or an aborted call) waited
 				}, Math.max(0, delay));
 				this.timer.unref?.();
 			}
@@ -1527,7 +1520,7 @@ export class Zip implements ZipControl {
 		// the request goes to the session's current model: a /model in the middle of a run switches it without a run start, and a
 		// request booked under the run's first model would make every later turn_end see a "model switch" (P(warm) = 0: any edit is free)
 		if (ctx?.model) this.model = ctx.model;
-		const now = Date.now(), key = modelKey(this.model), last = Math.max(this.lastReqMs, this.branchLastMs);
+		const now = Date.now(), key = modelKey(this.model), last = Math.max(this.lastReqMs, lastMessageMs(this.branch(ctx ?? this.liveCtx)));
 		const edited = this.nextEdit !== null;
 		// the free cache signal: this response's cacheRead against what this request re-sent unchanged, after this gap (same model only)
 		this.pending = { gapS: last && (this.lastModelKey || this.prevKey) === key ? (now - last) / 1000 : -1, expect: edited ? this.nextEdit! : this.prevTotal, edited, key };

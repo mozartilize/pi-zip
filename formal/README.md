@@ -90,6 +90,10 @@ say 100
   a request is a fact of this clock; what pi-zip *believed* (P(warm), cold, past TTL) is observed separately. No property asks
   that a warm cache be believed warm (survival the provider has not shown may be priced cold): `traces/gc-aside.trace` and
   `tests/bridge.rs` pin that a side question which read the whole prefix is a touch for pi-zip (0.4.12), one at a gone cache not.
+  `traces/producer-touch.trace` pins a touch shortly before the old producer deadline: no call at that deadline, then eventual
+  production after the refreshed clock expires. Narrative observations include `at` (seconds since trace start) so the bridge
+  test checks when the call began. Long tool calls with usage appended during the call are not expressible by this alphabet:
+  `call` includes its tool result and `wait` ends the run. Unit and real-Pi integration regressions cover that case.
 * **Requests**: each goes to the provider as a real Anthropic-shaped payload (system blocks, tools, `tool_use` / `tool_result`
   pairs, errored and aborted messages dropped as pi-ai does, the tier's `cache_control`), through pi-zip's
   `before_provider_request` (its request repair, `guard.ts`, and its payload-tier reading run on it).

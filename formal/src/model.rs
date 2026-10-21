@@ -638,6 +638,8 @@ pub struct Tick {
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct NarrCall {
+    /// Seconds since trace start: observes whether a usage touch postponed a producer call.
+    pub at: f64,
     pub input: f64,
     pub output: f64,
     pub away: bool,
