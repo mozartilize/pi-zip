@@ -323,7 +323,7 @@ const mutants = [
 		file: "cache.ts",
 		pattern: "an aside that read the main prefix",
 		check: "an aside that read the whole prefix keeps the cache warm",
-		edit: (source: string) => rep(source, '(en.kind === "cache_warm" || readPrefix(en, resp))', 'en.kind === "cache_warm"'),
+		edit: (source: string) => rep(source, 'en.kind === "cache_warm" || readPrefix(en, resp)', 'en.kind === "cache_warm"'),
 	},
 	{
 		name: "producer-keeps-stale-touch-deadline",
@@ -342,13 +342,19 @@ const mutants = [
 		name: "survival-keeps-run-start-touch",
 		pattern: "in-run usage refreshes",
 		check: "survival samples from the newest usage touch",
-		edit: (source: string) => rep(source, 'Math.max(this.lastReqMs, lastMessageMs(requestBranch(this.branch(ctx ?? this.liveCtx))))', 'this.lastReqMs'),
+		edit: (source: string) => rep(source, 'Math.max(this.lastReqMs, activity.ms)', 'this.lastReqMs'),
 	},
 	{
 		name: "survival-counts-trailing-messages",
 		pattern: "in-run usage refreshes",
 		check: "survival samples from the newest usage touch",
-		edit: (source: string) => rep(source, 'lastMessageMs(requestBranch(this.branch(ctx ?? this.liveCtx)))', 'lastMessageMs(this.branch(ctx ?? this.liveCtx))'),
+		edit: (source: string) => rep(source, 'cacheActivity(requestBranch(this.branch(ctx ?? this.liveCtx)))', 'cacheActivity(this.branch(ctx ?? this.liveCtx))'),
+	},
+	{
+		name: "survival-ignores-possible-rewrite",
+		pattern: "possible prefix rewrite censors",
+		check: "a rewritten prefix cannot teach survival across the old gap",
+		edit: (source: string) => rep(source, '!pend.censored && pend.gapS', 'pend.gapS'),
 	},
 ];
 const only = process.env.PZ_MUTANTS?.split(","); // run some by name

@@ -76,32 +76,38 @@ export const refused = (m: Any): boolean => {
 
 /** A usage entry of any kind (pi-aside's "aside", say) whose read covers the cacheable prefix (cacheRead + cacheWrite) of `m`, the newest
  *  response that ran before it, on m's provider and model (the one that answered, as Pi names it): it refreshed m's cache entry. */
+const sameModel = (en: Any, m: Any): boolean => !!m && typeof en.model === "string" && en.model.trim().length > 0 && en.provider === m.provider && (en.model === m.model || en.model === m.responseModel);
 const readPrefix = (en: Any, m: Any): boolean => {
 	const prefix = (Number(m?.usage?.cacheRead) || 0) + (Number(m?.usage?.cacheWrite) || 0);
-	return prefix > 0 && typeof en.model === "string" && en.model.trim().length > 0 && (Number(en.usage?.cacheRead) || 0) >= prefix && en.provider === m.provider && (en.model === m.model || en.model === m.responseModel);
+	return prefix > 0 && sameModel(en, m) && (Number(en.usage?.cacheRead) || 0) >= prefix;
 };
 
-/**
+/** `censored`: a matching usage may have rewritten the prefix since its last response/read. Branch order, not timestamps, clears it.
  * Last time anything touched the cache, according to the branch: the newest message, a cache-warm usage entry (Pi's own idle refresh
  * persists `{ type: "usage", kind: "cache_warm" }`; read or rewritten, the entry lives another TTL), or any other usage entry that
  * read the whole prefix (readPrefix). A request the provider refused (an error with no usage) touched nothing, and neither did the
  * messages that made it (the prompt or the tool results it carried, written before it failed): the clock stays at the last request
  * that was read. Fresh process: err on the warm side (0 = unknown).
  */
-export function lastMessageMs(branch: Any[]): number {
-	let last = 0, pending = 0, resp: Any = null; // pending: the newest non-assistant message since the last response, counted once its response is known
+export function cacheActivity(branch: Any[]): { ms: number; censored: boolean } {
+	let last = 0, pending = 0, resp: Any = null, censored = false; // pending: the newest non-assistant message since the last response, counted once its response is known
 	for (const en of branch) {
 		if (en?.type === "message" && en.message) {
 			const t = tsOf(en, en.message);
 			if (en.message.role === "assistant") {
 				if (!refused(en.message)) last = Math.max(last, pending, t);
-				if (ran(en.message)) resp = en.message;
+				if (ran(en.message)) (resp = en.message), (censored = false);
 				pending = 0;
 			} else pending = Math.max(pending, t);
-		} else if (en?.type === "usage" && (en.kind === "cache_warm" || readPrefix(en, resp))) last = Math.max(last, tsOf(en));
+		} else if (en?.type === "usage") {
+			if (en.kind === "cache_warm" || readPrefix(en, resp)) (last = Math.max(last, tsOf(en))), (censored = false);
+			else if (sameModel(en, resp)) censored = true;
+		}
 	}
-	return Math.max(last, pending); // trailing messages with no response yet (the run in progress) count, as before
+	return { ms: Math.max(last, pending), censored }; // trailing messages with no response yet (the run in progress) count, as before
 }
+
+export const lastMessageMs = (branch: Any[]): number => cacheActivity(branch).ms;
 
 /** The newest assistant message that really ran: its provider/model and prompt size. */
 export function lastPrompt(branch: Any[]): { key: string; total: number } {
