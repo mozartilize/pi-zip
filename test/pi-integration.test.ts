@@ -2235,12 +2235,15 @@ for (const order of ORDERS) describe(`survival after a possible prefix rewrite (
 });
 
 // Use Pi's actual warmer, with a synthetic provider and clock: no sleep, network, or real model invocation.
-for (const pi of ["1.1.0", "1.2.0", "1.3.0"]) describe(`real warmer overlap (Pi ${pi})`, () => {
+// Ordinary tests use the installed Pi; the offline validation matrix may select a directory of public pinned builds.
+const warmerBuildRoot = process.env.PZ_WARMER_BUILD_ROOT;
+for (const pi of warmerBuildRoot ? ["1.1.0", "1.2.0", "1.3.0"] : ["installed"]) describe(`real warmer overlap (Pi ${pi})`, () => {
 	for (const kind of ["censored hit", "censored miss", "clean", "edited", "refused"]) test(`${kind}: the main snapshot survives two refreshes`, async () => {
 		const realNow = Date.now, realSet = globalThis.setTimeout, realClear = globalThis.clearTimeout;
 		const stats = process.env.PI_ZIP_CACHE_STATS;
 		process.env.PI_ZIP_CACHE_STATS = join(mkdtempSync(join(tmpdir(), "pz-overlap-")), "stats.json");
-		const { CacheWarmer } = await import(`/home/purboo/private/pz-eval/pi-builds/wolfbits/${pi}/node_modules/@earendil-works/pi-coding-agent/dist/core/cache-warmer.js`);
+		const warmerFile = warmerBuildRoot ? join(warmerBuildRoot, pi, "node_modules/@earendil-works/pi-coding-agent/dist/core/cache-warmer.js") : fileURLToPath(new URL("../node_modules/@earendil-works/pi-coding-agent/dist/core/cache-warmer.js", import.meta.url));
+		const { CacheWarmer } = await import(warmerFile);
 		let now = realNow(), r: Awaited<ReturnType<typeof rig>> | undefined, warmer: Any;
 		Date.now = () => now;
 		try {

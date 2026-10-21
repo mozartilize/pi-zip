@@ -1084,7 +1084,9 @@ Refusal rollback now includes persisted branch touches so a refused main call ca
 Provider payload repair, retention observation and relay metadata guarding continue to run for refreshes.
 
 The real-warmer overlap tests load each of the three pinned CacheWarmer implementations, use a synthetic clock/provider,
-and drive two actual refreshes at their scheduled 270-second delays during one main request. They cover censored hits,
+and drive two actual refreshes at their scheduled 270-second delays during one main request. Ordinary `bun test` uses the
+installed Pi's warmer; the validation-only `PZ_WARMER_BUILD_ROOT` selects the directory containing the three public pinned
+builds for the full offline matrix. No developer-specific build path is required by the test suite. They cover censored hits,
 censored misses, an uncensored hour-gap control, edited-prefix expectations, and a refused main response after warming.
 They check the original snapshot object survives, no censored alive/dead sample is recorded, clean learning resumes,
 main rollback/savings/edit state is preserved, and orphan-result repair still applies to warming payloads. The focused
