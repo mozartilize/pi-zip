@@ -15,6 +15,7 @@ import { branchOutputs, recalledHandlesFromBranch, resolveHandlesInBranch } from
 import { cleanupRecall, commandNamesRecall, fileRecallFor, materialize, parseRecallPath, recallRoot, recallRootShown, rewriteCommand, sidDir, type FileRecall } from "./recallfile.ts";
 import { buildCut } from "./summary.ts";
 import { Judge, HINT_CUSTOM, citesWork, latestProjectedUser, latestUserText, requestOpen } from "./judge.ts";
+import { lookupRefs, lookupText, type LookupRef } from "./lookup.ts";
 import { coldTarget, compactionRoom, settings, toolCallIndex } from "./plan.ts";
 import { type Any, attempt, COMMIT_CUSTOM, envInt, PRODUCT, textOf, tok4, tokensOf } from "./util.ts";
 import { pendingSummary, replayGrowth } from "./state.ts";
@@ -115,6 +116,9 @@ export class Zip implements ZipControl {
 	private judge = new Judge((rec) => this.ledger(rec));
 	private judgeReq = 0;
 	private judgePrompt = "";
+	/** The lookup cue of the newest user request in this run: references found once per request, removed when a request carries them. */
+	private lookup: { scope: string; pending: LookupRef[] } = { scope: "\0", pending: [] };
+	private readonly lookupOn = process.env.PI_ZIP_LOOKUP !== "0";
 	private stuckNoted = false;
 	private cold = false;
 	private coldReason = "";
@@ -752,6 +756,7 @@ export class Zip implements ZipControl {
 		this.inRun = true;
 		this.stuckNoted = false;
 		this.judge.startRun();
+		this.lookup = { scope: "\0", pending: [] }; // a cue is request-local: a new run with the same text gets it again
 		if (!this.judgePrompt) this.judgePrompt = textOf([...this.branch(ctx)].reverse().find((e) => e.message?.role === "user")?.message?.content);
 		this.cancelTimer(); // the user is back: nothing is started behind their back any more
 		this.cancelDoor();
@@ -1187,30 +1192,74 @@ export class Zip implements ZipControl {
 		return hinted ? { messages: hinted } : undefined;
 	}
 
-	/** One lookup note on the request already going out. A miss is kept; the note is not a steer and does not mark a recall. */
+	/**
+	 * One request-local note on the request already going out: the lookup cue of the newest user request, then the judge's lookup note.
+	 * A note that does not fit is kept for the next request. Neither part is a steer or marks a recall.
+	 */
 	private withHint(messages: Any[], ctx: Any): Any[] | null {
-		if (!this.judge.enabled || !this.inRun || this.recallMode !== "tool" || requestOpen(messages)) return null;
+		const judging = this.judge.enabled;
+		if ((!judging && !this.lookupOn) || !this.inRun || this.recallMode !== "tool" || requestOpen(messages)) return null;
 		try {
 			const entries = ((ctx?.sessionManager?.buildSessionProjection?.() as Any)?.entries ?? []) as Any[];
 			const blocks = buildBlocks(entries, this.steerIds);
-			const folded = new Set<string>([...this.foldedCalls.values(), ...blocks.filter((b) => b.ours && b.entryId).map((b) => handleFor(b.entryId!))]);
-			const resolvable = new Set(resolveHandlesInBranch(this.branch(ctx), [...folded]).items.filter((it) => it.text != null).map((it) => it.handle));
+			const scope = latestUserText(blocks);
 			const cwd = (ctx?.cwd as string) ?? process.cwd();
-			const hint = this.judge.proposeHints({ folded: resolvable, recalled: this.recalled, reqCount: this.judgeReq, scope: latestUserText(blocks), cited: (h, loc) => citesWork(blocks, h, loc, cwd) });
-			if (!hint) return null;
-			const msg = { role: "user", content: hint.text };
+			const cue = this.lookupOn ? this.lookupCue(scope, messages, blocks, ctx, cwd) : null;
+			let hint: ReturnType<Judge["proposeHints"]> = null;
+			if (judging) {
+				const folded = new Set<string>([...this.foldedCalls.values(), ...blocks.filter((b) => b.ours && b.entryId).map((b) => handleFor(b.entryId!))]);
+				const resolvable = new Set(resolveHandlesInBranch(this.branch(ctx), [...folded]).items.filter((it) => it.text != null).map((it) => it.handle));
+				hint = this.judge.proposeHints({ folded: resolvable, recalled: this.recalled, reqCount: this.judgeReq, scope, cited: (h, loc) => citesWork(blocks, h, loc, cwd) });
+			}
+			if (!cue && !hint) return null;
+			const msg = { role: "user", content: [cue?.text, hint?.text].filter(Boolean).join("\n") };
 			const sc = this.scaleOf(ctx, entries);
 			const body = messages.filter((m) => m?.role !== "system").reduce((n: number, m: Any) => n + wireTokensOf(m), 0);
 			const room = compactionRoom(ctx?.model, this.reserve(ctx));
-			if (room !== null && sizeOf(sc, body + wireTokensOf(msg)) > room) { this.judge.hintNote({ shown: hint.shown, dropped: "room" }); return null; }
-			this.judge.hintNote({ shown: hint.shown, skipped: hint.skipped });
-			this.judge.commitHints(hint.shown, hint.skipped);
-			attempt(() => this.pi.appendEntry(HINT_CUSTOM, { handles: hint.shown }), undefined);
+			if (room !== null && sizeOf(sc, body + wireTokensOf(msg)) > room) {
+				if (cue) this.ledger({ type: "lookup_hint", shown: cue.shown, dropped: "room" });
+				if (hint) this.judge.hintNote({ shown: hint.shown, dropped: "room" });
+				return null;
+			}
+			if (cue) {
+				const shown = new Set(cue.shown);
+				this.lookup.pending = this.lookup.pending.filter((r) => !shown.has(r.handle));
+				this.ledger({ type: "lookup_hint", shown: cue.shown, via: cue.via, left: this.lookup.pending.length });
+			}
+			if (hint) {
+				this.judge.hintNote({ shown: hint.shown, skipped: hint.skipped });
+				this.judge.commitHints(hint.shown, hint.skipped);
+				attempt(() => this.pi.appendEntry(HINT_CUSTOM, { handles: hint!.shown }), undefined);
+			}
 			return [...messages, msg];
 		} catch (err) {
 			this.ledger({ type: "error", where: "judge_hint", error: errText(err) });
 			return null;
 		}
+	}
+
+	/**
+	 * The lookup cue for this request. The branch is scanned once per user request, at its first request, so the cue goes out before the
+	 * model can repeat a call. `live` = outputs this request shows in full (a fold applied to this very request makes an output not live).
+	 */
+	private lookupCue(scope: string, messages: Any[], blocks: Block[], ctx: Any, cwd: string): { text: string; shown: string[]; via: string[] } | null {
+		if (scope !== this.lookup.scope) {
+			this.lookup = { scope, pending: [] };
+			if (!scope) return null;
+			const entryOf = new Map<string, string>();
+			for (const b of blocks) if (b.kind === "toolResult" && b.entryId && b.msg.toolCallId) entryOf.set(b.msg.toolCallId, b.entryId);
+			const live = new Set<string>();
+			for (const m of messages) {
+				const id = m?.role === "toolResult" && !textOf(m.content).startsWith(PH_MARK) ? entryOf.get(m.toolCallId) : undefined;
+				if (id) live.add(handleFor(id));
+			}
+			this.lookup.pending = lookupRefs(scope, this.branch(ctx), cwd, live);
+		}
+		const pending = this.lookup.pending;
+		if (!pending.length) return null;
+		const packed = lookupText(pending);
+		if (!packed.shown.length) return null;
+		return { ...packed, via: packed.shown.map((h) => pending.find((r) => r.handle === h)!.via) };
 	}
 
 	/** While the user waits for a summary, Pi's working line says what for. */
@@ -1406,12 +1455,12 @@ export class Zip implements ZipControl {
 		if (!this.active()) return undefined;
 		try {
 			const fresh = this.collectSteer(e); // marked before anything is validated: a steering message is part of its turn
-			const out = await this.onTurnEnd(e, ctx);
 			try {
-				this.judgeBoundary(e, ctx, out);
+				this.judgeBoundary(e, ctx); // invalidate old advice before this boundary's planner reads it
 			} catch (err) {
 				this.ledger({ type: "error", where: "judge", error: errText(err) }); // never drop this turn's edits for an optional hint
 			}
+			const out = await this.onTurnEnd(e, ctx);
 			const previousRent = rentOf(this.branch(ctx));
 			const recs = [...this.drafts(), ...(this.rent !== previousRent ? [{ type: "custom", customType: "pi-zip/rent", data: { rent: this.rent } }] : [])]; // summaries recorded during the run, after the turn's edits (a compaction goes first)
 			if (!fresh.length && !recs.length) return out;
@@ -1423,12 +1472,12 @@ export class Zip implements ZipControl {
 		}
 	}
 
-	private judgeBoundary(e: Any, ctx: Any, out: Any) {
+	private judgeBoundary(e: Any, ctx: Any) {
 		if (!this.judge.enabled || !this.inRun || !this.active() || e.message?.stopReason !== "toolUse") return;
 		const entries = e.context.contextEntries, blocks = buildBlocks(entries, this.steerIds);
-		const sc = this.scaleOf(ctx, entries);
+		const { o, cal: sc } = this.opts(ctx, false, entries, 1, false);
 		this.judge.maybeRun(ctx, blocks, toolCallIndex(blocks), this.judgePrompt, this.judgeReq,
-			sizeOf(sc, blocks.reduce((n, b) => n + b.tokens, 0)), coldTarget(settings().coldCap, sc.O, compactionRoom(ctx.model, this.reserve(ctx))));
+			sizeOf(sc, blocks.reduce((n, b) => n + b.tokens, 0)), coldTarget(settings().coldCap, sc.O, compactionRoom(ctx.model, this.reserve(ctx))), o);
 	}
 
 	/** Steering and follow-up user messages (typed during a run) are not new user turns; Pi does not mark them, so we persist the ids. */

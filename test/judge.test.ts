@@ -1,14 +1,14 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
-import { Judge, judgeInput, parseVerdict, judgeModelRef, judgeReasoning, hintText, requestOpen, locatorOf, citesWork, latestUserText, JUDGE_SYSTEM, NEED_CUSTOM, CATALOGUE_TOKENS, type EvidenceSpan } from "../src/judge.ts";
-import { buildBlocks, countUserTurns, plan, planContext, toolCallIndex, UNIT, type PlanOpts } from "../src/plan.ts";
+import { Judge, judgeInput, supersededOutputs, parseFacts, parseEvidence, parseVerdict, judgeModelRef, judgeReasoning, hintText, requestOpen, locatorOf, citesWork, latestUserText, JUDGE_SYSTEM, NEED_CUSTOM, CATALOGUE_TOKENS, type EvidenceSpan } from "../src/judge.ts";
+import { buildBlocks, countUserTurns, foldCandidates, foldPlaceholder, plan, planContext, toolCallIndex, UNIT, type PlanOpts } from "../src/plan.ts";
 import { checkEdits, decideEdits } from "../src/core.ts";
 import { handleFor, PH_MARK } from "../src/placeholder.ts";
 import { resolveHandlesInBranch } from "../src/recall.ts";
 import { cardText } from "../src/ui.ts";
 import { Zip } from "../src/run.ts";
 import { lawPrices } from "../src/learn.ts";
-import { A, U, fakeCtx, fakePi, longTurn, project, startZip, type Any } from "./helpers.ts";
+import { A, R, U, fakeCtx, fakePi, longTurn, project, startZip, type Any } from "./helpers.ts";
 import { tok4 } from "../src/util.ts";
 
 const saved = { ...process.env };
@@ -19,7 +19,9 @@ afterEach(() => {
 	}
 });
 const h = (i: number) => handleFor(`r${i}`);
-const textReply = (text = "zzzzzzzzzz U -") => ({ stopReason: "stop", content: [{ type: "text", text }], usage: { input: 100, output: 20, cost: { total: 0.002 } } });
+// Policy codes express mock intent; production receives independent Y/N/U facts.
+const factLine = (h: string, code: string) => `${h} ${{ H: "Y N N", C: "N Y N", N: "Y N Y", U: "U U U" }[code]}`;
+const textReply = (text = "zzzzzzzzzz U -") => ({ stopReason: "stop", content: [{ type: "text", text: text.replace(/^([0-9a-z]{10}) ([CHNU]) (\S+)$/gm, (_, h, code) => factLine(h, code)) }], usage: { input: 100, output: 20, cost: { total: 0.002 } } });
 const model = { provider: "p", id: "cheap", contextWindow: 200_000, maxTokens: 4096, cost: { input: 1 } };
 const deferred = () => {
 	let resolve!: (v: Any) => void;
@@ -33,7 +35,7 @@ function rig(complete: Any = async () => textReply(), timeout = 30_000) {
 	const judge = new Judge((r) => records.push(r), timeout);
 	const ctx = { model, modelRegistry: { getAvailable: () => [model], complete: (...args: Any[]) => { calls.push(args); return complete(...args); } } };
 	const blocks = buildBlocks(longTurn(24));
-	const run = (req = 24, bs = blocks, context = 40_000) => judge.maybeRun(ctx, bs, toolCallIndex(bs), "task", req, context, 40_000);
+	const run = (req = 24, bs = blocks, context = 40_000, opts: Partial<PlanOpts> = {}) => judge.maybeRun(ctx, bs, toolCallIndex(bs), "task", req, context, 40_000, { cwd: "/tmp", inturnAge: 10, keepLines: 0, ...opts });
 	judge.startRun();
 	return { judge, records, calls, ctx, blocks, run };
 }
@@ -53,8 +55,8 @@ describe("judge input and parser", () => {
 		const b = judgeInput(next, toolCallIndex(next), "original task", 6000, a.catalogue, 13);
 		expect(b.prefix).toBe(a.prefix);
 		expect(b.text).toContain(`${h(1)} age=13 folded`);
-		expect(b.text).toContain('"thinking":"hmm"');
-		expect(b.text).toContain('"command":"ls"');
+		expect(b.text).toContain("assistant: hmm\nx\ncall bash ls");
+		expect(b.text).not.toContain('"type":');
 		const appended = buildBlocks(longTurn(14));
 		const c = judgeInput(appended, toolCallIndex(appended), "original task", 6000, b.catalogue, 14);
 		expect(c.prefix.startsWith(b.prefix)).toBe(true);
@@ -114,6 +116,172 @@ describe("judge input and parser", () => {
 		]);
 		const uncited = parseVerdict("cccccccccc N E1", known, ev, meta).diag.n;
 		expect(uncited).toEqual([{ handle: "cccccccccc", ev: "E1", result: "uncited" }]);
+	});
+});
+
+const toolCall = (id: string, name: string, args: Any) => {
+	const m = { role: "assistant", content: [{ type: "text", text: "x" }, { type: "toolCall", id, name, arguments: args }] };
+	return { sourceEntry: { id: `a-${id}`, type: "message", message: m }, messages: [m] };
+};
+const toolResult = (id: string, name: string, text = "y".repeat(3000), isError = false) => {
+	const m = { role: "toolResult", toolCallId: id, toolName: name, isError, content: [{ type: "text", text }] };
+	return { sourceEntry: { id: `r-${id}`, type: "message", message: m }, messages: [m] };
+};
+const round = (id: string, name: string, args: Any, isError = false) => [toolCall(id, name, args), toolResult(id, name, undefined, isError)];
+
+describe("evidence rows and supersession", () => {
+	test("assistant rows show prose and calls without signatures, and a cut row keeps its head", () => {
+		const m = { role: "assistant", content: [{ type: "thinking", thinking: "plan-head " + "p".repeat(3000), thinkingSignature: "S".repeat(20_000) },
+			{ type: "text", text: "done" }, { type: "toolCall", id: "c1", name: "read", arguments: { path: "/w/a.ts" } }] };
+		const bs = buildBlocks([U("u1", "task"), { sourceEntry: { id: "a1", type: "message", message: m }, messages: [m] }]);
+		const wide = judgeInput(bs, toolCallIndex(bs), "task", 6000, undefined, 1).text;
+		expect(wide).toContain("E2 assistant: plan-head");
+		expect(wide).not.toContain("SSSSSSSSSS");
+		expect(wide).not.toContain("thinkingSignature");
+		const row = wide.split("E2 ")[1];
+		expect(row.length).toBeLessThanOrEqual("assistant: ".length + 2000);
+		expect(row.endsWith("…")).toBe(true);
+		const narrow = judgeInput(bs, toolCallIndex(bs), "task", 50, undefined, 1).text;
+		expect(narrow.split("Recent work:\n")[1]).toMatch(/^E1 assistant: plan-head p+…$/);
+		const short = { role: "assistant", content: [{ type: "text", text: "done" }, { type: "toolCall", id: "c1", name: "read", arguments: { path: "/w/a.ts" } }] };
+		const sb = buildBlocks([U("u1", "task"), { sourceEntry: { id: "a1", type: "message", message: short }, messages: [short] }]);
+		expect(judgeInput(sb, toolCallIndex(sb), "task", 6000, undefined, 1).text).toContain("E2 assistant: done\ncall read /w/a.ts");
+	});
+
+	test("exact repeats and successful writes supersede; failures, other ranges and recall do not", () => {
+		const entries = [U("u1", "go"),
+			...round("c1", "read", { path: "/w/a.ts" }),
+			...round("c2", "read", { path: "/w/a.ts", offset: 50 }),
+			...round("c3", "bash", { command: "npm test" }),
+			...round("c4", "edit", { path: "/w/a.ts", oldText: "a", newText: "b" }, true),
+			...round("c5", "bash", { command: "npm test" }),
+			...round("c6", "edit", { path: "/w/a.ts", oldText: "a", newText: "b" }),
+			...round("c7", "read", { path: "/w/b.ts" }),
+			...round("c8", "read", { path: "/w/b.ts" }, true),
+			...round("c9", "zip_recall", { handle: "x" }),
+			...round("c10", "zip_recall", { handle: "x" }),
+			...round("c11", "grep", { pattern: "x", path: "/w" }),
+			...round("c12", "grep", { path: "/w", pattern: "x" }),
+			...round("c13", "bash", { command: "npm test -- a" }),
+			A("end")];
+		const bs = buildBlocks(entries), r = (id: string) => handleFor(`r-${id}`);
+		const got = supersededOutputs(bs, toolCallIndex(bs), "/w");
+		expect(Object.fromEntries(got)).toEqual({ [r("c3")]: r("c5"), [r("c1")]: r("c6"), [r("c2")]: r("c6"), [r("c4")]: r("c6"), [r("c11")]: r("c12") });
+	});
+
+	test("superseded outputs are cold below every gate, never sent, and a late model reply cannot replace them", async () => {
+		const reply = deferred();
+		const r = rig(() => reply.promise);
+		r.run(); await flush();
+		expect(r.calls).toHaveLength(1);
+		const sent = r.calls[0][1].messages[0].content[0].text;
+		expect(sent).toContain(`"handle":"${h(1)}"`);
+		// While that call runs, the first command runs again: its older output is now superseded.
+		const again = [...longTurn(24), A("a99", ["c99"]), R("r99", "c99", 0, "z".repeat(3000))];
+		((again.at(-2) as Any).messages[0].content[1]).arguments = { command: "ls d1" };
+		const bs = buildBlocks(again);
+		r.run(25, bs, 1000);
+		const scope = latestUserText(bs);
+		expect(r.judge.labels(25, scope)?.get(h(1))).toBe("cold");
+		reply.resolve(textReply(`${h(1)} H E1\n${h(2)} H E1`));
+		await r.judge.running;
+		expect(r.judge.labels(25, scope)?.get(h(1))).toBe("cold");
+		expect(r.judge.labels(25, scope)?.get(h(2))).toBe("hot");
+		// A later batch never submits it.
+		r.run(40, bs, 40_000, { inturnAge: 10 }); await r.judge.running;
+		for (const call of r.calls.slice(1)) expect(call[1].messages[0].content[0].text).not.toContain(`"handle":"${h(1)}"`);
+		// Without the repeat (pruned), the rule no longer holds and the fixed label goes.
+		r.run(41, r.blocks, 1000);
+		expect(r.judge.verdicts.get(h(1))?.fixed).toBeFalsy();
+	});
+});
+
+describe("fact classification", () => {
+	const a = "aaaaaaaaaa", b = "bbbbbbbbbb", c = "cccccccccc";
+	const known = new Set([a]);
+	const meta = new Map([[a, { folded: true, locator: "/w/a.ts" }]]);
+	const referenced: EvidenceSpan[] = [{ id: "E7", role: "user", handles: [a], locators: [] }];
+
+	test("all 27 three-fact combinations prioritize demand over finished and require negative dependency for cold", () => {
+		// Columns: lookup N, U, Y. Rows: active/finished.
+		// Lookup takes precedence when cited; active protects even when finished=Y; cold requires N Y N.
+		const table = [
+			["N N", ["warm", "warm", "need"]], ["N U", ["warm", "warm", "need"]], ["N Y", ["cold", "warm", "need"]],
+			["U N", ["warm", "warm", "need"]], ["U U", ["warm", "warm", "need"]], ["U Y", ["warm", "warm", "need"]],
+			["Y N", ["hot", "hot", "need"]], ["Y U", ["hot", "hot", "need"]], ["Y Y", ["hot", "hot", "need"]],
+		] as const;
+		for (const [answers, expected] of table) for (const [i, lookup] of ["N", "U", "Y"].entries()) {
+			const parsed = parseFacts(`${a} ${answers} ${lookup}`, known, referenced, meta);
+			expect(parsed.verdicts.get(a)).toBe(expected[i]);
+			expect(parsed.nOk.get(a)).toBe(expected[i] === "need");
+		}
+		// Classification needs no citation; an uncited lookup does not erase active=Y.
+		expect(parseFacts(`${a} N Y N`, known, [], meta).verdicts.get(a)).toBe("cold");
+		expect(parseFacts(`${a} Y Y N`, known, [], meta).verdicts.get(a)).toBe("hot");
+		expect(parseFacts(`${a} Y Y Y`, known, [], meta).verdicts.get(a)).toBe("hot");
+		expect(parseFacts(`${a} N Y Y`, known, [], meta).verdicts.get(a)).toBe("warm");
+	});
+
+	test("lookup requires an exact non-tool reference; live outputs are hot, never recalled", () => {
+		for (const evidence of [[], [{ id: "E1", role: "toolResult", handles: [a], locators: ["/w/a.ts"] }],
+			[{ id: "E1", role: "assistant", handles: [b], locators: ["/other/a.ts"] }]] as EvidenceSpan[][]) {
+			const parsed = parseFacts(`${a} N N Y`, known, evidence, meta);
+			expect(parsed.verdicts.get(a)).toBe("warm"); expect(parsed.nOk.get(a)).toBe(false);
+			expect(parsed.diag.badEvidence).toBe(1);
+		}
+		for (const evidence of [referenced, [{ id: "E2", role: "assistant", handles: [], locators: ["/w/a.ts"] }]] as EvidenceSpan[][]) {
+			expect(parseFacts(`${a} U Y Y`, known, evidence, meta).verdicts.get(a)).toBe("need");
+			const live = parseFacts(`${a} U Y Y`, known, evidence, new Map([[a, { folded: false, locator: "/w/a.ts" }]]));
+			expect(live.verdicts.get(a)).toBe("hot"); expect(live.nOk.get(a)).toBe(false);
+		}
+	});
+
+	test("missing, duplicate and malformed answers cannot acquire a cold label; old protocols are rejected", () => {
+		const all = new Set([a, b, c]);
+		for (const duplicate of [`${a} N Y N`, `${a} Y N N`, `${a} N maybe N`]) {
+			const parsed = parseFacts(`${a} N Y N\n${duplicate}\n${b} Y N N\nzzzzzzzzzz N Y N`, all, [], meta);
+			expect([...parsed.verdicts.values()]).toEqual(["warm", "hot", "warm"]);
+			expect(parsed.diag).toMatchObject({ duplicate: 1, missing: 1, foreign: 1 });
+		}
+		expect(parseFacts(`${a} N Y ?\n${b} U U U`, all, [], meta).diag.malformed).toBe(1);
+		for (const reply of ["", `${a} C E1`, `${a} - E1 -`, `${a} N N Y N N`, `${a} yes no no`, `[{"handle":"${a}"}]`]) {
+			expect(() => parseFacts(reply, known, referenced, meta)).toThrow();
+		}
+	});
+
+	test("production sends facts-v1 and protects completed but still needed results", async () => {
+		const r = rig(async () => textReply(`${h(1)} N Y N\n${h(2)} Y Y N`));
+		r.run(); await r.judge.running;
+		expect(r.calls[0][1].systemPrompt).toBe(JUDGE_SYSTEM);
+		expect(r.judge.verdicts.get(h(1))?.v).toBe("cold");
+		expect(r.judge.verdicts.get(h(2))?.v).toBe("hot");
+		expect(r.records.find((x) => x.type === "judge").protocol).toBe("facts-v1");
+	});
+});
+
+describe("historical evidence assertions", () => {
+	const known = new Set([h(1), h(2)]);
+	const evidence: EvidenceSpan[] = [
+		{ id: "E1", role: "user", locators: [], handles: [h(1)] },
+		{ id: "E2", role: "assistant", locators: [], handles: [] },
+		{ id: "E3", role: "toolResult", locators: [], handles: [] },
+	];
+	const meta = new Map([[h(1), { folded: true, locator: null }], [h(2), { folded: false, locator: null }]]);
+	test("independent assertions, conflicts, invalid citations and lookup roles", () => {
+		for (const [fields, expected] of [
+			["E1 - -", "hot"], ["- E2 -", "cold"], ["- - E1", "need"], ["- - -", "warm"],
+			["E1 E2 -", "warm"], ["- E2 E1", "warm"], ["E1 E99 -", "warm"],
+			["- - E3", "warm"], ["- - E2", "warm"],
+		]) expect(parseEvidence(`${h(1)} ${fields}`, known, evidence, meta).verdicts.get(h(1))).toBe(expected);
+		expect(parseEvidence(`${h(1)} - - -\n${h(2)} - - E1`, known, evidence, meta).verdicts.get(h(2))).toBe("hot");
+	});
+	test("omissions equal abstentions; duplicate, foreign and old-protocol rows cannot supply a decision", () => {
+		const omitted = parseEvidence(`${h(1)} - E2 -`, known, evidence, meta);
+		const explicit = parseEvidence(`${h(1)} - E2 -\n${h(2)} - - -`, known, evidence, meta);
+		expect([...omitted.verdicts]).toEqual([...explicit.verdicts]);
+		expect(parseEvidence(`${h(1)} - E2 -\n${h(1)} E1 - -`, known, evidence, meta).verdicts.get(h(1))).toBe("warm");
+		expect(parseEvidence("zzzzzzzzzz - E2 -", known, evidence, meta).diag.foreign).toBe(1);
+		expect(() => parseEvidence(`${h(1)} C E2`, known, evidence, meta)).toThrow();
 	});
 });
 
@@ -194,6 +362,101 @@ describe("judge folds keep the existing decision", () => {
 	});
 });
 
+describe("incremental judge selection", () => {
+	test("default protected outputs generate no call; age 60 and size boundaries use planner candidates", async () => {
+		const r = rig();
+		r.run(24, r.blocks, 40_000, { inturnAge: 60 });
+		expect(r.calls).toHaveLength(0);
+		const blocks = buildBlocks(longTurn(72));
+		const opts = { cwd: "/tmp", keepLines: 0 };
+		const candidates = foldCandidates(blocks, toolCallIndex(blocks), opts).flat();
+		expect(candidates.map((b) => b.age)).toEqual(Array.from({ length: 13 }, (_, i) => 72 - i));
+		// rig's default is intentionally age 10; override it to test the production default explicitly.
+		const prod = rig(); prod.run(72, blocks, 40_000, { inturnAge: 60 }); await prod.judge.running;
+		expect(prod.records[0].known).toBe(13);
+		const text = prod.calls[0][1].messages[0].content[0].text;
+		expect(text).toContain(`"handle":"${h(13)}"`);
+		expect(text).not.toContain(`"handle":"${h(14)}"`);
+	});
+	test("candidate filtering preserves recent evidence and excludes recalled or non-saving outputs", async () => {
+		const r = rig(), blocks = buildBlocks(longTurn(72));
+		const small = blocks.find((b) => b.entryId === "r2")!;
+		small.raw = small.msg = { ...small.msg, content: [{ type: "text", text: "x".repeat(2000) }] };
+		const image = blocks.find((b) => b.entryId === "r3")!;
+		image.msg = { ...image.msg, content: [...image.msg.content, { type: "image", data: "a", mimeType: "image/png" }] };
+		image.raw = image.msg;
+		const latest = blocks.at(-1)!;
+		latest.msg = { ...latest.msg, content: [{ type: "text", text: "New evidence from an unselected recent output" }] };
+		r.run(72, blocks, 40_000, { inturnAge: 60, recalled: new Set([h(1)]) }); await r.judge.running;
+		const text = r.calls[0][1].messages[0].content[0].text;
+		for (const n of [1, 2, 3, 72]) expect(text).not.toContain(`"handle":"${h(n)}"`);
+		expect(text).toContain("New evidence from an unselected recent output");
+		expect(foldPlaceholder(image, toolCallIndex(blocks), { cwd: "/tmp" })).toBeNull();
+	});
+	test("new batch updates only submitted handles and does not refresh retained timestamps", async () => {
+		const r = rig(async () => textReply(`${h(1)} H E1`));
+		r.run(); await r.judge.running;
+		expect(r.judge.verdicts.get(h(1))?.atReq).toBe(24);
+		r.run(32, buildBlocks(longTurn(32))); await r.judge.running;
+		expect(r.calls).toHaveLength(2);
+		const second = r.calls[1][1].messages[0].content[0].text;
+		expect(second).not.toContain(`"handle":"${h(1)}"`);
+		expect(second).toContain(`"handle":"${h(16)}"`);
+		expect(r.records[1]).toMatchObject({ known: 8, reused: 15 });
+		expect(r.judge.verdicts.get(h(1))).toMatchObject({ v: "hot", atReq: 24 });
+		expect(r.judge.verdicts.get(h(16))).toMatchObject({ v: "warm", atReq: 32 });
+		r.run(40, buildBlocks(longTurn(32))); await r.judge.running;
+		expect(r.calls).toHaveLength(2); // neither catalogue size nor unchanged evidence starts a call
+		expect(r.judge.labels(45, "do the long task")?.has(h(1))).toBe(false);
+		expect(r.judge.labels(45, "do the long task")?.has(h(16))).toBe(true);
+	});
+	test("fresh references invalidate below pressure; a submitted omission replaces the old verdict", async () => {
+		let n = 0;
+		const r = rig(async () => textReply(n++ ? `${h(2)} U -` : `${h(1)} C E1`));
+		r.run(); await r.judge.running;
+		const entries = longTurn(24);
+		entries.push(A("reference", []));
+		entries.at(-1)!.messages[0].content = [{ type: "text", text: `Still need ${h(1)}` }];
+		r.run(25, buildBlocks(entries), 1000);
+		expect(r.judge.labels(25, "do the long task")?.has(h(1))).toBe(false);
+		expect(r.calls).toHaveLength(1);
+		r.run(45, buildBlocks(entries)); await r.judge.running;
+		expect(r.judge.verdicts.get(h(1))).toMatchObject({ v: "warm", atReq: 45 });
+	});
+	test("scope changes during a call abort and reject its late reply even below pressure", async () => {
+		const d = deferred(), r = rig(() => d.promise);
+		r.run(); await flush();
+		const entries = [...longTurn(24), U("steer", "new task")];
+		r.run(25, buildBlocks(entries), 1000);
+		expect(r.calls[0][2].signal.aborted).toBe(true);
+		d.resolve(textReply(`${h(1)} C E1`)); await r.judge.running;
+		expect(r.judge.verdicts.size).toBe(0);
+		expect(r.judge.scope).toBe("new task");
+	});
+	test("a new explicit dependency during a call rejects that snapshot, not just changed user scopes", async () => {
+		const d = deferred(), r = rig(() => d.promise);
+		r.run(); await flush();
+		const entries = longTurn(24);
+		entries.push(A("dependency", []));
+		entries.at(-1)!.messages[0].content = [{ type: "text", text: `Need ${h(1)} for the next step` }];
+		r.run(25, buildBlocks(entries));
+		expect(r.calls[0][2].signal.aborted).toBe(true);
+		d.resolve(textReply(`${h(1)} C E1`)); await r.judge.running;
+		expect(r.judge.verdicts.size).toBe(0);
+		expect(r.judge.stats.errors).toBe(0); // invalidation is not a provider failure
+	});
+	test("live/folded transitions and pruning invalidate old judgments", async () => {
+		const r = rig(async () => textReply(`${h(1)} C E1`));
+		r.run(); await r.judge.running;
+		const folded = buildBlocks(project(longTurn(24), [{ type: "context_edit", targetId: "r1", replacement: { content: [{ type: "text", text: "folded" }] } }]));
+		r.run(25, folded, 1000);
+		expect(r.judge.verdicts.has(h(1))).toBe(false);
+		r.run(26, [], 1000);
+		expect(r.judge.verdicts.size).toBe(0);
+		expect((r.judge as Any).catalogue.size).toBe(0);
+	});
+});
+
 describe("background judge", () => {
 	test("one exact folded handle triggers without a locator or five eligible outputs", async () => {
 		const r = rig();
@@ -257,7 +520,7 @@ describe("background judge", () => {
 		expect(r.records[0]).toMatchObject({ reqCount: 24, eligible: expect.any(Number), known: expect.any(Number), inputTokens: expect.any(Number) });
 		const bad = rig(async () => textReply('{"cold":[]}'));
 		bad.run(); await bad.judge.running;
-		expect(bad.records[0]).toMatchObject({ error: "Judge response must be verdict lines", replyHead: '{"cold":[]}' });
+		expect(bad.records[0]).toMatchObject({ error: "Judge response has no fact lines", replyHead: '{"cold":[]}' });
 		const later = deferred(), s = rig(() => later.promise);
 		s.run(); await flush();
 		s.judge.stop(); s.judge.startRun(); s.run(32);
@@ -326,8 +589,16 @@ describe("background judge", () => {
 
 	test("no capability metadata keeps the provider default; a mandatory model is not forced off", () => {
 		expect(judgeReasoning(model, "low")).toBeUndefined();
-		expect(judgeReasoning({ reasoning: true })).toBeUndefined();
-		expect(judgeReasoning({ reasoning: true, thinkingLevelMap: { off: null } })).toBeUndefined();
+		expect(judgeReasoning({ reasoning: true })).toBeUndefined(); // Pi sends its off effort: nothing to lower
+		// the provider picks the effort when none is named: the lowest supported level above off
+		expect(judgeReasoning({ reasoning: true, thinkingLevelMap: { off: null } })).toBe("minimal");
+		const luna = { provider: "github-copilot", api: "openai-responses", reasoning: true, thinkingLevelMap: { off: "none", minimal: null, low: "low" } };
+		expect(judgeReasoning(luna, undefined)).toBe("low");
+		expect(judgeReasoning(luna, "high")).toBe("high"); // an explicit level wins
+		expect(judgeReasoning({ ...luna, api: "anthropic-messages" }, undefined)).toBeUndefined(); // Pi turns thinking off there
+		expect(judgeReasoning({ ...luna, reasoning: false }, undefined)).toBeUndefined();
+		const registry = { getSupportedThinkingLevels: () => ["off", "medium", "high"], clampThinkingLevel: (_m: Any, l: string) => l };
+		expect(judgeReasoning(luna, undefined, registry)).toBe("medium"); // the host's list, not the static map
 		expect(judgeReasoning({ reasoning: true, thinkingLevelMap: { off: null } }, "off")).toBe("minimal");
 		expect(judgeReasoning({ reasoning: false }, "high")).toBe("off");
 	});
@@ -342,6 +613,26 @@ describe("background judge", () => {
 		expect(r.calls.length).toBe(1);
 		expect(r.calls[0][2].reasoning).toBeUndefined();
 		expect(r.records[0].error).toBeUndefined();
+	});
+
+	test("a model that reasons by default is asked for its lowest level; without streamSimple the default stays", async () => {
+		const luna = { ...model, provider: "github-copilot", id: "gpt-6-luna", api: "openai-responses", reasoning: true, thinkingLevelMap: { off: "none", minimal: null, low: "low" } };
+		process.env.PI_ZIP_JUDGE_MODEL = "github-copilot/gpt-6-luna";
+		const r = rig(), streamed: Any[] = [];
+		r.ctx.modelRegistry.getAvailable = () => [luna];
+		(r.ctx.modelRegistry as Any).streamSimple = (_m: Any, _c: Any, o: Any) => { streamed.push(o); return { result: async () => textReply() }; };
+		r.run(); await r.judge.running;
+		expect(streamed.map((o) => o.reasoning)).toEqual(["low"]);
+		expect(r.calls.length).toBe(0);
+		expect(r.records[0]).toMatchObject({ level: "low" });
+		expect(r.records[0].error).toBeUndefined();
+		const bare = rig();
+		bare.ctx.modelRegistry.getAvailable = () => [luna];
+		bare.run(); await bare.judge.running;
+		expect(bare.calls.length).toBe(1);
+		expect(bare.calls[0][2].reasoning).toBeUndefined();
+		expect(bare.records[0].level).toBeUndefined();
+		expect(bare.records[0].error).toBeUndefined();
 	});
 
 	test("a changed user request is judged again inside the old verdict window", async () => {
@@ -409,6 +700,21 @@ describe("background judge", () => {
 });
 
 describe("Zip integration", () => {
+	test("new evidence invalidates advice before the boundary's planner reads it", async () => {
+		const r = rig(async () => textReply(`${h(1)} C E1`));
+		r.run(); await r.judge.running;
+		const entries = longTurn(24);
+		entries.push(A("dependency", []));
+		entries.at(-1)!.messages[0].content = [{ type: "text", text: `Still need ${h(1)}` }];
+		const { pi } = fakePi(), { ctx } = fakeCtx(entries, { model });
+		const zip = new Zip(pi); zip.sessionStart(ctx); await startZip(zip, ctx);
+		(zip as Any).judge = r.judge;
+		let wasCold: boolean | undefined;
+		(zip as Any).onTurnEnd = async () => { wasCold = r.judge.verdicts.get(h(1))?.v === "cold"; };
+		await zip.turnEnd({ message: { role: "assistant", stopReason: "toolUse" }, entries: [], context: { contextEntries: entries } }, ctx);
+		expect(wasCold).toBe(false);
+		zip.shutdown();
+	});
 	test("a need custom message never creates a user turn, including after a final answer", () => {
 		const entries = [U("u", "task"), A("a")];
 		const m = { role: "custom", customType: NEED_CUSTOM, content: "reminder" };
@@ -418,7 +724,7 @@ describe("Zip integration", () => {
 	});
 
 	test("turnEnd does not await the judge; off and session switch discard its late answer", async () => {
-		const entries = longTurn(24, { chars: 12_000 }), d = deferred(), calls: Any[] = [];
+		const entries = longTurn(72, { chars: 12_000 }), d = deferred(), calls: Any[] = [];
 		const { pi } = fakePi({ sendMessage: (...args: Any[]) => calls.push(args) });
 		const { ctx } = fakeCtx(entries, { model, modelRegistry: { getAvailable: () => [model], complete: () => d.promise } });
 		const zip = new Zip(pi); zip.sessionStart(ctx); await startZip(zip, ctx);
@@ -561,7 +867,7 @@ function materializeFixtureSnapshot(snap: Any) {
 	return { entries, branch, blocks, calls: toolCallIndex(blocks), steerIds };
 }
 
-describe("finite semantic eval corpus (test/fixtures/judge-decisions.json)", () => {
+describe("finite contract corpus (test/fixtures/judge-decisions.json)", () => {
 	const corpus = JSON.parse(readFileSync(new URL("./fixtures/judge-decisions.json", import.meta.url), "utf8"));
 
 	test("separates prompt contrastive examples from held-out eval cases and covers all 10 categories", () => {
@@ -596,9 +902,7 @@ describe("finite semantic eval corpus (test/fixtures/judge-decisions.json)", () 
 	});
 
 	test("replays held-out snapshots for expected labels, adversarial verdicts, and policy invariants", () => {
-		const codes = ["C", "H", "N", "U"] as const;
-		const confusion: Record<string, Record<string, number>> = Object.fromEntries(codes.map((a) => [a, Object.fromEntries(codes.map((b) => [b, 0]))]));
-		let abstained = 0, unsupportedNeed = 0, policyViolations = 0, promptTokens = 0;
+		let checkedTargets = 0, abstained = 0, unsupportedNeed = 0, policyViolations = 0, promptTokens = 0;
 
 		for (const c of corpus.evalCases) {
 			const s = materializeFixtureSnapshot(c.snapshot);
@@ -613,8 +917,8 @@ describe("finite semantic eval corpus (test/fixtures/judge-decisions.json)", () 
 			}
 
 			// 1. Expected / contract-accepted decision evaluation.
-			const expectedLines = c.targets.map((t: Any) => `${handleFor(t.entryId)} ${t.expected} ${t.validEvidence[0]}`).join("\n");
-			const parsed = parseVerdict(expectedLines, inp.manifest, inp.evidence, meta);
+			const expectedLines = c.targets.map((t: Any) => factLine(handleFor(t.entryId), t.expected)).join("\n");
+			const parsed = parseFacts(expectedLines, inp.manifest, inp.evidence, meta);
 			abstained += parsed.abstained;
 			const judge = new Judge(() => {});
 			judge.startRun();
@@ -636,7 +940,7 @@ describe("finite semantic eval corpus (test/fixtures/judge-decisions.json)", () 
 				const th = handleFor(t.entryId);
 				expect(inp.manifest.has(th)).toBe(true);
 				expect(t.accepted).toContain(t.expected);
-				confusion[t.expected][t.expected]++;
+				checkedTargets++;
 				expect(parsed.verdicts.get(th)).toBe(t.expectedVerdict);
 				expect(!!hint?.shown.includes(th)).toBe(!!t.expectHint);
 				if (t.forbiddenActions.includes("fold_before_cold")) {
@@ -681,17 +985,15 @@ describe("finite semantic eval corpus (test/fixtures/judge-decisions.json)", () 
 
 		const report = {
 			cases: corpus.evalCases.length,
-			confusion,
+			checkedTargets,
 			abstained,
 			unsupportedNeed,
 			policyViolations,
 			promptTokens,
 			costUsd: 0,
 			latencyMs: 0,
-			semanticQualityEvaluated: process.env.PI_ZIP_JUDGE_EVAL_LIVE === "1",
-			note: process.env.PI_ZIP_JUDGE_EVAL_LIVE === "1"
-				? "live model semantic evaluation enabled"
-				: "live LLM semantic quality not evaluated (no API credentials configured); deterministic and adversarial policy checks only",
+			semanticQualityEvaluated: false,
+			note: "Contract fixtures and adversarial policy checks only; no model accuracy measurement.",
 		};
 		expect(report.cases).toBe(10);
 		expect(report.abstained).toBeGreaterThanOrEqual(1);

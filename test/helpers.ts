@@ -93,6 +93,7 @@ export function longTurn(rounds: number, o: { chars?: number; mutating?: number[
 	for (let i = 1; i <= rounds; i++) {
 		const a = A(`a${i}`, [`c${i}`]);
 		const call = (a.messages[0] as Any).content[1];
+		call.arguments = { command: `ls d${i}` }; // distinct calls: an identical repeat supersedes the older output (judge)
 		if (o.mutating?.includes(i)) call.arguments = { command: "npm test" };
 		if (o.recalls?.includes(i)) Object.assign(call, { name: "zip_recall", arguments: { handle: "x" } });
 		out.push(a);

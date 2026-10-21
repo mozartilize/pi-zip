@@ -647,6 +647,43 @@ export interface PlanResult {
 	atRoomUnedited?: boolean; // the context as it is (no fold, no cut applied) is at Pi's compaction room: a request sent unchanged would trigger it
 }
 
+/** Candidate groups in planner order. Shared with the background judge; economics still belongs to plan(). */
+export function foldCandidates(blocks: Block[], calls: Calls, o: PlanOpts): [Block[], Block[], Block[]] {
+	const s = settings(), scale = o.scale ?? UNIT;
+	const turns = countUserTurns(blocks) + (o.promptPending && !openStarter(blocks) ? 1 : 0);
+	const age = o.inturnAge ?? s.inturnAge;
+	// Preserve the automatic-cache observation prefix in both selection paths.
+	const head = o.law?.pr.cls === "automatic" ? (MIN_EXPECT - scale.O) / scale.c : 0;
+	const groups: [Block[], Block[], Block[]] = [[], [], []];
+	let start = 0;
+	for (const b of blocks) {
+		const pos = start; start += b.tokens;
+		if (b.kind !== "toolResult" || b.edited || !b.entryId || pos < head || o.recalled?.has(handleFor(b.entryId))) continue;
+		const text = textOf((b.raw ?? b.msg).content);
+		if (tok4(text) <= (o.foldMin ?? s.foldMin)) continue;
+		const call = calls.get(b.msg.toolCallId), name = call?.name ?? b.msg.toolName;
+		if (name === RECALL_TOOL || (name === "bash" && commandNamesRecall(call?.args?.command))
+			|| (["read", "grep", "find", "ls"].includes(name) && !!parseRecallPath(call?.args?.path))) continue;
+		const rereadable = () => classifyRecoverability(name ?? "", call?.args, text, o.cwd) === "rereadable";
+		if (o.rereadOnly && !rereadable()) continue;
+		if (b.userTurn < turns - PROTECT_USER_TURNS + 1) groups[0].push(b);
+		else {
+			if (o.pause && b.userTurn < turns && rereadable()) groups[1].push(b);
+			if (age > 0 && b.age >= age) groups[2].push(b);
+		}
+	}
+	return groups;
+}
+
+/** A useful, recallable replacement; ranking cannot bypass the planner's saving check. */
+export function foldPlaceholder(b: Block, calls: Calls, o: PlanOpts): { ph: string; phTok: number } | null {
+	if (!b.entryId || o.recalled?.has(handleFor(b.entryId))) return null;
+	const ph = makePlaceholderFor(b, calls, o.keepLines ?? settings().keepLines, !!o.rereadOnly, o.fileRecall);
+	if (ph === null) return null;
+	const phTok = tokensOf({ ...b.msg, content: [{ type: "text", text: ph }] });
+	return phTok < 0.9 * b.tokens ? { ph, phTok } : null;
+}
+
 /** Estimated content before the earliest edited block: what stays cached through the edit with O (real: O + c x it). A cut edits from the start. */
 export function untouchedEst(blocks: Block[], folds: FoldTarget[], cut: boolean): number {
 	const ids = new Set(folds.map((t) => t.entryId));
@@ -686,9 +723,6 @@ export function plan(entries: Any[], o: PlanOpts): { f: PlanResult; c: PlanResul
 		o.trace?.push({ where, ...t, ...(r !== null ? { keep: o.keep } : {}), ...(Tsuf !== undefined ? { Tsuf } : {}), ...(cut !== undefined ? { cut } : {}), ...(isReady ? { ready: true } : {}), ...(key !== undefined ? { key } : {}) });
 		return t.ok;
 	};
-	const foldMin = o.foldMin ?? s.foldMin;
-	const keepLines = o.keepLines ?? s.keepLines;
-	const inturnAge = o.inturnAge ?? s.inturnAge;
 	let judging = false, target = coldCap, minIdx = 0;
 	const blocks = buildBlocks(entries, o.steerIds);
 	if (!blocks.length) return null;
@@ -720,31 +754,15 @@ export function plan(entries: Any[], o: PlanOpts): { f: PlanResult; c: PlanResul
 	};
 	const addFold = (b: Block, trig: string): boolean => {
 		if (tokOverride.has(b.idx) || recalled.has(handleFor(b.entryId!))) return false; // F4: never refold what the model recalled
-		const ph = makePlaceholderFor(b, calls, keepLines, !!o.rereadOnly, o.fileRecall);
-		if (ph === null) return false;
-		const phTok = tokensOf({ ...b.msg, content: [{ type: "text", text: ph }] }); // the folded message: its id and framing stay
-		if (!(phTok < 0.9 * b.tokens)) return false;
+		const replacement = foldPlaceholder(b, calls, o);
+		if (!replacement) return false;
+		const { ph, phTok } = replacement;
 		tokOverride.set(b.idx, phTok);
 		const call = calls.get(b.msg.toolCallId);
 		folds.push({ entryId: b.entryId!, toolCallId: b.msg.toolCallId, visIdx: visOfBlock[b.idx] ?? -1, contentKey: contentKeyOf(b.msg.content), tool: call?.name ?? b.msg.toolName ?? "tool", args: call ? shortArgs(call.args) : "", entryTokens: b.tokens, phTokens: phTok, ph, trig, recover: classify(b) });
 		return true;
 	};
-	// a zip_recall result IS content the model just asked for: folding it would undo the recall (and loop); never
-	// ... and so is a built-in read, grep, find, ls or bash call on a recall file (file recall, when an allowlist hides zip_recall)
-	const isRecall = (b: Block) => {
-		const call = calls.get(b.msg.toolCallId), name = call?.name ?? b.msg.toolName;
-		if (name === RECALL_TOOL) return true;
-		if (name === "bash") return commandNamesRecall(call?.args?.command);
-		return (name === "read" || name === "grep" || name === "find" || name === "ls") && !!parseRecallPath(call?.args?.path);
-	};
-	// Observability: on an automatic (prefix) cache no fold starts inside the first MIN_EXPECT real tokens, so the next response's cacheRead
-	// is an uncensored survival sample (learn.ts sample). Without it every idle return folded into the first 1-7K tokens and its sample was
-	// censored, so the learned curve never saw a return (live GLM bench). Explicit caches are exempt: the provider looks back only ~20
-	// blocks from the last breakpoint, a far head is not read either way. A cut replaces the prefix from the first message: exempt too.
-	const head = law.pr.cls === "automatic" ? (MIN_EXPECT - O) / c : 0; // MIN_EXPECT counts from the first token, O included
-	const start: number[] = [];
-	blocks.reduce((acc, b) => ((start[b.idx] = acc), acc + b.tokens), 0);
-	const foldable = (b: Block) => b.kind === "toolResult" && !b.edited && !!b.entryId && tok4(textOf((b.raw ?? b.msg).content)) > foldMin && !isRecall(b) && start[b.idx] >= head && (!o.rereadOnly || classify(b) === "rereadable");
+	const candidates = foldCandidates(blocks, calls, o);
 	const protectedTurn = (b: Block) => b.userTurn >= userTurns - PROTECT_USER_TURNS + 1;
 	const savings = () => folds.reduce((a, t) => a + t.entryTokens - t.phTokens, 0);
 	// the eligible outputs, class by class, each biggest first, until the view is at the working size: inside one rewrite a fold beyond
@@ -760,13 +778,13 @@ export function plan(entries: Any[], o: PlanOpts): { f: PlanResult; c: PlanResul
 	};
 	const choose = () => {
 	// outputs of the user turns before the previous one
-	take(blocks.filter((b) => foldable(b) && !protectedTurn(b)), trig);
+	take(candidates[0], trig);
 	// the protected window = the new prompt + the previous user turn; after a pause (or a model switch) the user comes back to a cache
 	// that is gone, and that turn's big re-readable reads are what makes the return expensive: they come back exactly
-	if (o.pause) take(blocks.filter((b) => foldable(b) && protectedTurn(b) && b.userTurn < userTurns && classify(b) === "rereadable"), `${trig}(relax)`);
+	take(candidates[1], `${trig}(relax)`);
 	// in-turn: outputs of the protected turns that are many requests old, whatever their recoverability class (every fold stays
 	// recallable). Age = assistant requests since the call was issued (the newest outputs, age < inturnAge, always stay).
-	if (inturnAge > 0) take(blocks.filter((b) => foldable(b) && protectedTurn(b) && b.age >= inturnAge), `${trig}(inturn)`);
+	take(candidates[2], `${trig}(inturn)`);
 	};
 	choose();
 	// Rent, production, cuts and the permission to rewrite always use the original plan. Reorder only its accepted folds.
