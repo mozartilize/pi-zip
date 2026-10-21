@@ -13,8 +13,10 @@ import {
 	BUDGET,
 	buildCut,
 	boundEpochs,
+	clipActive,
 	consolidateEpochs,
 	mkEpoch,
+	MERGE_REASONING_TOKENS,
 	EPOCH_WORDS,
 	EFFORT_REFUSED_RE,
 	FIRST_REQUESTS,
@@ -632,6 +634,47 @@ describe("append-only narrative epochs (billion-context §3.2, §3.6, §4.2; pi-
 		expect(parseSummary(result.text).epochs!.activeState).toBe("open deploy TODO");
 	});
 
+	test("clipping the current state keeps open items from the middle, whole lines in order, and counts what it drops", () => {
+		const status = (k: number) => `status ${k}: the parser module compiles and its unit tests run green again`;
+		const lines = [...Array.from({ length: 20 }, (_, k) => status(k)), "- [ ] rotate the staging key before Friday", ...Array.from({ length: 20 }, (_, k) => status(20 + k))];
+		const out = clipActive(lines.join("\n"), 1000).split("\n");
+		expect(out.join("\n").length).toBeLessThanOrEqual(1000);
+		expect(out).toContain("- [ ] rotate the staging key before Friday"); // a head and tail clip drops exactly this line
+		const body = out.slice(0, -1);
+		expect(body.every((l) => lines.includes(l))).toBe(true); // never cut inside a line
+		expect(body).toEqual(lines.filter((l) => body.includes(l))); // original order
+		expect(out.at(-1)).toBe(`[… ${lines.length - body.length} other lines omitted for length …]`);
+		// only open items, more than fit: the count names them, and nothing over the bound goes out
+		const todos = Array.from({ length: 40 }, (_, k) => `- [ ] item ${k} needs a follow-up check in module ${k}`);
+		const t = clipActive(todos.join("\n"), 1000).split("\n");
+		expect(t.join("\n").length).toBeLessThanOrEqual(1000);
+		expect(t.slice(0, -1)).toEqual(todos.slice(0, t.length - 1));
+		expect(t.at(-1)).toBe(`[… ${41 - t.length} open items omitted for length …]`);
+		expect(clipActive("short", 1000)).toBe("short");
+	});
+
+	test("an open item in the middle of a long current state survives two summaries the conversation is silent on", async () => {
+		const critical = "- [ ] re-run the migration on the replica after the index fix";
+		const filler = (tag: string) => Array.from({ length: 30 }, (_, k) => `${tag} status ${k}: builds and tests are green on branch feature-${k}`).join("\n");
+		let previous: string | null = "## Narrative\n" + formatNarrative({ activeState: `${filler("old")}\n${critical}\n${filler("older")}`, epochs: [mkEpoch(1, 1, "request 1", "time unknown", 1, "old fact")] });
+		for (const i of [1, 2]) {
+			const blocks = buildBlocks([summaryEntry(previous!), U(`u${i}`, `unrelated work ${i}`), A(`a${i}`), U("keep", "kept")]);
+			let sent = "";
+			const complete = async (_m: Any, c: Any) => {
+				sent = c.messages[0].content[0].text;
+				const prev = /<previous-active-state>\n([\s\S]*?)\n<\/previous-active-state>/.exec(sent)?.[1] ?? "";
+				// a compliant model: everything it was given (the marker line too), then the new status
+				return { stopReason: "stop", content: [{ type: "text", text: `---DECISIONS---\nfact ${i}\n---ACTIVE---\n${prev}\n${filler(`new${i}`)}` }] };
+			};
+			previous = (await buildCut({ blocks, calls: toolCallIndex(blocks), cutIdx: blocks.length - 1, prefixTokens: 50_000, summaryTokensPlanned: 7000 } as Any,
+				{ model: { id: "m" }, modelRegistry: { complete } })).text;
+			expect(sent).toContain(critical); // the reconciling call saw it
+			const active = parseSummary(previous).epochs!.activeState;
+			expect(active).toContain(critical);
+			expect(active).toMatch(/\[… \d+ other lines omitted for length …\]$/);
+		}
+	});
+
 	test("tier merge reserve can veto ROI that the narrative call alone would pass", () => {
 		const previous = "## Narrative\n" + formatNarrative({ activeState: "deploy after QA", epochs: Array.from({ length: 5 }, (_, i) =>
 			mkEpoch(i + 1, i + 1, `request ${i + 1}`, "time unknown", i === 0 ? 2 : 1, "constraint value ".repeat(200))) });
@@ -648,6 +691,26 @@ describe("append-only narrative epochs (billion-context §3.2, §3.6, §4.2; pi-
 		expect(gain).toBeGreaterThan(t.K - (pr.w * work.inputTokens + pr.out * work.outputTokens));
 		expect(estimateMergeWork(null, 300).merges).toBe(0);
 		expect(estimateMergeWork(previous, 300, 1, { maxTokens: 700 }).outputTokens).toBe(2100);
+	});
+
+	test("a model that reasons anyway gets reasoning room on merge calls, and the planner reserve pays for it", async () => {
+		const previous = "## Narrative\n" + formatNarrative({ activeState: "pending", epochs: Array.from({ length: 5 }, (_, i) =>
+			mkEpoch(i + 1, i + 1, `request ${i + 1}`, "time unknown", 1, "constraint value ".repeat(200))) });
+		const always = { provider: "p", id: "always", reasoning: true, thinkingLevelMap: { off: null } };
+		// three 3000-token word caps; each gains MERGE_REASONING_TOKENS only where reasoning cannot be turned off
+		expect(estimateMergeWork(previous, 300, 1, always).outputTokens).toBe(3 * (3000 + MERGE_REASONING_TOKENS));
+		expect(estimateMergeWork(previous, 300, 1, { ...always, thinkingLevelMap: {} }).outputTokens).toBe(9000);
+		expect(estimateMergeWork(previous, 300, 1, { ...always, reasoning: false }).outputTokens).toBe(9000);
+		expect(estimateMergeWork(previous, 300, 1, { provider: "github-copilot", api: "openai-responses", id: "g", reasoning: true }).outputTokens).toBe(3 * (3000 + MERGE_REASONING_TOKENS));
+		expect(estimateMergeWork(previous, 300, 1, { provider: "github-copilot", api: "anthropic-messages", id: "c", reasoning: true }).outputTokens).toBe(9000); // Pi turns its thinking off
+		expect(estimateMergeWork(previous, 300, 1, { ...always, maxTokens: 5000 }).outputTokens).toBe(15_000); // never past the model's own limit
+		const caps: number[] = [];
+		const blocks = buildBlocks([summaryEntry(previous), U("u", "new work"), A("a"), U("keep", "kept")]);
+		await buildCut({ blocks, calls: toolCallIndex(blocks), cutIdx: blocks.length - 1, prefixTokens: 50_000, summaryTokensPlanned: 300 } as Any, { model: always, modelRegistry: { complete: async (_m: Any, c: Any, options: Any) => {
+			if (c.messages[0].content[0].text.includes("<epoch heading=")) caps.push(options.maxTokens);
+			return { stopReason: "stop", content: [{ type: "text", text: "- merged" }], usage: { cost: { total: 0 } } };
+		} } });
+		expect(caps[0]).toBe(3000 + MERGE_REASONING_TOKENS);
 	});
 
 	test("merge calls have their own output cap and report predicted and actual costs", async () => {

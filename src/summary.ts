@@ -4,7 +4,7 @@ import { randomUUID } from "node:crypto";
 import { blockTime, cdDirOf, clipMid, distinctLines, handleFor, keyTexts, outcomeHint, RECALL_TOOL, shortArgs, strippableCdDirs, whenLabel } from "./placeholder.ts";
 import { type Block, type Cut, type PlanResult, NARRATIVE_CALL_MAX, NARRATIVE_MAX, settings, toolCallIndex } from "./plan.ts";
 import { type FileRecall, fileRecallHow } from "./recallfile.ts";
-import { type Any, attempt, clamp, clip, envInt, fmtWhen, textOf, tok4 } from "./util.ts";
+import { type Any, attempt, clamp, clip, envInt, fmtWhen, reasonsByDefault, textOf, tok4 } from "./util.ts";
 
 export const SUMMARY_MARK = "[summary of earlier conversation by pi-zip]";
 const POLICY_BLOCK_RE = /violate|terms of service|usage polic|content polic|acceptable use/i;
@@ -540,6 +540,39 @@ function prose(t: string): string {
 }
 /** A part of a reply clipped to its word budget (head and tail kept). */
 const clipPart = (t: string, words: number) => excerpt(t, Math.max(200, words * CHARS_PER_WORD), Math.floor(Math.max(200, words * CHARS_PER_WORD) / 3));
+/** Characters the current state may take in a summary for this many words (the same bound as clipPart). */
+const activeChars = (words: number) => Math.max(200, words * CHARS_PER_WORD);
+
+/** A line of the current state that holds open work: a `- [ ]` item (the format the prompt asks for), or a line naming a todo or blocker. */
+const OPEN_LINE = /^\s*(?:[-*+]|\d+[.)])\s+\[ \]|\b(?:todo|fixme|blocker|blocked|pending|next step)s?\b/i;
+
+/**
+ * The current state bounded to `maxChars` by whole lines. Open-work lines are kept before other lines; kept lines stay in their order.
+ * A line is never cut in the middle, except an open line that alone exceeds the room left (its head is kept). Every dropped line is
+ * counted in one closing marker, so the reader of the summary sees that open work was left out and how much.
+ */
+export function clipActive(text: string, maxChars: number): string {
+	if (text.length <= maxChars) return text;
+	const lines = text.split("\n"), open = lines.map((l) => OPEN_LINE.test(l));
+	const kept: (string | null)[] = lines.map(() => null);
+	const room = maxChars - 80; // the marker: "[… 9999 open items and 9999 other lines omitted for length …]" with its newline
+	let used = 0;
+	for (const wantOpen of [true, false]) {
+		for (let i = 0; i < lines.length; i++) {
+			if (kept[i] !== null || open[i] !== wantOpen || !lines[i].trim()) continue;
+			const left = room - used;
+			if (lines[i].length + 1 <= left) kept[i] = lines[i];
+			else if (wantOpen && left >= 120) kept[i] = lines[i].slice(0, left - 3).replace(/\s+\S*$/, "") + " …";
+			else continue;
+			used += kept[i]!.length + 1;
+		}
+	}
+	let o = 0, s = 0;
+	lines.forEach((l, i) => { if (kept[i] === null && l.trim()) open[i] ? o++ : s++; });
+	const n = (k: number, what: string) => `${k} ${what}${k > 1 ? "s" : ""}`;
+	const marker = `[… ${[o ? n(o, "open item") : "", s ? n(s, "other line") : ""].filter(Boolean).join(" and ")} omitted for length …]`;
+	return [...kept.filter((l): l is string => l !== null), ...(o || s ? [marker] : [])].join("\n");
+}
 
 const MARK_LINE = /^[\s#*_>`-]*(DECISIONS|ACTIVE)\b[\s#*_:`-]*$/i;
 const ACTIVE_TOPIC = /current state|state of the work|open todo|todos|next step|blocker|in.flight|active|status/i;
@@ -648,8 +681,17 @@ export function pickPair(eps: EpochBlock[]): number {
 	return 0;
 }
 
+/** Output tokens a merge call adds for reasoning the model spends anyway. Reasoning counts toward the call's maxTokens. */
+export const MERGE_REASONING_TOKENS = envInt("SUM_MERGE_REASONING_TOKENS", 4096);
+
+/** The model reasons on a summariser call even though none is asked for: by default (reasonsByDefault), or because its provider refused a
+ *  request without reasoning and is now asked for "low" (lowEffort). */
+export function reasonsAnyway(model: Any): boolean {
+	return reasonsByDefault(model) || (!!model?.reasoning && lowEffort.has(`${model.provider ?? ""}/${model.id ?? ""}`));
+}
+
 /** Shared by execution and the planner's cost reserve; merge calls have a word-sized cap, not the narrative's 16K cap. */
-function mergeSpec(a: EpochBlock, b: EpochBlock) {
+function mergeSpec(a: EpochBlock, b: EpochBlock, model?: Any) {
 	const words = clamp(Math.round(0.6 * wordCount(a.durableProse + " " + b.durableProse)), 120, EPOCH_WORDS);
 	const prompt =
 		[a, b].map((e) => `<epoch heading="${epochHead(e).slice(5).replace(/"/g, "'")}">\n${e.durableProse}\n</epoch>`).join("\n\n") +
@@ -658,13 +700,13 @@ function mergeSpec(a: EpochBlock, b: EpochBlock) {
 		`depend on; where the later epoch supersedes the earlier one, keep only the later; drop only what is plainly obsolete. Add nothing that is not in them, ` +
 		`and do not mention the epochs or the merge. Output only the merged text, as short markdown bullets without headings. Stay under about ${words} words. Do not call tools.`;
 	const maxChars = Math.min(words * CHARS_PER_WORD, Math.max(400, Math.floor((a.durableProse.length + b.durableProse.length) * 0.75)));
-	return { prompt, maxChars, maxTokens: Math.max(1024, words * 12) };
+	return { prompt, maxChars, maxTokens: Math.max(1024, words * 12) + (reasonsAnyway(model) ? MERGE_REASONING_TOKENS : 0) };
 }
 const mergeBlock = (a: EpochBlock, b: EpochBlock, body: string) => mkEpoch(epochNum(a, false), epochNum(b, true), joinTurns(a, b), joinTime(a, b), Math.max(a.level ?? 1, b.level ?? 1) + 1, body);
 
 /** One tier merge: two neighbouring epochs into one by a small call. */
 async function mergeEpochs(a: EpochBlock, b: EpochBlock, ctx: Any, signal?: AbortSignal): Promise<Narrative & { block?: EpochBlock }> {
-	const spec = mergeSpec(a, b);
+	const spec = mergeSpec(a, b, ctx.model);
 	const r = await complete(ctx, spec.prompt, signal, spec.maxTokens);
 	if (!r.ok || !r.text) return r;
 	const body = excerpt(prose(r.text) || NONE_ROW, spec.maxChars, Math.floor(spec.maxChars / 3));
@@ -681,7 +723,7 @@ export function estimateMergeWork(previous: string | null, budgetTokens: number,
 	// The new epoch is never merged on this cut. Reserve its largest permitted body and a heading allowance.
 	let eps = [...struct.epochs, mkEpoch(999999, 999999, "requests 999999–999999", "time unknown", 1, "x".repeat(EPOCH_WORDS * CHARS_PER_WORD + 128))];
 	while (eps.length > 2 && epochTokens(eps) > epochCap(budgetTokens) && work.merges < MAX_MERGES_PER_CUT) {
-		const i = pickPair(eps), a = eps[i], b = eps[i + 1], spec = mergeSpec(a, b);
+		const i = pickPair(eps), a = eps[i], b = eps[i + 1], spec = mergeSpec(a, b, model);
 		work.inputTokens += Math.ceil(scale * tok4(NARRATIVE_SYSTEM + spec.prompt)) + 256;
 		work.outputTokens += Math.min(spec.maxTokens, Number(model?.maxTokens) > 0 ? Number(model.maxTokens) : spec.maxTokens);
 		work.merges++;
@@ -971,7 +1013,7 @@ export async function narrative(prefix: Block[], ctx: Any, budgetTokens: number,
 		return { text: null, ok: false, ms: Date.now() - t0, costUsd: 0, error: err instanceof Error ? err.message : String(err) };
 	}
 	const w = epochWords(budgetTokens);
-	const previous = excerpt(previousActive, ACTIVE_INPUT_TOKENS * 4 - 80, ACTIVE_INPUT_TOKENS * 2);
+	const previous = clipActive(previousActive, ACTIVE_INPUT_TOKENS * 4 - 80);
 	const prompt =
 		(previous ? `<previous-active-state>\n${previous}\n</previous-active-state>\n\n` : "") +
 		`<conversation>\n${conv}\n</conversation>\n\n` +
@@ -986,7 +1028,9 @@ export async function narrative(prefix: Block[], ctx: Any, budgetTokens: number,
 		`---ACTIVE---\n` +
 		`(volatile: reconcile the previous active state with this slice. Carry forward every still-open todo, next step and blocker, even if not ` +
 		`mentioned in this slice. Remove an item only when this slice provides evidence that it was completed or superseded; silence is not completion. ` +
-		`Update changed status and add new open work. Do not copy the previous active state into DECISIONS. <= ${w.active} words)\n` +
+		`Update changed status and add new open work. Write each open todo, next step and blocker as its own line starting with "- [ ] ", ` +
+		`before the other state lines; to stay in budget, shorten wording and merge related items rather than drop one. ` +
+		`Do not copy the previous active state into DECISIONS. <= ${w.active} words)\n` +
 		`Be concrete and keep exact paths, names and numbers. Stay under about ${w.durable + w.active} words in all. Do not call tools.`;
 	const r = await complete(ctx, prompt, ownSignal);
 	if (!r.ok || !r.text) return { ...r, ms: Date.now() - t0 };
@@ -1061,7 +1105,7 @@ export async function buildCut(p: PlanResult, ctx: Any, signal?: AbortSignal): P
 	if (nar.ok && nar.text) {
 		const w = epochWords(nb);
 		const durable = clipPart(nar.durable ?? prose(nar.text), w.durable);
-		const active = clipPart(nar.active || prevStruct.activeState, w.active);
+		const active = clipActive(nar.active || prevStruct.activeState, activeChars(w.active));
 		const nextNum = (prevStruct.epochs.length ? epochNum(prevStruct.epochs.at(-1)!, true) : 0) + 1;
 		const ep = mkEpoch(nextNum, nextNum, turnsLabel(prevReq, sk.users), nowWhen ?? "time unknown", 1, durable || NONE_ROW);
 		const cons = await consolidateEpochs([...prevStruct.epochs, ep], ctx, cap, signal);
