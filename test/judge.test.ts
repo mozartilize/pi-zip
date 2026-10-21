@@ -290,6 +290,24 @@ describe("evidence rows and supersession", () => {
 		bs.find((b) => b.entryId === "r2")!.edited = true;
 		r.run(61, bs, 1000);
 		expect(r.judge.labels(61, "next task")?.get(h(1))).toBe("cold");
+
+		// 5. citesWork shares workReferences' 24K window: folded placeholders do not push a user citation out, and assistant recall echoes do not count.
+		const foldedTail = Array.from({ length: 25 }, (_, i) => [A(`af${i}`, [`cf${i}`]), R(`rf${i}`, `cf${i}`, 1500)]).flat();
+		const foldedProj = project(
+			[U("u1", `inspect ${h(1)} in /w/src/target.ts`), ...foldedTail],
+			foldedTail.filter((e) => e.sourceEntry.message.role === "toolResult").map((e) => ({
+				type: "context_edit",
+				targetId: e.sourceEntry.id,
+				replacement: { content: [{ type: "text", text: `${PH_MARK} · bash · 150 lines] ${handleFor(e.sourceEntry.id)}\n` + "k".repeat(1100) }] },
+			})),
+		);
+		expect(citesWork(buildBlocks(foldedProj), h(1), "/w/src/target.ts", "/w")).toBe(true);
+		const recallEcho = buildBlocks([
+			U("u1", "continue"),
+			{ sourceEntry: { id: "aRec", type: "message", message: { role: "assistant", content: [{ type: "text", text: `recalling ${h(1)} from /w/src/target.ts` }, { type: "toolCall", id: "cRec", name: "zip_recall", arguments: { handle: h(1) } }] } },
+				messages: [{ role: "assistant", content: [{ type: "text", text: `recalling ${h(1)} from /w/src/target.ts` }, { type: "toolCall", id: "cRec", name: "zip_recall", arguments: { handle: h(1) } }] }] },
+		]);
+		expect(citesWork(recallEcho, h(1), "/w/src/target.ts", "/w")).toBe(false);
 	});
 });
 

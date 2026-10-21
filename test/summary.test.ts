@@ -651,6 +651,11 @@ describe("append-only narrative epochs (billion-context §3.2, §3.6, §4.2; pi-
 		expect(t.slice(0, -1)).toEqual(todos.slice(0, t.length - 1));
 		expect(t.at(-1)).toBe(`[… ${41 - t.length} open items omitted for length …]`);
 		expect(clipActive("short", 1000)).toBe("short");
+		// an oversized open item ending in a long path keeps the path prefix instead of stripping back to "- [ ] …"
+		const longPath = `- [ ] /home/user/${"sub_directory_segment/".repeat(12)}target_file.ts`;
+		const clippedPath = clipActive(`${longPath}\nstatus: waiting`, 220).split("\n")[0];
+		expect(clippedPath.startsWith("- [ ] /home/user/sub_directory_segment/")).toBe(true);
+		expect(clippedPath.endsWith(" …")).toBe(true);
 	});
 
 	test("an open item in the middle of a long current state survives two summaries the conversation is silent on", async () => {

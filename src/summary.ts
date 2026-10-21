@@ -562,8 +562,10 @@ export function clipActive(text: string, maxChars: number): string {
 			if (kept[i] !== null || open[i] !== wantOpen || !lines[i].trim()) continue;
 			const left = room - used;
 			if (lines[i].length + 1 <= left) kept[i] = lines[i];
-			else if (wantOpen && left >= 120) kept[i] = lines[i].slice(0, left - 3).replace(/\s+\S*$/, "") + " …";
-			else continue;
+			else if (wantOpen && left >= 120) {
+				const head = lines[i].slice(0, left - 3), trimmed = head.replace(/\s+\S{1,24}$/, "");
+				kept[i] = (trimmed.length >= 16 ? trimmed : head) + " …";
+			} else continue;
 			used += kept[i]!.length + 1;
 		}
 	}
@@ -794,7 +796,7 @@ const list = (title: string, m: { kept: string[]; omitted: number }, marker: str
 
 /** A user request as the summary quotes it: verbatim, the middle of a very long one left out. The marker names the request's handle
  *  (recall returns user requests by handle, like tool outputs) so the model can read the whole request again. */
-function requestText(content: Any, entryId?: string, file?: FileRecall): string {
+function requestText(content: Any, entryId?: string | null, file?: FileRecall): string {
 	const t = textOf(content).trim();
 	if (t.length <= 3000) return t;
 	const h = entryId ? handleFor(entryId) : null;
@@ -807,7 +809,7 @@ function requestText(content: Any, entryId?: string, file?: FileRecall): string 
  * A summary another summariser wrote (Pi's own compaction, say) keeps no list of requests; compaction never deletes entries, so the
  * branch still holds every request that summary took out of the view, and they are quoted from there, numbered from the session's first.
  */
-export function earlierRequests(branch: Any[], firstId: string | undefined, file?: FileRecall): string[] | null {
+export function earlierRequests(branch: Any[], firstId: string | null | undefined, file?: FileRecall): string[] | null {
 	const end = firstId ? branch.findIndex((e) => e?.id === firstId) : -1;
 	if (end < 0) return null;
 	const out: string[] = [];
