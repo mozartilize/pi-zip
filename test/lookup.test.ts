@@ -84,6 +84,20 @@ describe("lookupRefs", () => {
 		expect(refs.map((r) => r.handle)).toEqual(["r4", "r2", "r1", "r3"].map(handleFor));
 		expect(lookupText(refs).shown).toEqual(["r4", "r2", "r1"].map(handleFor));
 	});
+
+	test("injected <skill> blocks do not cue SKILL.md or example references inside them, while user text around them still cues", () => {
+		const skillRead = round("1", "read", { path: "/app/skills/testing/SKILL.md" }, big("skill doc"));
+		const exampleRead = round("2", "read", { path: "/app/examples/demo.ts" }, big("example"));
+		const realRead = round("3", "read", { path: "/app/src/target.ts" }, big("target"));
+		const realCmd = round("4", "bash", { command: "bun test" }, big("test output"));
+		const branch = branchOf([U("u1", "go"), ...skillRead, ...exampleRead, ...realRead, ...realCmd]);
+		const skillBlock = `<skill name="testing" location="/app/skills/testing/SKILL.md">\nSee /app/examples/demo.ts and handle ${handleFor("r2")}.\n</skill>`;
+		expect(lookupRefs(`${skillBlock}\n\nreview`, branch, cwd, new Set())).toEqual([]);
+		expect(lookupRefs(`${skillBlock}\n\nreview /app/src/target.ts and ${handleFor("r4")}`, branch, cwd, new Set())).toEqual([
+			{ handle: handleFor("r4"), label: "bash bun test", via: "handle" },
+			{ handle: handleFor("r3"), label: "read /app/src/target.ts", via: "locator" },
+		]);
+	});
 });
 
 describe("lookup cue on the first request", () => {
