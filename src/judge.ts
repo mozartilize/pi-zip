@@ -44,6 +44,11 @@ export interface ParsedVerdict {
 	verdicts: Map<string, Verdict>;
 	nOk: Map<string, boolean>;
 	locator: Map<string, string | null>;
+	/**
+	 * Rows the guards accepted whose facts are not all settled: under facts-v1, at least one answer is U; under the
+	 * historical protocols, an explicit U line without a citation. This counts attribution of the reply, not verdict
+	 * weight, so a decisive "Y U N" row (hot) is counted and a decisive all-N "NNN" row is not.
+	 */
 	abstained: number;
 	diag: VerdictDiag;
 }
@@ -55,7 +60,19 @@ export interface VerdictDiag {
 	malformed: number;
 	/** Well-formed lines for a handle outside the current catalogue. */
 	foreign: number;
+	/**
+	 * Policy codes after precedence, so eleven fact triples collapse into U. `facts` keeps them apart.
+	 * parseFacts counts them after its guards; the replay-only parsers count a well-formed known line here before
+	 * their duplicate check, so their duplicates inflate these tallies.
+	 */
 	raw: Record<"C" | "H" | "N" | "U", number>;
+	/**
+	 * Facts protocol only: histogram of the accepted answer triples ("<active><finished><lookup>"), at most 27 keys.
+	 * Optional because the historical parsers report policy codes only. Counting happens after the missing,
+	 * duplicate, malformed and foreign guards, so a rejected line contributes no fact. A facts-v1 record without
+	 * `facts` predates this field; its `counts.unknown` is the older, narrower policy-U count.
+	 */
+	facts?: Record<string, number>;
 	missing: number;
 	duplicate: number;
 	badEvidence: number;
@@ -358,7 +375,8 @@ export function parseFacts(text: string, known: ReadonlySet<string>, evidence: r
 	if (!text.trim()) throw new Error("Judge response is empty");
 	const lines = text.trim().split(/\n+/);
 	const hits = new Map<string, (string[] | null)[]>();
-	const diag: VerdictDiag = { lines: lines.length, malformed: 0, foreign: 0, raw: { C: 0, H: 0, N: 0, U: 0 }, missing: 0, duplicate: 0, badEvidence: 0, n: [] };
+	const facts: Record<string, number> = {};
+	const diag: VerdictDiag = { lines: lines.length, malformed: 0, foreign: 0, raw: { C: 0, H: 0, N: 0, U: 0 }, facts, missing: 0, duplicate: 0, badEvidence: 0, n: [] };
 	let valid = 0;
 	for (const line of lines) {
 		const m = /^([0-9a-z]{10}) ([YNU]) ([YNU]) ([YNU])$/.exec(line.trim());
@@ -381,9 +399,12 @@ export function parseFacts(text: string, known: ReadonlySet<string>, evidence: r
 		if (rows.length !== 1) { diag.duplicate++; continue; }
 		if (!rows[0]) continue;
 		const [active, finished, lookup] = rows[0];
+		const triple = `${active}${finished}${lookup}`;
+		facts[triple] = (facts[triple] ?? 0) + 1;
+		if (triple.includes("U")) abstained++;
 		const code = lookup === "Y" ? "N" : active === "Y" ? "H" : finished === "Y" && active === "N" && lookup === "N" ? "C" : "U";
 		diag.raw[code]++;
-		if (code === "U") { abstained++; continue; }
+		if (code === "U") continue;
 		if (code === "N") {
 			const span = evidence.find((e) => e.role !== "toolResult" && (e.handles.includes(h) || (!!info?.locator && e.locators.includes(info.locator))));
 			if (!span) {
@@ -796,6 +817,8 @@ export class Judge {
 				this.verdicts.set(h, { v, atReq: reqCount, locator: parsed.locator.get(h) ?? null, nOk: parsed.nOk.get(h) ?? false });
 				if (v !== "warm") counts[v]++;
 			}
+			// Counted from the reply, not from applied verdicts: a handle the loop above skipped as fixed still adds,
+			// and a decisive row with one U fact overlaps counts.hot or counts.need.
 			counts.unknown = parsed.abstained;
 			this.stats.unknown += parsed.abstained;
 			this.failures = 0;

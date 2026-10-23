@@ -1184,12 +1184,11 @@ export class Zip implements ZipControl {
 				const live = plan.folds.filter((t) => applied.has(t.entryId));
 				this.noticeFor(ctx, plan, live, plan.cut ?? plan.native ?? null, plan.ctxBefore, sizeOf(plan.scale, (out?.messages ?? e.messages).filter((m: Any) => m.role !== "system").reduce((n: number, m: Any) => n + wireTokensOf(m), 0)));
 			}
-			const hinted = this.withHint(out?.messages ?? e.messages, ctx);
-			if (hinted) return { messages: hinted };
-			return out ? { messages: out.messages } : undefined;
 		}
-		const hinted = this.withHint(e.messages, ctx);
-		return hinted ? { messages: hinted } : undefined;
+		this.requestStart(ctx);
+		const hinted = this.withHint(out?.messages ?? e.messages, ctx);
+		if (hinted) return { messages: hinted };
+		return out ? { messages: out.messages } : undefined;
 	}
 
 	/**

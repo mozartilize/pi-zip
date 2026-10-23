@@ -329,6 +329,10 @@ describe("fact classification", () => {
 			const parsed = parseFacts(`${a} ${answers} ${lookup}`, known, referenced, meta);
 			expect(parsed.verdicts.get(a)).toBe(expected[i]);
 			expect(parsed.nOk.get(a)).toBe(expected[i] === "need");
+			// The triple survives the collapse: every combination, including a decisive row that still holds a U.
+			const triple = answers.replace(" ", "") + lookup;
+			expect(parsed.diag.facts).toEqual({ [triple]: 1 });
+			expect(parsed.abstained).toBe(triple.includes("U") ? 1 : 0);
 		}
 		// Classification needs no citation; an uncited lookup does not erase active=Y.
 		expect(parseFacts(`${a} N Y N`, known, [], meta).verdicts.get(a)).toBe("cold");
@@ -351,26 +355,48 @@ describe("fact classification", () => {
 		}
 	});
 
+	test("facts keep the triples the policy code collapses, and only for rows the guards accepted", () => {
+		const decisive = parseFacts(`${a} N N N`, known, referenced, meta);
+		expect(decisive.diag.raw).toEqual({ C: 0, H: 0, N: 0, U: 1 }); // NNN is a policy U, but every fact was settled
+		expect(decisive.diag.facts).toEqual({ NNN: 1 });
+		expect(decisive.abstained).toBe(0);
+
+		const partial = parseFacts(`${a} U Y N\n${b} Y Y N\n${c} Y Y N`, new Set([a, b, c]), referenced, meta);
+		expect(partial.diag.facts).toEqual({ UYN: 1, YYN: 2 }); // repeats accumulate
+		expect(partial.abstained).toBe(1);
+
+		const broken = parseFacts(`${a} U U U\n${b} N Y ?`, new Set([a, b, c]), referenced, meta); // c missing, b malformed
+		expect(broken.diag).toMatchObject({ malformed: 1, missing: 1, facts: { UUU: 1 } });
+		// Decisive verdicts whose U sits outside the deciding fact: hot with an unknown finished, and with an unknown lookup.
+		for (const triple of ["Y U N", "Y N U"]) {
+			const hot = parseFacts(`${a} ${triple}`, known, [], meta);
+			expect(hot.verdicts.get(a)).toBe("hot");
+			expect(hot.abstained).toBe(1);
+		}
+	});
+
 	test("missing, duplicate and malformed answers cannot acquire a cold label; old protocols are rejected", () => {
 		const all = new Set([a, b, c]);
 		for (const duplicate of [`${a} N Y N`, `${a} Y N N`, `${a} N maybe N`]) {
 			const parsed = parseFacts(`${a} N Y N\n${duplicate}\n${b} Y N N\nzzzzzzzzzz N Y N`, all, [], meta);
 			expect([...parsed.verdicts.values()]).toEqual(["warm", "hot", "warm"]);
 			expect(parsed.diag).toMatchObject({ duplicate: 1, missing: 1, foreign: 1 });
+			expect(parsed.diag.facts).toEqual({ YNN: 1 }); // the duplicated handle and the foreign line are not counted
 		}
-		expect(parseFacts(`${a} N Y ?\n${b} U U U`, all, [], meta).diag.malformed).toBe(1);
+		expect(parseFacts(`${a} N Y ?\n${b} U U U`, all, [], meta).diag).toMatchObject({ malformed: 1, facts: { UUU: 1 } });
 		for (const reply of ["", `${a} C E1`, `${a} - E1 -`, `${a} N N Y N N`, `${a} yes no no`, `[{"handle":"${a}"}]`]) {
 			expect(() => parseFacts(reply, known, referenced, meta)).toThrow();
 		}
 	});
 
 	test("production sends facts-v1 and protects completed but still needed results", async () => {
-		const r = rig(async () => textReply(`${h(1)} N Y N\n${h(2)} Y Y N`));
+		const r = rig(async () => textReply(`${h(1)} N Y N\n${h(2)} Y U N`)); // h(2) is decisive but not fully attributable
 		r.run(); await r.judge.running;
 		expect(r.calls[0][1].systemPrompt).toBe(JUDGE_SYSTEM);
 		expect(r.judge.verdicts.get(h(1))?.v).toBe("cold");
 		expect(r.judge.verdicts.get(h(2))?.v).toBe("hot");
-		expect(r.records.find((x) => x.type === "judge").protocol).toBe("facts-v1");
+		expect(r.records.find((x) => x.type === "judge")).toMatchObject({ protocol: "facts-v1", counts: { cold: 1, hot: 1, need: 0, unknown: 1 }, diag: { raw: { C: 1, H: 1, N: 0, U: 0 }, facts: { NYN: 1, YUN: 1 } } });
+		expect(r.judge.stats.unknown).toBe(1);
 	});
 });
 
