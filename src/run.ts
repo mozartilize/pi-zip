@@ -1329,12 +1329,56 @@ export class Zip implements ZipControl {
 		return u ? { summaryUsage: { input: u.input, output: u.output, cacheRead: u.cacheRead, cacheWrite: u.cacheWrite } } : {};
 	}
 
-	/** Settle writes pending artifact records and prepares another return in every mode. */
+	/** Settle writes pending artifact records and prepares another return in every mode. A repaired length stop has one chance to
+	 *  take that summary at this boundary: once Pi has omitted the truncated assistant, the resulting tool context is runnable again. */
 	async settle(e: Any, ctx: Any): Promise<Any> {
 		this.judge.stop();
 		this.inRun = false;
+		const branch = this.branch(ctx), entries = e.context.contextEntries;
+		const latestIdx = branch.findLastIndex((en: Any) => en?.type === "message" && en.message?.role === "assistant");
+		const latestEntry = branch[latestIdx], latest = latestEntry?.message;
+		const repair = latestIdx < 0 ? undefined : [...branch.slice(latestIdx + 1)].reverse().find((en: Any) => en?.type === "context_edit" && en.targetId === latestEntry.id);
+		let recovered = false;
+		for (let i = branch.length - 1; i >= 0; i--) {
+			const en = branch[i];
+			if (en?.type === "message" && en.message?.role === "user") break;
+			if (en?.type === "compaction" && en.details?.by === PRODUCT && en.details?.recovery === "length") { recovered = true; break; }
+		}
+		if (latest?.stopReason === "length" && repair?.replacement === null && e.context?.canContinue === true && !recovered) {
+			const blocks = buildBlocks(entries, this.steerIds), userTurns = countUserTurns(blocks);
+			// Price the same cut ordinary settle prepares for the next prompt; recovery uses it now with the current repaired turn as its runnable suffix.
+			const p = candidateOf(entries, (cutAt, foldsOnly, ready) => this.opts(ctx, true, entries, 1, false, cutAt, foldsOnly, ready), this.avail(branch), "length").r.p;
+			if (p && p.cutIdx !== null) {
+				if (this.bg && (this.bg.head !== headOf(branch) || this.bg.key !== p.firstKeptEntryId)) this.discardBg("replaced");
+				const prepared = this.ready(branch).find((a) => a.key === p.firstKeptEntryId)?.cut;
+				if (!prepared && (!this.bg || this.bg.aborted)) this.startBg(p, ctx, true);
+				const bg = this.bg, t0 = performance.now();
+				let cut: Cut | null = prepared ? { ...prepared, prepared: true } : null;
+				if (!cut && bg && !bg.aborted && bg.key === p.firstKeptEntryId) {
+					this.inRun = true; // keep the completed artifact in boundary drafts instead of appending behind this boundary
+					try {
+						cut = await this.working(ctx, `${PRODUCT}: recovering from the context limit`, bg.promise);
+					} finally {
+						this.inRun = false;
+					}
+				}
+				if (cut && this.active()) {
+					const waitMs = performance.now() - t0;
+					const plan = valvePlanOf(p, { ...cut, trigger: "valve", prepared: true }, true, waitMs, waitMs);
+					const out = this.commit(e, ctx, plan, { t0, blocks, userTurns, usageTotal: 0, allowLatestCut: true });
+					if (out) {
+						const compaction = out.entries.find((d: Any) => d.type === "compaction" && d.summary === cut!.text);
+						if (compaction) compaction.details = { ...compaction.details, recovery: "length" };
+						this.rent = 0;
+						this.cancelTimer();
+						this.cancelDoor();
+						return { entries: [...out.entries, ...this.drafts()], continue: true };
+					}
+				}
+			}
+		}
+		this.want("settle", ctx, undefined, entries);
 		const recs = this.drafts();
-		this.want("settle", ctx, undefined, e.context.contextEntries);
 		this.armDoor(ctx, false); // a summary ready now was priced by this run's last turn_end at this P(warm): the next change decides
 		return recs.length ? { entries: [...e.entries, ...recs] } : undefined;
 	}
@@ -1588,7 +1632,7 @@ export class Zip implements ZipControl {
 		this.notify(ctx, data.text, data);
 	}
 
-	private commit(e: Any, ctx: Any, plan: RunPlan, o: { t0: number; blocks: Block[]; userTurns: number; usageTotal: number }) {
+	private commit(e: Any, ctx: Any, plan: RunPlan, o: { t0: number; blocks: Block[]; userTurns: number; usageTotal: number; allowLatestCut?: boolean }) {
 		plan.persisted = true;
 		const sc = plan.scale, c = sc.c; // one scale for the whole run: stats, notices and the ledger agree with what the plan compared against the limits
 		const ctxTokens = plan.cut ? piContextTokens(e.context.contextEntries, this.branch(ctx), e.entries) : sizeOf(sc, o.blocks.reduce((a, b) => a + b.tokens, 0));
@@ -1600,7 +1644,11 @@ export class Zip implements ZipControl {
 			this.ledger({ type: "cold_noop", turnIndex: e.turnIndex, ctx: Math.round(ctxTokens), ...(stale ? { staleTargets: stale } : {}) });
 			return undefined;
 		}
-		const bad = checkEdits(o.blocks, o.userTurns, live, cut);
+		// At a repaired length stop there is no upcoming prompt: Pi's own recovery cut may keep only the current runnable turn.
+		// Keep the ordinary fold protections and all structural/pairing checks; relax only the two-turn quality margin for that cut.
+		const bad = o.allowLatestCut && cut
+			? checkEdits(o.blocks, o.userTurns, live, null) ?? checkEdits(o.blocks, o.userTurns + 2, [], cut)
+			: checkEdits(o.blocks, o.userTurns, live, cut);
 		if (bad) {
 			this.ledger({ type: "guard_drop", turnIndex: e.turnIndex, reason: bad, folds: live.length, source: plan.source });
 			plan.persisted = false; // keep the request-local view: never switch the fold set mid-run
