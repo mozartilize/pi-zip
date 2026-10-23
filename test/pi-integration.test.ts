@@ -241,8 +241,9 @@ async function rig(setup: (sm: SessionManager) => void = populate, opts: RigOpts
 	const build = (drafts: Any[]) => {
 		const preview = SessionManager.inMemory(CWD, undefined, [sm.getHeader() as Any, ...sm.getBranch()]);
 		apply(preview, drafts);
-		const projection = preview.buildSessionProjection();
-		return { contextEntries: projection.entries, contextMessages: projection.messages, llmMessages: convertToLlm(projection.messages), pendingMessages: [], canContinue: false };
+		const projection = preview.buildSessionProjection(), llmMessages = convertToLlm(projection.messages);
+		const finalRole = llmMessages.at(-1)?.role;
+		return { contextEntries: projection.entries, contextMessages: projection.messages, llmMessages, pendingMessages: [], canContinue: llmMessages.some((m: Any) => m.role !== "system") && finalRole !== "assistant" };
 	};
 	/** What Pi's agent session does at turn_end: boundary handlers propose entries, the drafts are applied to the real session. */
 	const turnEnd = async (assistantEntryId: string, message: Any) => {
@@ -261,11 +262,11 @@ async function rig(setup: (sm: SessionManager) => void = populate, opts: RigOpts
 		return drafts;
 	};
 	/** The end of a run: agent_before_settle (pi-zip plans the next cold return and, interactive, arms the away timer). */
-	const settle = async () => {
+	const settle = async (full = false) => {
 		const out = await runner.emitBoundary({ type: "agent_before_settle", outcome: "completed" } as Any, build as Any);
 		apply(sm, out.entries as Any[]);
 		busy = false;
-		return out.entries as Any[];
+		return full ? out : out.entries as Any[];
 	};
 	const apply = (manager: SessionManager, drafts: Any[]) => (AgentSession.prototype as Any)._applyBoundaryDrafts.call({}, manager, drafts) as Any[];
 	/** A prompt as Pi runs it (AgentSession.prompt): the input handlers while Pi is idle (it waits for them), then before_agent_start and
@@ -356,6 +357,49 @@ const produced = async (r: Any) => {
 	expect(r.narrativeCalls.length).toBe(1);
 	await r.prompt();
 };
+
+for (const mode of ["unrepaired", "queued", "repaired"] as const) test(`a length stop ${mode === "repaired" ? "compacts at the open settle boundary and continues" : `does not recover from ${mode} context`}`, async () => {
+	const repaired = mode === "repaired";
+	const staged = SessionManager.inMemory(CWD, undefined, shiftedFile(0, 9000));
+	for (let i = 0; i < 3; i++) {
+		const at = Date.now() - 10_000 + i * 10;
+		staged.appendMessage({ ...user(`recent request ${i}`), timestamp: at });
+		staged.appendMessage({ ...asst([call(`recent-${i}`)], "toolUse"), timestamp: at + 1 });
+		staged.appendMessage({ ...result(`recent-${i}`, bulk("recent output", 100)), timestamp: at + 2 });
+		staged.appendMessage({ ...asst([{ type: "text", text: "recent answer" }]), timestamp: at + 3 });
+	}
+	const file = [staged.getHeader(), ...staged.getEntries()];
+	const r = await rig(undefined, { file, tui: true, start: true, latencyMs: 10, model: { ...MODEL, contextWindow: 90_000 } });
+	const ctx = r.runner.createContext(), complete = ctx.modelRegistry.complete;
+	if (repaired) ctx.modelRegistry.complete = async () => ({ stopReason: "error", content: [], errorMessage: "403 FreeTierError", usage: { cost: { total: 0 } } });
+	try {
+		const now = Date.now();
+		r.sm.appendMessage({ ...user("current request"), timestamp: now });
+		r.sm.appendMessage({ ...asst([call("current")], "toolUse"), timestamp: now + 1 });
+		r.sm.appendMessage({ ...result("current", bulk("current output", 200)), timestamp: now + 2 });
+		const truncated = { ...asst([{ type: "text", text: "truncated answer" }], "length"), timestamp: now + 3 };
+		const truncatedId = r.sm.appendMessage(truncated);
+		await r.runner.emit({ type: "message_end", message: truncated } as Any);
+		if (repaired) r.sm.appendContextEdit(truncatedId, null);
+		if (mode === "queued") r.sm.appendMessage({ ...user("queued follow-up"), timestamp: now + 4 }); // runnable, but not Pi's length repair
+
+		const out = await r.settle(true) as Any;
+		const compaction = out.entries.find((d: Any) => d.type === "compaction" && d.details?.recovery === "length");
+		expect(out.continue).toBe(repaired);
+		expect(!!compaction).toBe(repaired);
+		if (repaired) {
+			expect(compaction.details).toMatchObject({ by: "pi-zip", trigger: "valve", recovery: "length" });
+			expect(r.compactCalls.n).toBe(0); // a boundary draft, not an idle ctx.compact()
+			const messages = r.projectionMessages();
+			expect(messages.some((m: Any) => m.role === "compactionSummary" && m.summary === compaction.summary)).toBe(true);
+			expect(JSON.stringify(messages)).not.toContain("truncated answer");
+			expect((await r.settle(true) as Any).continue).toBe(false); // the recovery marker makes continuation one-shot
+		}
+	} finally {
+		ctx.modelRegistry.complete = complete;
+		await r.shutdown();
+	}
+});
 
 describe("boundary decision regressions", () => {
 	for (const pWarm of [1, 0] as const) for (const how of ["applied", "esc", "mismatch"] as const) test(`first-request rent resets on application or a cold request (P=${pWarm}, ${how})`, async () => {
