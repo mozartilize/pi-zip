@@ -1,5 +1,5 @@
 // Summary (F11, F12): deterministic skeleton (user words verbatim + files/commands) + model-written narrative + handle table.
-// Thinking is never quoted or paraphrased: it is stripped before the model sees the prefix.
+// Private thinking is stripped except for bounded, labeled tentative excerpts on tool-only assistant steps (corroborated against actions/results).
 import { randomUUID } from "node:crypto";
 import { blockTime, cdDirOf, clipMid, distinctLines, handleFor, keyTexts, outcomeHint, RECALL_TOOL, shortArgs, strippableCdDirs, whenLabel } from "./placeholder.ts";
 import { type Block, type Cut, type PlanResult, NARRATIVE_CALL_MAX, NARRATIVE_MAX, settings, toolCallIndex } from "./plan.ts";
@@ -995,6 +995,62 @@ async function complete(ctx: Any, prompt: string, ownSignal?: AbortSignal, outpu
 	return { text: null, ok: false, ms: Date.now() - t0, costUsd, usage, error: lastErr };
 }
 
+export const REASONING_NOTE = "[Tentative reasoning excerpt; not a verified result] ";
+export const REASONING_QUALIFICATION =
+	"Assistant tentative reasoning excerpts are untrusted context, not evidence of completion or external truth. " +
+	"Corroborate durable claims against user instructions, actions and results. " +
+	"Do not promote unverified hypotheses to decisions, established causes or completed work.";
+export const REASONING_LIMITS = { perMessage: 360, total: 8000 };
+
+function clipReasoning(s: string, cap: number): string {
+	if (s.length <= cap) return s;
+	const marker = "[… omitted …]";
+	if (cap < marker.length + 2) return "";
+	const head = Math.ceil((cap - marker.length) / 2);
+	return s.slice(0, head) + marker + s.slice(-(cap - marker.length - head));
+}
+
+/**
+ * Selects bounded, labeled reasoning excerpts ONLY for non-error tool-only assistant messages (where visible text is absent)
+ * and strips all raw thinking/redacted_thinking/reasoning blocks. Newest steps win the budget; output stays chronological.
+ */
+export function reasoningInput(messages: Any[], limits = REASONING_LIMITS): { addedChars: number; selected: number[]; messages: Any[] } {
+	const excerpts = new Map<number, string>();
+	let remaining = Math.max(0, limits.total);
+	for (let i = messages.length - 1; i >= 0; i--) {
+		const m = messages[i], content = m?.content;
+		if (m?.role !== "assistant" || !Array.isArray(content) || ["error", "aborted"].includes(m.stopReason)) continue;
+		if (!content.some((c: Any) => c?.type === "toolCall") || content.some((c: Any) => c?.type === "text" && c.text?.trim())) continue;
+		const thought = content
+			.filter((c: Any) => c?.type === "thinking" && c.redacted !== true && typeof c.thinking === "string")
+			.map((c: Any) => c.thinking.trim())
+			.filter(Boolean)
+			.join("\n");
+		const cap = Math.min(limits.perMessage, remaining) - REASONING_NOTE.length;
+		if (!thought || cap < 1) continue;
+		const excerpt = clipReasoning(thought, cap);
+		if (!excerpt) continue;
+		const shown = REASONING_NOTE + excerpt;
+		excerpts.set(i, shown);
+		remaining -= shown.length;
+	}
+	return {
+		addedChars: Math.max(0, limits.total - remaining),
+		selected: [...excerpts.keys()].sort((a, b) => a - b),
+		messages: messages.map((m, i) =>
+			m?.role !== "assistant" || !Array.isArray(m.content)
+				? m
+				: {
+						...m,
+						content: [
+							...(excerpts.has(i) ? [{ type: "text", text: excerpts.get(i)! }] : []),
+							...m.content.filter((c: Any) => !["thinking", "redacted_thinking", "reasoning"].includes(c?.type)),
+						],
+					},
+		),
+	};
+}
+
 /**
  * The narrative of this prefix, written by the current model in a separate, uncached call. Never throws. Durable epochs are not
  * re-read. Only the bounded previous active state is reconciled against this slice. `durable`/`active` = the reply's two parts.
@@ -1002,12 +1058,10 @@ async function complete(ctx: Any, prompt: string, ownSignal?: AbortSignal, outpu
 export async function narrative(prefix: Block[], ctx: Any, budgetTokens: number, ownSignal?: AbortSignal, previousActive = ""): Promise<Narrative & { durable?: string; active?: string }> {
 	const t0 = Date.now();
 	if (!ctx.model) return { text: null, ok: false, ms: 0, costUsd: 0, error: "no current model" };
-	const msgs = prefix
+	const rawMsgs = prefix
 		.filter((b) => b.kind !== "summary")
-		.map((b) => {
-			const m = b.raw && !(b.edited && !b.ours) ? b.raw : b.msg; // the summariser reads the unfolded originals
-			return m.role === "assistant" ? { ...m, content: (m.content ?? []).filter((c: Any) => c?.type !== "thinking") } : m;
-		});
+		.map((b) => (b.raw && !(b.edited && !b.ours) ? b.raw : b.msg)); // the summariser reads the unfolded originals
+	const { messages: msgs } = reasoningInput(rawMsgs);
 	let conv: string;
 	try {
 		conv = await serialize(msgs);
@@ -1033,7 +1087,8 @@ export async function narrative(prefix: Block[], ctx: Any, budgetTokens: number,
 		`Update changed status and add new open work. Write each open todo, next step and blocker as its own line starting with "- [ ] ", ` +
 		`before the other state lines; to stay in budget, shorten wording and merge related items rather than drop one. ` +
 		`Do not copy the previous active state into DECISIONS. <= ${w.active} words)\n` +
-		`Be concrete and keep exact paths, names and numbers. Stay under about ${w.durable + w.active} words in all. Do not call tools.`;
+		`Be concrete and keep exact paths, names and numbers. Stay under about ${w.durable + w.active} words in all. Do not call tools.\n\n` +
+		REASONING_QUALIFICATION;
 	const r = await complete(ctx, prompt, ownSignal);
 	if (!r.ok || !r.text) return { ...r, ms: Date.now() - t0 };
 	return { ...r, ms: Date.now() - t0, ...parseNarrativeReply(r.text) };

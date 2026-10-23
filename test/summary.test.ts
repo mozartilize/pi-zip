@@ -29,6 +29,10 @@ import {
 	parseSummary,
 	PREV_NARRATIVE_CHARS,
 	previousNarrative,
+	REASONING_LIMITS,
+	REASONING_NOTE,
+	REASONING_QUALIFICATION,
+	reasoningInput,
 	skeleton,
 	TABLE_ROWS,
 } from "../src/summary.ts";
@@ -875,5 +879,58 @@ describe("append-only narrative epochs (billion-context §3.2, §3.6, §4.2; pi-
 		const roundTrip = parseEpochNarrative(formatNarrative(parseSummary(prev!).epochs!))!;
 		expect(roundTrip.activeState).toContain("Clean active state: all 42 auth tests passing");
 		expect(roundTrip.epochs.map((e) => e.id)).toEqual(["Epoch 1", "Epoch 2", "Epoch 3"]);
+	});
+
+	test("4. bounded reasoning excerpts: narrative includes labeled tentative thinking only for clean tool-only steps, newest-first under budget", async () => {
+		const toolOnly = (id: string, thought: string, extra: Any[] = [], stopReason = "toolUse") => ({
+			sourceEntry: { id, type: "message", message: {} },
+			messages: [{
+				role: "assistant",
+				stopReason,
+				content: [
+					{ type: "thinking", thinking: thought },
+					...extra,
+					{ type: "toolCall", id: `call-${id}`, name: "read", arguments: { path: `src/${id}.ts` } },
+				],
+			}],
+		});
+		const entries = [
+			U("u1", "investigate parser"),
+			toolOnly("a-clean", "Checking parser token boundary at offset 128"),
+			tres("a-clean", "read", "offset 128"),
+			toolOnly("a-visible", "Private draft thought that must be suppressed because visible text exists", [{ type: "text", text: "Visible explanation" }]),
+			tres("a-visible", "read", "ok"),
+			toolOnly("a-redacted", "Secret redacted thought", [{ type: "thinking", thinking: "Redacted block", redacted: true }]),
+			toolOnly("a-aborted", "Aborted step thought that must not enter summary", [], "aborted"),
+			U("keep", "kept"),
+			A("keepA"),
+		];
+		// Make a-redacted's only thinking block redacted:
+		entries[5].messages[0].content[0].redacted = true;
+
+		const blocks = buildBlocks(entries);
+		let sentPrompt = "";
+		const complete = async (_m: Any, c: Any) => {
+			sentPrompt = c.messages[0].content[0].text;
+			return { stopReason: "stop", content: [{ type: "text", text: "---DECISIONS---\n- Parser checked\n---ACTIVE---\n- [ ] Next" }], usage: { cost: { total: 0 } } };
+		};
+		await narrative(blocks.slice(0, blocks.findIndex((b) => b.entryId === "keep")), { model: { id: "m" }, modelRegistry: { complete } }, 1000);
+		expect(sentPrompt).toContain(`${REASONING_NOTE}Checking parser token boundary at offset 128`);
+		expect(sentPrompt).toContain(REASONING_QUALIFICATION);
+		expect(sentPrompt).not.toContain("Private draft thought");
+		expect(sentPrompt).not.toContain("Secret redacted thought");
+		expect(sentPrompt).not.toContain("Aborted step thought");
+
+		// Budget allocation: newest wins when total cap is tight, but output order stays chronological
+		const r = reasoningInput([
+			{ role: "assistant", stopReason: "toolUse", content: [{ type: "thinking", thinking: "OLDEST-THOUGHT" }, { type: "toolCall", id: "c1", name: "read", arguments: {} }] },
+			{ role: "assistant", stopReason: "toolUse", content: [{ type: "thinking", thinking: "MIDDLE-THOUGHT" }, { type: "toolCall", id: "c2", name: "read", arguments: {} }] },
+			{ role: "assistant", stopReason: "toolUse", content: [{ type: "thinking", thinking: "NEWEST-THOUGHT" }, { type: "toolCall", id: "c3", name: "read", arguments: {} }] },
+		], { perMessage: 120, total: (REASONING_NOTE.length + "MIDDLE-THOUGHT".length) * 2 });
+		expect(r.selected).toEqual([1, 2]);
+		expect(r.messages[0].content).toEqual([{ type: "toolCall", id: "c1", name: "read", arguments: {} }]);
+		expect(r.messages[1].content[0].text).toBe(`${REASONING_NOTE}MIDDLE-THOUGHT`);
+		expect(r.messages[2].content[0].text).toBe(`${REASONING_NOTE}NEWEST-THOUGHT`);
+		expect(r.addedChars).toBeLessThanOrEqual(REASONING_LIMITS.total);
 	});
 });

@@ -6,7 +6,7 @@ import { repairPayload } from "../src/guard.ts";
 import { cacheActivity, detectCold, isColdByTtl, lastMessageMs, observedTier, payloadRetention, resolveTtl } from "../src/cache.ts";
 import { classifyRecoverability, isReadOnlyBash } from "../src/classify.ts";
 import { colorTail, fmtK, noticeText, renderNotice, splitDesc, type NoticeAction, type NoticeData } from "../src/notice.ts";
-import { clipMid, handleFor, makePlaceholder, makePlaceholderFor, outcomeHint, pickKeyLines, shortArgs } from "../src/placeholder.ts";
+import { clipMid, handleFor, KEY_LINE_MAX_CHARS, keyTexts, makePlaceholder, makePlaceholderFor, outcomeHint, pickKeyLines, shortArgs } from "../src/placeholder.ts";
 import { buildBlocks, toolCallIndex } from "../src/plan.ts";
 import { A, type Any, fakeCtx, fakePi, R, startZip, U } from "./helpers.ts";
 import { branchOutputs, parseRange, recalledHandlesFromBranch, recallSections, resolveHandlesInBranch, searchOutputs, sliceRecall } from "../src/recall.ts";
@@ -211,6 +211,14 @@ describe("handles and placeholders", () => {
 		expect(pickKeyLines(ktxt, 3).length).toBeLessThanOrEqual(3);
 		expect(pickKeyLines(ktxt, 0)).toEqual([]);
 		expect(JSON.stringify(pickKeyLines(ktxt, 8))).toBe(JSON.stringify(kl));
+		// Oversized single-line outputs (e.g. 32k-char minified bundle grep) are clipped with head+tail in pickKeyLines & keyTexts
+		const hugeLine = "HEAD-MARKER:" + "x".repeat(32_000) + ":TAIL-MARKER";
+		const clipped = pickKeyLines(hugeLine, 8);
+		expect(clipped).toHaveLength(1);
+		expect(clipped[0].text.length).toBeLessThanOrEqual(KEY_LINE_MAX_CHARS);
+		expect(clipped[0].text).toContain("HEAD-MARKER:");
+		expect(clipped[0].text).toContain(":TAIL-MARKER");
+		expect(keyTexts(hugeLine)[0].length).toBeLessThanOrEqual(KEY_LINE_MAX_CHARS);
 	});
 	test("the placeholder lists key lines with original line numbers", () => {
 		const ph = makePlaceholder(ktxt + "\n" + "pad ".repeat(400), "bash", "cat f", h)!;
