@@ -3,7 +3,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { isAbsolute, normalize, resolve } from "node:path";
 import { foldCandidates, foldPlaceholder, settings, type Block, type Calls, type PlanOpts, type Verdict } from "./plan.ts";
-import { handleFor, handleTokens, pickKeyLines, shortArgs, RECALL_TOOL } from "./placeholder.ts";
+import { handleFor, handleTokens, outcomeHint, pickKeyLines, shortArgs, RECALL_TOOL } from "./placeholder.ts";
 import { envInt, reasonsByDefault, textOf, tok4, type Any } from "./util.ts";
 
 export const NEED_CUSTOM = "pi-zip/need";
@@ -277,13 +277,27 @@ export function citesWork(blocks: readonly Block[], handle: string, locator: str
 
 /** Longest evidence row for one assistant message, in characters; tool results use 1200. */
 const ASSISTANT_ROW_CHARS = 2000;
+const TOOL_ROW_CHARS = 1200;
 
 /** Keep the head of a long row: an evidence row cut at its start opens mid-sentence (or mid-blob) and cannot be cited. */
 const clipHead = (s: string, n: number) => (s.length <= n ? s : n <= 1 ? "" : s.slice(0, n - 1) + "…");
 
+/** Keep both opening context and final outcome/error line within `n` characters. */
+function clipHeadTail(s: string, n: number): string {
+	if (s.length <= n) return s;
+	if (n <= 1) return "";
+	if (n <= 6) return clipHead(s, n);
+	const sep = "\n…\n";
+	const avail = n - sep.length;
+	const head = Math.ceil(avail * 0.55);
+	const tail = avail - head;
+	return s.slice(0, head) + sep + s.slice(s.length - tail);
+}
+
 /**
- * Prose and thinking text plus one `call <tool> <args>` line per tool call. Signatures, ids and other provider fields are not
- * evidence: serialized, they filled half of the evidence window with base64.
+ * Prose and thinking text plus one `call <tool> <args>` line per tool call. Visible text and tool calls precede thinking
+ * so a long thinking block cannot push tool calls past the 2000-char row cap. Signatures, ids and other provider fields are
+ * not evidence: serialized, they filled half of the evidence window with base64.
  */
 function assistantBody(msg: Any): { prose: string; shown: string; recall: boolean } {
 	const content = msg.content;
@@ -293,8 +307,30 @@ function assistantBody(msg: Any): { prose: string; shown: string; recall: boolea
 	const kept = parts.filter((c) => !(c?.type === "toolCall" && c.name === RECALL_TOOL));
 	const words = (c: Any) => (c?.type === "text" ? c.text : c?.type === "thinking" ? c.thinking : "") ?? "";
 	const prose = kept.map(words).filter(Boolean).join("\n");
-	const shown = kept.map((c) => (c?.type === "toolCall" ? `call ${`${c.name ?? "tool"} ${shortArgs(c.arguments)}`.trim()}` : words(c))).filter(Boolean).join("\n");
+	const textAndCalls = kept.filter((c) => c?.type === "text" || c?.type === "toolCall").map((c) => (c?.type === "toolCall" ? `call ${`${c.name ?? "tool"} ${shortArgs(c.arguments)}`.trim()}` : c.text ?? "")).filter(Boolean);
+	const thinking = kept.filter((c) => c?.type === "thinking").map((c) => c.thinking ?? "").filter(Boolean);
+	const shown = [...textAndCalls, ...thinking].join("\n");
 	return { prose, shown: clipHead(shown, ASSISTANT_ROW_CHARS), recall };
+}
+
+/** Outcome hint plus head/key/error/tail lines so pass/fail/exit status past byte 1200 stays visible in Recent work. */
+function toolResultBody(b: Block, calls?: Calls): string {
+	const call = calls?.get(b.msg.toolCallId);
+	const tool = call?.name ?? b.msg.toolName ?? "tool";
+	const raw = textOf(b.msg.content);
+	const hint = outcomeHint(raw, tool, b.msg.isError);
+	const prefix = hint ? `[${hint}] ` : "";
+	if (raw.length <= TOOL_ROW_CHARS - prefix.length) return prefix + raw;
+	const keys = pickKeyLines(raw, 4)
+		.filter((k) => k.why === "error" || k.why === "id")
+		.map((k) => `${k.no}: ${clipHeadTail(k.text.trim(), 160)}`)
+		.join("\n");
+	const avail = Math.max(0, TOOL_ROW_CHARS - prefix.length - (keys ? keys.length + 2 : 0));
+	const body = clipHeadTail(raw, avail);
+	if (!keys) return clipHead(prefix + body, TOOL_ROW_CHARS);
+	const sepAt = body.indexOf("\n…\n");
+	const merged = sepAt >= 0 ? `${body.slice(0, sepAt)}\n…\n${keys}\n…\n${body.slice(sepAt + 3)}` : `${body}\n${keys}`;
+	return clipHead(prefix + merged, TOOL_ROW_CHARS);
 }
 
 /** Rows keep their bytes and order while retained; unavailable rows and overflow are evicted at batch boundaries. */
@@ -328,7 +364,7 @@ export function judgeInput(blocks: Block[], calls: Calls, firstPrompt: string, t
 		if (b.kind === "toolResult") {
 			const call = calls.get(b.msg.toolCallId);
 			if ((call?.name ?? b.msg.toolName) === RECALL_TOOL || b.ours) continue;
-			const shown = textOf(b.msg.content).slice(0, 1200);
+			const shown = toolResultBody(b, calls);
 			const row = clipHead(`toolResult: ${shown}`, remaining);
 			rows.unshift({ role: "toolResult", prose: "", shown: row, locators: [] });
 			remaining -= row.length;
@@ -346,6 +382,86 @@ export function judgeInput(blocks: Block[], calls: Calls, firstPrompt: string, t
 		}
 	}
 	const evidence: EvidenceSpan[] = rows.map((row, i) => ({ id: `E${i + 1}`, role: row.role, locators: row.locators, handles: row.role === "toolResult" || row.recall ? [] : mentioned(row.prose, handles) }));
+	// Build the displayed Recent work window under the same `tailTokens * 4` character budget:
+	// reserve up to 35% for recent user prompts + assistant milestone replies so multi-turn causal anchors survive,
+	// then fill the rest with the newest assistant tool-call steps and deduplicated toolResult digests in chronological order.
+	const budgetChars = Math.max(0, tailTokens * 4);
+	const displayCandidates: { idx: number; shown: string; anchor: boolean }[] = [];
+	const seenToolKeys = new Set<string>();
+	for (let i = blocks.length - 1; i >= 0; i--) {
+		const b = blocks[i];
+		if (b.msg?.role === "custom" && (b.msg.customType === NEED_CUSTOM || b.msg.customType === HINT_CUSTOM)) continue;
+		if (b.kind === "user") {
+			const prose = textOf(b.msg.content);
+			if (!prose.trim()) continue;
+			displayCandidates.push({ idx: i, shown: `user: ${clipHeadTail(prose, 900)}`, anchor: true });
+		} else if (b.kind === "assistant") {
+			if (["error", "aborted"].includes(b.msg?.stopReason)) continue;
+			const content = b.msg?.content;
+			if (typeof content === "string") {
+				if (!content.trim()) continue;
+				displayCandidates.push({ idx: i, shown: `assistant: ${clipHeadTail(content, 1500)}`, anchor: true });
+				continue;
+			}
+			const parts: Any[] = Array.isArray(content) ? content : [];
+			const recall = parts.some((c) => c?.type === "toolCall" && c.name === RECALL_TOOL);
+			const kept = parts.filter((c) => !(c?.type === "toolCall" && c.name === RECALL_TOOL));
+			const textStr = kept.filter((c) => c?.type === "text").map((c) => String(c.text ?? "")).filter((s) => s.trim()).join("\n").trim();
+			const thinkStr = kept.filter((c) => c?.type === "thinking").map((c) => String(c.thinking ?? "")).filter((s) => s.trim()).join("\n").trim();
+			const callStr = kept.filter((c) => c?.type === "toolCall").map((c) => `call ${`${c.name ?? "tool"} ${shortArgs(c.arguments)}`.trim()}`).join("\n");
+			const prose = [textStr, thinkStr].filter(Boolean).join("\n");
+			if (recall && !prose) continue;
+			const isMilestone = !callStr && textStr.length > 0;
+			const shownBody = isMilestone
+				? clipHeadTail(textStr, 1500)
+				: clipHeadTail([textStr ? clipHeadTail(textStr, 650) : "", callStr, thinkStr ? clipHead(thinkStr, textStr ? 200 : 300) : ""].filter(Boolean).join("\n"), 1000);
+			if (!shownBody.trim()) continue;
+			displayCandidates.push({ idx: i, shown: `assistant: ${shownBody}`, anchor: isMilestone });
+		} else if (b.kind === "toolResult") {
+			const call = calls.get(b.msg.toolCallId);
+			const tool = call?.name ?? b.msg.toolName ?? "tool";
+			if (tool === RECALL_TOOL || b.ours) continue;
+			const raw = textOf(b.msg.content);
+			const hint = outcomeHint(raw, tool, b.msg.isError);
+			const dedupKey = `${tool}\0${raw.slice(0, 180)}\0${raw.slice(-180)}`;
+			if (seenToolKeys.has(dedupKey)) {
+				const short = `toolResult: [${[hint, "repeated head+tail"].filter(Boolean).join("; ")}] ${clipHead(raw.trim(), 120)}`;
+				displayCandidates.push({ idx: i, shown: clipHead(short, 180), anchor: false });
+			} else {
+				seenToolKeys.add(dedupKey);
+				let dShown: string;
+				if (raw.length <= 480) {
+					dShown = clipHeadTail((hint ? `[${hint}] ` : "") + raw, 520);
+				} else {
+					const keys = pickKeyLines(raw, 4).map((k) => `${k.no}: ${clipHeadTail(k.text.trim(), 150)}`).join("\n");
+					const trimmed = raw.trim();
+					const body = keys || `${clipHead(trimmed, 200)}\n…\n${trimmed.slice(-200)}`;
+					dShown = clipHeadTail((hint ? `[${hint}]\n` : "") + body, 560);
+				}
+				displayCandidates.push({ idx: i, shown: `toolResult: ${dShown}`, anchor: false });
+			}
+		}
+	}
+	const chosenRows = new Map<number, string>();
+	let remDisplay = budgetChars;
+	let anchorBudget = Math.floor(budgetChars * 0.35);
+	for (const c of displayCandidates) {
+		if (!c.anchor || anchorBudget <= 0 || remDisplay <= 0) continue;
+		const row = clipHeadTail(c.shown, Math.min(anchorBudget, remDisplay));
+		if (!row) continue;
+		chosenRows.set(c.idx, row);
+		anchorBudget -= row.length;
+		remDisplay -= row.length;
+	}
+	for (const c of displayCandidates) {
+		if (remDisplay <= 0) break;
+		if (chosenRows.has(c.idx)) continue;
+		const row = clipHeadTail(c.shown, remDisplay);
+		if (!row) break;
+		chosenRows.set(c.idx, row);
+		remDisplay -= row.length;
+	}
+	const orderedRecent = [...chosenRows.entries()].sort((a, b) => a[0] - b[0]).map(([, s], i) => `E${i + 1} ${s}`);
 	const citedHandles = new Set(evidence.flatMap((e) => e.handles));
 	const citedLocators = new Set(evidence.filter((e) => e.role !== "toolResult").flatMap((e) => e.locators));
 	const stateRow = (h: string, item: CatalogueItem) => `${h} age=${reqCount - item.issued} ${statusOf(h)}`;
@@ -364,7 +480,7 @@ export function judgeInput(blocks: Block[], calls: Calls, firstPrompt: string, t
 	const manifest = new Set(submitted.map(([h]) => h));
 	const prefix = `Task: ${JSON.stringify(firstPrompt.slice(0, 8000))}\nCatalogue:\n${submitted.map(([, x]) => x.row + "\n").join("")}`;
 	const state = submitted.map(([h, item]) => stateRow(h, item)).join("\n");
-	const recent = rows.map((row, i) => `E${i + 1} ${row.shown}`);
+	const recent = orderedRecent;
 	const latest = latestUserText(blocks).slice(0, 4000);
 	const folded = new Set([...manifest].filter((h) => statusOf(h) === "folded"));
 	return { catalogue, prefix, evidence, manifest, folded, text: `${prefix}\nCurrent state:\n${state}\nLatest request:\n${JSON.stringify(latest)}\nRecent work:\n${recent.join("\n")}` };
@@ -576,7 +692,7 @@ function workReferences(blocks: readonly Block[], cwd: string) {
 	let remaining = 24_000;
 	for (let i = blocks.length - 1; i >= 0 && remaining > 0; i--) {
 		const b = blocks[i];
-		if (b.kind === "toolResult") { if (!b.ours && b.msg.toolName !== RECALL_TOOL) remaining -= Math.min(1200, textOf(b.msg.content).length); continue; }
+		if (b.kind === "toolResult") { if (!b.ours && b.msg.toolName !== RECALL_TOOL) remaining -= Math.min(TOOL_ROW_CHARS, textOf(b.msg.content).length); continue; }
 		let prose: string;
 		if (b.kind === "user") prose = textOf(b.msg.content);
 		else if (b.kind === "assistant") {
