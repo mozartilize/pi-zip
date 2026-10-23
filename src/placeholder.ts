@@ -36,15 +36,17 @@ const hexLike = (line: string): boolean => {
 	return false;
 };
 
+export const KEY_LINE_MAX_CHARS = 500;
+
 /** Deterministic key lines: first line, error/warning lines, id-like lines (tickets, hashes, key=value, labelled numbers), last line; sorted by line number. */
-export function pickKeyLines(text: string, keep = 8): KeyLine[] {
+export function pickKeyLines(text: string, keep = 8, maxLineChars = KEY_LINE_MAX_CHARS): KeyLine[] {
 	const lines = text.split("\n");
 	if (keep <= 0 || !lines.length) return [];
 	const picked = new Map<number, KeyLine>();
 	const add = (no: number, why: KeyLine["why"]) => {
 		if (picked.size >= keep || picked.has(no)) return;
 		const t = lines[no - 1] ?? "";
-		if (t.trim()) picked.set(no, { no, text: t, why });
+		if (t.trim()) picked.set(no, { no, text: maxLineChars > 0 && t.length > maxLineChars ? clipMid(t, maxLineChars) : t, why });
 	};
 	const room = () => picked.size < keep - (picked.has(lines.length) ? 0 : 1); // always leave room for the last line
 	add(1, "first");
