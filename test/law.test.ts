@@ -125,6 +125,7 @@ describe("through the extension: the free signal is learned, persisted and used;
 		const { ctx } = fakeCtx(entries, { model, branch: back(t0) });
 		zip.sessionStart(ctx);
 		await startZip(zip, ctx); // prior: 365 s > 300 s -> cold
+		(zip as Any).requestStart(undefined);
 		zip.providerRequest({ payload: {} });
 		zip.messageEnd({ role: "assistant", stopReason: "stop", usage: { input: 900, cacheRead: 60_032, cacheWrite: 0, output: 10 } });
 		const e = loadStats().models["zhipu/glm"];
@@ -284,7 +285,7 @@ describe("final model (research round 5, final-model.md section 8 tests 1-5)", (
 		zip.sessionStart(ctx);
 		await startZip(zip, ctx);
 		await zip.context({ messages: flat(small) }, ctx); // warm, below the cap: no run plan
-		const reply = (total: number) => { zip.providerRequest({ payload: {} }); zip.messageEnd({ role: "assistant", stopReason: "stop", usage: { input: total, cacheRead: 0, cacheWrite: 0, output: 10 } }); };
+		const reply = (total: number) => { if (!(zip as Any).pending) (zip as Any).requestStart(ctx); zip.providerRequest({ payload: {} }); zip.messageEnd({ role: "assistant", stopReason: "stop", usage: { input: total, cacheRead: 0, cacheWrite: 0, output: 10 } }); };
 		const end = (entries: Any[]) => zip.turnEnd({ message: { role: "assistant", stopReason: "stop", usage: { input: 1_000, cacheRead: 0, cacheWrite: 0 } }, context: { contextEntries: entries }, entries: [], turnIndex: 0 }, ctx);
 		reply(5_000);
 		const s1 = [...turns(1, 40), U("uN", "now"), A("aN")]; // ~160K estimated: far above any EOQ threshold
@@ -306,7 +307,7 @@ describe("final model (research round 5, final-model.md section 8 tests 1-5)", (
 		const zip = new Zip(fakePi().pi as Any);
 		const { ctx } = fakeCtx(big);
 		zip.sessionStart(ctx);
-		const reply = (total: number) => { zip.providerRequest({ payload: {} }); zip.messageEnd({ role: "assistant", stopReason: "stop", usage: { input: total, cacheRead: 0, cacheWrite: 0, output: 10 } }); };
+		const reply = (total: number) => { if (!(zip as Any).pending) (zip as Any).requestStart(ctx); zip.providerRequest({ payload: {} }); zip.messageEnd({ role: "assistant", stopReason: "stop", usage: { input: total, cacheRead: 0, cacheWrite: 0, output: 10 } }); };
 		await startZip(zip, ctx);
 		const req = await zip.context({ messages: flat(big) }, ctx); // warm run start, far above the threshold: the valve fires
 		expect(req).toBeDefined();

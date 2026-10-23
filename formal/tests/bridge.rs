@@ -65,6 +65,17 @@ fn an_aside_that_read_the_prefix_is_a_touch() {
     assert!(run.st[3].believed_cold && run.st[3].pause, "after the aside at a gone cache: {:?}", run.st[3]);
 }
 
+/// A side write at a dead cache cannot teach an hour of survival from the next main hit.
+#[test]
+fn a_cold_aside_does_not_teach_survival_across_its_rewrite() {
+    let Some(run) = replay(&src(), "gc-aside-rewrite.trace") else { return };
+    for p in all() {
+        assert!(p.f.first_violation(&run).is_none(), "gc-aside-rewrite.trace: {} must hold", p.id);
+    }
+    assert!(run.st[2].warm && run.st[2].believed_cold, "a write is no authoritative read touch");
+    assert!(!run.st[3].warm && run.st[3].believed_cold, "the truly cold return must stay cold");
+}
+
 /// A touch just before the producer's old deadline postpones production until the new deadline.
 #[test]
 fn a_usage_touch_postpones_the_producer() {

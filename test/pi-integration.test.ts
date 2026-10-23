@@ -350,11 +350,12 @@ afterEach(() => {
 const isFolded = (m: Any) => m.role === "toolResult" && JSON.stringify(m.content).includes("[folded by pi-zip");
 /** Nobody waits for a summary: the first request of a return whose plan wants one goes with its folds alone and starts it in the
  *  background; once it is written, the prompt tried again takes it (a later decision). */
-const produced = async (r: Any) => {
+const produced = async (r: Any, gapMs = 0) => {
 	const first = await r.request();
 	expect(first.some((m: Any) => m.role === "compactionSummary")).toBe(false);
 	await new Promise((res) => setTimeout(res, 50));
 	expect(r.narrativeCalls.length).toBe(1);
+	r.zip.lastReqMs -= gapMs; // synthetic absence after the preparatory main request
 	await r.prompt();
 };
 
@@ -859,7 +860,7 @@ describe("real Pi: the request view is identical before and after turn_end persi
 	test("a summary and a fold persisted together: Pi's 'Compacted from N' is its usage-based size before the edits, not chars/4 of a half-applied batch", async () => {
 		const r = await rig((sm) => populate(sm, 6000), { tui: true });
 		sendPrompt(r.sm, "next request");
-		await produced(r);
+		await produced(r, 301_000); // this return, which adopts the prepared run plan, is cold
 		const req1 = await r.request();
 		expect(req1.some((m) => m.role === "compactionSummary")).toBe(false);
 		// the response that carried the plan reports a real prompt size; the turn's tool result follows it
@@ -2182,6 +2183,7 @@ describe("an aside that read the main prefix keeps the cache warm (pi-aside)", (
 		const realNow = Date.now, start = realNow();
 		try {
 			Date.now = () => start;
+			await r.request();
 			r.zip.providerRequest({ payload: { messages: [] } }, r.zip.liveCtx);
 			r.sm.appendMessage({ ...asst([call("long-tool")], "toolUse"), timestamp: start, usage: { ...usage, cacheRead: 150_000 } });
 			r.sm.appendMessage({ ...result("long-tool", "done"), timestamp: start + 408_000 });
@@ -2192,6 +2194,7 @@ describe("an aside that read the main prefix keeps the cache warm (pi-aside)", (
 			const source = process.env.PI_ZIP_TEST_SRC ?? fileURLToPath(new URL("../src", import.meta.url));
 			const { inRunClock } = await import(join(source, "core.ts"));
 			expect(inRunClock(r.sm.getBranch(), { model: MODEL }, Date.now(), { reqMs: start, modelKey: "p/m" }), "the in-run clock keeps a qualifying usage touch").toMatchObject({ cold: false, gapS: 10, pause: false });
+			await r.request();
 			r.zip.providerRequest({ payload: { messages: [] } }, r.zip.liveCtx);
 			expect(r.zip.pending.gapS, "survival samples from the newest usage touch").toBe(10);
 		} finally {
@@ -2205,6 +2208,169 @@ describe("an aside that read the main prefix keeps the cache warm (pi-aside)", (
 		expect(await coldAt(withAside("p", "m", 149_999)), "an aside that read less is no touch").toBe(true);
 		expect(await coldAt(withAside("p", "m2", 150_000)), "another model's aside is no touch").toBe(true);
 		expect(await coldAt(withAside("q", "m", 150_000)), "another provider's aside is no touch").toBe(true);
+	});
+});
+
+// 0.4.13: usage can replace a dead prefix without proving that the old prefix survived.
+for (const order of ORDERS) describe(`survival after a possible prefix rewrite (Pi ${order} order)`, () => {
+	for (const automatic of [false, true]) for (const hit of [false, true]) test(`possible prefix rewrite censors the old interval (${automatic ? "automatic, live" : "explicit, restart"}, ${hit ? "hit" : "miss"})`, async () => {
+		const realNow = Date.now, stats = process.env.PI_ZIP_CACHE_STATS;
+		process.env.PI_ZIP_CACHE_STATS = join(mkdtempSync(join(tmpdir(), "pz-rewrite-")), "stats.json");
+		delete process.env.PI_ZIP_TTL_SECS;
+		let now = realNow(), r: Awaited<ReturnType<typeof rig>> | undefined;
+		Date.now = () => now;
+		try {
+			const sm = SessionManager.inMemory(CWD);
+			sm.appendMessage({ ...asst([{ type: "text", text: "previous" }]), timestamp: now - 3_660_000, usage: { ...usage, cacheRead: automatic ? 150_000 : 100_000, cacheWrite: automatic ? 0 : 50_000 } });
+			const rewrite = (manager: SessionManager) => {
+				(manager as Any).appendUsage("unknown-package", "p", "m", { ...usage, input: automatic ? 150_000 : 0, cacheWrite: automatic ? 0 : 150_000 });
+				(manager.getBranch().at(-1) as Any).timestamp = new Date(now - 60_000).toISOString();
+			};
+			if (!automatic) rewrite(sm);
+			r = await rig(undefined, { file: [sm.getHeader() as Any, ...sm.getEntries()], pi: order });
+			if (automatic) rewrite(r.sm);
+			expect(r.zip.cold, "a write alone does not refresh the prefix-read clock").toBe(true);
+			const response = (read = true) => ({ ...asst([{ type: "text", text: "done" }]), timestamp: now, usage: { ...usage, input: !read && automatic ? 150_001 : 0, cacheRead: read ? 150_000 : 0, cacheWrite: automatic ? 0 : read ? 100 : 150_001 } });
+			await r.request();
+			r.zip.providerRequest({ payload: { messages: [] } }, r.zip.liveCtx);
+			expect(r.zip.pending.gapS).toBe(3660);
+			let m = response(hit);
+			r.sm.appendMessage(m);
+			r.zip.messageEnd(m);
+			expect(loadStats().models["p/m"]?.n ?? 0, "a rewritten prefix cannot teach survival across the old gap").toBe(0);
+			expect(loadStats().models["p/m"]?.cls).toBe(automatic ? "automatic" : "explicit"); // class learning still runs
+			now += 3_660_000;
+			await r.prompt();
+			expect(r.zip.cold, "a later truly cold return uses the TTL prior").toBe(true);
+			// A clean response interval still learns real beyond-TTL survival.
+			await r.request();
+			r.zip.providerRequest({ payload: { messages: [] } }, r.zip.liveCtx);
+			m = response(); r.sm.appendMessage(m); r.zip.messageEnd(m);
+			expect(loadStats().models["p/m"].n, "learning resumes after the main response").toBe(1);
+			expect(loadStats().models["p/m"].bins[15][0]).toBe(1);
+		} finally {
+			await r?.shutdown(); Date.now = realNow;
+			if (stats === undefined) delete process.env.PI_ZIP_CACHE_STATS; else process.env.PI_ZIP_CACHE_STATS = stats;
+		}
+	});
+	for (const other of [false, true]) test(`qualifying reads preserve survival learning (${other ? "different model write" : "same model read"})`, async () => {
+		const stats = process.env.PI_ZIP_CACHE_STATS, realNow = Date.now;
+		process.env.PI_ZIP_CACHE_STATS = join(mkdtempSync(join(tmpdir(), "pz-clean-read-")), "stats.json");
+		let r: Awaited<ReturnType<typeof rig>> | undefined;
+		const now = realNow(); Date.now = () => now;
+		try {
+			const sm = SessionManager.inMemory(CWD);
+			sm.appendMessage({ ...asst([{ type: "text", text: "previous" }]), timestamp: now - 3_660_000, usage: { ...usage, cacheWrite: 150_000 } });
+			r = await rig(undefined, { file: [sm.getHeader() as Any, ...sm.getEntries()], pi: order });
+			// A valid read or another model's write appended in the live process.
+			(r.sm as Any).appendUsage("any-kind", "p", other ? "another-model" : "m", { ...usage, cacheRead: other ? 0 : 150_000, cacheWrite: other ? 150_000 : 0 });
+			(r.sm.getBranch().at(-1) as Any).timestamp = new Date(now - 600_000).toISOString();
+			r.sm.appendMessage({ ...result("pending", "unsent"), timestamp: now - 10 });
+			r.sm.appendMessage({ ...user("pending"), timestamp: now - 1 });
+			await r.request();
+			r.zip.providerRequest({ payload: { messages: [] } }, r.zip.liveCtx);
+			expect(r.zip.pending.gapS).toBe(other ? 3660 : 600);
+			r.zip.messageEnd({ ...asst([{ type: "text", text: "done" }]), timestamp: now, usage: { ...usage, cacheRead: 150_000 } });
+			expect(loadStats().models["p/m"].n, "an uncontaminated interval still teaches survival").toBe(1);
+			expect(loadStats().models["p/m"].bins[other ? 15 : 10][0]).toBe(1);
+		} finally {
+			await r?.shutdown(); Date.now = realNow;
+			if (stats === undefined) delete process.env.PI_ZIP_CACHE_STATS; else process.env.PI_ZIP_CACHE_STATS = stats;
+		}
+	});
+});
+
+// Use Pi's actual warmer, with a synthetic provider and clock: no sleep, network, or real model invocation.
+// Ordinary tests use the installed Pi; the offline validation matrix may select a directory of public pinned builds.
+const warmerBuildRoot = process.env.PZ_WARMER_BUILD_ROOT;
+for (const pi of warmerBuildRoot ? ["1.1.0", "1.2.0", "1.3.0"] : ["installed"]) describe(`real warmer overlap (Pi ${pi})`, () => {
+	for (const kind of ["censored hit", "censored miss", "clean", "edited", "refused"]) test(`${kind}: the main snapshot survives two refreshes`, async () => {
+		const realNow = Date.now, realSet = globalThis.setTimeout, realClear = globalThis.clearTimeout;
+		const stats = process.env.PI_ZIP_CACHE_STATS;
+		process.env.PI_ZIP_CACHE_STATS = join(mkdtempSync(join(tmpdir(), "pz-overlap-")), "stats.json");
+		const warmerFile = warmerBuildRoot ? join(warmerBuildRoot, pi, "node_modules/@earendil-works/pi-coding-agent/dist/core/cache-warmer.js") : fileURLToPath(new URL("../node_modules/@earendil-works/pi-coding-agent/dist/core/cache-warmer.js", import.meta.url));
+		const { CacheWarmer } = await import(warmerFile);
+		let now = realNow(), r: Awaited<ReturnType<typeof rig>> | undefined, warmer: Any;
+		Date.now = () => now;
+		try {
+			const sm = SessionManager.inMemory(CWD);
+			sm.appendMessage({ ...asst([{ type: "text", text: "previous" }]), timestamp: now - 3_660_000, usage: { ...usage, input: 0, cacheWrite: 150_001 } });
+			const censored = kind.startsWith("censored");
+			if (censored) {
+				(sm as Any).appendUsage("any-package", "p", "m", { ...usage, cacheWrite: 150_001 });
+				(sm.getBranch().at(-1) as Any).timestamp = new Date(now - 60_000).toISOString();
+			}
+			r = await rig(undefined, { file: [sm.getHeader() as Any, ...sm.getEntries()], pi: pi === "1.1.0" ? "1.1" : "1.2" });
+			const z = r.zip;
+			if (kind === "edited") z.nextEdit = 9000;
+			z.stats.activeSaved = 123;
+			await r.request(); // real ExtensionRunner main context lifecycle
+			await r.runner.emitBeforeProviderRequest({ messages: [] } as Any);
+			const snapshot = z.pending, before = { clock: z.reqMsBefore, key: z.lastModelKey, model: z.model, saved: z.stats.readSavedTokens };
+			expect(snapshot).toMatchObject({ censored, gapS: 3660, expect: kind === "edited" ? 9000 : 150_001, edited: kind === "edited", key: "p/m" });
+			if (kind === "edited") z.nextEdit = 7000; // a later boundary's edit belongs to the NEXT main request
+			let refreshes = 0;
+			const payloads: Any[] = [], hooks: Any[] = [];
+			const options = { onPayload: (payload: Any) => r!.runner.emitBeforeProviderRequest(payload) };
+			warmer = new CacheWarmer({ streamSimple: (_m: Any, _c: Any, opts: Any) => ({ result: async () => {
+				refreshes++;
+				hooks.push(opts.onPayload);
+				const payload = await opts.onPayload({ messages: [{ role: "user", content: [{ type: "tool_result", tool_use_id: "orphan", content: "repair me" }] }] });
+				payloads.push(payload); // assert outside CacheWarmer's best-effort catch
+				return { ...asst([{ type: "text", text: "warm" }]), timestamp: now, usage: { ...usage, input: 0, cacheRead: 150_001 } };
+			} }) }, r.sm, () => "streaming", (event: Any) => r!.runner.emitCacheWarmingDecision(event));
+			const timers: { delay: number; unref: () => void }[] = [];
+			(globalThis as Any).setTimeout = (_fn: Any, delay: number) => { const handle = { delay, unref() {} }; timers.push(handle); return handle; };
+			(globalThis as Any).clearTimeout = () => {};
+			warmer.start({ model: MODEL, context: { messages: [] }, options }, () => true);
+			expect(warmer.run.phase).toBe("streaming");
+			for (let i = 0; i < 2; i++) {
+				expect(timers.at(-1)!.delay).toBe(270_000);
+				now += 270_000;
+				await warmer.refresh(warmer.run);
+				(r.sm.getBranch().at(-1) as Any).timestamp = new Date(now).toISOString();
+			}
+			expect(refreshes).toBe(2);
+			expect(hooks).toEqual([options.onPayload, options.onPayload]);
+			expect(payloads).toHaveLength(2);
+			for (const payload of payloads) {
+				expect(JSON.stringify(payload), "warming payload guarding still repairs orphan results").toContain("[tool result, call folded]");
+				expect(JSON.stringify(payload)).not.toContain('"type":"tool_result"');
+			}
+			expect(r.sm.getBranch().filter((e: Any) => e.type === "usage" && e.kind === "cache_warm")).toHaveLength(2);
+			expect(z.pending, "main snapshot survives two real warmer refreshes").toBe(snapshot);
+			expect(z.reqMsBefore, "refreshes preserve the main rollback clock").toBe(before.clock);
+			expect(z.lastReqMs, "a warming decision still advances the live clock").toBe(now);
+			expect(z.lastModelKey).toBe(before.key);
+			expect(z.model).toBe(before.model);
+			expect(z.stats.readSavedTokens, "refreshes do not book main-request savings").toBe(before.saved);
+			expect(z.nextEdit, "refreshes do not consume the next main edit").toBe(kind === "edited" ? 7000 : null);
+			warmer.cancel(); globalThis.setTimeout = realSet; globalThis.clearTimeout = realClear;
+			const message = { ...asst([{ type: "text", text: "main" }], kind === "refused" ? "error" : "stop"), timestamp: now, usage: { ...usage, input: 0, cacheRead: kind === "censored miss" || kind === "refused" ? 0 : kind === "edited" ? 9000 : 150_001, cacheWrite: kind === "censored miss" ? 150_001 : 0 } };
+			r.sm.appendMessage(message);
+			await r.runner.emitMessageEnd({ type: "message_end", message } as Any);
+			expect(z.pending).toBeNull();
+			expect(z.justEdited).toBe(kind === "edited");
+			if (kind === "refused") expect(z.lastReqMs, "a refused main response keeps the independent warmer touch").toBe(now);
+			const count = censored || kind === "refused" ? 0 : 1;
+			expect(loadStats().models["p/m"]?.n ?? 0, "the main response uses its own censor and gap").toBe(count);
+			if (count) expect(loadStats().models["p/m"].bins[15][0], "the main gap belongs in the hour bin, not a refresh interval").toBe(1);
+			// Only successful main responses establish the next interval's prefix. Refusals retain the earlier prefix.
+			now += 600_000;
+			await r.request();
+			await r.runner.emitBeforeProviderRequest({ messages: [] } as Any);
+			expect(z.pending.gapS).toBe(600);
+			expect(z.pending.expect).toBe(kind === "edited" ? 7000 : 150_001);
+			const clean = { ...asst([{ type: "text", text: "clean" }]), timestamp: now, usage: { ...usage, input: 0, cacheRead: 150_001 } };
+			r.sm.appendMessage(clean);
+			await r.runner.emitMessageEnd({ type: "message_end", message: clean } as Any);
+			expect(loadStats().models["p/m"].n, "learning resumes on the next clean main interval").toBe(count + 1);
+			expect(loadStats().models["p/m"].bins[10][0]).toBe(1);
+		} finally {
+			warmer?.cancel(); globalThis.setTimeout = realSet; globalThis.clearTimeout = realClear; Date.now = realNow;
+			await r?.shutdown();
+			if (stats === undefined) delete process.env.PI_ZIP_CACHE_STATS; else process.env.PI_ZIP_CACHE_STATS = stats;
+		}
 	});
 });
 

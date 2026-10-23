@@ -39,6 +39,7 @@ function live(msgs: Any[]) {
 	for (const m of msgs) {
 		if (m.role !== "assistant") continue;
 		z.model = MODEL;
+		(z as Any).requestStart(undefined);
 		z.providerRequest({ payload: {} });
 		z.messageEnd(m);
 	}
@@ -72,6 +73,7 @@ describe("growth g is rebuilt from the branch", () => {
 		msgs.forEach((m, i) => {
 			z.model = MODEL;
 			if (i === 2 || i === 5) z.nextEdit = 0; // the request that first carried an edit
+			(z as Any).requestStart(undefined);
 			z.providerRequest({ payload: {} });
 			z.messageEnd(m);
 		});
@@ -113,6 +115,7 @@ describe("justEdited: the newest response was the first to carry an edit of ours
 		const z = new Zip(pi) as Any;
 		z.model = MODEL;
 		z.nextEdit = 0; // the valve's edit is carried by this request
+		(z as Any).requestStart(undefined);
 		z.providerRequest({ payload: {} });
 		z.messageEnd(a1.message);
 		expect(z.justEdited).toBe(true);
@@ -125,17 +128,20 @@ describe("a refused request does not move the cache clock (GC)", () => {
 		const { pi } = fakePi();
 		const z = new Zip(pi) as Any;
 		z.model = MODEL;
+		(z as Any).requestStart(undefined);
 		z.providerRequest({ payload: {} });
 		z.messageEnd(resp(30_000, T0));
 		const real = z.lastReqMs;
 		expect(real).toBeGreaterThan(0);
 		z.lastReqMs = real - 400_000; // pretend the answered request was a while ago
 		const before = z.lastReqMs;
+		(z as Any).requestStart(undefined);
 		z.providerRequest({ payload: {} });
 		expect(z.lastReqMs).toBeGreaterThan(before); // the request went out
 		z.messageEnd(resp(0, T0 + 1, { stopReason: "error", usage: { input: 0, cacheRead: 0, cacheWrite: 0 } }));
 		expect(z.lastReqMs).toBe(before); // the provider refused it: no cache was touched (old code: now)
 		// an error that reports usage was read
+		(z as Any).requestStart(undefined);
 		z.providerRequest({ payload: {} });
 		z.messageEnd(resp(30_000, T0 + 2, { stopReason: "error" }));
 		expect(z.lastReqMs).toBeGreaterThan(before);

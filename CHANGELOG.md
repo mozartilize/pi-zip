@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.4.13
+
+- A side request that rewrites a cold prefix no longer teaches pi-zip that the provider kept the old cache alive through the
+  entire absence. Survival learning censors an interval after a matching usage entry without a qualifying full-prefix read;
+  a later full-prefix read or successful main response starts a clean interval. A write alone still does not refresh the
+  prefix-read clock. The rule uses branch order, including equal timestamps, survives restarts, and accepts any usage kind
+  with the existing real provider/model identities. Partial reads and incomplete usage reports conservatively lose that
+  interval; cache class and growth still learn. No new setting or API call; the cost formula and planner are unchanged.
+- Survival snapshots belong to each main assistant context, so Pi's streaming cache refreshes cannot replace the censor,
+  gap, prefix expectation or edit state while the main response is still running. Refresh payloads still receive repair
+  and relay metadata guarding; a refused main request retains successful intervening warm touches.
+
 ## 0.4.12
 
 - A side question no longer makes pi-zip think the cache went cold. Extensions such as pi-aside answer a side question on

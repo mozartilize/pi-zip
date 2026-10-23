@@ -4,7 +4,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createHash } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { lastMessageMs, lastPrompt, modelKey, payloadRetention, refused, ttlFor, type ColdInfo } from "./cache.ts";
+import { cacheActivity, lastMessageMs, lastPrompt, modelKey, payloadRetention, refused, ttlFor, type ColdInfo } from "./cache.ts";
 import { agentDir, curve, describe, lawPrices, loadStats, pWarm, record, sample, statsPath, GAP_EDGES, type Entry } from "./learn.ts";
 import { repairPayload } from "./guard.ts";
 import { candidateOf, decideEdits, checkEdits, clock, decideRun, inRunClock, requestBranch, want, decideTurnEnd, grow, headOf, planOpts, readyOf, rentOf, runPlanOf, scaleOf, unusedOf, valvePlanOf, SUMMARY_CUSTOM, type Artifact, type Avail, type Env, type Learned } from "./core.ts";
@@ -156,7 +156,7 @@ export class Zip implements ZipControl {
 	private prevTotal = 0; // prompt size (input + cacheRead + cacheWrite) of the newest response, and its model
 	private prevKey = "";
 	private nextEdit: number | null = null; // the next request is the first to carry a new edit: its untouched prefix (real tokens)
-	private pending: { gapS: number; expect: number; edited: boolean; key: string } | null = null;
+	private pending: { censored: boolean; gapS: number; expect: number; edited: boolean; key: string } | null = null;
 	private rentHead = "";
 	private rent = 0; // R14: accumulated planned savings, persisted at each boundary
 	private justEdited = false; // the newest response answered a request that first carried an edit: the next request gets no warm edit
@@ -1153,7 +1153,7 @@ export class Zip implements ZipControl {
 
 
 	async context(e: Any, ctx: Any): Promise<Any> {
-		if (!this.active()) return undefined;
+		if (!this.active()) return void this.requestStart(ctx);
 		if (this.starting) await this.starting; // agent_start's start-of-run handling of a driven run
 		if (ctx?.signal?.aborted) return undefined;
 		const first = !this.runChecked;
@@ -1184,12 +1184,11 @@ export class Zip implements ZipControl {
 				const live = plan.folds.filter((t) => applied.has(t.entryId));
 				this.noticeFor(ctx, plan, live, plan.cut ?? plan.native ?? null, plan.ctxBefore, sizeOf(plan.scale, (out?.messages ?? e.messages).filter((m: Any) => m.role !== "system").reduce((n: number, m: Any) => n + wireTokensOf(m), 0)));
 			}
-			const hinted = this.withHint(out?.messages ?? e.messages, ctx);
-			if (hinted) return { messages: hinted };
-			return out ? { messages: out.messages } : undefined;
 		}
-		const hinted = this.withHint(e.messages, ctx);
-		return hinted ? { messages: hinted } : undefined;
+		this.requestStart(ctx);
+		const hinted = this.withHint(out?.messages ?? e.messages, ctx);
+		if (hinted) return { messages: hinted };
+		return out ? { messages: out.messages } : undefined;
 	}
 
 	/**
@@ -1437,9 +1436,7 @@ export class Zip implements ZipControl {
 
 	/** Pi's idle warming is a cache touch, never a producer wake or an answer to Pi's decision. */
 	cacheWarmingDecision(e: Any, ctx: Any): undefined {
-		if (e?.action === "warm") {
-			this.lastReqMs = Date.now();
-		}
+		if (e?.action === "warm") this.lastReqMs = Date.now();
 		this.want("timer", ctx);
 		if (e?.action === "warm") this.armDoor(ctx, false); // the touch moved the door's moments
 		return undefined;
@@ -1711,20 +1708,23 @@ export class Zip implements ZipControl {
 		if (model) this.model = model;
 	}
 
-	providerRequest(e: Any, ctx?: Any): Any {
+	/** Main context preparation owns this snapshot; Pi's warmer replays payload hooks without another context transform. */
+	private requestStart(ctx: Any) {
 		// the request goes to the session's current model: a /model in the middle of a run switches it without a run start, and a
 		// request booked under the run's first model would make every later turn_end see a "model switch" (P(warm) = 0: any edit is free)
 		if (ctx?.model) this.model = ctx.model;
-		const now = Date.now(), key = modelKey(this.model), last = Math.max(this.lastReqMs, lastMessageMs(requestBranch(this.branch(ctx ?? this.liveCtx))));
+		const now = Date.now(), key = modelKey(this.model), activity = cacheActivity(requestBranch(this.branch(ctx ?? this.liveCtx))), last = Math.max(this.lastReqMs, activity.ms);
 		const edited = this.nextEdit !== null;
 		// the free cache signal: this response's cacheRead against what this request re-sent unchanged, after this gap (same model only)
-		this.pending = { gapS: last && (this.lastModelKey || this.prevKey) === key ? (now - last) / 1000 : -1, expect: edited ? this.nextEdit! : this.prevTotal, edited, key };
+		this.pending = { censored: activity.censored, gapS: last && (this.lastModelKey || this.prevKey) === key ? (now - last) / 1000 : -1, expect: edited ? this.nextEdit! : this.prevTotal, edited, key };
 		this.nextEdit = null;
 		this.reqMsBefore = this.lastReqMs;
 		this.lastReqMs = now;
 		this.lastModelKey = key;
 		this.stats.readSavedTokens += this.stats.activeSaved;
-		const p: Any = e.payload;
+	}
+	providerRequest(e: Any, ctx?: Any): Any {
+		const m = ctx?.model ?? this.model, key = modelKey(m), p: Any = e.payload;
 		const seen = payloadRetention(p); // what this very request asked the provider for: it wins over any environment
 		if (seen && key && (seen !== this.retention?.tier || this.retention?.key !== key || this.retention?.src !== "payload")) {
 			this.retention = { key, tier: seen, src: "payload" };
@@ -1736,7 +1736,7 @@ export class Zip implements ZipControl {
 			for (const m of p.messages) if (m?.role !== "system" && m?.role !== "developer") tok += tok4(JSON.stringify(m?.content ?? "")) + 8;
 			this.ledger({ type: "cold_wire", tokens: Math.round(sizeOf(this.runPlan?.scale ?? UNIT, tok)), messages: p.messages.length, folds: this.runPlan && !this.runPlan.persisted ? this.runPlan.folds.length : 0, summary: !!this.runPlan?.cut, source: this.runPlan?.source ?? null });
 		}
-		const m = this.model, sk = `${key}@${m?.baseUrl ?? ""}`, was = this.stickyKey;
+		const sk = `${key}@${m?.baseUrl ?? ""}`, was = this.stickyKey;
 		this.stickyKey = null; // set again below when this request names its session: the request a refusal answers
 		if (this.off) return undefined; // strict no-op
 		const uid = stickyFits(m, p) && this.stickyOf(sk) !== "off" ? stickyUserId(this.sessionId(ctx)) : undefined;
@@ -1764,7 +1764,7 @@ export class Zip implements ZipControl {
 			if (m?.role === "custom" && ctx) void this.drivenStart(ctx); // the agent_start was a driven run's: its start of run, now
 		}
 		if (m?.role === "assistant" && m.stopReason !== "error" && m.stopReason !== "aborted") this.lastReqMs = Date.now(); // the response is complete: the entry was refreshed when it finished
-		else if (refused(m)) this.lastReqMs = this.reqMsBefore; // the provider refused the request: it touched no cache (cache.ts lastMessageMs reads the branch the same way)
+		else if (refused(m)) this.lastReqMs = Math.max(this.reqMsBefore, lastMessageMs(requestBranch(this.branch(ctx ?? this.liveCtx)))); // the provider refused the request: it touched no cache (cache.ts lastMessageMs reads the branch the same way)
 		const sk = this.stickyKey, err = String(m?.errorMessage ?? ""), ok = !!sk && this.stickyOf(sk) === "ok";
 		if (sk && m?.role === "assistant" && m.stopReason !== "error" && m.stopReason !== "aborted" && ((this.sticky400 = 0), !ok)) (this.stickyOf(sk, "ok"), this.ledger({ type: "sticky_ok", key: sk }));
 		// a refusal that names the field; a 400 ("400 status code (no body)" too; Pi does not retry it) to a model that never answered it,
@@ -1793,8 +1793,8 @@ export class Zip implements ZipControl {
 		const cr = u.cacheRead ?? 0, cw = u.cacheWrite ?? 0, total = (u.input ?? 0) + cr + cw;
 		if (!(total > 0)) return;
 		const known = this.entKey === pend.key ? this.ent?.cls : undefined;
-		const alive = pend.gapS >= GAP_EDGES[0] ? sample(pend.expect, cr, total, pend.edited, cw > 0 ? "explicit" : known) : null;
-		if (pend.gapS >= GAP_EDGES[0]) this.ledger({ type: "cache_sample", gapS: Math.round(pend.gapS), expect: Math.round(pend.expect), cacheRead: cr, total, edited: pend.edited, alive });
+		const alive = !pend.censored && pend.gapS >= GAP_EDGES[0] ? sample(pend.expect, cr, total, pend.edited, cw > 0 ? "explicit" : known) : null;
+		if (pend.gapS >= GAP_EDGES[0]) this.ledger({ type: "cache_sample", gapS: Math.round(pend.gapS), expect: Math.round(pend.expect), cacheRead: cr, total, edited: pend.edited, censored: pend.censored, alive });
 		if (alive !== null || !known || (cw > 0 && known !== "explicit")) { // the file is touched only when there is something to learn
 			this.ent = record(pend.key, { explicit: cw > 0, total, gapS: pend.gapS, alive });
 			this.entKey = pend.key;
