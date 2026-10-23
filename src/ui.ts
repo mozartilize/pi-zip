@@ -69,7 +69,7 @@ export interface CardData {
 	recalls: number;
 	last?: string; // "10:50  folded 12 old outputs · cache cold (away 47 min)"
 	quiet: boolean;
-	judge?: { calls: number; costUsd: number; unknown: number; errors: number };
+	judge?: { calls: number; costUsd: number; unknown: number; errors: number }; // unknown: verdict rows with at least one U fact
 	unzip?: string; // how the model gets folded outputs back, when it is not zip_recall (file recall under a tool allowlist)
 	failed?: number; // summary calls of this session whose narrative failed (each still a summary: the fallback)
 	failedWhy?: string; // "07:10 narrative hit the token cap": when and why the newest one failed
