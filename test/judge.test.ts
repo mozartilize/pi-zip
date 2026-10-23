@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
-import { BoundaryIndex, Judge, judgeInput, supersededOutputs, parseFacts, parseEvidence, parseVerdict, judgeModelRef, judgeReasoning, hintText, requestOpen, locatorOf, citesWork, latestUserText, JUDGE_SYSTEM, NEED_CUSTOM, CATALOGUE_TOKENS, type EvidenceSpan } from "../src/judge.ts";
+import { BoundaryIndex, Judge, judgeInput, candidateCausalTrace, supersededOutputs, parseFacts, parseEvidence, parseVerdict, judgeModelRef, judgeReasoning, hintText, requestOpen, locatorOf, citesWork, latestUserText, JUDGE_SYSTEM, NEED_CUSTOM, CATALOGUE_TOKENS, type EvidenceSpan } from "../src/judge.ts";
 import { buildBlocks, countUserTurns, foldCandidates, foldPlaceholder, plan, planContext, toolCallIndex, UNIT, type PlanOpts } from "../src/plan.ts";
 import { checkEdits, decideEdits } from "../src/core.ts";
 import { handleFor, PH_MARK } from "../src/placeholder.ts";
@@ -54,13 +54,68 @@ describe("judge input and parser", () => {
 		const next = buildBlocks(folded);
 		const b = judgeInput(next, toolCallIndex(next), "original task", 6000, a.catalogue, 13);
 		expect(b.prefix).toBe(a.prefix);
-		expect(b.text).toContain(`${h(1)} age=13 folded`);
+		expect(b.text).toContain(`${h(1)} age=13 folded turn=1/1`);
 		expect(b.text).toContain("assistant: x\ncall bash ls\nhmm");
 		expect(b.text).not.toContain('"type":');
 		const appended = buildBlocks(longTurn(14));
 		const c = judgeInput(appended, toolCallIndex(appended), "original task", 6000, b.catalogue, 14);
 		expect(c.prefix.startsWith(b.prefix)).toBe(true);
 		expect(c.catalogue.size).toBe(14);
+	});
+
+	test("per-candidate local causal trace records turn ratio, caller intent, turnEdits, and closing milestone", () => {
+		const entries = [
+			U("u1", "fix parser"),
+			{
+				sourceEntry: { id: "a1", type: "message", message: {} },
+				messages: [{
+					role: "assistant",
+					stopReason: "toolUse",
+					content: [
+						{ type: "thinking", thinking: "Inspecting parser token table before editing" },
+						{ type: "toolCall", id: "c-r1", name: "read", arguments: { path: "src/parser.ts" } },
+					],
+				}],
+			},
+			R("r1", "c-r1", 20, "parser source"),
+			{
+				sourceEntry: { id: "a2", type: "message", message: {} },
+				messages: [{
+					role: "assistant",
+					stopReason: "toolUse",
+					content: [{ type: "toolCall", id: "c-e1", name: "edit", arguments: { path: "src/parser.ts" } }],
+				}],
+			},
+			R("e1", "c-e1", 20, "edited parser"),
+			{
+				sourceEntry: { id: "a3", type: "message", message: {} },
+				messages: [{
+					role: "assistant",
+					stopReason: "stop",
+					content: [{ type: "text", text: "Fixed parser token table and verified all tests." }],
+				}],
+			},
+			U("u2", "now check lexer"),
+			{
+				sourceEntry: { id: "a4", type: "message", message: {} },
+				messages: [{
+					role: "assistant",
+					stopReason: "toolUse",
+					content: [
+						{ type: "text", text: "Reading lexer implementation" },
+						{ type: "toolCall", id: "c-r2", name: "read", arguments: { path: "src/lexer.ts" } },
+					],
+				}],
+			},
+			R("r2", "c-r2", 20, "lexer source"),
+		];
+		const blocks = buildBlocks(entries);
+		const input = judgeInput(blocks, toolCallIndex(blocks), "fix parser", 6000, undefined, 10, "/app");
+		const stateSection = input.text.split("\nCurrent state:\n")[1].split("\nLatest request:")[0];
+		expect(stateSection).toContain(`${handleFor("r1")} age=`);
+		expect(stateSection).toContain(`turn=1/2 why="Inspecting parser token table before editing" turnEdits=src/parser.ts closed=1/2 ("Fixed parser token table and verified all tests.")`);
+		expect(stateSection).toContain(`${handleFor("r2")} age=`);
+		expect(stateSection).toContain(`turn=2/2 why="Reading lexer implementation" closed=open`);
 	});
 
 	test("thousands of outputs fit a hard catalogue budget, prioritizing citations and folded originals", () => {

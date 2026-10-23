@@ -333,14 +333,71 @@ function toolResultBody(b: Block, calls?: Calls): string {
 	return clipHead(prefix + merged, TOOL_ROW_CHARS);
 }
 
+/**
+ * Per-candidate local causal trace for `Current state`:
+ * - which user turn (`turn=t/T`) the tool call ran in,
+ * - a short snippet of the assistant step that invoked it (`why=...`),
+ * - subsequent edits/writes in that same turn (`turnEdits=...`),
+ * - whether that turn or a subsequent turn before `T` closed with a final assistant reply (`closed=t_c/T (...)` or `closed=open`).
+ */
+export function candidateCausalTrace(blocks: readonly Block[], idx: number, maxTurn: number): string {
+	const b = blocks[idx];
+	const parts: string[] = [`turn=${b.userTurn}/${maxTurn}`];
+	let why = "";
+	for (let j = idx - 1; j >= 0; j--) {
+		if (blocks[j].kind !== "assistant") continue;
+		const content = Array.isArray(blocks[j].msg?.content) ? blocks[j].msg.content : [];
+		if (content.some((c: Any) => c?.type === "toolCall" && c.id === b.msg.toolCallId)) {
+			const txt = textOf(blocks[j].msg?.content).trim();
+			const thk = content.filter((c: Any) => c?.type === "thinking").map((c: Any) => String(c.thinking ?? "")).join(" ").trim();
+			why = (txt || thk).replace(/\s+/g, " ").trim();
+			break;
+		}
+	}
+	if (why) parts.push(`why=${JSON.stringify(clipHead(why, 90))}`);
+	const turnEdits: string[] = [];
+	let closedTurn = 0;
+	let closedReply = "";
+	for (let j = idx + 1; j < blocks.length; j++) {
+		const bj = blocks[j];
+		if (bj.kind !== "assistant" || ["error", "aborted"].includes(bj.msg?.stopReason)) continue;
+		const content = Array.isArray(bj.msg?.content) ? bj.msg.content : [];
+		if (bj.userTurn === b.userTurn) {
+			for (const c of content) {
+				if (c?.type === "toolCall" && (c.name === "edit" || c.name === "write")) {
+					const p = String(c.arguments?.path ?? c.arguments?.file_path ?? "").split("/").slice(-2).join("/");
+					if (p && !turnEdits.includes(p)) turnEdits.push(p);
+				}
+			}
+		}
+		const hasCall = content.some((c: Any) => c?.type === "toolCall");
+		const txt = textOf(bj.msg?.content).trim();
+		if (!hasCall && txt && !closedTurn) {
+			closedTurn = bj.userTurn;
+			closedReply = txt.replace(/\s+/g, " ").trim();
+		}
+	}
+	if (turnEdits.length) parts.push(`turnEdits=${turnEdits.slice(0, 4).join(",")}`);
+	if (closedTurn > 0) {
+		parts.push(`closed=${closedTurn}/${maxTurn} (${JSON.stringify(clipHead(closedReply, 80))})`);
+	} else {
+		parts.push("closed=open");
+	}
+	return parts.join(" ");
+}
+
 /** Rows keep their bytes and order while retained; unavailable rows and overflow are evicted at batch boundaries. */
 export function judgeInput(blocks: Block[], calls: Calls, firstPrompt: string, tailTokens = 6000, previous: Catalogue = new Map(), reqCount = 0, cwd = "", selected?: ReadonlySet<string>) {
-	const catalogue = new Map(previous), live = new Map<string, Block>();
-	for (const b of blocks) {
+	const catalogue = new Map(previous), live = new Map<string, Block>(), idxByHandle = new Map<string, number>();
+	let maxTurn = 1;
+	for (let i = 0; i < blocks.length; i++) {
+		const b = blocks[i];
+		if (b.userTurn > maxTurn) maxTurn = b.userTurn;
 		if (b.kind !== "toolResult" || !b.entryId) continue;
 		const h = handleFor(b.entryId), call = calls.get(b.msg.toolCallId);
 		if ((call?.name ?? b.msg.toolName) === RECALL_TOOL) continue;
 		live.set(h, b);
+		idxByHandle.set(h, i);
 		if (catalogue.has(h) || (selected && !selected.has(h))) continue;
 		const text = textOf((b.raw ?? b.msg).content), label = `${call?.name ?? b.msg.toolName ?? "tool"} ${shortArgs(call?.args)}`.trim();
 		const tokens = tok4(text), issued = reqCount - b.age;
@@ -464,7 +521,11 @@ export function judgeInput(blocks: Block[], calls: Calls, firstPrompt: string, t
 	const orderedRecent = [...chosenRows.entries()].sort((a, b) => a[0] - b[0]).map(([, s], i) => `E${i + 1} ${s}`);
 	const citedHandles = new Set(evidence.flatMap((e) => e.handles));
 	const citedLocators = new Set(evidence.filter((e) => e.role !== "toolResult").flatMap((e) => e.locators));
-	const stateRow = (h: string, item: CatalogueItem) => `${h} age=${reqCount - item.issued} ${statusOf(h)}`;
+	const stateRow = (h: string, item: CatalogueItem) => {
+		const idx = idxByHandle.get(h);
+		const trace = idx !== undefined ? ` ${candidateCausalTrace(blocks, idx, maxTurn)}` : "";
+		return `${h} age=${reqCount - item.issued} ${statusOf(h)}${trace}`;
+	};
 	const priority = (h: string, item: CatalogueItem) => selected && !selected.has(h) ? 3 : citedHandles.has(h) || (item.locator && citedLocators.has(item.locator)) ? 0 : statusOf(h) === "folded" ? 1 : 2;
 	const keep = new Set<string>();
 	let used = 0;
