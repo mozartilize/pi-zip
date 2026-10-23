@@ -55,7 +55,7 @@ describe("judge input and parser", () => {
 		const b = judgeInput(next, toolCallIndex(next), "original task", 6000, a.catalogue, 13);
 		expect(b.prefix).toBe(a.prefix);
 		expect(b.text).toContain(`${h(1)} age=13 folded`);
-		expect(b.text).toContain("assistant: hmm\nx\ncall bash ls");
+		expect(b.text).toContain("assistant: x\ncall bash ls\nhmm");
 		expect(b.text).not.toContain('"type":');
 		const appended = buildBlocks(longTurn(14));
 		const c = judgeInput(appended, toolCallIndex(appended), "original task", 6000, b.catalogue, 14);
@@ -130,22 +130,36 @@ const toolResult = (id: string, name: string, text = "y".repeat(3000), isError =
 const round = (id: string, name: string, args: Any, isError = false) => [toolCall(id, name, args), toolResult(id, name, undefined, isError)];
 
 describe("evidence rows and supersession", () => {
-	test("assistant rows show prose and calls without signatures, and a cut row keeps its head", () => {
+	test("assistant rows show visible prose and calls before thinking without signatures, and tool rows keep head+tail outcome digests", () => {
 		const m = { role: "assistant", content: [{ type: "thinking", thinking: "plan-head " + "p".repeat(3000), thinkingSignature: "S".repeat(20_000) },
 			{ type: "text", text: "done" }, { type: "toolCall", id: "c1", name: "read", arguments: { path: "/w/a.ts" } }] };
 		const bs = buildBlocks([U("u1", "task"), { sourceEntry: { id: "a1", type: "message", message: m }, messages: [m] }]);
 		const wide = judgeInput(bs, toolCallIndex(bs), "task", 6000, undefined, 1).text;
-		expect(wide).toContain("E2 assistant: plan-head");
+		expect(wide).toContain("E2 assistant: done\ncall read /w/a.ts");
 		expect(wide).not.toContain("SSSSSSSSSS");
 		expect(wide).not.toContain("thinkingSignature");
 		const row = wide.split("E2 ")[1];
-		expect(row.length).toBeLessThanOrEqual("assistant: ".length + 2000);
-		expect(row.endsWith("…")).toBe(true);
+		expect(row.length).toBeLessThanOrEqual("assistant: ".length + 1000);
 		const narrow = judgeInput(bs, toolCallIndex(bs), "task", 50, undefined, 1).text;
-		expect(narrow.split("Recent work:\n")[1]).toMatch(/^E1 assistant: plan-head p+…$/);
+		expect(narrow.split("Recent work:\n")[1]).toContain("assistant: done\ncall read /w/a.ts");
 		const short = { role: "assistant", content: [{ type: "text", text: "done" }, { type: "toolCall", id: "c1", name: "read", arguments: { path: "/w/a.ts" } }] };
 		const sb = buildBlocks([U("u1", "task"), { sourceEntry: { id: "a1", type: "message", message: short }, messages: [short] }]);
 		expect(judgeInput(sb, toolCallIndex(sb), "task", 6000, undefined, 1).text).toContain("E2 assistant: done\ncall read /w/a.ts");
+		// Long bash toolResult keeps both opening context and tail error/exit outcome beyond byte 1200.
+		const longBash = "HEADER_START\n" + "middle line\n".repeat(150) + "AssertionError: expected 200 to equal 403\nCommand exited with code 1";
+		const tb = buildBlocks([U("u1", "task"), toolCall("c9", "bash", { command: "bun test" }), toolResult("c9", "bash", longBash, true)]);
+		const trText = judgeInput(tb, toolCallIndex(tb), "task", 6000, undefined, 1).text;
+		expect(trText).toContain("toolResult: [exit 1]");
+		expect(trText).toContain("HEADER_START");
+		expect(trText).toContain("AssertionError: expected 200 to equal 403");
+		// Older identical tool outputs in Recent work collapse to a short repeated digest while keeping the newest full digest.
+		const dup = buildBlocks([
+			U("u1", "task"),
+			toolCall("c1", "bash", { command: "bun test" }), toolResult("c1", "bash", longBash, true),
+			toolCall("c2", "bash", { command: "bun test" }), toolResult("c2", "bash", longBash, true),
+		]);
+		const dupText = judgeInput(dup, toolCallIndex(dup), "task", 6000, undefined, 2).text;
+		expect(dupText).toContain("repeated head+tail");
 	});
 
 	test("exact repeats and successful writes supersede; failures, other ranges and recall do not", () => {
