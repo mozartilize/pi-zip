@@ -1,7 +1,7 @@
 // Summary (F11, F12): deterministic skeleton (user words verbatim + files/commands) + model-written narrative + handle table.
 // Private thinking is stripped except for bounded, labeled tentative excerpts on tool-only assistant steps (corroborated against actions/results).
 import { randomUUID } from "node:crypto";
-import { blockTime, cdDirOf, clipMid, distinctLines, handleFor, keyTexts, outcomeHint, RECALL_TOOL, shortArgs, strippableCdDirs, whenLabel } from "./placeholder.ts";
+import { blockTime, cdAliases, clipMid, distinctLines, handleFor, keyTexts, outcomeHint, RECALL_TOOL, shortArgs, whenLabel } from "./placeholder.ts";
 import { type Block, type Cut, type PlanResult, NARRATIVE_CALL_MAX, NARRATIVE_MAX, settings, toolCallIndex } from "./plan.ts";
 import { type FileRecall, fileRecallHow } from "./recallfile.ts";
 import { type Any, attempt, clamp, clip, envInt, fmtWhen, reasonsByDefault, textOf, tok4 } from "./util.ts";
@@ -155,7 +155,8 @@ export interface ParsedSummary {
 	narrative: string[]; // model-written text and free text, oldest first
 	narrativeAt?: string; // a narrative carried forward unchanged (its call failed) says when it was written
 	epochs?: StructuredNarrative; // the narrative in the append-only format (current state + epochs); absent for older formats and free text
-	cmdDirs: string[]; // the shared `cd <dir>` prefixes the command rows leave out (oldest first)
+	cmdDirs: string[]; // the `cd <dir>` prefixes older summaries left out of their rows without an alias (oldest first)
+	cmdAliases: Map<string, string>; // dir -> alias: a row `[a] cmd` stands for `cd <dir> && cmd`
 }
 
 const SECTIONS: Array<[RegExp, string]> = [
@@ -188,14 +189,20 @@ const COVERS_ROW = /^Covers \d+ earlier messages\./;
 const NONE_ROW = "(none)";
 /** Heading of a previous narrative carried forward unchanged because the call for a new one failed (buildCut). */
 const narrCarriedHead = (at: string | undefined, why: string) => `## Narrative (carried forward from the summary of ${at ?? "an earlier time"}; possibly stale: a new one could not be written: ${why})`;
-/** The commands heading names the shared `cd <dir>` prefixes its rows leave out. */
-const cmdsHead = (dirs: string[]) => `## Commands run (with exit status${dirs.length ? `; a leading "cd <dir> &&" is left out for: ${dirs.join(", ")}` : ""})`;
+/** The commands heading names each aliased `cd <dir>` once, and the dirs older summaries left out of their rows without an alias. */
+const cmdsHead = (aliases: Map<string, string>, legacy: string[]) => {
+	const legend = [...aliases].sort((x, y) => x[1].length - y[1].length || x[1].localeCompare(y[1])).map(([d, a]) => `${a}=${d}`);
+	return `## Commands run (with exit status${legend.length ? `; "[a] cmd" stands for "cd <dir> && cmd": ${legend.join(", ")}` : ""}${legacy.length ? `; a leading "cd <dir> &&" is left out for: ${legacy.join(", ")}` : ""})`;
+};
 const CMD_DIRS_RE = /^## Commands run \(.*; a leading "cd <dir> &&" is left out for: (.*)\)$/;
+const CMD_ALIAS_RE = /^## Commands run \(.*?; "\[a\] cmd" stands for "cd <dir> && cmd": (.*?)(?:; a leading "cd <dir> &&" is left out for: .*)?\)$/;
+/** Alias names an alias legend uses in this text (`[a] `, anywhere a command is shown). */
+const usedAliases = (text: string): Set<string> => new Set([...text.matchAll(/\[([a-z]{1,3})\] /g)].map((m) => m[1]));
 const NARR_CARRIED_RE = /^## Narrative \(carried forward from the summary of ([^;]+);/;
 
 /** Parse any summary text: pi-zip's current and older formats (carried-forward blocks nested inside carried-forward blocks included), or free text. */
 export function parseSummary(text: string | null): ParsedSummary {
-	const out: ParsedSummary = { cmdDirs: [], structured: false, users: { items: [], omitted: 0 }, files: { rows: [], omitted: 0 }, cmds: { items: [], omitted: 0 }, others: { items: [], omitted: 0 }, errors: { items: [], omitted: 0 }, table: { items: [], omitted: 0 }, narrative: [] };
+	const out: ParsedSummary = { cmdDirs: [], cmdAliases: new Map(), structured: false, users: { items: [], omitted: 0 }, files: { rows: [], omitted: 0 }, cmds: { items: [], omitted: 0 }, others: { items: [], omitted: 0 }, errors: { items: [], omitted: 0 }, table: { items: [], omitted: 0 }, narrative: [] };
 	if (!text) return out;
 	// occurrences in text order; in the older nested format the nested (older) copy of a section comes first, so order = oldest first
 	const occ: Array<{ key: string; lines: string[]; indented?: boolean }> = [{ key: "free", lines: [] }];
@@ -207,6 +214,11 @@ export function parseSummary(text: string | null): ParsedSummary {
 			if (at) out.narrativeAt = at[1];
 			const dirs = CMD_DIRS_RE.exec(line);
 			if (dirs) out.cmdDirs.push(...dirs[1].split(", ").filter((d) => d && !out.cmdDirs.includes(d)));
+			const al = CMD_ALIAS_RE.exec(line);
+			for (const pair of al ? al[1].split(/, (?=[a-z]{1,3}=)/) : []) {
+				const m = /^([a-z]{1,3})=(.+)$/.exec(pair);
+				if (m && ![...out.cmdAliases.values()].includes(m[1])) out.cmdAliases.set(m[2], m[1]);
+			}
 			occ.push({ key: hit[1], lines: [], indented: hit[1] === "users" && (line.trim() === USERS_HEAD || line.trim() === USERS_HEAD_SHORT) });
 			if (hit[1] !== "free" && hit[1] !== "narr") out.structured = true;
 			continue;
@@ -837,8 +849,7 @@ export function skeleton(prefix: Block[], previous: string | null, tableText = "
 	const errors: string[] = [];
 	const now: IndexRow[] = []; // every recallable result of this prefix, oldest first
 	const nowText: string[] = []; // ... and its output (to tell look-alike rows apart)
-	const usedDirs = new Set<string>(); // shared `cd <dir>` prefixes left out of this prefix's command rows
-	const shared = strippableCdDirs(bashCommands(prefix), parseSummary(previous).cmdDirs);
+	const aliases = cdAliases(bashCommands(prefix), parseSummary(previous).cmdAliases);
 	for (const b of prefix) {
 		if (b.kind === "user") {
 			const t = requestText(b.msg.content, b.entryId, file);
@@ -854,9 +865,7 @@ export function skeleton(prefix: Block[], previous: string | null, tableText = "
 				const m = /Command exited with code (\d+)/.exec(resText);
 				const status = m ? `exit ${m[1]}` : res?.msg.isError ? "error" : res ? "exit 0" : "no result";
 				const tag = res ? ` (${whenLabel(blockTime(res), res.userTurn)}${res.entryId ? ", " + handleFor(res.entryId) : ""})` : ""; // every result is recallable, so every one gets its handle
-				const d = cdDirOf(String(a.command ?? ""));
-				if (d && shared.has(d)) usedDirs.add(d);
-				cmds.push(`\`${shortArgs({ command: String(a.command ?? "") }, BUDGET.cmdChars, shared)}\` -> ${status}${tag}`);
+				cmds.push(`\`${shortArgs({ command: String(a.command ?? "") }, BUDGET.cmdChars, aliases)}\` -> ${status}${tag}`);
 			} else if (typeof a.path === "string" || typeof a.file_path === "string") {
 				const p = String(a.path ?? a.file_path);
 				if (!files.has(p)) files.set(p, new Map());
@@ -867,7 +876,7 @@ export function skeleton(prefix: Block[], previous: string | null, tableText = "
 				others.push(`${c.name} ${shortArgs(a)}${tag}`);
 			}
 			if (res?.entryId && c.name !== RECALL_TOOL) {
-				now.push({ handle: handleFor(res.entryId), tool: c.name, args: shortArgs(a, 60, shared), turn: res.userTurn, at: blockTime(res) });
+				now.push({ handle: handleFor(res.entryId), tool: c.name, args: shortArgs(a, 60, aliases), turn: res.userTurn, at: blockTime(res) });
 				nowText.push(resText);
 			}
 			if (res?.msg.isError) errors.push(`- ${c.name} ${shortArgs(a)}: ${clip(resText, 200)}`);
@@ -900,8 +909,8 @@ export function skeleton(prefix: Block[], previous: string | null, tableText = "
 	out.push(mu.lines.some((l) => /^\d+\. ≈ /.test(l)) ? USERS_HEAD_SHORT : USERS_HEAD);
 	out.push(...(mu.lines.length ? mu.lines : [NONE_ROW]));
 	out.push(...list("## Files touched", mf, "older omitted"));
-	const dirs = [...new Set([...prev.cmdDirs, ...usedDirs])]; // every dir any row leaves out (at most one: strippableCdDirs)
-	out.push(...list(cmdsHead(dirs), mc, "older omitted"));
+	const cmdsAt = out.length; // its heading is written last: the legend names only the aliases some row of this summary still shows
+	out.push(...list(cmdsHead(new Map(), []), mc, "older omitted"));
 	if (mo.kept.length) out.push(...list("## Other tool calls (time, handle)", mo, "older omitted"));
 	out.push(...list("## Errors", me, "older omitted"));
 	// index rows of this prefix that would read the same (same tool and arguments): each gets the first line of its output that tells it apart
@@ -914,6 +923,8 @@ export function skeleton(prefix: Block[], previous: string | null, tableText = "
 	}
 	const index = handleIndex(now, previous, out.join("\n") + "\n" + tableText, INDEX_TOKENS, file);
 	if (index) out.push(index);
+	const used = usedAliases(out.join("\n") + "\n" + tableText);
+	out[cmdsAt] = cmdsHead(new Map([...aliases].filter(([, a]) => used.has(a))), prev.cmdDirs);
 	// buildCut carries durable epochs and reconciles active state separately from these deterministic lists.
 	return { text: out.join("\n"), users: users.length };
 }
@@ -1102,7 +1113,7 @@ export async function buildCut(p: PlanResult, ctx: Any, signal?: AbortSignal): P
 	const prev = prefix[0]?.kind === "summary" ? String(prefix[0].msg.summary ?? "") || null : null;
 	const prevParsed = parseSummary(prev);
 	const slice = prefix.filter((b) => b.kind !== "summary");
-	const shared = strippableCdDirs(bashCommands(slice), prevParsed.cmdDirs);
+	const aliases = cdAliases(bashCommands(slice), prevParsed.cmdAliases);
 	const texts: string[] = [];
 	const keyLists: string[][] = [];
 	const rows: HandleRow[] = prefix
@@ -1115,7 +1126,7 @@ export async function buildCut(p: PlanResult, ctx: Any, signal?: AbortSignal): P
 			const hint = keys[0] ?? "";
 			texts.push(out);
 			keyLists.push(keys);
-			return { handle: handleFor(b.entryId!), tool, args: call ? shortArgs(call.args, undefined, shared) : "", turn: b.userTurn, at: blockTime(b), outcome: outcomeHint(out, tool, !!b.msg.isError), hint };
+			return { handle: handleFor(b.entryId!), tool, args: call ? shortArgs(call.args, undefined, aliases) : "", turn: b.userTurn, at: blockTime(b), outcome: outcomeHint(out, tool, !!b.msg.isError), hint };
 		});
 	// rows of one tool that would show the same key line (the first line of every status report, say): each shows the first of its
 	// lines that none of the others has, nor a row of that tool the previous summary's table already shows

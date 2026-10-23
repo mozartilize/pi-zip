@@ -156,13 +156,23 @@ export function sharedCdDirs(cmds: string[]): Set<string> {
 	}
 	return new Set([...n].filter(([, k]) => k >= 2).map(([d]) => d).sort());
 }
-/** The `cd <dir>` prefix rows may leave out: only when exactly one dir is shared by these commands and no other dir was left out
- *  earlier (`earlier` = the dirs an earlier summary's heading names). With two dirs in play, `cd` is what tells rows apart: kept. */
-export function strippableCdDirs(cmds: string[], earlier: string[] = []): Set<string> {
-	const s = sharedCdDirs(cmds);
-	if (s.size !== 1) return new Set();
-	const [d] = s;
-	return earlier.every((e) => e === d) ? s : new Set();
+/** Alias number i: a..z, then aa, ab, ... */
+const aliasName = (i: number): string => (i < 26 ? "" : aliasName(Math.floor(i / 26) - 1)) + String.fromCharCode(97 + (i % 26));
+/** Short aliases for `cd <dir>` prefixes (dir -> alias): a row writes `[a] cmd` for `cd <dir> && cmd`, and the heading names each dir
+ *  once. Every dir works this way, so rows in several dirs stay told apart. An alias of `earlier` (an earlier summary's heading) keeps
+ *  its letter; a dir that at least two of these commands share gets the first letter no earlier alias holds, in order of first use. */
+export function cdAliases(cmds: string[], earlier: Map<string, string> = new Map()): Map<string, string> {
+	const out = new Map(earlier);
+	const shared = sharedCdDirs(cmds), taken = new Set(earlier.values());
+	let next = 0;
+	for (const c of cmds) {
+		const d = cdDirOf(c);
+		if (!d || out.has(d) || !shared.has(d)) continue;
+		while (taken.has(aliasName(next))) next++;
+		taken.add(aliasName(next));
+		out.set(d, aliasName(next));
+	}
+	return out;
 }
 
 const HEREDOC_RE = /<<-?\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\1/;
@@ -183,16 +193,18 @@ function heredocLabel(cmd: string): string | null {
 	return `${lines[0].trim()} … ${gist.trim()}${after ? ` ${m[2]} ${after}` : ""}`;
 }
 
-/** A command as a label: a `cd` prefix shared with other rows (`shared`) dropped, a heredoc shown by its gist, clipped in the middle. */
-export function cmdLabel(cmd: string, n = ARG_CHARS, shared?: Set<string>): string {
+/** A command as a label: an aliased `cd` prefix, a heredoc shown by its gist, clipped in the middle. */
+export function cmdLabel(cmd: string, n = ARG_CHARS, aliases?: Map<string, string>): string {
 	const d = cdDirOf(cmd);
-	const c = d && shared?.has(d) ? cmd.replace(CD_RE, "") : cmd;
-	return clipMid(heredocLabel(c) ?? c, n);
+	const a = d ? aliases?.get(d) : undefined;
+	if (!a) return clipMid(heredocLabel(cmd) ?? cmd, n);
+	const c = cmd.replace(CD_RE, ""), head = `[${a}] `;
+	return head + clipMid(heredocLabel(c) ?? c, Math.max(1, n - head.length));
 }
 
-export function shortArgs(args: Any, n = ARG_CHARS, shared?: Set<string>): string {
+export function shortArgs(args: Any, n = ARG_CHARS, aliases?: Map<string, string>): string {
 	if (!args || typeof args !== "object") return "";
-	if (typeof args.command === "string") return cmdLabel(args.command, n, shared);
+	if (typeof args.command === "string") return cmdLabel(args.command, n, aliases);
 	const path = typeof args.path === "string" ? args.path : typeof args.file_path === "string" ? args.file_path : null;
 	if (path !== null && typeof args.pattern !== "string") {
 		// which slice of the file, written the way Pi's own read row writes it: "src/a.ts:1-2000", "src/a.ts:50-"

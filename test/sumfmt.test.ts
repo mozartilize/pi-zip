@@ -2,7 +2,7 @@
 // mechanical lists, short fold text, JSON key fields. Synthetic sessions only.
 import { describe, expect, test } from "bun:test";
 import { buildBlocks, toolCallIndex } from "../src/plan.ts";
-import { cmdLabel, distinctLines, handleFor, jsonKeyFields, keyTexts, makePlaceholder, makePlaceholderFor, sharedCdDirs, shortArgs, strippableCdDirs } from "../src/placeholder.ts";
+import { cmdLabel, distinctLines, handleFor, jsonKeyFields, keyTexts, makePlaceholder, makePlaceholderFor, cdAliases, sharedCdDirs, shortArgs } from "../src/placeholder.ts";
 import { BUDGET, buildCut, handleRowsOf, INDEX_TOKENS, skeleton, TABLE_ROWS } from "../src/summary.ts";
 import { A, type Any, U } from "./helpers.ts";
 
@@ -50,7 +50,7 @@ describe("row labels tell look-alike rows apart (2026-10-11 item 3)", () => {
 		expect(rows[1]).not.toEndWith(" · queue: 3 items"); // the new one shows another of its lines
 	});
 
-	test("commands: a shared `cd <dir> &&` / `cd <dir>;` is left out (the heading names it), heredocs show their gist, the clip keeps head and tail", async () => {
+	test("commands: a shared `cd <dir> &&` / `cd <dir>;` becomes an alias (the heading names its dir), heredocs show their gist, the clip keeps head and tail", async () => {
 		const dir = "/home/user/projects/example-app";
 		const py = (seq: number) => `cd ${dir}; python3 - <<'EOF'\nimport json\nL=[json.loads(l) for l in open('data/ledger.jsonl')]\nfor e in L:\n    if e['seq']>${seq}: print(e['seq'], e['kind'])\nEOF`;
 		const entries: Any[] = [U("u1", "go")];
@@ -58,43 +58,53 @@ describe("row labels tell look-alike rows apart (2026-10-11 item 3)", () => {
 		entries.push(tcall("b9", "bash", { command: `cd ${dir} && make all` }), tres("b9", "bash", "ok"), A("e"));
 		const t = skeleton(buildBlocks(entries), null).text;
 		const cmds = sec(t, "## Commands run");
-		expect(cmds.split("\n")[0]).toBe(`## Commands run (with exit status; a leading "cd <dir> &&" is left out for: ${dir})`);
+		expect(cmds.split("\n")[0]).toBe(`## Commands run (with exit status; "[a] cmd" stands for "cd <dir> && cmd": a=${dir})`);
 		const rows = cmds.split("\n").filter((l) => l.startsWith("`"));
 		expect(rows).toHaveLength(4);
-		expect(rows.every((r) => !r.includes(`cd ${dir}`))).toBe(true);
+		expect(rows.every((r) => !r.includes(`cd ${dir}`) && r.startsWith("`[a] "))).toBe(true);
 		expect(new Set(rows.map((r) => r.replace(/\(.*\)$/, ""))).size).toBe(4);
 		for (const s of [120, 130, 140]) expect(cmds).toContain(`e['seq']>${s}`);
-		expect(rows[3]).toMatch(/^`make all` -> exit 0/);
+		expect(rows[3]).toMatch(/^`\[a\] make all` -> exit 0/);
 		// carried into the next summary, the heading keeps the dir
 		const again = skeleton(buildBlocks([U("u2", "x"), tcall("c1", "bash", { command: "ls" }), tres("c1", "bash", "a"), A("e2")]), t).text;
-		expect(sec(again, "## Commands run").split("\n")[0]).toContain(`left out for: ${dir}`);
+		expect(sec(again, "## Commands run").split("\n")[0]).toContain(`a=${dir})`);
 		// a cd used once says where the command ran: kept
 		expect(skeleton(buildBlocks([U("u1", "go"), tcall("x", "bash", { command: "cd /a/b && ls" }), tres("x", "bash", "a"), A("e")]), null).text).toContain("`cd /a/b && ls`");
 	});
 
-	test("two dirs with two commands each: no row drops its cd (it is what tells them apart), and the heading names none", () => {
+	test("two dirs with two commands each: each gets its own alias, so rows stay told apart; an earlier alias keeps its letter", () => {
 		const entries: Any[] = [U("u1", "go")];
 		["/srv/a", "/srv/b", "/srv/a", "/srv/b"].forEach((d, i) => entries.push(tcall(`d${i}`, "bash", { command: `cd ${d} && make t${i}` }), tres(`d${i}`, "bash", "ok")));
 		entries.push(A("e"));
 		const cmds = sec(skeleton(buildBlocks(entries), null).text, "## Commands run");
-		expect(cmds.split("\n")[0]).toBe("## Commands run (with exit status)");
+		expect(cmds.split("\n")[0]).toBe('## Commands run (with exit status; "[a] cmd" stands for "cd <dir> && cmd": a=/srv/a, b=/srv/b)');
 		const rows = cmds.split("\n").filter((l) => l.startsWith("`"));
-		expect(rows).toHaveLength(4);
-		expect(rows[0]).toStartWith("`cd /srv/a && make t0`");
-		expect(rows[2]).toStartWith("`cd /srv/a && make t2`");
-		expect(rows[1]).toStartWith("`cd /srv/b && make t1`");
-		expect(strippableCdDirs(["cd /srv/a && x", "cd /srv/a && y"], ["/srv/b"]).size).toBe(0); // another dir was stripped earlier: keep
+		expect(rows.map((r) => r.slice(0, r.indexOf(" -> ")))).toEqual(["`[a] make t0`", "`[b] make t1`", "`[a] make t2`", "`[b] make t3`"]);
+		// an alias an earlier summary gave keeps its letter; a new dir takes the first free one
+		expect(cdAliases(["cd /srv/a && x", "cd /srv/a && y"], new Map([["/srv/b", "a"]]))).toEqual(new Map([["/srv/b", "a"], ["/srv/a", "b"]]));
+		// a dir used once has no alias (its cd says where that command ran)
+		expect(cdAliases(["cd /srv/a && x", "cd /srv/b && y", "cd /srv/b && z"])).toEqual(new Map([["/srv/b", "a"]]));
 	});
 
-	test("one shared dir is still stripped, also when an earlier summary stripped the same dir; the heading lists it", () => {
-		const one = (id: string, n: number) => [tcall(`${id}${n}`, "bash", { command: `cd /srv/a && step ${n}` }), tres(`${id}${n}`, "bash", "ok")];
-		const t1 = skeleton(buildBlocks([U("u1", "go"), ...one("x", 1), ...one("x", 2), A("e")]), null).text;
-		const c1 = sec(t1, "## Commands run");
-		expect(c1.split("\n")[0]).toBe('## Commands run (with exit status; a leading "cd <dir> &&" is left out for: /srv/a)');
-		expect(c1).toContain("`step 1` -> exit 0");
-		const t2 = skeleton(buildBlocks([U("u2", "more"), ...one("y", 3), ...one("y", 4), A("e2")]), t1).text;
-		expect(sec(t2, "## Commands run")).toContain("`step 4` -> exit 0");
-		expect(sec(t2, "## Commands run").split("\n")[0]).toContain("left out for: /srv/a)");
+	test("aliases carry across summaries; the legend drops an alias no row shows; an older heading's left-out dir stays named", () => {
+		const one = (id: string, d: string, n: number) => [tcall(`${id}${n}`, "bash", { command: `cd ${d} && step ${n}` }), tres(`${id}${n}`, "bash", "ok")];
+		const t1 = skeleton(buildBlocks([U("u1", "go"), ...one("x", "/srv/a", 1), ...one("x", "/srv/a", 2), A("e")]), null).text;
+		expect(sec(t1, "## Commands run")).toContain("`[a] step 1` -> exit 0");
+		const t2 = skeleton(buildBlocks([U("u2", "more"), ...one("y", "/srv/b", 3), ...one("y", "/srv/b", 4), ...one("y", "/srv/a", 5), A("e2")]), t1).text;
+		const c2 = sec(t2, "## Commands run");
+		expect(c2.split("\n")[0]).toBe('## Commands run (with exit status; "[a] cmd" stands for "cd <dir> && cmd": a=/srv/a, b=/srv/b)');
+		expect(c2).toContain("`[a] step 1` -> exit 0"); // carried row, same alias
+		expect(c2).toContain("`[b] step 4` -> exit 0");
+		expect(c2).toContain("`[a] step 5` -> exit 0"); // used once in this slice, but already aliased
+		// a previous legend entry no row shows any more is dropped
+		const stale = '## Commands run (with exit status; "[a] cmd" stands for "cd <dir> && cmd": a=/gone)\n`ls` -> exit 0';
+		const t3 = skeleton(buildBlocks([U("u3", "go"), ...one("z", "/srv/x", 6), ...one("z", "/srv/x", 7), A("e3")]), stale).text;
+		expect(sec(t3, "## Commands run").split("\n")[0]).toBe('## Commands run (with exit status; "[a] cmd" stands for "cd <dir> && cmd": b=/srv/x)');
+		// an older summary's heading (its rows dropped the cd with no alias) keeps naming that dir
+		const legacy = '## Commands run (with exit status; a leading "cd <dir> &&" is left out for: /old)\n`make` -> exit 0';
+		const t4 = skeleton(buildBlocks([U("u4", "go"), ...one("w", "/srv/a", 8), ...one("w", "/srv/a", 9), A("e4")]), legacy).text;
+		expect(sec(t4, "## Commands run").split("\n")[0]).toBe('## Commands run (with exit status; "[a] cmd" stands for "cd <dir> && cmd": a=/srv/a; a leading "cd <dir> &&" is left out for: /old)');
+		expect(sec(t4, "## Commands run")).toContain("`make` -> exit 0");
 	});
 
 	test("cmdLabel: heredoc gist (comment, else echo/print, else tail), cd only when shared, middle clip", () => {
@@ -103,8 +113,9 @@ describe("row labels tell look-alike rows apart (2026-10-11 item 3)", () => {
 		expect(cmdLabel(hd("x = 1\nprint(len(rows))\ny = 2"))).toBe("python3 - <<'EOF' … print(len(rows))");
 		expect(cmdLabel(hd("x = [r for r in rows if r['a'] > 5]\ny = sum(x)"))).toBe("python3 - <<'EOF' … x = [r for r in rows if r['a'] > 5] y = sum(x)");
 		expect(cmdLabel("cat <<EOF > f.txt\nhello\nEOF\nwc -l f.txt")).toBe("cat <<EOF > f.txt … hello EOF wc -l f.txt");
-		expect(cmdLabel("cd /x && ls", 90, new Set(["/x"]))).toBe("ls");
-		expect(cmdLabel("cd /x && ls", 90, new Set(["/y"]))).toBe("cd /x && ls");
+		expect(cmdLabel("cd /x && ls", 90, new Map([["/x", "a"]]))).toBe("[a] ls");
+		expect(cmdLabel("cd /x && ls", 90, new Map([["/y", "a"]]))).toBe("cd /x && ls");
+		expect(cmdLabel("cd /x && " + "y".repeat(200), 40, new Map([["/x", "a"]]))).toHaveLength(40); // the alias counts toward the clip
 		const long = "npm run test -- " + "--flag ".repeat(40) + "--testPathPattern=alpha.spec.ts";
 		expect(cmdLabel(long, 60).endsWith("alpha.spec.ts")).toBe(true);
 		expect(shortArgs({ command: long }, 60)).toBe(cmdLabel(long, 60));
@@ -222,7 +233,7 @@ describe("smaller mechanical lists (2026-10-11 item 2, 2026-10-10 item 3)", () =
 		expect(text).toContain("\n1. REQUEST 1: please");
 		expect(text).toContain("\n200. REQUEST 200: please");
 		expect(text).toMatch(/\n\d+\. ≈ REQUEST \d+: please/);
-		expect(text).toContain('a leading "cd <dir> &&" is left out for: /work/repo');
+		expect(text).toContain('"[a] cmd" stands for "cd <dir> && cmd": a=/work/repo)');
 	});
 });
 
