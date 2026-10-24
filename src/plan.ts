@@ -32,6 +32,7 @@ const SUMMARY_RATIO = 0.1;
 
 export const DEFAULT_RESERVE_TOKENS = 16_384; // Pi's compaction reserve default
 export const COMPACT_MARGIN = 8_192; // estimates are chars/4: stay clear of the trigger
+export const DEFAULT_SUMMARY_WINDOW = 200_000; // prepare checkpoints for a possible switch to a smaller window
 const MIN_TARGET = 4_096;
 
 /** Pi's compaction reserve for this model: compaction.modelOverrides["provider/id"], else compaction.reserveTokens, else 16384. */
@@ -47,6 +48,25 @@ export function compactionRoom(model: Any, reserve = DEFAULT_RESERVE_TOKENS): nu
 	const w = Number(model?.contextWindow);
 	return w > 0 ? Math.max(MIN_TARGET, w - reserve - COMPACT_MARGIN) : null;
 }
+
+export const SUMMARY_PRESSURE_CAP = 0.8 * compactionRoom({ contextWindow: DEFAULT_SUMMARY_WINDOW })!; // 140,339.2
+
+/** Summary application threshold: 80% of the active model's safe compaction room, capped at 400K tokens.
+ * Unknown windows cannot establish pressure unless PI_ZIP_SUMMARY_AT overrides the real-token threshold. */
+export const summaryThreshold = (room: number | null): number => {
+	const over = envInt("SUMMARY_AT", -1);
+	if (over >= 0) return over;
+	return room === null ? Infinity : Math.min(0.8 * room, 400_000);
+};
+
+/** Background summary preparation threshold: min(0.8 * room, 200K-window pressure cap).
+ * On large windows (e.g. 1M), background summaries are prepared from 140.3K without applying them until the active window's own
+ * min(0.8 * room, 400K) is reached. A switch can reuse a prepared prefix only if the summary plus untouched suffix fits the new window. */
+export const summaryPrepareThreshold = (room: number | null): number => {
+	const over = envInt("SUMMARY_AT", -1);
+	if (over >= 0) return over;
+	return room === null ? Infinity : Math.min(0.8 * room, SUMMARY_PRESSURE_CAP);
+};
 
 export const PI_KEEP_RECENT = 20_000; // Pi's compaction keepRecentTokens default
 
@@ -434,7 +454,7 @@ export const CAP_CONTENT_MIN = 0.5;
 export const coldTarget = (cap: number, O: number, room: number | null): number => Math.min(Math.max(cap, O + CAP_CONTENT_MIN * cap), room ?? Infinity);
 
 export const settings = () => ({
-	coldCap: envInt("COLD_CAP", 40_000), // cold: fold, then summarise, down to this many real tokens of the whole context, but never below O + half of it (coldTarget)
+	coldCap: envInt("COLD_CAP", 40_000), // folding/cut target, not summary permission; never below O + half of it (coldTarget)
 	foldMin: envInt("FOLD_MIN", 500), // outputs below this many tokens are never folded
 	keepLines: envInt("KEEP_LINES", 8),
 	judgeAge: Math.max(1, envInt("JUDGE_AGE", 10)), // minimum age before the judge scores a live output; not a permission to fold earlier
@@ -608,6 +628,8 @@ export interface PlanOpts {
 	law?: Law; // prices, g and P(warm): the only input that depends on P; default: the explicit class ratios at P = 0
 	pause?: boolean; // a return after a pause (the absence outlived the requested cache lifetime) or a model switch: the previous user turn's re-readable outputs may fold
 	trace?: (LawTerms & { where: "summary" | "plan" | "guard"; cut?: boolean; ready?: boolean; key?: string })[]; // every law evaluation is pushed here (ledger)
+	/** Output diagnostic, overwritten on each plan; sizes are calibrated whole-context tokens. */
+	summaryGate?: { before: number; afterFolds: number; target: number; threshold: number | null; prepareThreshold: number | null; room: number | null; eligible: boolean; prepareEligible: boolean; checkpoint?: { key: string; after: number; advance: number; refresh: boolean }; reason: "folds-only" | "unknown-window" | "below-target" | "below-pressure" | "prepare-only" | "pressure" };
 	reserve?: number; // Pi's compaction reserveTokens (default 16384)
 	steerIds?: Set<string>; // user entries that are mid-run steering or follow-up messages, not new user turns
 	scale?: Scale; // real = O + c x content estimate (calibrate); default UNIT = the estimates are taken as real
@@ -624,6 +646,10 @@ export interface PlanOpts {
 	cutAt?: string; // cut at this entry or not at all (a summary for that cut is produced or being produced: core.ts adopt)
 	foldsOnly?: boolean; // no cut: the plan of the folds alone (its summary is not ready: core.ts unready)
 	ready?: readonly string[];
+	/** Model-switch rescue: the context must fit a smaller window, and the alternative is Pi's own summary or an overflow, so the law's
+	 *  price never refuses the cut. `cutLatest`: a cut may enter the protected turns, up to and keeping the current user message.
+	 *  `force`: these outputs fold whatever their turn or age (chosen by the caller, biggest first, only as many as the window needs). */
+	rescue?: { cutLatest?: boolean; force?: ReadonlySet<string> };
 	readySizes?: Readonly<Record<string, number>>; // cuts whose summary is produced and ready: its call is spent, so the law prices it at 0 (theory 1.4)
 }
 
@@ -667,6 +693,7 @@ export function foldCandidates(blocks: Block[], calls: Calls, o: PlanOpts): [Blo
 		const rereadable = () => classifyRecoverability(name ?? "", call?.args, text, o.cwd) === "rereadable";
 		if (o.rereadOnly && !rereadable()) continue;
 		if (b.userTurn < turns - PROTECT_USER_TURNS + 1) groups[0].push(b);
+		else if (o.rescue?.force?.has(b.entryId)) groups[2].push(b);
 		else {
 			if (o.pause && b.userTurn < turns && rereadable()) groups[1].push(b);
 			if (age > 0 && b.age >= age) groups[2].push(b);
@@ -701,7 +728,7 @@ export const contentKeyOf = (content: Any): string => {
 /** The planner: one plan, whatever the cache is believed to be. Below the working view W (the cold target) it plans nothing. Above
  *  it, eligible outputs fold biggest first, class by class, until the view is at W: those of user turns older than the previous one;
  *  after a pause (PlanOpts.pause), the previous turn's re-readable outputs; those of the protected turns at least INTURN_AGE requests
- *  old. If the folds cannot reach W, one summary: the first cut from the one reaching W whose summary pays with its call, and with
+ *  old. Only at min(80% of Pi's compaction room, 400K) after folds, one summary: the first cut from the one reaching W whose summary pays with its call, and with
  *  which the whole plan pays (folds inside the prefix are void). Then the whole plan must pay. P(warm) enters only the law (o.law), so
  *  a lower P never plans less. The target never exceeds Pi's compaction room. null: nothing to plan, or the law refuses. */
 export function plan(entries: Any[], o: PlanOpts): { f: PlanResult; c: PlanResult | null; a: PlanResult | null; stuck?: boolean } | null {
@@ -724,12 +751,21 @@ export function plan(entries: Any[], o: PlanOpts): { f: PlanResult; c: PlanResul
 		return t.ok;
 	};
 	let judging = false, target = coldCap, minIdx = 0;
+	delete o.summaryGate;
 	const blocks = buildBlocks(entries, o.steerIds);
 	if (!blocks.length) return null;
 	const userTurns = countUserTurns(blocks) + (o.promptPending && !openStarter(blocks) ? 1 : 0); // the upcoming prompt is a new user turn (unless it joins an open starter)
 	const calls = toolCallIndex(blocks);
 	const recalled = o.recalled ?? new Set<string>();
 	const ctxEst = blocks.reduce((a, b) => a + b.tokens, 0); // content
+	const recordPressure = (after: number) => {
+		const threshold = summaryThreshold(room), prep = summaryPrepareThreshold(room), afterReal = real(after);
+		const prepareEligible = !o.foldsOnly && Number.isFinite(prep) && after > coldCap && afterReal >= prep;
+		const eligible = !o.foldsOnly && Number.isFinite(threshold) && after > coldCap && afterReal >= threshold;
+		const reason = o.foldsOnly ? "folds-only" : !Number.isFinite(threshold) ? "unknown-window" : after <= coldCap ? "below-target" : eligible ? "pressure" : prepareEligible ? "prepare-only" : "below-pressure";
+		o.summaryGate = { before: real(ctxEst), afterFolds: afterReal, target: real(coldCap), threshold: Number.isFinite(threshold) ? threshold : null, prepareThreshold: Number.isFinite(prep) ? prep : null, room, eligible, prepareEligible, reason };
+	};
+	recordPressure(ctxEst);
 	let tail = 0;
 	for (let i = blocks.length - 1; i >= 0 && tail < PI_KEEP_RECENT; i--) tail += c * blocks[i].tokens;
 	o.keep = tail;
@@ -814,14 +850,17 @@ export function plan(entries: Any[], o: PlanOpts): { f: PlanResult; c: PlanResul
 	// carries forward; the cap is never chased below it (a context that is mostly this floor would be re-summarised for nothing)
 	const prevSum = blocks[0]?.kind === "summary" ? blocks[0].tokens : 0;
 	// The skeleton can leave as little as 300 narrative tokens. Reserve merges at that smallest possible epoch budget.
-	const mergeWork: MergeWork = prevSum && !o.foldsOnly && ctxAfterFolds > coldCap
+	recordPressure(ctxAfterFolds);
+	const canApplySummary = o.summaryGate!.eligible;
+	const canPrepareSummary = o.summaryGate!.prepareEligible;
+	const mergeWork: MergeWork = prevSum && !o.foldsOnly && canPrepareSummary && ctxAfterFolds > coldCap
 		? estimateMergeWork(String(blocks[0].msg.summary ?? ""), 300, c, o.model)
 		: { inputTokens: 0, outputTokens: 0, merges: 0 };
 	const mergeCall = law.pr.w * mergeWork.inputTokens + law.pr.out * mergeWork.outputTokens;
 	const activeInput = prevSum ? c * (ACTIVE_INPUT_TOKENS + 128) : 0;
 	const atRoom = room !== null && real(ctxAfterFolds) >= room;
 	const atRoomUnedited = room !== null && real(ctxEst) >= room;
-	const sumTrigger: "cold" | "valve" | null = !o.foldsOnly && ctxAfterFolds > coldCap ? trig : null;
+	const sumTrigger: "cold" | "valve" | null = !o.foldsOnly && canPrepareSummary && ctxAfterFolds > coldCap ? trig : null;
 	const minCut = blocks[0].kind === "summary" ? 2 : 1; // never re-summarise a prefix that is only the previous summary
 	const pre: number[] = [];
 	const S = (x: number) => Math.max(clamp(SUMMARY_RATIO * c * x, SUMMARY_FLOOR, SUMMARY_CAP), c * prevSum) / c; // the next summary carries the previous one forward
@@ -836,13 +875,14 @@ export function plan(entries: Any[], o: PlanOpts): { f: PlanResult; c: PlanResul
 	if (!sumTrigger) return finish({ f, c: null, a: null });
 	let acc = 0;
 	for (const b of blocks) { pre[b.idx] = acc; acc += tokOverride.get(b.idx) ?? b.tokens; }
-	const limit = blocks.findIndex(protectedTurn), cuts: number[] = [];
+	const limit = o.rescue?.cutLatest ? blocks.findIndex((b) => b.userTurn >= userTurns) : blocks.findIndex(protectedTurn), cuts: number[] = [];
 	for (let i = minCut; i < blocks.length && (limit < 0 || i <= limit); i++) if (isCutBlock(blocks[i])) cuts.push(i);
 	if (!cuts.length) return finish({ f, c: null, a: null });
 	const cw = cuts.findIndex((k) => ctxAfterFolds - pre[k] + S(pre[k]) <= coldCap);
 	const first = cw < 0 ? cuts.length - 1 : cw;
 	const paying = cuts.slice(first).find((k) => {
 		const X = c * pre[k], Sr = c * S(pre[k]);
+		if (o.rescue) return X > Sr; // any shrinking cut: the window, not the price, decides
 		if (X < 2 * Sr) return false;
 		const call = law.pr.w * (c * Math.max(0, pre[k] - prevSum) + activeInput) + law.pr.out * Math.min(c * S(pre[k]), NARRATIVE_MAX) + mergeCall;
 		return gate("summary", X, Sr, null, call, Sr, undefined, undefined, false, blocks[k].entryId ?? undefined)
@@ -850,8 +890,21 @@ export function plan(entries: Any[], o: PlanOpts): { f: PlanResult; c: PlanResul
 	});
 	const bound = paying ?? cuts[first], ready = new Set(o.ready ?? []);
 	const readySize = (k: number) => o.readySizes?.[blocks[k].entryId!] ?? S(pre[k]);
-	const have = cuts.filter((k) => k <= bound && ready.has(blocks[k].entryId!) && pre[k] >= 2 * readySize(k)).pop();
-	return finish({ f, c: paying === undefined ? null : result(paying), a: have === undefined ? null : result(have, readySize(have)) }, true);
+	const checkpoint = cuts.filter((k) => ready.has(blocks[k].entryId!) && pre[k] >= 2 * readySize(k)).pop();
+	const have = (!o.application || canApplySummary)
+		? cuts.filter((k) => k <= bound && ready.has(blocks[k].entryId!) && pre[k] >= 2 * readySize(k)).pop()
+		: undefined;
+	// A speculative checkpoint does not shorten the live prefix. Re-reading it for a new cut ID alone wastes a full summary call.
+	// Refresh only near the preparation limit, with at least a quarter-threshold of newly covered real tokens (35K by default).
+	const prep = summaryPrepareThreshold(room);
+	const refresh = canApplySummary || checkpoint === undefined || (paying !== undefined
+		&& real(ctxAfterFolds - pre[checkpoint] + readySize(checkpoint)) >= prep
+		&& c * (pre[paying] - pre[checkpoint]) >= prep / 4);
+	if (!canApplySummary && checkpoint !== undefined) o.summaryGate!.checkpoint = {
+		key: blocks[checkpoint].entryId!, after: Math.round(real(ctxAfterFolds - pre[checkpoint] + readySize(checkpoint))),
+		advance: Math.round(paying === undefined ? 0 : c * (pre[paying] - pre[checkpoint])), refresh,
+	};
+	return finish({ f, c: paying === undefined || !refresh ? null : result(paying), a: have === undefined ? null : result(have, readySize(have)) }, true);
 }
 
 /** Select from the planner's tuple: production uses the plain law; application uses G_{1/10} and takes only READY summaries. */
@@ -868,7 +921,7 @@ export function selectPlan(q: ReturnType<typeof plan>, o: PlanOpts): PlanResult 
 	const a = o.cutAt === undefined ? q.a : q.a?.firstKeptEntryId === o.cutAt ? q.a : null;
 	const judged = (p: PlanResult) => p.judged ? { ...p, ...p.judged, judged: undefined } : p;
 	if (a && !o.deferSummary && test(a, true)) return judged(a);
-	if (!o.application && !o.foldsOnly && o.cutAt === undefined && q.c) return q.c;
+	if (!o.application && !o.foldsOnly && o.cutAt === undefined && q.c && o.summaryGate?.eligible) return q.c;
 	return test(q.f) ? judged(q.f) : null;
 }
 

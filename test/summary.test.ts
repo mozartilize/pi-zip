@@ -689,7 +689,12 @@ describe("append-only narrative epochs (billion-context §3.2, §3.6, §4.2; pi-
 			mkEpoch(i + 1, i + 1, `request ${i + 1}`, "time unknown", i === 0 ? 2 : 1, "constraint value ".repeat(200))) });
 		const entries = [summaryEntry(previous), U("u2", "continue"), AX("bulk", 100_000), U("u3", "next"), A("a3"), U("u4", "last"), A("a4")];
 		const trace: Any[] = [], pr = lawPrices("automatic", false), g = 1000;
-		const q = plan(entries, { cwd: "/tmp", scale: UNIT, coldCap: 10_000, law: { pr, pWarm: 1, g }, trace });
+		// This checks the law's merge reserve, not the pressure gate: an unknown window would otherwise skip the summary law.
+		const savedAt = process.env.PI_ZIP_SUMMARY_AT;
+		process.env.PI_ZIP_SUMMARY_AT = "0";
+		let q;
+		try { q = plan(entries, { cwd: "/tmp", scale: UNIT, coldCap: 10_000, law: { pr, pWarm: 1, g }, trace }); }
+		finally { if (savedAt === undefined) delete process.env.PI_ZIP_SUMMARY_AT; else process.env.PI_ZIP_SUMMARY_AT = savedAt; }
 		expect(q!.c).toBeNull();
 		const t = trace.find((t) => t.where === "summary");
 		const work = estimateMergeWork(previous, 300);

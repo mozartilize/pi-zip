@@ -1,10 +1,14 @@
 // The pure decision core (src/core.ts): view, clock, law, plan and decide as functions of (branch, Λ, now).
-import { describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { checkEdits, clock, inRunClock, decideRun, decideEdits, want, decideTurnEnd, artifactsOf, grow, headOf, lawOf, planOpts, readyOf, unusedOf, runPlanOf, scaleOf, valvePlanOf, type Env, type Learned } from "../src/core.ts";
 import { planContext, UNIT, type PlanResult } from "../src/plan.ts";
 import { buildCut } from "../src/summary.ts";
 import { replayGrowth } from "../src/state.ts";
 import { A, AX, R, U, type Any } from "./helpers.ts";
+
+let savedAt: string | undefined;
+beforeEach(() => { savedAt = process.env.PI_ZIP_SUMMARY_AT; process.env.PI_ZIP_SUMMARY_AT = "0"; });
+afterEach(() => { if (savedAt === undefined) delete process.env.PI_ZIP_SUMMARY_AT; else process.env.PI_ZIP_SUMMARY_AT = savedAt; });
 
 const MODEL = { provider: "p", id: "m", contextWindow: 200_000, promptCache: { short: 300, long: 3600 } };
 const env = (over: Partial<Env> = {}): Env => ({ model: MODEL, cwd: "/tmp", sys: { text: "sys", tools: [] }, reserve: 16_384, recalled: new Set(), steerIds: new Set(), rereadOnly: false, ...over });

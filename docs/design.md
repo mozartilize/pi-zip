@@ -53,7 +53,7 @@ In claims 3-6, $B$ is the rewrite price $\kappa A$ of the one-stream model, not 
 
 ## The decision in plain words
 
-pi-zip plans the same eligible outputs at every cache probability. It folds the biggest outputs in each protection class until the working view is reached. If that is not enough, it looks for a summary cut before the two protected turns, pricing both the summary itself and the whole edit with its call. A completed summary's call is already paid; application uses its actual size and the rent guard. Otherwise, the decision tries folds alone and asks the background producer for the missing summary.
+pi-zip plans the same eligible outputs at every cache probability. It folds the biggest outputs in each protection class until the working view is reached. Summary compaction is gated separately from folding with two thresholds (`PI_ZIP_SUMMARY_AT` overrides both): background preparation starts once the calibrated context after folds reaches `min(0.8 * room, 140,339)` (`140,339` is the 80% threshold of a 200K-window model), while summary application requires `min(0.8 * room, 400,000)` for the active model. On a 1M-window model, a checkpoint summary is prepared from `140.3K` upward without compacting the live context until `400K` (about 40% of its window). A 500K model applies from `~380.3K`, while 200K/272K models keep their `~140.3K`/`~197.9K` thresholds. A newer checkpoint is prepared only when the context after the existing one is again at the preparation threshold and the new cut covers at least a quarter of that threshold (`~35K`) more; a new cut ID alone does not re-read the prefix. Pi checks its compaction threshold before each request, before extension context hooks. After a switch to a smaller window, pi-zip answers that threshold compaction least loss first: (1) if folds alone fit 90% of the new room, it cancels Pi's compaction and this run's next request carries the folds; (2) a READY checkpoint whose summary plus the kept turns (after their folds) stays below the room compacts only its prefix; (3) a checkpoint still being written is waited for; (4) otherwise the cut the window needs is summarised at once, its narrative read by the previous model when its window is larger (the new model reads it when that call fails and the prefix fits); (5) when the two protected turns alone are too big, the cut may go up to the current user message, and only as many of the kept outputs fold, biggest first, as the window needs (each stays recallable). The economic law never refuses these cuts: the alternative is Pi's own summary or an overflow. Only when even the current request with a summary of everything before it is over the room does pi-zip cancel the compaction and abort the run, with the history intact. A switch that lands after Pi's check is caught in the context hook and aborted the same way. A cold cache or model switch makes an already eligible rewrite cheap; it does not authorize summarizing a context that still has room. A completed summary's call is already paid; application uses its actual size and the rent guard. Otherwise, the decision tries folds alone and asks the background producer for the missing summary.
 
 The guard applies an edit when accumulated rent pays its expected rewrite price, or when the plain law pays and at least a tenth of that price has already been paid in rent. Production and the room wait use the plain law with the full call price. That price is charged even if the call goes unused; the product has no fixed unused-call budget and does not estimate a separate per-call probability of use. A warm decision immediately after an edited request takes no new edit, except for the room wait. This back-to-back rule does not block production.
 
@@ -71,10 +71,10 @@ guard(B → A | p, η):     Beff = p·κ·A − (1−p)·κ·D − η·D
 plan(view, p, pause, Y):
   F = eligible outputs, class by class, biggest output first, until view after F ≤ W:
       older turns · previous turn's re-readables if pause · protected outputs ≥ 60 requests old
-  if view after F ≤ W: return (F, none, none)
+  if view after F ≤ W or view after F < min(0.8·room, 140,339.2): return (F, none, none)
   cW = first cut before the previous turn that brings the view to W (else deepest cut)
   c  = first cut from cW with X ≥ 2S(X) whose summary AND whole edit pass law WITH the call
-  a  = deepest artifact in Y no deeper than c (or cW without c), still a prefix, with X ≥ 2S
+  a  = none if view after F < min(0.8·room, 400,000) else deepest artifact in Y no deeper than c (or cW without c), still a prefix, with X ≥ 2S
   return (F, c, a)
 
 decide(at):  # typed prompt, first request of a driven run, or turn_end
@@ -404,8 +404,7 @@ No cell of 4 price/cache regimes × 8 session strata has a cost-ratio confidence
   decisions per regime. The monotone variant is monotone only away from the room wait.
 - **Summary quality is not proved.** What a summary keeps, and what is lost when a summary is summarised again, are measured only
   by a hidden-item detector and a small chain test.
-- **The price of a lost item is never measured.** It is replaced by the working view $W = 40\text{K}$, calibrated on recorded
-  sessions.
+- **The price of a lost item is never measured.** Folding uses the working view $W = 40\text{K}$, while summary compaction waits until the calibrated post-fold context reaches `min(80% of Pi's compaction room, 400K tokens)` (`summaryGate` in the session ledger records `before`, `afterFolds`, `target`, `threshold`, `prepareThreshold`, `room`, `eligible`, `prepareEligible`, `reason` and, for an unapplied checkpoint, `checkpoint: { key, after, advance, refresh }` for tuning; switches log `model_switch` with its `stage` (`folds`, `ready`, `waited`, `summary`, `rescue-cut`, `rescue-folds`, `too-big`) and `model_switch_blocked`).
 - **Per-item need rates are not observable.** They enter as classes (the protection window, 60 requests, 500 tokens) and as
   claim 8's ordering assumption.
 - **κ is a class ratio, not your price table.** A factor-2 error costs at most 6 % in the EOQ model.

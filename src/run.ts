@@ -16,7 +16,7 @@ import { cleanupRecall, commandNamesRecall, fileRecallFor, materialize, parseRec
 import { buildCut } from "./summary.ts";
 import { Judge, HINT_CUSTOM, citesWork, latestProjectedUser, latestUserText, requestOpen } from "./judge.ts";
 import { lookupRefs, lookupText, type LookupRef } from "./lookup.ts";
-import { coldTarget, compactionRoom, settings, toolCallIndex } from "./plan.ts";
+import { coldTarget, compactionRoom, foldPlaceholder, plan, settings, toolCallIndex } from "./plan.ts";
 import { type Any, attempt, COMMIT_CUSTOM, envInt, PRODUCT, textOf, tok4, tokensOf } from "./util.ts";
 import { pendingSummary, replayGrowth } from "./state.ts";
 import { fmtLife, type CardData, type ChartBin, type StateWord } from "./ui.ts";
@@ -94,7 +94,7 @@ function pendingPrompt(e: Any): Any | null {
 	return { sourceEntry: { type: "message", message: m }, messages: [m] };
 }
 
-type NativeRun = { cut: Cut; before: number; after: number; o: PlanOpts; cal: Scale; p: PlanResult };
+type NativeRun = { cut: Cut; before: number; after: number; o: PlanOpts; cal: Scale; p: PlanResult; waitMs?: number };
 /** The start of a run, read once: the return it is (core.ts clock), the settle plan's targets and, for a prompt, what its idle input
  *  decided (the native summary that went in, or why none did). A prompt's input hands it to that prompt's run at agent_start. */
 interface Start {
@@ -160,7 +160,7 @@ export class Zip implements ZipControl {
 	private rentHead = "";
 	private rent = 0; // R14: accumulated planned savings, persisted at each boundary
 	private justEdited = false; // the newest response answered a request that first carried an edit: the next request gets no warm edit
-	// pi-zip's own ctx.compact() in flight: the only compaction session_before_compact answers (compaction null = cancel a late ask)
+	// pi-zip's own ctx.compact() in flight (compaction null = cancel a late ask)
 	private nativeAsk: { compaction: Any | null; answered: boolean; askedAt: number; askedWall: number; until: number } | null = null;
 	/** What became of the native path for this run, for the notice (the session file alone says why a summary went the draft way). */
 	private nativeNote: { native: string; ms?: number; askMs?: number } | null = null;
@@ -173,6 +173,12 @@ export class Zip implements ZipControl {
 	private foreignRun = false;
 	// the native summary already went in; its joint decision supplies the first request's folds and notice sizes
 	private nativeRun: NativeRun | null = null;
+	// model switch: the folds-only plan a cancelled threshold compaction hands this run, the compaction Pi is committing, the rescue folds
+	// allowed in protected turns until committed, and the newest request's model (its larger window reads a prefix the new one cannot)
+	private switchRun: { o: PlanOpts; cal: Scale; p: PlanResult } | null = null;
+	private switchPending: (NativeRun & { key: string; waitMs: number }) | null = null;
+	private rescueIds = new Set<string>();
+	private lastReqModel: Any = null;
 	// the idle door (armDoor): its timer, the evaluation in flight, the inputs seen, and the decision the next run carries (any run)
 	private doorTimer: ReturnType<typeof setTimeout> | null = null;
 	private doorGen = 0;
@@ -448,8 +454,10 @@ export class Zip implements ZipControl {
 	/** Ledger form of the law's evaluations: Phi, K, eta, T next to g, w/r, P(warm) and where the inputs came from. */
 	private lawLedger(where: string, o: PlanOpts) {
 		const l = o.law!, pr = l.pr, rd = (x: number) => (Number.isFinite(x) ? Math.round(x * 1000) / 1000 : x > 0 ? "inf" : null);
+			const sg = o.summaryGate ? { before: Math.round(o.summaryGate.before), afterFolds: Math.round(o.summaryGate.afterFolds), target: Math.round(o.summaryGate.target), threshold: o.summaryGate.threshold === null ? null : Math.round(o.summaryGate.threshold), prepareThreshold: o.summaryGate.prepareThreshold === null ? null : Math.round(o.summaryGate.prepareThreshold), room: o.summaryGate.room === null ? null : Math.round(o.summaryGate.room), eligible: o.summaryGate.eligible, prepareEligible: o.summaryGate.prepareEligible, reason: o.summaryGate.reason, ...(o.summaryGate.checkpoint ? { checkpoint: o.summaryGate.checkpoint } : {}) } : undefined;
 		this.ledger({
 			type: "law", where, g: Math.round(l.g), pWarm: rd(l.pWarm), survSrc: where === "run" ? this.survSrc : "in-run", cls: pr.cls, wr: rd(pr.w / pr.r), prSrc: pr.src,
+			...(sg ? { summaryGate: sg } : {}),
 			steps: (o.trace ?? []).map((t) => ({ at: t.where, ok: t.ok, B: Math.round(t.B), A: Math.round(t.A), T: Math.round(t.T), ...(t.Tsuf !== undefined ? { Tsuf: Math.round(t.Tsuf) } : {}), phi: rd(t.phi), K: rd(t.K), eta: rd(t.eta) })),
 		});
 	}
@@ -819,11 +827,8 @@ export class Zip implements ZipControl {
 		else if (!carried && ready) this.nativeNote = { native: "no idle input before this prompt's run" };
 	}
 
-	/** session_before_compact: answers ONLY the compaction pi-zip itself asked for a moment ago (nativeAsk): its own summary and its own
-	 *  tokensBefore. Pi's threshold and overflow compactions, /compact and other extensions' compactions get undefined and run untouched.
-	 *  Once pi-zip has given up on its compaction (compaction null), a late ask of it is cancelled, never one with a live signal: that is
-	 *  another compaction (pi-zip's own was aborted). */
-	sessionBeforeCompact(e?: Any): Any {
+	/** Own native requests, plus Pi's threshold check after a model switch. Manual and unrelated auto-compactions stay untouched. */
+	sessionBeforeCompact(e?: Any, ctx?: Any): Any {
 		const a = this.nativeAsk;
 		if (typeof e?.customInstructions === "string" && e.customInstructions.startsWith(NATIVE_MARKER)) {
 			// pi-zip's own compaction: answered, once, while its ask is open; cancelled otherwise (never left to Pi's default summariser, which
@@ -841,6 +846,7 @@ export class Zip implements ZipControl {
 			}
 			return { cancel: true };
 		}
+		if ((!a || a.answered) && e?.reason === "threshold" && ctx && this.active() && this.switchedModel(ctx)) return this.switchCompact(e, ctx);
 		if (!a || a.answered || Date.now() > a.until) return undefined;
 		if (e?.reason !== undefined && e.reason !== "manual") return undefined; // ctx.compact() is a manual compaction
 		if (!a.compaction && e?.signal && e.signal.aborted !== true) return undefined;
@@ -848,6 +854,168 @@ export class Zip implements ZipControl {
 		a.askedAt = performance.now();
 		a.askedWall = Date.now();
 		return a.compaction ? { compaction: a.compaction } : { cancel: true };
+	}
+
+	private switchedModel(ctx: Any): boolean {
+		// Pi may check compaction before the first agent_start after reopening a session restores prevKey.
+		const previous = this.lastModelKey || this.prevKey || lastPrompt(this.branch(ctx)).key;
+		return !!previous && !!ctx?.model && previous !== modelKey(ctx.model);
+	}
+
+	private stopSwitch(ctx: Any, reason: string) {
+		this.ledger({ type: "model_switch_blocked", model: modelKey(ctx.model), reason });
+		this.notify(ctx, `${PRODUCT}: the context does not fit ${ctx.model?.id ?? "the selected model"} (${reason}); the run stopped with the history intact. Select a larger-window model, or shorten the latest request.`);
+		// Awaiting abort from an active hook deadlocks: Pi waits for this handler before it can settle.
+		void Promise.resolve(ctx.abort?.()).catch((err) => this.ledger({ type: "error", where: "switch_abort", error: errText(err) }));
+		return { cancel: true };
+	}
+
+	/** The next request of this run plans again: its run plan was made for the previous model's window. */
+	private replan() {
+		this.runPlan = null;
+		this.runEdits = false;
+		this.runChecked = false;
+	}
+
+	/** The newest request's model when its window is larger: it can still read a prefix the new model cannot. */
+	private summaryModel(ctx: Any): Any {
+		const old = this.lastReqModel;
+		return old && modelKey(old) !== modelKey(ctx.model) && Number(old.contextWindow) > Number(ctx.model?.contextWindow) ? old : ctx.model;
+	}
+
+	/** The fewest biggest outputs kept after `p`'s cut whose folds lower the view by `excess` real tokens. */
+	private rescueFolds(p: PlanResult, o: PlanOpts, excess: number): Set<string> {
+		const out = new Set<string>(), done = new Set(p.folds.map((t) => t.entryId));
+		const kept = p.blocks.slice(p.cutIdx ?? 0).filter((b) => b.kind === "toolResult" && b.entryId && !b.edited && !done.has(b.entryId)).sort((x, y) => y.tokens - x.tokens);
+		let saved = 0;
+		for (const b of kept) {
+			if (saved >= excess) break;
+			const r = foldPlaceholder(b, p.calls, o);
+			if (!r) continue;
+			out.add(b.entryId!);
+			saved += p.scale.c * (b.tokens - r.phTok);
+		}
+		return out;
+	}
+
+	/**
+	 * Pi checks its compaction threshold before context hooks, so a switch to a smaller window is fitted here, least loss first:
+	 * 1. folds alone fit: cancel Pi's compaction; this run's next request carries the folds;
+	 * 2. a READY prefix summary fits with the kept turns after their folds: Pi compacts with it;
+	 * 3. a summary being written: wait for it, then 2;
+	 * 4. write the cut this window needs now, its narrative read by the previous model when that window is larger;
+	 * 5. the two protected turns alone are too big: cut up to the current user message, then fold its biggest outputs as needed.
+	 * The run stops only when even the current request cannot fit. Folds ride the run plan (nativeRun); Pi's entry is the summary.
+	 */
+	private async switchCompact(e: Any, ctx: Any): Promise<Any> {
+		const room = compactionRoom(ctx.model, this.reserve(ctx));
+		if (room === null) return undefined; // no window to fit: Pi's own handling stands
+		const key = modelKey(ctx.model), head = headOf(this.branch(ctx)), t0 = performance.now();
+		const entries = ctx.sessionManager.buildSessionProjection().entries;
+		const fit = 0.9 * room; // planned sizes are estimates: headroom for the summary's real size and the next reply
+		const afterOf = (p: PlanResult, summaryTokens: number) => p.cutIdx === null ? p.ctxAfterFolds : p.ctxAfterFolds - p.scale.c * (p.prefixTokens - summaryTokens);
+		const planFor = (rescue?: PlanOpts["rescue"]) => {
+			const avail = this.ready(this.branch(ctx)).filter((a) => !a.running);
+			const { o, cal } = this.opts(ctx, false, entries, 0, true, undefined, false, avail.map((a) => a.key));
+			o.readySizes = Object.fromEntries(avail.filter((a) => a.summaryTokens !== undefined).map((a) => [a.key, a.summaryTokens!]));
+			if (rescue) o.rescue = rescue;
+			return { o, cal, q: plan(entries, o) };
+		};
+		const log = (stage: string, extra: Any = {}) => this.ledger({ type: "model_switch", stage, model: key, room, ms: Math.round(performance.now() - t0), ...extra });
+		try {
+			let { o, cal, q } = planFor();
+			if (!q) return { cancel: true }; // below the working view: nothing to compact
+			if (q.f.ctxAfterFolds < fit) {
+				this.switchRun = { o, cal, p: q.f };
+				this.replan();
+				log("folds", { before: Math.round(q.f.ctxTokens), after: Math.round(q.f.ctxAfterFolds), folds: q.f.folds.length });
+				return { cancel: true };
+			}
+			const readyFit = (): { p: PlanResult; cut: Cut } | null => {
+				const p = q?.a;
+				const cut = p ? readyOf(this.branch(ctx), this.mine).find((x) => x.key === p.firstKeptEntryId)?.cut : undefined;
+				return p && cut && afterOf(p, tokensOf({ role: "compactionSummary", summary: cut.text })) < room ? { p, cut } : null;
+			};
+			let got = readyFit(), waitMs = 0, stage = "ready";
+			const bg = this.bg;
+			if (!got && bg && !bg.aborted && bg.head === head) {
+				const w0 = performance.now();
+				await this.working(ctx, `${PRODUCT}: finishing a summary for ${ctx.model?.id ?? key}`, waitFor(bg.promise, e.signal));
+				waitMs = performance.now() - w0;
+				if (e.signal?.aborted) return { cancel: true };
+				({ o, cal, q } = planFor());
+				if (!q) return { cancel: true };
+				[got, stage] = [readyFit(), "waited"];
+			}
+			let rescue: PlanOpts["rescue"] | undefined;
+			if (!got) {
+				let p = q.c;
+				if (!p || afterOf(p, p.summaryTokensPlanned) >= fit) {
+					rescue = { cutLatest: true };
+					({ o, cal, q } = planFor(rescue));
+					p = q?.c ?? null;
+					if (p && afterOf(p, p.summaryTokensPlanned) >= fit) {
+						const force = this.rescueFolds(p, o, afterOf(p, p.summaryTokensPlanned) - fit);
+						if (force.size) {
+							rescue = { cutLatest: true, force };
+							({ o, cal, q } = planFor(rescue));
+							p = q?.c ?? null;
+						}
+					}
+				}
+				if (!p || afterOf(p, p.summaryTokensPlanned) >= room) {
+					log("too-big", { after: p ? Math.round(afterOf(p, p.summaryTokensPlanned)) : null });
+					return this.stopSwitch(ctx, "even the current request with a summary of everything before it is over its safe room");
+				}
+				const sumModel = this.summaryModel(ctx);
+				const call = (model: Any) => Object.create(ctx, { model: { value: model }, signal: { value: e.signal } });
+				let w = await this.roomWait(p, call(sumModel));
+				// The larger model failed (auth, quota): the new one still writes it when the prefix fits its window.
+				if (w && !w.cut.llmOk && sumModel !== ctx.model && p.scale.c * p.prefixTokens < room) w = (await this.roomWait(p, call(ctx.model))) ?? w;
+				if (!w) return e.signal?.aborted ? { cancel: true } : this.stopSwitch(ctx, "its summary could not be written");
+				got = { p, cut: w.cut };
+				waitMs += w.ms;
+				stage = rescue?.force ? "rescue-folds" : rescue ? "rescue-cut" : "summary";
+			}
+			if (e.signal?.aborted) return { cancel: true };
+			if (!this.active() || modelKey(ctx.model) !== key || headOf(this.branch(ctx)) !== head) return this.stopSwitch(ctx, "the model or session changed while its summary was written");
+			const { p, cut } = got;
+			const after = afterOf(p, tokensOf({ role: "compactionSummary", summary: cut.text }));
+			// a rescue cut may enter the protected turns (the length-recovery relaxation); every structural and pairing check stays
+			const invalid = checkEdits(p.blocks, p.userTurns, p.folds, null, rescue?.force) ?? checkEdits(p.blocks, p.userTurns + (rescue?.cutLatest ? 2 : 0), [], cut);
+			log(stage, { key: cut.firstKeptEntryId, before: Math.round(p.ctxTokens), after: Math.round(after), folds: p.folds.length, forced: rescue?.force?.size ?? 0, waitedMs: Math.round(waitMs), llmOk: cut.llmOk, ...(invalid ? { invalid } : {}) });
+			if (after >= room || invalid) return this.stopSwitch(ctx, invalid ?? "its summary came out larger than planned");
+			this.cancelTimer();
+			this.rescueIds = new Set(rescue?.force ?? []);
+			this.switchPending = { key: cut.firstKeptEntryId, cut, before: p.ctxTokens, after, o, cal, p, waitMs };
+			return { compaction: { summary: cut.text, firstKeptEntryId: cut.firstKeptEntryId, tokensBefore: p.ctxTokens,
+				details: { by: PRODUCT, via: "native", door: "model-switch", trigger: "cold", waitedMs: Math.round(waitMs) }, usage: cut.usage } };
+		} catch (err) {
+			return this.stopSwitch(ctx, `summary preparation failed: ${errText(err)}`);
+		}
+	}
+
+	/** Book only the switch compaction Pi actually committed (another extension can replace or cancel it); its folds ride the run plan. */
+	sessionCompact(e: Any, _ctx: Any) {
+		const entry = e.compactionEntry, s = this.switchPending;
+		this.switchPending = null;
+		if (!s || entry?.details?.by !== PRODUCT || entry.details.door !== "model-switch" || entry.firstKeptEntryId !== s.key || entry.summary !== s.cut.text) {
+			if (s) this.rescueIds.clear();
+			return;
+		}
+		const { cut } = s, c = s.p.scale.c, saved = Math.round(c * (cut.prefixTokens - cut.summaryTokens));
+		this.stats.summaries++;
+		this.stats.summarizedTokens += saved;
+		this.stats.activeSaved += saved;
+		this.stats.writeSavedTokens += saved;
+		this.rent = 0;
+		this.nextEdit = 0;
+		this.discardBg("replaced");
+		this.replan();
+		this.nativeRun = { cut, before: s.before, after: s.after, o: s.o, cal: s.cal, p: s.p, waitMs: s.waitMs };
+		this.ledger({ type: "summary", via: "native", door: "model-switch", trigger: "cold", count: cut.count, tokensBefore: entry.tokensBefore,
+			prefixTokens: Math.round(c * cut.prefixTokens), summaryTokens: Math.round(c * cut.summaryTokens), waitedMs: Math.round(s.waitMs),
+			ms: cut.ms, llmOk: cut.llmOk, llmError: cut.llmError, costUsd: cut.costUsd, ...this.usageOf(cut) });
 	}
 
 	/** The native path ends for the rest of the process (logged once): later summaries wait for turn_end. */
@@ -1173,6 +1341,16 @@ export class Zip implements ZipControl {
 		this.rent = rentNext; // only a request that passed cancellation earns rent or ends the stretch
 		const plan = this.runPlan && !this.runPlan.persisted ? this.runPlan : null;
 		const out = plan ? applyPlanToMessages(e.messages, plan) : null;
+		// A switch can land after Pi's pre-request compaction check. Context hooks cannot persist a summary: fail closed here.
+		if (this.switchedModel(ctx)) {
+			const room = compactionRoom(ctx.model, this.reserve(ctx));
+			const sc = this.scaleOf(ctx);
+			const tokens = sizeOf(sc, (out?.messages ?? e.messages).filter((m: Any) => m.role !== "system").reduce((n: number, m: Any) => n + wireTokensOf(m), 0));
+			if (room !== null && tokens >= room) {
+				this.stopSwitch(ctx, "the request still exceeds the new model's safe room");
+				return undefined;
+			}
+		}
 		if ((first && this.pWarm < 0.5) || out || plan?.native) this.rent = 0; // R14: an applied rewrite or a cold request ends the rent stretch
 		if (plan && (out || plan.native)) { // a native summary is already in the request Pi built: it still goes out with this request
 			if (!plan.sent) this.nextEdit = plan.untouched ?? 0;
@@ -1281,11 +1459,12 @@ export class Zip implements ZipControl {
 		const t0 = performance.now();
 		const now = ((ctx.sessionManager.buildSessionProjection() as Any)?.entries ?? []) as Any[];
 		// Pi kept the native decision's fold targets by ID: carry that decision, looking up positions in this projection.
-		const nat = this.nativeRun, foreign = this.foreignRun;
+		const nat = this.nativeRun, sw = this.switchRun, foreign = this.foreignRun;
 		this.nativeRun = null;
+		this.switchRun = null;
 		this.foreignRun = false;
 		const d = decideRun({
-			cold: this.cold, justEdited: this.justEdited, nat, foreign, now, ready: this.ready(this.branch(ctx)),
+			cold: this.cold, justEdited: this.justEdited, nat: nat ?? sw, foreign, now, ready: this.ready(this.branch(ctx)),
 			opts: (entries, cutAt, foldsOnly, ready) => this.opts(ctx, false, entries, this.pWarm, this.pause, cutAt, foldsOnly, ready),
 		});
 		// no warm edit on the request right after an edited one (no back-to-back warm rewrites); the summary the plan wants is still
@@ -1309,10 +1488,11 @@ export class Zip implements ZipControl {
 
 		const foldMs = performance.now() - t0, settleIds = this.settleIds;
 		// a plan that cannot be persisted must never be sent: the request view would differ from what turn_end can write (I1)
-		const r = runPlanOf({ p, cal, cold: this.cold, native, nat, folds: p?.folds ?? [], settleIds, ms: foldMs, now });
+		const r = runPlanOf({ p, cal, cold: this.cold, native, nat, folds: p?.folds ?? [], settleIds, ms: foldMs, now, forced: this.rescueIds });
 		if (r.drop) this.ledger(r.drop);
 		const { folds } = r;
 		this.runPlan = r.plan;
+		if (nat?.waitMs) this.runPlan.waitMs = nat.waitMs; // a switch summary the user waited for says so in its notice
 		const { source, ctxBefore, ctxAfter } = r.plan;
 		this.ledger({ type: "cold_plan", trigger, source, folds: folds.length, summary: !!native, ...(native ? { via: "native" } : {}), ...this.calOf(cal), ctxBefore: Math.round(ctxBefore), ctxAfter: Math.round(ctxAfter), ms: Math.round(foldMs) });
 		return rentNext;
@@ -1576,7 +1756,7 @@ export class Zip implements ZipControl {
 		if (d.kind === "b2b") this.ledger({ type: "b2b_skip", where: "turn_end" });
 		else {
 			for (const n of d.notes) this.ledger(n);
-			if (d.o.trace?.length) this.lawLedger("turn_end", d.o);
+			if (d.o.trace?.length || (d.o.summaryGate && !d.o.summaryGate.eligible)) this.lawLedger("turn_end", d.o);
 		}
 		const rentNext = d.p && pIn >= 0.5 ? this.rent : d.rentNext;
 		let p = d.kind === "plan" ? d.p : null, cut: Cut | null = null, ready = false, waitMs = 0, away = false;
@@ -1646,13 +1826,14 @@ export class Zip implements ZipControl {
 		// At a repaired length stop there is no upcoming prompt: Pi's own recovery cut may keep only the current runnable turn.
 		// Keep the ordinary fold protections and all structural/pairing checks; relax only the two-turn quality margin for that cut.
 		const bad = o.allowLatestCut && cut
-			? checkEdits(o.blocks, o.userTurns, live, null) ?? checkEdits(o.blocks, o.userTurns + 2, [], cut)
-			: checkEdits(o.blocks, o.userTurns, live, cut);
+			? checkEdits(o.blocks, o.userTurns, live, null, this.rescueIds) ?? checkEdits(o.blocks, o.userTurns + 2, [], cut)
+			: checkEdits(o.blocks, o.userTurns, live, cut, this.rescueIds);
 		if (bad) {
 			this.ledger({ type: "guard_drop", turnIndex: e.turnIndex, reason: bad, folds: live.length, source: plan.source });
 			plan.persisted = false; // keep the request-local view: never switch the fold set mid-run
 			return undefined;
 		}
+		for (const t of live) this.rescueIds.delete(t.entryId); // persisted: a rescue fold is an ordinary edit from now on
 		const sentBefore = !!plan.sent;
 		const mixed = sentBefore && plan.carriedIds && live.some((t) => !plan.carriedIds!.has(t.entryId));
 		if (!sentBefore || cut || mixed) this.nextEdit = plan.untouched ?? 0; // a new room summary is first sent with the next request
@@ -1713,6 +1894,7 @@ export class Zip implements ZipControl {
 		// the request goes to the session's current model: a /model in the middle of a run switches it without a run start, and a
 		// request booked under the run's first model would make every later turn_end see a "model switch" (P(warm) = 0: any edit is free)
 		if (ctx?.model) this.model = ctx.model;
+		this.lastReqModel = this.model;
 		const now = Date.now(), key = modelKey(this.model), activity = cacheActivity(requestBranch(this.branch(ctx ?? this.liveCtx))), last = Math.max(this.lastReqMs, activity.ms);
 		const edited = this.nextEdit !== null;
 		// the free cache signal: this response's cacheRead against what this request re-sent unchanged, after this gap (same model only)

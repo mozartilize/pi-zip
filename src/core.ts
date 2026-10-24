@@ -65,12 +65,13 @@ export function scaleOf(entries: Any[], branch: Any[], sys: SysInfo, key?: strin
 }
 
 /** The guard's view of a candidate edit set; folds whose entry left the projection are ignored. */
-export function checkEdits(blocks: Block[], userTurns: number, folds: FoldTarget[], cut: Cut | null): string | null {
+export function checkEdits(blocks: Block[], userTurns: number, folds: FoldTarget[], cut: Cut | null, forced?: ReadonlySet<string>): string | null {
 	const byId = new Map(blocks.map((b) => [b.entryId, b]));
 	const live = folds.filter((t) => byId.has(t.entryId));
 	const cutBlock = cut ? byId.get(cut.firstKeptEntryId) : undefined;
 	if (cut && !cutBlock) return `cut target ${cut.firstKeptEntryId} is not in the projection`;
-	return validateEdits(blocks, { folds: new Map(live.map((t) => [byId.get(t.entryId)!.idx, t.ph])), recover: new Map(live.map((t) => [byId.get(t.entryId)!.idx, t.recover])), cut: cutBlock ? cutBlock.idx : null }, userTurns);
+	const forcedIdx = forced?.size ? new Set(live.filter((t) => forced.has(t.entryId)).map((t) => byId.get(t.entryId)!.idx)) : undefined;
+	return validateEdits(blocks, { folds: new Map(live.map((t) => [byId.get(t.entryId)!.idx, t.ph])), recover: new Map(live.map((t) => [byId.get(t.entryId)!.idx, t.recover])), cut: cutBlock ? cutBlock.idx : null, ...(forcedIdx ? { forced: forcedIdx } : {}) }, userTurns);
 }
 
 // ---- clock --------------------------------------------------------------------------------------------------------------------
@@ -169,7 +170,8 @@ export function candidateOf(entries: Any[], opts: (cutAt?: string, foldsOnly?: b
 	const { o, cal } = opts(undefined, foldsOnly, avail.map((a) => a.key));
 	o.readySizes = Object.fromEntries(avail.filter((a) => a.summaryTokens !== undefined).map((a) => [a.key, a.summaryTokens!]));
 	const q = plan(entries, o);
-	return { r: { o, cal: o.scale ?? cal ?? UNIT, p: q?.a ?? q?.c ?? null } };
+	// A due speculative refresh must not be hidden by the older READY checkpoint that triggered it.
+	return { r: { o, cal: o.scale ?? cal ?? UNIT, p: o.summaryGate?.reason === "prepare-only" && q?.c ? q.c : q?.a ?? q?.c ?? null } };
 }
 
 // ---- decide -------------------------------------------------------------------------------------------------------------------
@@ -208,7 +210,7 @@ export function decideRun(x: { cold: boolean; justEdited: boolean; nat: { o: Pla
 }
 
 /** Native folds retain the prompt decision and use entry IDs to find their positions; other folds are guarded before sending. */
-export function runPlanOf(x: { p: PlanResult | null; cal: Scale; cold: boolean; native: Cut | null; nat: { before: number; after: number } | null; folds: FoldTarget[]; settleIds: string[]; ms: number; now?: Any[] }): { plan: RunPlan; folds: FoldTarget[]; drop?: Note } {
+export function runPlanOf(x: { p: PlanResult | null; cal: Scale; cold: boolean; native: Cut | null; nat: { before: number; after: number } | null; folds: FoldTarget[]; settleIds: string[]; ms: number; now?: Any[]; forced?: ReadonlySet<string> }): { plan: RunPlan; folds: FoldTarget[]; drop?: Note } {
 	const { p, cal, cold, native, nat } = x;
 	let folds = x.folds, drop: Note | undefined;
 	const sameSet = x.settleIds.length === folds.length && x.settleIds.every((id) => folds.some((u) => u.entryId === id));
@@ -221,7 +223,7 @@ export function runPlanOf(x: { p: PlanResult | null; cal: Scale; cold: boolean; 
 			return { ...t, visIdx };
 		});
 	} else if (p) {
-		const invalid = checkEdits(p.blocks, p.userTurns, folds, null);
+		const invalid = checkEdits(p.blocks, p.userTurns, folds, null, x.forced);
 		if (invalid) {
 			drop = { type: "guard_drop", where: "run_plan", reason: invalid, folds: folds.length, summary: false };
 			folds = [];
