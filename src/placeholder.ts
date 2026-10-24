@@ -1,6 +1,6 @@
 // Placeholders (F2): tool + args + size + key lines + handle. Handles are deterministic in the session entry id.
 import { createHash } from "node:crypto";
-import type { Block, Calls } from "./plan.ts";
+import { type Block, type Calls, callOf } from "./plan.ts";
 import { type FileRecall, fileRecallHow } from "./recallfile.ts";
 import { type Any, attempt, clip, fmtWhen, textOf } from "./util.ts";
 
@@ -311,6 +311,6 @@ export function makePlaceholderFor(b: Block, calls: Calls, keep = 8, noRecall = 
 	const content = b.msg.content;
 	if (Array.isArray(content) && content.some((c: Any) => c?.type !== "text")) return null;
 	if (!b.entryId) return null;
-	const call = calls.get(b.msg.toolCallId);
+	const call = callOf(calls, b.msg);
 	return makePlaceholder(textOf(content), call?.name ?? b.msg.toolName ?? "tool", call ? shortArgs(call.args) : "", handleFor(b.entryId), keep, { at: blockTime(b), turn: b.userTurn, isError: !!b.msg.isError, noRecall, file });
 }

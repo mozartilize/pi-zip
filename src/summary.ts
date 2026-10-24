@@ -3,464 +3,18 @@
 import { randomUUID } from "node:crypto";
 import { classifySummaryRead } from "./classify.ts";
 import { blockTime, cdAliases, clipMid, distinctLines, handleFor, keyTexts, outcomeHint, RECALL_TOOL, shortArgs, whenLabel } from "./placeholder.ts";
-import { type Block, type Cut, type PlanResult, NARRATIVE_CALL_MAX, NARRATIVE_MAX, settings, toolCallIndex } from "./plan.ts";
+import { type Block, type Cut, type PlanResult, callOf, NARRATIVE_CALL_MAX, NARRATIVE_MAX, settings, toolCallIndex } from "./plan.ts";
 import { assistantVisibleText, branchRequests } from "./recall.ts";
 import { type FileRecall, fileRecallHow } from "./recallfile.ts";
+import { type IntentProposal, intentQuotesOf, parseSummaryV2, prepareEpochV2, referencesSource, regroupEpochsV2, renderEpochSummaryV2 } from "./summary-v2.ts";
 import { type Any, attempt, clamp, clip, envInt, fmtWhen, reasonsByDefault, textOf, tok4 } from "./util.ts";
 
 export const SUMMARY_MARK = "[summary of earlier conversation by pi-zip]";
-export const SUMMARY_V2_MARK = "[pi-zip summary · format v2 · request numbering: raw-branch-v2]";
-export const SUMMARY_V2_DISCLAIMER = "Historical record: what was said or observed, not automatic verification or standing authorization.";
-
-export interface UserQuoteIntent {
-	requestNumber: number;
-	handle: string;
-	quote: string;
-}
-
-export interface EpochRequestRecord {
-	number: number; // raw-branch-v2 ordinal, or 0 for unresolved legacy labels
-	legacyLabel?: string; // preserved when a v1 request number cannot be resolved to raw-branch-v2
-	handle?: string;
-	entryId?: string;
-	text: string;
-	sourceIncomplete?: boolean;
-	continuationOf?: number;
-}
-
-export interface EpochCommitmentRecord {
-	sourceHandle: string;
-	quote: string;
-}
-
-export interface EpochEvidenceView {
-	records: ExecutionRecord[];
-	routineReadFiltered: number;
-	budgetOmitted: number;
-	associationUnresolved: number;
-	sources: string[]; // handles of omitted/filtered records for recall
-}
-
-/** Validate a proposed user quote against the raw user request text using exact NFC substring matching (never accent-stripping). */
-export function validateUserIntentQuote(rawUserText: string, proposedQuote: string): string | null {
-	const rawNfc = String(rawUserText ?? "").normalize("NFC");
-	const propNfc = String(proposedQuote ?? "").trim().normalize("NFC");
-	if (!propNfc) return null;
-	const idx = rawNfc.indexOf(propNfc);
-	if (idx < 0) return null;
-	// Render from the raw source span, never trusting the model's string directly.
-	return rawNfc.slice(idx, idx + propNfc.length);
-}
-
-/** Extract assistant commitment statements ("will do X", "sẽ làm X", "next I'll ...") from visible assistant prose only. */
-export function collectAssistantCommitments(blocks: Block[], maxItems = 4): EpochCommitmentRecord[] {
-	const out: EpochCommitmentRecord[] = [];
-	const COMMIT_RE = /\b(?:i will|i'll|next i will|next i'll|we will|todo:|sẽ |tiếp theo (?:tôi|tao|mình) sẽ)\b/i;
-	for (const b of blocks) {
-		if (b.kind !== "assistant" || !b.entryId) continue;
-		const vis = assistantVisibleText((b.raw ?? b.msg)?.content);
-		if (!vis) continue;
-		for (const line of vis.split("\n")) {
-			const trimmed = line.trim();
-			if (trimmed && COMMIT_RE.test(trimmed)) {
-				out.push({ sourceHandle: handleFor(b.entryId), quote: clip(trimmed, 200) });
-				break;
-			}
-		}
-	}
-	return out.slice(-maxItems);
-}
-
-export interface EpochSummaryV2 {
-	text: string;
-	ok: boolean;
-	reason?: "request-budget-overflow";
-	overflow?: { requiredTokens: number; availableTokens: number };
-	diagnostics: {
-		formatVersion: "v2";
-		numbering: "raw-branch-v2";
-		requestCount: number;
-		verbatimCount: number;
-		sourceIncompleteCount: number;
-		executionCount: number;
-		resultCount: number;
-		routineReadFiltered: number;
-		budgetOmitted: number;
-		associationUnresolved: number;
-		quoteAccepted: number;
-		quoteRejected: number;
-		roleMismatch: number;
-		tokens: {
-			requests: number;
-			intent: number;
-			state: number;
-			prose: number;
-			commitments: number;
-			evidence: number;
-			overhead: number;
-			total: number;
-		};
-	};
-}
-
-const V2_QUOTE_PREFIX = "  > ";
-const escapeQuotedLines = (text: string): string =>
-	String(text ?? "")
-		.split("\n")
-		.map((l) => `${V2_QUOTE_PREFIX}${l}`)
-		.join("\n");
-
-const unescapeQuotedLines = (lines: string[]): string =>
-	lines
-		.map((l) => (l.startsWith(V2_QUOTE_PREFIX) ? l.slice(V2_QUOTE_PREFIX.length) : l.startsWith("> ") ? l.slice(2) : l))
-		.join("\n");
-
-/**
- * Build a format-v2 epoch-grouped summary with:
- * - Verbatim-first user request retention (re-read from raw branch when available; never drops via closure/age inference).
- * - NFC quote-span validation for Current intent (rejects accent-altered quotes, assistant/tool role confusion, or prompt injection).
- * - Canonical execution catalogue per epoch (deduplicated by executionId & resultEntryId; routine verified reads omitted unless referenced or error).
- * - Explicit `request-budget-overflow` failure when protected user requests exceed the available summary/window cap.
- */
-export function buildEpochSummaryV2(opts: {
-	prefix: Block[];
-	previous?: string | null;
-	branch?: Any[];
-	cwd?: string;
-	file?: FileRecall;
-	activeState?: string;
-	activeAt?: string;
-	activeStale?: string;
-	durableProse?: string;
-	proposedIntents?: Array<{ requestNumber?: number; handle?: string; role?: string; quote: string }>;
-	referencedHandles?: ReadonlySet<string>;
-	referencedExecutions?: ReadonlySet<string>;
-	maxSummaryTokens?: number;
-	maxEvidenceTokens?: number;
-	epochId?: number;
-	sourceInterval?: string;
-	timestamp?: string;
-}): EpochSummaryV2 {
-	const {
-		prefix,
-		previous = null,
-		branch = [],
-		cwd = ".",
-		file,
-		activeState = "",
-		durableProse = "(none)",
-		proposedIntents = [],
-		maxSummaryTokens = Infinity,
-		maxEvidenceTokens = 1500,
-		epochId = 1,
-		timestamp = "time unknown",
-	} = opts;
-
-	// 1. Collect raw user requests from branch (raw-branch-v2) or prefix blocks
-	const rawBranchReqs = branch.length ? branchRequests(branch) : [];
-	const byEntryId = new Map(rawBranchReqs.map((r) => [r.entryId, r]));
-	const byHandle = new Map(rawBranchReqs.map((r) => [r.handle, r]));
-	const byNum = new Map(rawBranchReqs.map((r) => [r.number, r]));
-
-	const reqRecords: EpochRequestRecord[] = [];
-	const seenReqIds = new Set<string>();
-
-	// Carry forward previous requests (restoring from raw branch if previously shortened!)
-	if (previous) {
-		const prev = parseSummary(previous);
-		const pn = prev.users.nums ?? prev.users.items.map((_, i) => prev.users.omitted + i + 1);
-		for (let i = 0; i < prev.users.items.length; i++) {
-			const itemText = prev.users.items[i];
-			const oldNum = pn[i];
-			const hMatch = /(?:handle |whole request: handle )([0-9a-z]{10})/.exec(itemText);
-			const matchedRaw = (hMatch ? byHandle.get(hMatch[1]) : undefined) ?? (rawBranchReqs.length ? byNum.get(oldNum) : undefined);
-			if (matchedRaw) {
-				if (!seenReqIds.has(matchedRaw.entryId)) {
-					seenReqIds.add(matchedRaw.entryId);
-					reqRecords.push({
-						number: matchedRaw.number,
-						handle: matchedRaw.handle,
-						entryId: matchedRaw.entryId,
-						text: matchedRaw.text,
-					});
-				}
-			} else {
-				const isShortened = itemText.startsWith(SHORT_MARK) || itemText.includes("[… middle of this request omitted");
-				reqRecords.push({
-					number: rawBranchReqs.length ? 0 : oldNum,
-					...(rawBranchReqs.length ? { legacyLabel: `legacy R${oldNum}` } : {}),
-					...(hMatch ? { handle: hMatch[1] } : {}),
-					text: itemText.replace(/^≈ /, ""),
-					...(isShortened ? { sourceIncomplete: true } : {}),
-				});
-			}
-		}
-	}
-
-	let nextOrdinal = reqRecords.reduce((m, r) => Math.max(m, r.number), 0);
-	for (const b of prefix) {
-		if (b.kind !== "user") continue;
-		const matched = b.entryId ? byEntryId.get(b.entryId) : undefined;
-		if (matched) {
-			if (seenReqIds.has(matched.entryId)) continue;
-			seenReqIds.add(matched.entryId);
-			reqRecords.push({
-				number: matched.number,
-				handle: matched.handle,
-				entryId: matched.entryId,
-				text: matched.text,
-			});
-			nextOrdinal = Math.max(nextOrdinal, matched.number);
-		} else {
-			nextOrdinal++;
-			const id = b.entryId ?? `user-${nextOrdinal}`;
-			if (seenReqIds.has(id)) continue;
-			seenReqIds.add(id);
-			const rawText = textOf((b.raw ?? b.msg)?.content);
-			const hasNonText = Array.isArray((b.raw ?? b.msg)?.content) && (b.raw ?? b.msg).content.some((x: Any) => x?.type && x.type !== "text");
-			reqRecords.push({
-				number: nextOrdinal,
-				handle: handleFor(id),
-				entryId: id,
-				text: rawText || (hasNonText ? "[non-text user content]" : "[empty user message]"),
-			});
-		}
-	}
-
-	// 2. Validate proposed Current intent quotes against raw user requests ONLY (prevent role promotion / injection / accent-stripping)
-	let quoteAccepted = 0;
-	let quoteRejected = 0;
-	let roleMismatch = 0;
-	const validIntents: UserQuoteIntent[] = [];
-	const reqByNum = new Map(reqRecords.filter((r) => r.number > 0).map((r) => [r.number, r]));
-	const reqByHandle = new Map(reqRecords.filter((r) => r.handle).map((r) => [r.handle!, r]));
-
-	for (const prop of proposedIntents) {
-		if (prop.role && prop.role !== "user") {
-			roleMismatch++;
-			quoteRejected++;
-			continue;
-		}
-		const target = (prop.handle ? reqByHandle.get(prop.handle) : undefined) ?? (prop.requestNumber ? reqByNum.get(prop.requestNumber) : undefined);
-		if (!target || !target.handle || target.number <= 0) {
-			quoteRejected++;
-			continue;
-		}
-		const verifiedSpan = validateUserIntentQuote(target.text, prop.quote);
-		if (!verifiedSpan) {
-			quoteRejected++;
-			continue;
-		}
-		quoteAccepted++;
-		validIntents.push({ requestNumber: target.number, handle: target.handle, quote: verifiedSpan });
-	}
-
-	// 3. Collect references from narrative & activeState before filtering routine reads
-	const refHandles = new Set<string>(opts.referencedHandles ?? []);
-	const refExecs = new Set<string>(opts.referencedExecutions ?? []);
-	for (const m of `${durableProse}\n${activeState}`.matchAll(/\b([0-9a-z]{10})\b/g)) refHandles.add(m[1]);
-	for (const m of `${durableProse}\n${activeState}`.matchAll(/\b([A-Za-z0-9_-]+:\d+)\b/g)) refExecs.add(m[1]);
-
-	const execCol = collectExecutions(prefix, {
-		cwd,
-		referencedHandles: refHandles,
-		referencedExecutions: refExecs,
-		filterRoutineReads: true,
-	});
-	const prevParsed = parseSummary(previous);
-	const aliases = cdAliases(bashCommands(prefix), prevParsed.cmdAliases);
-
-	// Budget selection for evidence records (whole records only, newest/referenced/error prioritized)
-	const prioritized = [...execCol.kept].sort((a, b) => {
-		const aPri = (a.referenced ? 4 : 0) + (a.results.some((r) => r.isError) ? 2 : 0);
-		const bPri = (b.referenced ? 4 : 0) + (b.results.some((r) => r.isError) ? 2 : 0);
-		return bPri - aPri;
-	});
-	const keptExecIds = new Set<string>();
-	let evTokensUsed = 0;
-	for (const rec of prioritized) {
-		const formatted = formatExecutionRecord(rec, aliases);
-		const t = tok4(formatted) + 1;
-		if (evTokensUsed + t <= maxEvidenceTokens || keptExecIds.size === 0 && maxEvidenceTokens > 0) {
-			keptExecIds.add(rec.executionId);
-			evTokensUsed += t;
-		}
-	}
-	const renderedExecs = execCol.kept.filter((r) => keptExecIds.has(r.executionId));
-	const budgetOmittedExecs = execCol.kept.filter((r) => !keptExecIds.has(r.executionId));
-	const budgetOmitted = budgetOmittedExecs.length;
-
-	const commitments = collectAssistantCommitments(prefix);
-
-	// 4. Render sections and measure token usage
-	const recallInstruction = file
-		? `Recall: ${file.dir}/<handle>.txt holds each original output or request; ${file.dir}/requests.txt lists all user requests (${fileRecallHow(file)}).`
-		: `Recall: call ${RECALL_TOOL} with handle/handles, requests="M-N", or grep with scope="outputs"|"requests"|"assistant"|"all".`;
-
-	const intentLines = [
-		"## Current intent — selected user quotes, scope not inferred",
-		...(validIntents.length
-			? validIntents.map((u) => `- R${u.requestNumber} · source ${u.handle}\n${escapeQuotedLines(u.quote)}`)
-			: ["(none selected; see verbatim Requests below)"]),
-	];
-	const stateHeading = opts.activeStale
-		? `## Current state — assistant interpretation (carried forward${opts.activeAt ? ` as of ${opts.activeAt}` : ""}; possibly stale: ${opts.activeStale})`
-		: `## Current state — assistant interpretation${opts.activeAt ? ` (as of ${opts.activeAt})` : ""}`;
-	const stateLines = [
-		stateHeading,
-		activeState.trim() ? prose(activeState) : "(none)",
-	];
-
-	const reqSpan = reqRecords.filter((r) => r.number > 0);
-	const reqLabel = reqSpan.length
-		? reqSpan[0].number === reqSpan.at(-1)!.number
-			? `request ${reqSpan[0].number}`
-			: `requests ${reqSpan[0].number}–${reqSpan.at(-1)!.number}`
-		: "no user request";
-	const firstBlockId = prefix.find((b) => b.entryId)?.entryId ?? "start";
-	const lastBlockId = [...prefix].reverse().find((b) => b.entryId)?.entryId ?? "end";
-	const interval = opts.sourceInterval ?? `${firstBlockId}..${lastBlockId}`;
-
-	const reqSectionLines = [
-		"Requests — user said",
-		...(reqRecords.length
-			? reqRecords.map((r) => {
-					const label = r.number > 0 ? `R${r.number}` : (r.legacyLabel ?? "legacy request");
-					const h = r.handle ? ` · handle ${r.handle}` : "";
-					const qual = r.sourceIncomplete ? " · source incomplete" : " · verbatim";
-					const cont = r.continuationOf ? ` · continuation of R${r.continuationOf}` : "";
-					return `- ${label}${h}${qual}${cont}\n${escapeQuotedLines(r.text)}`;
-				})
-			: ["(none)"]),
-	];
-
-	const proseLines = [
-		"Decisions / findings — assistant interpretation",
-		prose(durableProse) || "(none)",
-	];
-
-	const commitmentLines = commitments.length
-		? [
-				"Commitments — assistant said, not verified completion",
-				...commitments.map((c) => `- source ${c.sourceHandle}\n${escapeQuotedLines(c.quote)}`),
-			]
-		: [];
-
-	const omittedHandles = [
-		...execCol.filtered.flatMap((r) => r.results.map((x) => x.handle)),
-		...budgetOmittedExecs.flatMap((r) => r.results.map((x) => x.handle)),
-	];
-	const omissionLine =
-		execCol.routineReadFiltered > 0 || budgetOmitted > 0
-			? `Catalogue omissions: ${execCol.routineReadFiltered} routine-read-filtered; ${budgetOmitted} budget-omitted${omittedHandles.length ? `; sources ${omittedHandles.slice(0, 10).join(", ")}` : ""}`
-			: "";
-
-	const evidenceLines = [
-		"Activity / evidence — tool observations",
-		...(renderedExecs.length ? renderedExecs.map((r) => formatExecutionRecord(r, aliases)) : ["(none)"]),
-		...(omissionLine ? [omissionLine] : []),
-	];
-
-	const usedAliasSet = usedAliases(evidenceLines.join("\n"));
-	const activeLegend = [...aliases].filter(([, a]) => usedAliasSet.has(a)).sort((x, y) => x[1].length - y[1].length || x[1].localeCompare(y[1])).map(([d, a]) => `${a}=${d}`);
-	const headerLines = [
-		SUMMARY_V2_MARK,
-		SUMMARY_V2_DISCLAIMER,
-		recallInstruction,
-		...(activeLegend.length ? [`Command directory aliases: ${activeLegend.join(", ")}`] : []),
-	];
-
-	const epochHeading = `### Epoch ${epochId} · source interval ${interval} · ${reqLabel} · ${timestamp}`;
-	const historyHeader = "## History";
-
-	const reqTokens = tok4(reqSectionLines.join("\n"));
-	const intentTokens = tok4(intentLines.join("\n"));
-	const stateTokens = tok4(stateLines.join("\n"));
-	const proseTokens = tok4(proseLines.join("\n"));
-	const commitmentTokens = commitmentLines.length ? tok4(commitmentLines.join("\n")) : 0;
-	const evidenceTokens = tok4(evidenceLines.join("\n"));
-	const overheadTokens = tok4([headerLines.join("\n"), historyHeader, epochHeading].join("\n")) + 8;
-
-	// If total exceeds maxSummaryTokens, reclaim from evidence and historical prose first before failing closed on protected requests.
-	let finalEvidenceLines = evidenceLines;
-	let finalProseLines = proseLines;
-	let finalCommitmentLines = commitmentLines;
-	const assemble = () =>
-		[
-			headerLines.join("\n"),
-			intentLines.join("\n"),
-			stateLines.join("\n"),
-			historyHeader,
-			epochHeading,
-			reqSectionLines.join("\n"),
-			finalProseLines.join("\n"),
-			...(finalCommitmentLines.length ? [finalCommitmentLines.join("\n")] : []),
-			finalEvidenceLines.join("\n"),
-		].join("\n\n");
-
-	let fullText = assemble();
-	if (tok4(fullText) > maxSummaryTokens) {
-		finalCommitmentLines = [];
-		const allOmitted = execCol.kept.length;
-		const allHandles = [...execCol.filtered, ...execCol.kept].flatMap((r) => r.results.map((x) => x.handle));
-		finalEvidenceLines = [
-			"Activity / evidence — tool observations",
-			"(none)",
-			...(execCol.routineReadFiltered + allOmitted > 0
-				? [`Catalogue omissions: ${execCol.routineReadFiltered} routine-read-filtered; ${allOmitted} budget-omitted${allHandles.length ? `; sources ${allHandles.slice(0, 10).join(", ")}` : ""}`]
-				: []),
-		];
-		fullText = assemble();
-	}
-	if (tok4(fullText) > maxSummaryTokens) {
-		finalProseLines = ["Decisions / findings — assistant interpretation", "(omitted to preserve verbatim user requests)"];
-		fullText = assemble();
-	}
-
-	const totalTokens = tok4(fullText);
-	const protectedMinTokens = tok4([headerLines.join("\n"), historyHeader, epochHeading, reqSectionLines.join("\n")].join("\n\n"));
-	const overflowed = totalTokens > maxSummaryTokens;
-
-	const verbatimCount = reqRecords.filter((r) => !r.sourceIncomplete).length;
-	const sourceIncompleteCount = reqRecords.filter((r) => r.sourceIncomplete).length;
-	const resultCount = execCol.records.reduce((n, r) => n + r.results.length, 0);
-
-	return {
-		text: fullText,
-		ok: !overflowed,
-		...(overflowed
-			? {
-					reason: "request-budget-overflow" as const,
-					overflow: { requiredTokens: protectedMinTokens, availableTokens: maxSummaryTokens },
-				}
-			: {}),
-		diagnostics: {
-			formatVersion: "v2",
-			numbering: "raw-branch-v2",
-			requestCount: reqRecords.length,
-			verbatimCount,
-			sourceIncompleteCount,
-			executionCount: execCol.records.length,
-			resultCount,
-			routineReadFiltered: execCol.routineReadFiltered,
-			budgetOmitted: tok4(fullText) > maxSummaryTokens ? execCol.kept.length : budgetOmitted,
-			associationUnresolved: execCol.associationUnresolved,
-			quoteAccepted,
-			quoteRejected,
-			roleMismatch,
-			tokens: {
-				requests: reqTokens,
-				intent: intentTokens,
-				state: stateTokens,
-				prose: tok4(finalProseLines.join("\n")),
-				commitments: finalCommitmentLines.length ? tok4(finalCommitmentLines.join("\n")) : 0,
-				evidence: tok4(finalEvidenceLines.join("\n")),
-				overhead: overheadTokens,
-				total: totalTokens,
-			},
-		},
-	};
-}
+export {
+	SUMMARY_V2_DISCLAIMER, SUMMARY_V2_MARK, buildEpochSummaryV2, collectAssistantCommitments, collectExecutions, formatExecutionRecord,
+	parseSummaryV2, prepareEpochV2, referencesSource, regroupEpochsV2, renderEpochSummaryV2, resolveIntents, validateUserIntentQuote,
+	type EpochSummaryV2, type ExecutionRecord, type ExecutionResultRef, type V2Epoch, type V2State,
+} from "./summary-v2.ts";
 const POLICY_BLOCK_RE = /violate|terms of service|usage polic|content polic|acceptable use/i;
 const CAP_ERR = "narrative hit the token cap";
 const NARRATIVE_SYSTEM =
@@ -475,246 +29,6 @@ export interface HandleRow {
 	turn?: number; // user turn of the output, so look-alike runs stay apart (shown only without `at`)
 	at?: number; // when the output arrived (ms), shown as local MM-DD HH:MM
 	outcome?: string; // exit status / test counts (outcomeHint)
-}
-
-export interface ExecutionResultRef {
-	resultEntryId: string;
-	handle: string;
-	at?: number;
-	turn?: number;
-	isError: boolean;
-	outcome: string;
-	rawText: string;
-	errorExcerpt?: string;
-	hint?: string;
-}
-
-export interface ExecutionRecord {
-	executionId: string; // `${assistantEntryId}:${toolCallPosition}` or `orphan-result:${resultEntryId}`
-	assistantEntryId: string | null;
-	toolCallPosition: number;
-	toolCallId: string | null;
-	tool: string;
-	args: Any;
-	command?: string;
-	path?: string;
-	requestNumber?: number;
-	ownerEpoch?: number;
-	results: ExecutionResultRef[]; // deduplicated by resultEntryId in source order
-	orphan?: boolean;
-	associationUnresolved?: boolean;
-	routineReadEligible?: boolean;
-	routineReadReason?: string;
-	referenced?: boolean;
-}
-
-export interface CollectExecutionsResult {
-	records: ExecutionRecord[];
-	routineReadFiltered: number;
-	associationUnresolved: number;
-	kept: ExecutionRecord[];
-	filtered: ExecutionRecord[];
-}
-
-function parseToolOutcome(tool: string, rawText: string, isError: boolean): string {
-	if (tool === "bash") {
-		const m = /Command exited with code (\d+)/.exec(rawText);
-		if (m) return `exit ${m[1]}`;
-		if (isError) return "error";
-		const oh = outcomeHint(rawText, tool, false);
-		return oh || "exit 0";
-	}
-	if (isError) return "error";
-	const oh = outcomeHint(rawText, tool, false);
-	if (oh) return oh;
-	if (tool === "read" || tool === "edit" || tool === "write") return rawText.trim() ? "success" : "unknown";
-	return rawText.trim() ? "completed" : "unknown";
-}
-
-/**
- * Deterministic source-order collector for tool executions and orphan results across a block slice (or raw branch entries).
- * - Identity: `(assistantEntryId, original content-block position)` exists as soon as the tool call is issued.
- * - Pairing: uses latest preceding issuer of `toolCallId`; if an assistant message issues duplicate `toolCallId`s or no issuer exists,
- *   the result becomes an orphan record `("orphan-result", resultEntryId)` with `associationUnresolved: true`.
- * - Multiple results for the same execution are preserved in order and deduplicated by `resultEntryId`.
- */
-export function collectExecutions(
-	blocks: Block[],
-	opts: { cwd?: string; referencedHandles?: ReadonlySet<string>; referencedExecutions?: ReadonlySet<string>; filterRoutineReads?: boolean } = {},
-): CollectExecutionsResult {
-	const cwd = opts.cwd ?? ".";
-	const records: ExecutionRecord[] = [];
-	const byExecId = new Map<string, ExecutionRecord>();
-	const issued = new Map<string, { execId: string; ambiguous: boolean }>();
-	let reqNum = 0;
-	for (const b of blocks) {
-		if (b.kind === "user") {
-			reqNum++;
-			continue;
-		}
-		if (b.kind === "assistant") {
-			const content = Array.isArray(b.msg?.content) ? b.msg.content : [];
-			const counts = new Map<string, number>();
-			for (const c of content) if (c?.type === "toolCall" && c.id) counts.set(c.id, (counts.get(c.id) ?? 0) + 1);
-			const aid = b.entryId ?? `asst-${b.idx}`;
-			for (let pos = 0; pos < content.length; pos++) {
-				const c = content[pos];
-				if (c?.type !== "toolCall") continue;
-				const name = String(c.name ?? "tool");
-				if (name === RECALL_TOOL) continue;
-				const execId = `${aid}:${pos}`;
-				const a = c.arguments ?? {};
-				const rec: ExecutionRecord = {
-					executionId: execId,
-					assistantEntryId: b.entryId,
-					toolCallPosition: pos,
-					toolCallId: c.id ? String(c.id) : null,
-					tool: name,
-					args: a,
-					...(name === "bash" && typeof a.command === "string" ? { command: a.command } : {}),
-					...(typeof a.path === "string" || typeof a.file_path === "string" ? { path: String(a.path ?? a.file_path) } : {}),
-					...(reqNum > 0 ? { requestNumber: reqNum } : {}),
-					results: [],
-				};
-				records.push(rec);
-				byExecId.set(execId, rec);
-				if (c.id) issued.set(String(c.id), { execId, ambiguous: (counts.get(c.id) ?? 0) > 1 });
-			}
-			continue;
-		}
-		if (b.kind === "toolResult") {
-			const toolName = String(b.msg?.toolName ?? "tool");
-			if (toolName === RECALL_TOOL) continue;
-			const cid = b.msg?.toolCallId ? String(b.msg.toolCallId) : "";
-			const m = cid ? issued.get(cid) : undefined;
-			const rawContent = (b.raw ?? b.msg)?.content;
-			const rawText = textOf(rawContent);
-			const isError = !!b.msg?.isError || /Command exited with code [1-9]\d*/.test(rawText);
-			const rid = b.entryId ?? `res-${b.idx}`;
-			const h = b.entryId ? handleFor(b.entryId) : handleFor(rid);
-			const keys = keyTexts(rawText, 4);
-			const resRef: ExecutionResultRef = {
-				resultEntryId: rid,
-				handle: h,
-				at: blockTime(b),
-				turn: b.userTurn,
-				isError,
-				outcome: parseToolOutcome(m && !m.ambiguous ? (byExecId.get(m.execId)?.tool ?? toolName) : toolName, rawText, isError),
-				rawText,
-				...(isError ? { errorExcerpt: clip(rawText.trim(), 200) } : {}),
-				...(keys[0] ? { hint: clip(keys[0], 90) } : {}),
-			};
-			if (!m || m.ambiguous) {
-				const orphanId = `orphan-result:${rid}`;
-				let orphan = byExecId.get(orphanId);
-				if (!orphan) {
-					orphan = {
-						executionId: orphanId,
-						assistantEntryId: null,
-						toolCallPosition: -1,
-						toolCallId: cid || null,
-						tool: toolName,
-						args: {},
-						...(reqNum > 0 ? { requestNumber: reqNum } : {}),
-						results: [resRef],
-						orphan: true,
-						associationUnresolved: true,
-						routineReadEligible: false,
-						routineReadReason: "association-unresolved",
-					};
-					records.push(orphan);
-					byExecId.set(orphanId, orphan);
-				}
-				continue;
-			}
-			const rec = byExecId.get(m.execId)!;
-			if (!rec.results.some((r) => r.resultEntryId === rid)) rec.results.push(resRef);
-		}
-	}
-	let routineReadFiltered = 0;
-	let associationUnresolved = 0;
-	const kept: ExecutionRecord[] = [];
-	const filtered: ExecutionRecord[] = [];
-	for (const rec of records) {
-		if (rec.associationUnresolved) associationUnresolved++;
-		const refExec = opts.referencedExecutions?.has(rec.executionId) ?? false;
-		const refHandle = rec.results.some((r) => opts.referencedHandles?.has(r.handle) ?? false);
-		rec.referenced = refExec || refHandle;
-		if (rec.orphan || rec.associationUnresolved || rec.results.length !== 1) {
-			rec.routineReadEligible = false;
-			rec.routineReadReason = rec.orphan || rec.associationUnresolved ? "association-unresolved" : rec.results.length === 0 ? "no-result" : "multiple-results";
-		} else {
-			const r0 = rec.results[0];
-			const dec = classifySummaryRead(rec.tool, rec.args, r0.rawText, cwd, r0.isError);
-			rec.routineReadEligible = dec.eligible && !rec.referenced;
-			rec.routineReadReason = rec.referenced ? "referenced" : dec.reason;
-		}
-		if (opts.filterRoutineReads && rec.routineReadEligible) {
-			routineReadFiltered++;
-			filtered.push(rec);
-		} else {
-			kept.push(rec);
-		}
-	}
-	return { records, routineReadFiltered, associationUnresolved, kept, filtered };
-}
-
-/** Merge two execution record lists deterministically by `executionId` and `resultEntryId`, resolving previously orphaned results when their call is present. */
-export function mergeExecutionRecords(older: ExecutionRecord[], newer: ExecutionRecord[]): ExecutionRecord[] {
-	const out: ExecutionRecord[] = [];
-	const byId = new Map<string, ExecutionRecord>();
-	const attachedResults = new Set<string>();
-	for (const src of [...older, ...newer]) {
-		if (!src.orphan) for (const r of src.results) attachedResults.add(r.resultEntryId);
-	}
-	for (const src of [...older, ...newer]) {
-		if (src.orphan && src.results.every((r) => attachedResults.has(r.resultEntryId))) continue; // resolved in newer view
-		const ex = byId.get(src.executionId);
-		if (!ex) {
-			const copy: ExecutionRecord = { ...src, results: [...src.results] };
-			byId.set(copy.executionId, copy);
-			out.push(copy);
-			continue;
-		}
-		for (const r of src.results) {
-			if (!ex.results.some((x) => x.resultEntryId === r.resultEntryId)) ex.results.push(r);
-		}
-		if (ex.ownerEpoch === undefined && src.ownerEpoch !== undefined) ex.ownerEpoch = src.ownerEpoch;
-	}
-	return out;
-}
-
-/** Render a single canonical execution record for an epoch's Activity / evidence section. */
-export function formatExecutionRecord(rec: ExecutionRecord, aliases?: Map<string, string>): string {
-	const argText = rec.tool === "bash" && rec.command !== undefined
-		? `\`${shortArgs({ command: rec.command }, BUDGET.cmdChars, aliases)}\``
-		: rec.path !== undefined
-			? rec.path
-			: shortArgs(rec.args, 60, aliases);
-	const callHead = `${rec.tool}${argText ? " " + argText : ""}`;
-	if (rec.orphan) {
-		const r = rec.results[0];
-		const w = whenLabel(r?.at, r?.turn);
-		const line1 = `- handle ${r?.handle ?? "unknown"} · ${callHead}${w ? ` · ${w}` : ""} · ${r?.outcome ?? "unknown"} · association unresolved`;
-		const sub = r?.isError && r.errorExcerpt ? `\n  Error: ${r.errorExcerpt}` : r?.hint ? `\n  Evidence: ${r.hint}` : "";
-		return line1 + sub;
-	}
-	if (!rec.results.length) {
-		return `- execution ${rec.executionId} · ${callHead} · no result`;
-	}
-	if (rec.results.length === 1) {
-		const r = rec.results[0];
-		const w = whenLabel(r.at, r.turn);
-		const line1 = `- execution ${rec.executionId} · handle ${r.handle} · ${callHead}${w ? ` · ${w}` : ""} · ${r.outcome}`;
-		const sub = r.isError && r.errorExcerpt ? `\n  Error: ${r.errorExcerpt}` : r.hint ? `\n  Evidence: ${r.hint}` : "";
-		return line1 + sub;
-	}
-	const handles = rec.results.map((r) => r.handle).join(", ");
-	const outcomes = rec.results.map((r) => `${r.handle}:${r.outcome}`).join(", ");
-	const subs = rec.results
-		.map((r) => (r.isError && r.errorExcerpt ? `  Error (${r.handle}): ${r.errorExcerpt}` : r.hint ? `  Evidence (${r.handle}): ${r.hint}` : ""))
-		.filter(Boolean);
-	return [`- execution ${rec.executionId} · handles ${handles} · ${callHead} · ${outcomes}`, ...subs].join("\n");
 }
 
 const TABLE_HEAD = "## Folded outputs (originals recallable with zip_recall; handles stay valid after later summaries or compaction)";
@@ -872,7 +186,7 @@ const SECTIONS: Array<[RegExp, string]> = [
 const USERS_HEAD = "## User requests (verbatim, oldest first, continuation lines indented)";
 /** Heading once older requests in the middle are shortened (USERS budget): those lines start with SHORT_MARK. */
 const USERS_HEAD_SHORT = "## User requests (oldest first, continuation lines indented; the first and the newest verbatim, lines starting with ≈ shortened to their start)";
-const SHORT_MARK = "≈ ";
+export const SHORT_MARK = "≈ ";
 /** The omission marker of a long request names its handle after this text (requestText); a shortened line keeps that handle. */
 const OMITTED_REQ_HANDLE = " (handle ";
 const OMITTED_REQ_RE = /\[… middle of this request omitted \(handle ([0-9a-z]{10})\)/;
@@ -901,147 +215,15 @@ const NARR_CARRIED_RE = /^## Narrative \(carried forward from the summary of ([^
 export function parseSummary(text: string | null): ParsedSummary {
 	const out: ParsedSummary = { cmdDirs: [], cmdAliases: new Map(), structured: false, users: { items: [], omitted: 0 }, files: { rows: [], omitted: 0 }, cmds: { items: [], omitted: 0 }, others: { items: [], omitted: 0 }, errors: { items: [], omitted: 0 }, table: { items: [], omitted: 0 }, narrative: [] };
 	if (!text) return out;
-	if (text.trimStart().startsWith(SUMMARY_V2_MARK)) {
+	const v2 = parseSummaryV2(text);
+	if (v2) {
+		// the format-v2 view an older-format reader needs: every request (numbered), the aliases and the epochs' prose
 		out.structured = true;
-		out.users.nums = [];
-		const lines = text.split("\n");
-		let inRequests = false;
-		let inState = false;
-		let inHistory = false;
-		let curReqNum = 0;
-		let curReqLines: string[] = [];
-		const stateLines: string[] = [];
-		const epochs: EpochBlock[] = [];
-		let curEpoch: { id: number; lastId: number; reqLabel: string; timestamp: string; level: number; note?: string; proseLines: string[]; inProse: boolean } | null = null;
-		const flushReq = () => {
-			if (curReqNum > 0 && curReqLines.length) {
-				out.users.items.push(unescapeQuotedLines(curReqLines));
-				out.users.nums!.push(curReqNum);
-			}
-			curReqNum = 0;
-			curReqLines = [];
-		};
-		const flushEpoch = () => {
-			if (!curEpoch) return;
-			const body = curEpoch.proseLines.join("\n").trim() || NONE_ROW;
-			epochs.push(mkEpoch(curEpoch.id, curEpoch.lastId, curEpoch.reqLabel, curEpoch.timestamp, curEpoch.level, body, curEpoch.note));
-			curEpoch = null;
-		};
-		const V2_EPOCH_HEAD = /^### Epochs? (\d+)(?:–(\d+))? · source interval [^·]+ · ([^·]+) · (.*)$/;
-		for (const l of lines) {
-			const al = /^Command directory aliases: (.*)$/.exec(l);
-			if (al) {
-				for (const pair of al[1].split(/, (?=[a-z]{1,3}=)/)) {
-					const m = /^([a-z]{1,3})=(.+)$/.exec(pair);
-					if (m && ![...out.cmdAliases.values()].includes(m[1])) out.cmdAliases.set(m[2], m[1]);
-				}
-				continue;
-			}
-			if (l.startsWith("## Current state")) {
-				flushReq();
-				inRequests = false;
-				inState = true;
-				inHistory = false;
-				const stale = /possibly stale: (.*)\)$/.exec(l)?.[1];
-				const at = /as of ([^;)]+)/.exec(l)?.[1];
-				if (!out.epochs) out.epochs = { activeState: "", epochs: [] };
-				if (at) out.epochs.activeAt = at;
-				if (stale) out.epochs.activeStale = stale;
-				continue;
-			}
-			if (l === "## History") {
-				flushReq();
-				inRequests = false;
-				inState = false;
-				inHistory = true;
-				continue;
-			}
-			if (l.startsWith("## ")) {
-				flushReq();
-				flushEpoch();
-				inRequests = false;
-				inState = false;
-				inHistory = false;
-				continue;
-			}
-			if (inState) {
-				if (l.trim() !== NONE_ROW) stateLines.push(l);
-				continue;
-			}
-			if (inHistory) {
-				const eh = V2_EPOCH_HEAD.exec(l);
-				if (eh) {
-					flushReq();
-					flushEpoch();
-					inRequests = false;
-					const parts = eh[4].split(" · ");
-					const timestamp = parts[0] ?? "time unknown";
-					let level = 1;
-					const notes: string[] = [];
-					for (const p of parts.slice(1)) {
-						const tm = TIER.exec(p);
-						if (tm) level = Number(tm[1]);
-						else notes.push(p);
-					}
-					curEpoch = {
-						id: Number(eh[1]),
-						lastId: Number(eh[2] ?? eh[1]),
-						reqLabel: eh[3].trim(),
-						timestamp: timestamp.trim(),
-						level,
-						...(notes.length ? { note: notes.join(" - ") } : {}),
-						proseLines: [],
-						inProse: false,
-					};
-					continue;
-				}
-			}
-			if (l === "Requests — user said") {
-				flushReq();
-				inRequests = true;
-				if (curEpoch) curEpoch.inProse = false;
-				continue;
-			}
-			if (l === "Decisions / findings — assistant interpretation") {
-				flushReq();
-				inRequests = false;
-				if (curEpoch) curEpoch.inProse = true;
-				continue;
-			}
-			if (l === "Commitments — assistant said, not verified completion" || l === "Activity / evidence — tool observations") {
-				flushReq();
-				inRequests = false;
-				if (curEpoch) curEpoch.inProse = false;
-				continue;
-			}
-			if (inRequests) {
-			const m = /^- (?:R(\d+)|legacy R(\d+)|legacy request)\b(?: · handle ([0-9a-z]{10}))?/.exec(l);
-			if (m) {
-				flushReq();
-				curReqNum = Number(m[1] ?? m[2] ?? (out.users.items.length + 1));
-				continue;
-			}
-				if (l.startsWith(V2_QUOTE_PREFIX)) {
-					curReqLines.push(l);
-					continue;
-				}
-				if (l.trim() === "" && curReqLines.length) continue;
-				flushReq();
-				inRequests = false;
-			}
-			if (curEpoch?.inProse) {
-				curEpoch.proseLines.push(l);
-			}
-		}
-		flushReq();
-		flushEpoch();
-		const activeText = stateLines.join("\n").trim();
-		out.epochs = {
-			...(out.epochs ?? {}),
-			activeState: activeText,
-			epochs,
-		};
-		if (activeText || epochs.length) out.narrative.push(formatNarrative(out.epochs));
+		const reqs = v2.epochs.flatMap((e) => e.requests);
+		out.users = { items: reqs.map((r) => r.text), omitted: 0, nums: reqs.map((r) => r.number || r.legacyNumber || 0) };
+		for (const [d, a] of v2.aliases) out.cmdAliases.set(d, a);
+		out.epochs = { activeState: v2.activeState, ...(v2.activeAt ? { activeAt: v2.activeAt } : {}), ...(v2.activeStale ? { activeStale: v2.activeStale } : {}), epochs: v2.epochs.map((e) => e.block) };
+		if (v2.activeState || v2.epochs.length) out.narrative.push(formatNarrative(out.epochs));
 		return out;
 	}
 	// occurrences in text order; in the older nested format the nested (older) copy of a section comes first, so order = oldest first
@@ -1195,7 +377,7 @@ function mergeItems(older: string[], newer: string[], omitted: number, maxItems:
 }
 
 /** Every bash command of these blocks, in order. */
-const bashCommands = (blocks: Block[]): string[] =>
+export const bashCommands = (blocks: Block[]): string[] =>
 	blocks.flatMap((b) => (b.kind === "assistant" ? (b.msg.content ?? []).filter((c: Any) => c?.type === "toolCall" && c.name === "bash").map((c: Any) => String(c.arguments?.command ?? "")) : []));
 
 /** Per-section budgets (characters unless noted); the total stays near the old design's 12,000-char carry plus the new prefix's own lists. */
@@ -1381,7 +563,7 @@ const epochTokens = (eps: EpochBlock[]) => eps.reduce((a, e) => a + (e.tokens ||
  * Model-written text as it may sit inside the narrative section: a markdown heading becomes a bold line, so nothing the model writes
  * can start a summary section (`## Errors`), an epoch (`#### Epoch`) or the current state; the summary mark line goes.
  */
-function prose(t: string): string {
+export function prose(t: string): string {
 	return t
 		.split("\n")
 		.map((l) => { const m = /^\s{0,3}#{1,6}\s+(.*?)[\s#]*$/.exec(l); return m ? (m[1] ? `**${m[1]}**` : "") : l; })
@@ -1428,22 +610,25 @@ export function clipActive(text: string, maxChars: number): string {
 	return [...kept.filter((l): l is string => l !== null), ...(o || s ? [marker] : [])].join("\n");
 }
 
-const MARK_LINE = /^[\s#*_>`-]*(DECISIONS|ACTIVE)\b[\s#*_:`-]*$/i;
+const MARK_LINE = /^[\s#*_>`-]*(DECISIONS|ACTIVE|INTENT)\b[\s#*_:`-]*$/i;
 const ACTIVE_TOPIC = /current state|state of the work|open todo|todos|next step|blocker|in.flight|active|status/i;
 /**
  * The two parts of a narrative reply: decisions and durable facts, and the current state and open todos. Reads the marker lines the
  * prompt asks for; a reply without them is split by its headings (the older four headings included); a reply with neither is all durable.
  */
-export function parseNarrativeReply(text: string): { durable: string; active: string } {
+export function parseNarrativeReply(text: string): { durable: string; active: string; intent?: string[] } {
 	const lines = text.split("\n");
-	const d: string[] = [], a: string[] = [];
+	const d: string[] = [], a: string[] = [], i: string[] = [];
 	const marked = lines.some((l) => MARK_LINE.test(l));
-	let cur = d;
+	let cur = d, sawIntent = false;
 	for (const l of lines) {
 		const m = MARK_LINE.exec(l);
 		if (marked) {
-			if (m) cur = m[1].toUpperCase() === "ACTIVE" ? a : d;
-			else cur.push(l);
+			if (m) {
+				const k = m[1].toUpperCase();
+				cur = k === "ACTIVE" ? a : k === "INTENT" ? i : d;
+				if (k === "INTENT") sawIntent = true;
+			} else cur.push(l);
 			continue;
 		}
 		const h = /^\s{0,3}#{1,6}\s+(.*)$/.exec(l);
@@ -1451,7 +636,7 @@ export function parseNarrativeReply(text: string): { durable: string; active: st
 		cur.push(l);
 	}
 	const none = (t: string) => (!t || /^\(?none\.?\)?\.?$/i.test(t) ? NONE_ROW : t);
-	return { durable: none(prose(d.join("\n"))), active: prose(a.join("\n")) };
+	return { durable: none(prose(d.join("\n"))), active: prose(a.join("\n")), ...(sawIntent ? { intent: intentQuotesOf(i) } : {}) };
 }
 
 /** The narrative section's body: the current state first, then the epochs, oldest first (bounded to `maxTokens` when given). */
@@ -1507,7 +692,7 @@ export const turnsLabel = (last: number, added: number) => (added > 1 ? `request
 const lastRequestNo = (u: Items) => Math.max(u.omitted + u.items.length, u.nums?.at(-1) ?? 0);
 
 /** An older-format or foreign narrative becomes Epoch 0, carried verbatim (head and tail of a long one); its state may be stale. */
-function legacyNarrative(prev: string | null, prevAt: number, lastReq: number): StructuredNarrative {
+export function legacyNarrative(prev: string | null, prevAt: number, lastReq: number): StructuredNarrative {
 	const p = previousNarrative(prev, prevAt, LEGACY_CHARS);
 	if (!p) return { activeState: "", epochs: [] };
 	const what = p.foreign ? "the earlier summary (another summariser's)" : "the earlier narrative";
@@ -1677,6 +862,8 @@ export interface SkeletonOptions {
 	cwd?: string;
 	filterRoutineReads?: boolean;
 	referencedHandles?: ReadonlySet<string>;
+	/** What the retained narrative and state say: a read it names by handle, path or file name is kept (referencesSource). */
+	referenceText?: string;
 }
 
 /**
@@ -1749,6 +936,7 @@ export function skeleton(
 				res &&
 				!res.msg.isError &&
 				!(resHandle && opts.referencedHandles?.has(resHandle)) &&
+				!referencesSource(opts.referenceText ?? "", { executionId: `${b.entryId}:${pos}`, results: resHandle ? [{ handle: resHandle } as Any] : [], path: typeof (a.path ?? a.file_path) === "string" ? String(a.path ?? a.file_path) : undefined, command: typeof a.command === "string" ? a.command : undefined }) &&
 				classifySummaryRead(c.name, a, resText, opts.cwd ?? ".", !!res.msg.isError, (res.raw ?? res.msg).content).eligible
 			) {
 				routineReadFiltered++;
@@ -1959,7 +1147,8 @@ export function reasoningInput(messages: Any[], limits = REASONING_LIMITS): { ad
  * The narrative of this prefix, written by the current model in a separate, uncached call. Never throws. Durable epochs are not
  * re-read. Only the bounded previous active state is reconciled against this slice. `durable`/`active` = the reply's two parts.
  */
-export async function narrative(prefix: Block[], ctx: Any, budgetTokens: number, ownSignal?: AbortSignal, previousActive = ""): Promise<Narrative & { durable?: string; active?: string }> {
+/** `intent`: also ask for the user's own words that state what they want now (format v2's Current intent), given the previous ones. */
+export async function narrative(prefix: Block[], ctx: Any, budgetTokens: number, ownSignal?: AbortSignal, previousActive = "", intent?: { previous: string[] }): Promise<Narrative & { durable?: string; active?: string; intent?: string[] }> {
 	const t0 = Date.now();
 	if (!ctx.model) return { text: null, ok: false, ms: 0, costUsd: 0, error: "no current model" };
 	const rawMsgs = prefix
@@ -1976,11 +1165,13 @@ export async function narrative(prefix: Block[], ctx: Any, budgetTokens: number,
 	const previous = clipActive(previousActive, ACTIVE_INPUT_TOKENS * 4 - 80);
 	const prompt =
 		(previous ? `<previous-active-state>\n${previous}\n</previous-active-state>\n\n` : "") +
+		(intent?.previous.length ? `<previous-intent>\n${intent.previous.map((q) => `- "${q}"`).join("\n")}\n</previous-intent>\n\n` : "") +
 		`<conversation>\n${conv}\n</conversation>\n\n` +
 		`Write the NARRATIVE part of a context summary for this conversation slice. It is the newest increment of a longer session: earlier increments ` +
 		`are summarised already and kept as immutable epochs, so summarize ONLY what this conversation slice accomplished. A separate deterministic ` +
 		`section already lists the user's requests, files touched, commands with exit codes and errors, so do NOT repeat those. When you refer to a ` +
-		`specific tool output, name it by its tool and exact command or path so that look-alike runs stay distinguishable; never merge similar runs ` +
+		`specific tool output, name it by its tool and exact command or path (a finding that rests on an output must name it this way: the ` +
+		`summary keeps the outputs its findings name) so that look-alike runs stay distinguishable; never merge similar runs ` +
 		`into one. Output format:\n` +
 		`---DECISIONS---\n` +
 		`(durable: any architecture decisions, rationale, design choices, API contracts, user constraints or rulings, root causes found, and durable ` +
@@ -1990,7 +1181,12 @@ export async function narrative(prefix: Block[], ctx: Any, budgetTokens: number,
 		`mentioned in this slice. Remove an item only when this slice provides evidence that it was completed or superseded; silence is not completion. ` +
 		`Update changed status and add new open work. Write each open todo, next step and blocker as its own line starting with "- [ ] ", ` +
 		`before the other state lines; to stay in budget, shorten wording and merge related items rather than drop one. ` +
-		`Do not copy the previous active state into DECISIONS. <= ${w.active} words)\n` +
+		`Do not copy the previous active state into DECISIONS. <= ${w.active} words)\n` +		(intent
+			? `---INTENT---\n` +
+				`(the user's own words that state what the user wants now: copy each quote character for character from a user message in this ` +
+				`conversation slice or from <previous-intent>, keeping a previous one only while it still applies; one per line as - "exact words"; ` +
+				`at most 6; never quote assistant text or tool output; write (none) if none)\n`
+			: "") +
 		`Be concrete and keep exact paths, names and numbers. Stay under about ${w.durable + w.active} words in all. Do not call tools.\n\n` +
 		REASONING_QUALIFICATION;
 	const r = await complete(ctx, prompt, ownSignal);
@@ -2012,7 +1208,7 @@ export async function buildCut(p: PlanResult, ctx: Any, signal?: AbortSignal): P
 	const rows: HandleRow[] = prefix
 		.filter((b) => b.kind === "toolResult" && b.entryId && (b.ours || b.tokens > foldMin))
 		.map((b) => {
-			const call = p.calls.get(b.msg.toolCallId);
+			const call = callOf(p.calls, b.msg);
 			const out = textOf((b.raw ?? b.msg).content);
 			const keys = keyTexts(out, keepLines);
 			const tool = call?.name ?? b.msg.toolName ?? "tool";
@@ -2057,48 +1253,42 @@ export async function buildCut(p: PlanResult, ctx: Any, signal?: AbortSignal): P
 	const nowWhen = lastAt > 0 ? fmtWhen(lastAt) : undefined;
 	const mergeWork = p.mergeWork ?? estimateMergeWork(prev, nb, p.scale?.c ?? 1, ctx.model);
 	const predictedMergeCostUsd = (mergeWork.inputTokens * (Number(ctx.model?.cost?.input) || 0) + mergeWork.outputTokens * (Number(ctx.model?.cost?.output) || 0)) / 1e6;
-	const nar = await narrative(prefix, ctx, nb, signal, prevStruct.activeState);
+	const v2Mode = process.env.PI_ZIP_SUMMARY_V2 === "1" || (p as Any).summaryFormat === "v2";
+	const prevV2 = v2Mode ? parseSummaryV2(prev) : null;
+	const nar = await narrative(prefix, ctx, nb, signal, prevStruct.activeState, v2Mode ? { previous: prevV2?.intents.map((x) => x.quote) ?? [] } : undefined);
 	let costUsd = nar.costUsd, actualMergeCostUsd = 0;
 	let usage = nar.usage;
-	const refHandles = new Set<string>();
-	for (const m of `${nar.text ?? ""}\n${prevStruct.activeState}`.matchAll(/\b([0-9a-z]{10})\b/g)) refHandles.add(m[1]);
 	const cwd = ctx?.cwd ?? ".";
-	const filteredTableRows = rows.filter((r) => {
-		if (refHandles.has(r.handle)) return true;
-		const b = prefix.find((x) => x.kind === "toolResult" && x.entryId && handleFor(x.entryId) === r.handle);
-		if (!b) return true;
-		const call = p.calls.get(b.msg.toolCallId);
-		const rawContent = (b.raw ?? b.msg)?.content;
-		const dec = classifySummaryRead(call?.name ?? b.msg.toolName ?? "tool", call?.args, textOf(rawContent), cwd, !!b.msg.isError, rawContent);
-		return !dec.eligible;
-	});
-	const finalTable = handleTable(filteredTableRows, prev, file);
-	const skFiltered = skeleton(slice, prev, finalTable ?? "", file, earlier, {
-		cwd,
-		filterRoutineReads: true,
-		referencedHandles: refHandles,
-	});
-	let text = skFiltered.text;
-	const how = file ? `read an output's file by its handle (${file.dir}/<handle>.txt)` : `${RECALL_TOOL} an output by its handle`;
-	if (process.env.PI_ZIP_SUMMARY_V2 === "1" || (p as Any).summaryFormat === "v2") {
+	if (v2Mode) {
 		const w = epochWords(nb);
-		const durable = nar.ok && nar.text ? clipPart(nar.durable ?? prose(nar.text), w.durable) : "(none)";
+		const durable = nar.ok && nar.text ? clipPart(nar.durable ?? prose(nar.text), w.durable) : NONE_ROW;
 		const active = nar.ok && nar.text ? clipActive(nar.active || prevStruct.activeState, activeChars(w.active)) : prevStruct.activeState;
-		const nextNum = (prevStruct.epochs.length ? epochNum(prevStruct.epochs.at(-1)!, true) : 0) + 1;
-		const v2 = buildEpochSummaryV2({
+		const intents: IntentProposal[] | undefined = nar.ok && nar.intent ? nar.intent.map((quote) => ({ quote, role: "user" })) : undefined;
+		const prep = prepareEpochV2({
 			prefix: slice,
 			previous: prev,
 			branch: attempt(() => ctx?.sessionManager?.getBranch?.() ?? [], []),
-			cwd: ctx?.cwd ?? ".",
-			file,
+			cwd,
 			activeState: active,
-			...(nowWhen ? { activeAt: nowWhen } : prevWhen ? { activeAt: prevWhen } : {}),
+			...(nar.ok && nowWhen ? { activeAt: nowWhen } : prevWhen ? { activeAt: prevWhen } : {}),
 			...(!nar.ok ? { activeStale: clip(nar.error ?? "n/a", 120) } : {}),
 			durableProse: durable,
-			maxSummaryTokens: (p as Any).maxSummaryTokens ?? p.summaryTokensPlanned,
-			epochId: nextNum,
+			...(intents ? { proposedIntents: intents } : {}),
 			timestamp: nowWhen ?? "time unknown",
 		});
+		// only the prose of old epochs is merged by the model; their requests and evidence are joined by code (regroupEpochsV2)
+		const capV2 = epochCap(nb);
+		let blocks = prep.state.epochs.map((e) => e.block);
+		if (nar.ok) {
+			const cons = await consolidateEpochs(blocks, ctx, capV2, signal);
+			actualMergeCostUsd = cons.costUsd;
+			costUsd += cons.costUsd;
+			usage = addUsage(usage, cons.usage);
+			blocks = cons.epochs;
+		}
+		prep.state.epochs = regroupEpochsV2(prep.state.epochs, boundEpochs(blocks, capV2));
+		// soft: the size this plan priced; hard: the most the compacted view can take and still fit the model's room
+		const v2 = renderEpochSummaryV2(prep, { soft: p.summaryTokensPlanned, hard: p.summaryRoomTokens ?? Infinity, file });
 		return {
 			firstKeptEntryId: p.blocks[p.cutIdx!].entryId!,
 			text: v2.text,
@@ -2116,6 +1306,23 @@ export async function buildCut(p: PlanResult, ctx: Any, signal?: AbortSignal): P
 			summaryDiagnostics: v2.diagnostics as unknown as Record<string, unknown>,
 		};
 	}
+	// a read the narrative or the current state names (by handle, path or file name) stays listed; other verified routine reads are left out
+	const refText = `${nar.text ?? ""}\n${prevStruct.activeState}`;
+	const refHandles = new Set<string>([...refText.matchAll(/\b([0-9a-z]{10})\b/g)].map((m) => m[1]));
+	const filteredTableRows = rows.filter((r) => {
+		if (refHandles.has(r.handle)) return true;
+		const b = prefix.find((x) => x.kind === "toolResult" && x.entryId && handleFor(x.entryId) === r.handle);
+		if (!b) return true;
+		const call = callOf(p.calls, b.msg);
+		const a = call?.args ?? {};
+		const path = typeof (a.path ?? a.file_path) === "string" ? String(a.path ?? a.file_path) : undefined;
+		if (referencesSource(refText, { executionId: "", results: [{ handle: r.handle } as Any], path, command: typeof a.command === "string" ? a.command : undefined })) return true;
+		const rawContent = (b.raw ?? b.msg)?.content;
+		return !classifySummaryRead(call?.name ?? b.msg.toolName ?? "tool", call?.args, textOf(rawContent), cwd, !!b.msg.isError, rawContent).eligible;
+	});
+	const finalTable = handleTable(filteredTableRows, prev, file);
+	let text = skeleton(slice, prev, finalTable ?? "", file, earlier, { cwd, filterRoutineReads: true, referencedHandles: refHandles, referenceText: refText }).text;
+	const how = file ? `read an output's file by its handle (${file.dir}/<handle>.txt)` : `${RECALL_TOOL} an output by its handle`;
 	const cap = epochCap(nb);
 	if (nar.ok && nar.text) {
 		const w = epochWords(nb);

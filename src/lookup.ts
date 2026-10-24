@@ -28,9 +28,14 @@ export function lookupRefs(text: string, branch: readonly Any[], cwd: string, li
 	const calls = new Map<string, Any>(), byHandle = new Map<string, LookupRef>(), newest = new Map<string, LookupRef | null>();
 	for (const en of branch) {
 		const msg = en?.type === "message" ? en.message : null;
-		if (msg?.role === "assistant" && Array.isArray(msg.content)) for (const c of msg.content) if (c?.type === "toolCall" && c.id) calls.set(c.id, c);
+		if (msg?.role === "assistant" && Array.isArray(msg.content)) {
+			// ids may be reused: a result belongs to the newest call issued before it; one message issuing an id twice leaves it unknown
+			const seen = new Map<string, number>();
+			for (const c of msg.content) if (c?.type === "toolCall" && c.id) seen.set(c.id, (seen.get(c.id) ?? 0) + 1);
+			for (const c of msg.content) if (c?.type === "toolCall" && c.id) calls.set(c.id, (seen.get(c.id) ?? 0) > 1 ? null : c);
+		}
 		if (msg?.role !== "toolResult" || !en.id) continue;
-		const call = calls.get(msg.toolCallId), tool = call?.name ?? msg.toolName ?? "tool";
+		const call = calls.get(msg.toolCallId) ?? undefined, tool = call?.name ?? msg.toolName ?? "tool";
 		if (tool === RECALL_TOOL) continue;
 		const handle = handleFor(en.id), label = `${tool} ${shortArgs(call?.arguments)}`.trim();
 		if (wanted.has(handle)) byHandle.set(handle, { handle, label, via: "handle" });

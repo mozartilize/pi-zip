@@ -476,7 +476,10 @@ export interface Block {
 	ours: boolean; // ... and it is one of our placeholders
 	age: number; // toolResult: assistant requests that came after the one that issued the call (0 = answered by the newest request); other kinds 0
 }
-export type Calls = Map<string, { name: string; args: Any }>;
+export type Call = { name: string; args: Any };
+/** Tool calls by id, plus each tool result's own call (`byResult`, keyed by the result message): ids may be reused, so a result belongs
+ *  to the newest call issued before it, never to a later call with the same id. Read a result's call with callOf. */
+export type Calls = Map<string, Call> & { byResult?: WeakMap<object, Call | null> };
 
 /** User turns so far: the real prompts. Steering and follow-up messages typed during a run belong to that run's turn. */
 export const countUserTurns = (blocks: Block[]): number => blocks.reduce((a, b) => Math.max(a, b.userTurn), 0);
@@ -556,8 +559,33 @@ export const isCutBlock = (b: Block): boolean => !!b.entryId && (b.kind === "use
 
 export function toolCallIndex(blocks: Block[]): Calls {
 	const m: Calls = new Map();
-	for (const b of blocks) if (b.kind === "assistant") for (const c of b.msg.content ?? []) if (c?.type === "toolCall") m.set(c.id, { name: c.name, args: c.arguments });
+	const byResult = new WeakMap<object, Call | null>();
+	const issued = new Map<string, Call | null>(); // id -> the newest call that issued it so far; null: one message issued it twice
+	for (const b of blocks) {
+		if (b.kind === "assistant") {
+			const content: Any[] = Array.isArray(b.msg.content) ? b.msg.content : [];
+			const seen = new Map<string, number>();
+			for (const c of content) if (c?.type === "toolCall") seen.set(c.id, (seen.get(c.id) ?? 0) + 1);
+			for (const c of content) {
+				if (c?.type !== "toolCall") continue;
+				const call = { name: c.name, args: c.arguments };
+				m.set(c.id, call);
+				issued.set(c.id, (seen.get(c.id) ?? 0) > 1 ? null : call);
+			}
+		} else if (b.kind === "toolResult" && b.msg && typeof b.msg === "object") {
+			byResult.set(b.msg, issued.get(b.msg.toolCallId) ?? null);
+			if (b.raw && typeof b.raw === "object") byResult.set(b.raw, issued.get(b.msg.toolCallId) ?? null);
+		}
+	}
+	m.byResult = byResult;
 	return m;
+}
+
+/** The call that produced this tool result message: its own source-order call when `calls` indexed it (undefined when ambiguous or
+ *  issued only after it), else the call with its id (an index built without results). */
+export function callOf(calls: Calls, msg: Any): Call | undefined {
+	if (msg && typeof msg === "object" && calls.byResult?.has(msg)) return calls.byResult.get(msg) ?? undefined;
+	return calls.get(msg?.toolCallId);
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -664,7 +692,9 @@ export interface PlanResult {
 	cutIdx: number | null;
 	firstKeptEntryId: string | null;
 	prefixTokens: number; // content estimate units (x c = real), like summaryTokensPlanned
-	summaryTokensPlanned: number;
+	summaryTokensPlanned: number; // soft target: what the plan priced; the summary may use more, up to summaryRoomTokens
+	/** Hard bound (estimate units): the largest summary whose compacted view still stays below the model's compaction room. Absent: no known window. */
+	summaryRoomTokens?: number;
 	mergeWork?: MergeWork; // reserved tier-merge input/output tokens for production, not a ready summary's sunk cost
 	sumTrigger: "cold" | "valve" | null;
 	scale: Scale;
@@ -690,7 +720,7 @@ export function foldCandidates(blocks: Block[], calls: Calls, o: PlanOpts): [Blo
 		if (b.kind !== "toolResult" || b.edited || !b.entryId || pos < head || (o.recalled?.size ? o.recalled.has(handleFor(b.entryId)) : false)) continue;
 		const text = textOf((b.raw ?? b.msg).content);
 		if (tok4(text) <= (o.foldMin ?? s.foldMin)) continue;
-		const call = calls.get(b.msg.toolCallId), name = call?.name ?? b.msg.toolName;
+		const call = callOf(calls, b.msg), name = call?.name ?? b.msg.toolName;
 		if (name === RECALL_TOOL || (name === "bash" && commandNamesRecall(call?.args?.command))
 			|| (["read", "grep", "find", "ls"].includes(name) && !!parseRecallPath(call?.args?.path))) continue;
 		const rereadable = () => classifyRecoverability(name ?? "", call?.args, text, o.cwd, (b.raw ?? b.msg).content) === "rereadable";
@@ -788,7 +818,7 @@ export function plan(entries: Any[], o: PlanOpts): { f: PlanResult; c: PlanResul
 		}
 	}
 	const classify = (b: Block): Recover => {
-		const call = calls.get(b.msg.toolCallId);
+		const call = callOf(calls, b.msg);
 		return classifyRecoverability(call?.name ?? b.msg.toolName ?? "", call?.args, textOf((b.raw ?? b.msg).content), o.cwd, (b.raw ?? b.msg).content);
 	};
 	const addFold = (b: Block, trig: string): boolean => {
@@ -797,7 +827,7 @@ export function plan(entries: Any[], o: PlanOpts): { f: PlanResult; c: PlanResul
 		if (!replacement) return false;
 		const { ph, phTok } = replacement;
 		tokOverride.set(b.idx, phTok);
-		const call = calls.get(b.msg.toolCallId);
+		const call = callOf(calls, b.msg);
 		folds.push({ entryId: b.entryId!, toolCallId: b.msg.toolCallId, visIdx: visOfBlock[b.idx] ?? -1, contentKey: contentKeyOf(b.msg.content), tool: call?.name ?? b.msg.toolName ?? "tool", args: call ? shortArgs(call.args) : "", entryTokens: b.tokens, phTokens: phTok, ph, trig, recover: classify(b) });
 		return true;
 	};
@@ -871,6 +901,7 @@ export function plan(entries: Any[], o: PlanOpts): { f: PlanResult; c: PlanResul
 		blocks, calls, folds: pick === null ? [...folds] : folds.filter((t) => blocks.findIndex((b) => b.entryId === t.entryId) >= pick || o.carriedFolds?.some((u) => u.entryId === t.entryId)),
 		cutIdx: pick, firstKeptEntryId: pick === null ? null : blocks[pick].entryId, prefixTokens: pick === null ? 0 : pre[pick],
 		summaryTokensPlanned: summary, ...(pick !== null ? { mergeWork } : {}), sumTrigger, scale: o.scale ?? UNIT,
+		...(pick !== null && room !== null ? { summaryRoomTokens: Math.max(0, Math.floor((room - real(ctxAfterFolds)) / c + pre[pick])) } : {}),
 		ctxTokens: real(ctxEst), ctxAfterFolds: real(ctxAfterFolds), userTurns, ...(o.fileRecall ? { fileRecall: o.fileRecall } : {}),
 		...(atRoom ? { atRoom } : {}), ...(atRoomUnedited ? { atRoomUnedited } : {}),
 	});
