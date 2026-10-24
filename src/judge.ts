@@ -2,7 +2,7 @@
 // A verdict only ranks folds the deterministic planner already allows. It never lowers a protected output's age.
 import { createHash, randomUUID } from "node:crypto";
 import { isAbsolute, normalize, resolve } from "node:path";
-import { foldCandidates, foldPlaceholder, settings, type Block, type Calls, type PlanOpts, type Verdict } from "./plan.ts";
+import { callOf, foldCandidates, foldPlaceholder, settings, type Block, type Calls, type PlanOpts, type Verdict } from "./plan.ts";
 import { handleFor, handleTokens, outcomeHint, pickKeyLines, shortArgs, RECALL_TOOL } from "./placeholder.ts";
 import { envInt, reasonsByDefault, textOf, tok4, type Any } from "./util.ts";
 
@@ -154,7 +154,7 @@ export class BoundaryIndex {
 			this.slots.push({ kind: b.kind, entryId: b.entryId ?? null, handle: null, locator: null, callKey: "", tool: "", isError: false, ours: false, edited: Boolean(b.edited), block: b });
 			return null;
 		}
-		const call = calls.get(b.msg.toolCallId), tool = call?.name ?? b.msg.toolName ?? "";
+		const call = callOf(calls, b.msg), tool = call?.name ?? b.msg.toolName ?? "";
 		if (tool === RECALL_TOOL) {
 			this.slots.push({ kind: b.kind, entryId: b.entryId, handle: null, locator: null, callKey: "", tool, isError: Boolean(b.msg?.isError), ours: Boolean(b.ours), edited: Boolean(b.edited), block: b });
 			return null;
@@ -236,7 +236,7 @@ export function supersededOutputs(blocks: readonly Block[], calls: Calls, cwd: s
 	const out = new Map<string, string>(), byCall = new Map<string, string[]>(), byPath = new Map<string, string[]>();
 	for (const b of blocks) {
 		if (b.kind !== "toolResult" || !b.entryId || b.ours) continue;
-		const call = calls.get(b.msg.toolCallId), tool = call?.name ?? b.msg.toolName;
+		const call = callOf(calls, b.msg), tool = call?.name ?? b.msg.toolName;
 		if (!tool || tool === RECALL_TOOL) continue;
 		const h = handleFor(b.entryId), key = `${tool}\0${stable(call?.args ?? null)}`, loc = locatorOf(call?.args, cwd);
 		if (!b.msg.isError) {
@@ -394,7 +394,7 @@ export function judgeInput(blocks: Block[], calls: Calls, firstPrompt: string, t
 		const b = blocks[i];
 		if (b.userTurn > maxTurn) maxTurn = b.userTurn;
 		if (b.kind !== "toolResult" || !b.entryId) continue;
-		const h = handleFor(b.entryId), call = calls.get(b.msg.toolCallId);
+		const h = handleFor(b.entryId), call = callOf(calls, b.msg);
 		if ((call?.name ?? b.msg.toolName) === RECALL_TOOL) continue;
 		live.set(h, b);
 		idxByHandle.set(h, i);
@@ -419,7 +419,7 @@ export function judgeInput(blocks: Block[], calls: Calls, firstPrompt: string, t
 		const b = blocks[i];
 		if (b.msg?.role === "custom" && (b.msg.customType === NEED_CUSTOM || b.msg.customType === HINT_CUSTOM)) continue;
 		if (b.kind === "toolResult") {
-			const call = calls.get(b.msg.toolCallId);
+			const call = callOf(calls, b.msg);
 			if ((call?.name ?? b.msg.toolName) === RECALL_TOOL || b.ours) continue;
 			const shown = toolResultBody(b, calls);
 			const row = clipHead(`toolResult: ${shown}`, remaining);
@@ -475,7 +475,7 @@ export function judgeInput(blocks: Block[], calls: Calls, firstPrompt: string, t
 			if (!shownBody.trim()) continue;
 			displayCandidates.push({ idx: i, shown: `assistant: ${shownBody}`, anchor: isMilestone });
 		} else if (b.kind === "toolResult") {
-			const call = calls.get(b.msg.toolCallId);
+			const call = callOf(calls, b.msg);
 			const tool = call?.name ?? b.msg.toolName ?? "tool";
 			if (tool === RECALL_TOOL || b.ours) continue;
 			const raw = textOf(b.msg.content);

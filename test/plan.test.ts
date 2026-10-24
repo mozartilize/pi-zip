@@ -89,6 +89,17 @@ describe("summary gate", () => {
 		expect(s.prefixTokens).toBe(r.prefixTokens);
 		expect(s.folds).toHaveLength(0);
 	});
+	test("a cut records the hard summary room: the largest summary whose compacted view still fits the model's room (above the soft target)", () => {
+		const o = sumOpts();
+		const s = planContext(sumCtx, o)!;
+		const room = compactionRoom(o.model, o.reserve)!;
+		expect(s.summaryRoomTokens).toBeDefined();
+		expect(s.summaryRoomTokens!).toBeGreaterThan(s.summaryTokensPlanned);
+		const after = (S: number) => s.ctxAfterFolds - s.scale.c * (s.prefixTokens - S);
+		expect(after(s.summaryRoomTokens!)).toBeLessThanOrEqual(room);
+		expect(after(s.summaryRoomTokens! + 1)).toBeGreaterThan(room);
+		expect(planContext(sumCtx, sumOpts({ model: {} }))?.summaryRoomTokens).toBeUndefined(); // no known window: no hard bound
+	});
 	test("successive warm summaries pay below the previous starting size without a regrowth budget", () => {
 		const o = sumOpts({ promptPending: false, law: at(1, 500) });
 		const first = planContext([...sumCtx, U("u4", "back")], o)!;

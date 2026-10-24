@@ -564,12 +564,38 @@ describe("model-switch checkpoints through Pi hooks", () => {
 		} finally { await r.shutdown(); }
 	});
 
-	test("format v2 request-budget-overflow: retention safety wins over model switch when verbatim protected user requests exceed the summary budget", async () => {
+	test("format v2: requests above the planned summary size but inside the new window's room compact verbatim (the plan is a soft target)", async () => {
+		defaults();
+		process.env.PI_ZIP_SUMMARY_V2 = "1";
+		const ask = (i: number) => `ACTIVE-CONSTRAINT-${i}: ` + "keep every user instruction verbatim without silent dropping ".repeat(900); // ~14K tokens each
+		const r = await rig((sm: SessionManager) => {
+			for (let i = 1; i <= 5; i++) {
+				sm.appendMessage(user(ask(i)));
+				sm.appendMessage({ ...asst([{ type: "text", text: "ok " + "pad ".repeat(48_000) }]), usage: undefined });
+			}
+			sm.appendMessage(user("latest short prompt"));
+		});
+		try {
+			await switchTo(r, 200_000);
+			expect(await threshold(r)).toBe(false);
+			expect(r.abortsInRun.n).toBe(0);
+			const comp: Any = r.sm.getBranch().find((e: Any) => e.type === "compaction");
+			expect(comp?.summary.startsWith("[pi-zip summary · format v2")).toBe(true);
+			expect(comp.summary).toContain(ask(1)); // summarised requests are whole, never shortened
+			const kept = JSON.stringify(r.projectionMessages());
+			for (let i = 1; i <= 5; i++) expect(comp.summary.includes(ask(i)) || kept.includes(ask(i))).toBe(true);
+		} finally {
+			delete process.env.PI_ZIP_SUMMARY_V2;
+			await r.shutdown();
+		}
+	});
+
+	test("format v2 request-budget-overflow: retention safety wins over model switch when verbatim protected user requests exceed the new window's room", async () => {
 		defaults();
 		process.env.PI_ZIP_SUMMARY_V2 = "1";
 		const hugeUserSetup = (sm: SessionManager) => {
 			for (let i = 1; i <= 5; i++) {
-				sm.appendMessage(user(`ACTIVE-CONSTRAINT-${i}: ` + "keep every user instruction verbatim without silent dropping ".repeat(900)));
+				sm.appendMessage(user(`ACTIVE-CONSTRAINT-${i}: ` + "keep every user instruction verbatim without silent dropping ".repeat(2900))); // ~45K tokens each, 225K in all
 				sm.appendMessage({ ...asst([{ type: "text", text: "ok " + "pad ".repeat(48_000) }]), usage: undefined });
 			}
 			sm.appendMessage(user("latest short prompt"));
