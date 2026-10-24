@@ -203,22 +203,34 @@ export function referencesSource(text: string, rec: Pick<ExecutionRecord, "execu
 /**
  * Tool executions of a block slice in source order. Identity: (assistant entry, content-block position), known as soon as the call is
  * issued. A result belongs to the newest call issued before it with its id; one message issuing an id twice, or no issuer at all, makes
- * it an orphan with its association unresolved (never guessed from a tool name or command). `priorIssuers` (call id -> execution id)
- * names calls of earlier epochs still waiting for a result. Several results of one execution are kept, one per result entry.
+ * it an orphan with its association unresolved (never guessed from a tool name or command). `priorIssuers` (call id -> execution id,
+ * "" when one message issued it twice) are the calls before the slice, from the raw branch: a result in the slice whose newest issuer
+ * came before it belongs to that earlier execution. Several results of one execution are kept, one per result entry.
+ * `requestNumbers` (user entry id -> raw-branch-v2 number) and `startRequest` (the request in effect when the slice begins) give each
+ * execution the request it was made under; without them the slice's own user messages are counted from 1.
  */
 export function collectExecutions(
 	blocks: Block[],
-	opts: { cwd?: string; referenceText?: string; referencedHandles?: ReadonlySet<string>; referencedExecutions?: ReadonlySet<string>; filterRoutineReads?: boolean; priorIssuers?: ReadonlyMap<string, string> } = {},
+	opts: {
+		cwd?: string;
+		referenceText?: string;
+		referencedHandles?: ReadonlySet<string>;
+		referencedExecutions?: ReadonlySet<string>;
+		filterRoutineReads?: boolean;
+		priorIssuers?: ReadonlyMap<string, string>;
+		requestNumbers?: ReadonlyMap<string, number>;
+		startRequest?: number;
+	} = {},
 ): CollectExecutionsResult {
 	const cwd = opts.cwd ?? ".";
 	const records: ExecutionRecord[] = [];
 	const byId = new Map<string, ExecutionRecord>();
 	const issued = new Map<string, { execId: string; ambiguous: boolean; prior?: boolean }>();
-	for (const [cid, execId] of opts.priorIssuers ?? []) issued.set(cid, { execId, ambiguous: false, prior: true });
-	let req = 0;
+	for (const [cid, execId] of opts.priorIssuers ?? []) issued.set(cid, { execId, ambiguous: !execId, prior: true });
+	let req = opts.startRequest ?? 0;
 	for (const b of blocks) {
 		if (b.kind === "user") {
-			req++;
+			req = (b.entryId ? opts.requestNumbers?.get(b.entryId) : undefined) ?? req + 1;
 			continue;
 		}
 		if (b.kind === "assistant") {
@@ -270,11 +282,12 @@ export function collectExecutions(
 			...(isError ? { errorExcerpt: clip(flat(rawText), 200) } : {}),
 			...(key ? { hint: clip(flat(key), 90) } : {}),
 		};
-		if (m?.prior && !owner) {
+		if (m?.prior && !m.ambiguous && !owner) {
 			// the call is in an earlier epoch: this record carries the result back to it
 			let rec = byId.get(m.execId);
 			if (!rec) {
-				rec = { executionId: m.execId, assistantEntryId: m.execId.split(":")[0] ?? null, toolCallPosition: -1, toolCallId: cid, tool: toolName, args: {}, results: [], priorEpoch: true };
+				const at = m.execId.lastIndexOf(":");
+				rec = { executionId: m.execId, assistantEntryId: m.execId.slice(0, at), toolCallPosition: Number(m.execId.slice(at + 1)), toolCallId: cid, tool: toolName, args: {}, ...(req > 0 ? { requestNumber: req } : {}), results: [], priorEpoch: true };
 				records.push(rec);
 				byId.set(rec.executionId, rec);
 			}
@@ -321,19 +334,23 @@ const resultSub = (r: ExecutionResultRef, label = "") => (r.isError && r.errorEx
 /** One execution as one record: a first line (identity, handle(s), call, when, outcome) and indented error or evidence lines. */
 export function formatExecutionRecord(rec: ExecutionRecord, aliases?: Map<string, string>): string {
 	const head = callHeadOf(rec, aliases);
+	// the request it was made under (raw-branch-v2 number); with it, the slice-local turn count is not shown
+	const R = rec.requestNumber ? `R${rec.requestNumber} · ` : "";
+	const when = (r?: ExecutionResultRef) => {
+		const w = whenLabel(r?.at, R ? undefined : r?.turn);
+		return w ? ` · ${w}` : "";
+	};
 	if (rec.orphan) {
 		const r = rec.results[0];
-		const w = whenLabel(r?.at, r?.turn);
-		return [`- handle ${r?.handle ?? "unknown"} · ${head}${w ? ` · ${w}` : ""} · ${r?.outcome ?? "unknown"} · association unresolved`, r ? resultSub(r) : ""].filter(Boolean).join("\n");
+		return [`- ${R}handle ${r?.handle ?? "unknown"} · ${head}${when(r)} · ${r?.outcome ?? "unknown"} · association unresolved`, r ? resultSub(r) : ""].filter(Boolean).join("\n");
 	}
-	if (!rec.results.length) return `- execution ${rec.executionId} · ${head} · no result`;
+	if (!rec.results.length) return `- ${R}execution ${rec.executionId} · ${head} · no result`;
 	if (rec.results.length === 1) {
 		const r = rec.results[0];
-		const w = whenLabel(r.at, r.turn);
-		return [`- execution ${rec.executionId} · handle ${r.handle} · ${head}${w ? ` · ${w}` : ""} · ${r.outcome}`, resultSub(r)].filter(Boolean).join("\n");
+		return [`- ${R}execution ${rec.executionId} · handle ${r.handle} · ${head}${when(r)} · ${r.outcome}`, resultSub(r)].filter(Boolean).join("\n");
 	}
 	return [
-		`- execution ${rec.executionId} · handles ${rec.results.map((r) => r.handle).join(", ")} · ${head} · ${rec.results.map((r) => `${r.handle}:${r.outcome}`).join(", ")}`,
+		`- ${R}execution ${rec.executionId} · handles ${rec.results.map((r) => r.handle).join(", ")} · ${head} · ${rec.results.map((r) => `${r.handle}:${r.outcome}`).join(", ")}`,
 		...rec.results.map((r) => resultSub(r, ` (${r.handle})`)).filter(Boolean),
 	].join("\n");
 }
@@ -656,6 +673,10 @@ export function prepareEpochV2(o: PrepareV2Options): PreparedV2 {
 	// this slice's requests
 	const seen = new Set(carried.flatMap((e) => e.requests.map((r) => r.entryId).filter(Boolean) as string[]));
 	let maxNo = carried.reduce((m, e) => e.requests.reduce((n, r) => Math.max(n, r.number), m), 0);
+	const posOf = new Map(branch.map((e, i) => [e?.id, i]));
+	const startAt = sliceFirst !== undefined ? posOf.get(sliceFirst) : undefined;
+	// the request in effect when the slice begins (it may begin inside one): the newest raw request before it
+	const startRequest = startAt !== undefined ? raw.reduce((n, r) => ((posOf.get(r.entryId) ?? Infinity) < startAt ? Math.max(n, r.number) : n), 0) : maxNo;
 	const requests: V2Request[] = [];
 	for (const b of o.prefix) {
 		if (b.kind !== "user") continue;
@@ -674,19 +695,25 @@ export function prepareEpochV2(o: PrepareV2Options): PreparedV2 {
 		maxNo++;
 		requests.push({ number: maxNo, handle: handleFor(id), entryId: id, text: t || (nonText ? "[non-text user content]" : "[empty user message]") });
 	}
-	// a call of an earlier epoch still waiting for its result: its call id, from the branch
+	// calls made before the slice, from the raw branch in source order (the newest issuer of an id wins; "" = one message issued it twice):
+	// a result in the slice for one of them belongs to that earlier execution, whether or not its record is still in the summary
 	const priorIssuers = new Map<string, string>();
+	if (startAt !== undefined)
+		for (const e of branch.slice(0, startAt)) {
+			const msg = e?.type === "message" ? e.message : null;
+			if (msg?.role !== "assistant" || !Array.isArray(msg.content) || !e.id) continue;
+			const counts = new Map<string, number>();
+			for (const c of msg.content) if (c?.type === "toolCall" && c.id) counts.set(String(c.id), (counts.get(String(c.id)) ?? 0) + 1);
+			msg.content.forEach((c: Any, pos: number) => {
+				if (c?.type === "toolCall" && c.id) priorIssuers.set(String(c.id), (counts.get(String(c.id)) ?? 0) > 1 ? "" : `${e.id}:${pos}`);
+			});
+		}
+	// the carried records still waiting for a result, by execution id
 	const waiting = new Map<string, { epoch: V2Epoch; index: number }>();
-	const entryById = new Map(branch.map((e) => [e?.id, e]));
 	for (const e of carried)
 		e.evidence.forEach((rec, index) => {
-			const m = /^- execution (\S+):(\d+) · .* · no result$/.exec(rec.split("\n")[0]);
-			if (!m) return;
-			const c = entryById.get(m[1])?.message?.content?.[Number(m[2])];
-			if (c?.type === "toolCall" && c.id) {
-				priorIssuers.set(String(c.id), `${m[1]}:${m[2]}`);
-				waiting.set(`${m[1]}:${m[2]}`, { epoch: e, index });
-			}
+			const m = /^- (?:R\d+ · )?execution (\S+) · .* · no result$/.exec(rec.split("\n")[0]);
+			if (m) waiting.set(m[1], { epoch: e, index });
 		});
 	const commitments = collectAssistantCommitments(o.prefix);
 	const commitmentRows = commitments.map((c) => `- source ${c.sourceHandle}\n${quoteLines(c.quote)}`);
@@ -696,7 +723,8 @@ export function prepareEpochV2(o: PrepareV2Options): PreparedV2 {
 	const ri = resolveIntents(props, allRequests);
 	const activeState = o.activeState ?? prevActive;
 	const referenceText = [o.durableProse ?? "", activeState, ...commitments.map((c) => c.quote), ...ri.intents.map((i) => i.quote)].join("\n");
-	const col = collectExecutions(o.prefix, { cwd: o.cwd, referenceText, referencedHandles: o.referencedHandles, referencedExecutions: o.referencedExecutions, filterRoutineReads: true, priorIssuers });
+	const requestNumbers = new Map(requests.filter((r) => r.entryId).map((r) => [r.entryId!, r.number]));
+	const col = collectExecutions(o.prefix, { cwd: o.cwd, referenceText, referencedHandles: o.referencedHandles, referencedExecutions: o.referencedExecutions, filterRoutineReads: true, priorIssuers, requestNumbers, startRequest });
 	const aliases = cdAliases(bashCommands(o.prefix), aliases0);
 	const nextId = o.epochId ?? carried.reduce((m, e) => Math.max(m, e.block.last ?? 0), 0) + 1;
 	const evidence: string[] = [];
@@ -706,15 +734,21 @@ export function prepareEpochV2(o: PrepareV2Options): PreparedV2 {
 			evidence.push(formatExecutionRecord(rec, aliases));
 			continue;
 		}
-		// the late result joins its call's record in the earlier epoch; this epoch only points at it
+		// a late result joins its call's record in the earlier epoch and this epoch points at it; when that record was left out of the
+		// summary, this epoch's row carries the result itself (still that execution, never an orphan)
 		const w = waiting.get(rec.executionId);
-		const r = rec.results[0];
-		if (w && r) {
-			const old = w.epoch.evidence[w.index].split("\n")[0].replace(/ · no result$/, "");
-			w.epoch.evidence[w.index] = [`${old.replace(/^- execution (\S+) · /, `- execution $1 · handle ${r.handle} · `)} · ${r.outcome} · result in Epoch ${nextId}`, resultSub(r)].filter(Boolean).join("\n");
+		const R = rec.requestNumber ? `R${rec.requestNumber} · ` : "";
+		rec.results.forEach((r, k) => {
 			lateResults++;
-		}
-		evidence.push(`- result for execution ${rec.executionId} (call in an earlier epoch) · handle ${r?.handle ?? "unknown"} · ${r?.outcome ?? "unknown"}`);
+			if (w && k === 0) {
+				const old = w.epoch.evidence[w.index].split("\n")[0].replace(/ · no result$/, "");
+				w.epoch.evidence[w.index] = [`${old.replace(/^(- (?:R\d+ · )?execution \S+ · )/, `$1handle ${r.handle} · `)} · ${r.outcome} · result in Epoch ${nextId}`, resultSub(r)].filter(Boolean).join("\n");
+				evidence.push(`- ${R}result for execution ${rec.executionId} (call in an earlier epoch) · handle ${r.handle} · ${r.outcome}`);
+			} else {
+				const note = w ? "call in an earlier epoch" : "call in an earlier epoch; its record there is not in this summary";
+				evidence.push([`- ${R}result for execution ${rec.executionId} (${note}) · handle ${r.handle} · ${r.outcome}`, resultSub(r)].filter(Boolean).join("\n"));
+			}
+		});
 	}
 	const ids = o.prefix.map((b) => b.entryId).filter(Boolean) as string[];
 	const nums = requests.map((r) => r.number);
@@ -752,13 +786,22 @@ export function prepareEpochV2(o: PrepareV2Options): PreparedV2 {
 }
 
 /** After the prose of neighbouring epochs was merged (consolidateEpochs / boundEpochs: blocks covering epoch number ranges), join each
- *  merged range's requests, commitments, evidence and omission counts by code, in order. */
+ *  merged range's requests, commitments, evidence and omission counts by code, in order. An epoch no block covers (its prose did not fit
+ *  at all) is kept with its prose marked omitted: requests and evidence never go with the prose. */
 export function regroupEpochsV2(epochs: readonly V2Epoch[], blocks: readonly EpochBlock[]): V2Epoch[] {
 	const out: V2Epoch[] = [];
-	for (const b of blocks) {
+	const done = new Set<EpochBlock>();
+	for (const e of epochs) {
+		const lo0 = e.block.first ?? 0, hi0 = e.block.last ?? lo0;
+		const b = blocks.find((x) => (x.first ?? 0) <= lo0 && hi0 <= (x.last ?? x.first ?? 0));
+		if (!b) {
+			out.push({ ...e, block: { ...e.block, durableProse: PROSE_OMITTED } });
+			continue;
+		}
+		if (done.has(b)) continue;
+		done.add(b);
 		const lo = b.first ?? 0, hi = b.last ?? lo;
-		const members = epochs.filter((e) => (e.block.first ?? 0) >= lo && (e.block.last ?? 0) <= hi);
-		if (!members.length) continue;
+		const members = epochs.filter((x) => (x.block.first ?? 0) >= lo && (x.block.last ?? 0) <= hi);
 		if (members.length === 1) {
 			out.push({ ...members[0], block: b });
 			continue;
@@ -767,10 +810,10 @@ export function regroupEpochsV2(epochs: readonly V2Epoch[], blocks: readonly Epo
 		out.push({
 			block: b,
 			interval: start === "unknown" && end === "unknown" ? "unknown" : `${start}..${end}`,
-			requests: members.flatMap((e) => e.requests),
-			commitments: members.flatMap((e) => e.commitments),
-			evidence: members.flatMap((e) => e.evidence),
-			omitted: { routine: members.reduce((n, e) => n + e.omitted.routine, 0), budget: members.reduce((n, e) => n + e.omitted.budget, 0), sources: members.flatMap((e) => e.omitted.sources) },
+			requests: members.flatMap((x) => x.requests),
+			commitments: members.flatMap((x) => x.commitments),
+			evidence: members.flatMap((x) => x.evidence),
+			omitted: { routine: members.reduce((n, x) => n + x.omitted.routine, 0), budget: members.reduce((n, x) => n + x.omitted.budget, 0), sources: members.flatMap((x) => x.omitted.sources) },
 		});
 	}
 	return out;
@@ -798,6 +841,7 @@ export interface EpochSummaryV2 {
 		quoteRejected: number;
 		roleMismatch: number;
 		proseOmitted: number;
+		intentsOmitted: number;
 		tokens: { requests: number; intent: number; state: number; prose: number; commitments: number; evidence: number; overhead: number; total: number };
 	};
 }
@@ -815,12 +859,15 @@ const PROSE_OMITTED = "(omitted to fit the summary room; this epoch's requests a
 /**
  * Fit the prepared summary. `soft`: the size the plan priced; evidence nobody points at (no error, not named by the retained prose, state,
  * commitments or intents) is dropped, oldest epoch first, whole records only, until the text fits it. `hard`: the size beyond which the
- * compacted view would not fit the model's room; above it the other evidence goes, then commitments, then the prose of old epochs and
- * last of the newest. User requests are never dropped: when they alone exceed `hard` the result is `request-budget-overflow`.
+ * compacted view would not fit the model's room; above it the other evidence goes, then commitments, then the intent quotes (the
+ * requests keep those words), then the prose of old epochs and last of the newest, then the state. User requests are never dropped: when
+ * they and the summary's fixed structure alone exceed `hard` the result is `request-budget-overflow`.
  */
 export function renderEpochSummaryV2(prep: PreparedV2, opts: { soft: number; hard: number; file?: FileRecall }): EpochSummaryV2 {
 	const s: V2State = { ...prep.state, epochs: prep.state.epochs.map((e) => ({ ...e, evidence: [...e.evidence], commitments: [...e.commitments], omitted: { ...e.omitted, sources: [...e.omitted.sources] } })) };
-	const ref = prep.referenceText;
+	// what the kept text says, after any prose merge: every epoch's prose and commitments, the state and the intents. An old epoch's
+	// evidence stays pinned while that epoch's own findings name it.
+	const ref = [prep.referenceText, s.activeState, ...s.intents.map((i) => i.quote), ...s.epochs.flatMap((e) => [e.block.durableProse, ...e.commitments])].join("\n");
 	const hard = Math.max(0, opts.hard), soft = Math.min(Math.max(0, opts.soft), hard);
 	let size = tok4(renderV2(s, opts.file));
 	let budgetOmitted = 0, proseOmitted = 0;
@@ -844,7 +891,7 @@ export function renderEpochSummaryV2(prep: PreparedV2, opts: { soft: number; har
 	};
 	const pinned = (rec: string) => {
 		if (isErrorRecord(rec) || recordHandles(rec).some((h) => ref.includes(h))) return true;
-		const x = /^- execution (\S+)/.exec(rec)?.[1];
+		const x = /^- (?:R\d+ · )?(?:result for )?execution (\S+)/.exec(rec)?.[1];
 		if (x && mentions(ref, x)) return true;
 		// a path or file name in the record's call ("read src/a.ts", "bash `cat a.ts`") named by the retained text: the referencesSource rule
 		const line = rec.split("\n")[0].split(" · ").filter((p) => !/^(?:- )?(?:execution|handles?|result for) /.test(p));
@@ -862,9 +909,16 @@ export function renderEpochSummaryV2(prep: PreparedV2, opts: { soft: number; har
 		for (const e of s.epochs) if (e.commitments.length) e.commitments = [];
 		size = tok4(renderV2(s, opts.file));
 	}
+	// the intent quotes repeat words the requests in History keep verbatim: they go before any prose, and before declaring overflow
+	let intentsOmitted = 0;
+	if (size > hard && s.intents.length) {
+		intentsOmitted = s.intents.length;
+		s.intents = [];
+		size = tok4(renderV2(s, opts.file));
+	}
 	for (let i = 0; i < s.epochs.length && size > hard; i++) {
 		const e = s.epochs[i];
-		if (e.block.durableProse === PROSE_OMITTED || e.block.durableProse === NONE) continue;
+		if (e.block.durableProse.length <= PROSE_OMITTED.length) continue; // the marker would not make it shorter
 		e.block = { ...e.block, durableProse: PROSE_OMITTED };
 		proseOmitted++;
 		size = tok4(renderV2(s, opts.file));
@@ -910,6 +964,7 @@ export function renderEpochSummaryV2(prep: PreparedV2, opts: { soft: number; har
 			quoteRejected: prep.stats.quoteRejected,
 			roleMismatch: prep.stats.roleMismatch,
 			proseOmitted,
+			intentsOmitted,
 			tokens,
 		},
 	};

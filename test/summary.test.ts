@@ -989,7 +989,7 @@ describe("format v2: unified execution catalogue, routine-read filter, verbatim 
 		expect(col.records[1].results[0].isError).toBe(false);
 		expect(col.records[1].results[0].outcome).toBe("exit 0");
 		expect(col.records[2].executionId).not.toBe(col.records[3].executionId);
-		expect(formatExecutionRecord(col.records[4])).toBe("- execution a4:1 · bash `sleep 10` · no result");
+		expect(formatExecutionRecord(col.records[4])).toBe("- R1 · execution a4:1 · bash `sleep 10` · no result"); // the request it was made under
 	});
 
 	test("routine verified read is filtered from catalogue unless referenced by narrative or errored; git status/diff remain kept", () => {
@@ -1059,13 +1059,13 @@ describe("format v2: unified execution catalogue, routine-read filter, verbatim 
 		const e2 = [tres("a1", "bash", "built\nCommand exited with code 0"), U("u2", "now test"), A("a2")];
 		const branch = [...e1, ...e2].map((e) => e.sourceEntry);
 		const first = buildEpochSummaryV2({ prefix: buildBlocks(e1), branch: branch.slice(0, 2), durableProse: "started make" });
-		expect(first.text).toContain("- execution a1:1 · bash `make` · no result");
+		expect(first.text).toContain("- R1 · execution a1:1 · bash `make` · no result");
 		const second = buildEpochSummaryV2({ prefix: buildBlocks(e2), previous: first.text, branch, durableProse: "make done" });
 		const h = handleFor("r-a1");
 		const st = parseSummaryV2(second.text)!;
 		expect(st.epochs).toHaveLength(2);
-		expect(st.epochs[0].evidence).toEqual([`- execution a1:1 · handle ${h} · bash \`make\` · exit 0 · result in Epoch 2\n  Evidence: built`]);
-		expect(st.epochs[1].evidence).toEqual([`- result for execution a1:1 (call in an earlier epoch) · handle ${h} · exit 0`]);
+		expect(st.epochs[0].evidence).toEqual([`- R1 · execution a1:1 · handle ${h} · bash \`make\` · exit 0 · result in Epoch 2\n  Evidence: built`]);
+		expect(st.epochs[1].evidence).toEqual([`- R1 · result for execution a1:1 (call in an earlier epoch) · handle ${h} · exit 0`]); // arrived while R1 was in effect
 		expect(second.text).not.toContain("association unresolved");
 		expect(second.diagnostics.lateResults).toBe(1);
 		expect(second.diagnostics.associationUnresolved).toBe(0);
@@ -1149,7 +1149,7 @@ describe("format v2: unified execution catalogue, routine-read filter, verbatim 
 				expect(st.epochs[0].evidence[0]).toContain("exit 1");
 				expect(res.diagnostics.requestCount).toBe(round);
 				expect(res.diagnostics.verbatimCount).toBe(round);
-				expect(res.text.match(/^- R1 · /gm)).toHaveLength(1);
+				expect(res.text.match(/^- R1 · handle /gm)).toHaveLength(1); // the request row, once
 				if (round >= 5) expect(st.epochs[4].requests[0].text).toBe("chọn cách 2");
 				if (round >= 4) expect(st.activeState).toBe(`- [ ] verify step ${round}`);
 			}
@@ -1243,6 +1243,72 @@ describe("format v2: unified execution catalogue, routine-read filter, verbatim 
 		expect(st.activeState).toBe("- [ ] confirm the timeout");
 		expect(st.activeStale).toContain("provider down");
 		expect(st.intents.map((i) => i.quote)).toEqual(["keep timeout at 30 seconds"]);
+	});
+
+	test("an old epoch's evidence stays pinned while that epoch's own findings name it (soft pressure in a later summary)", () => {
+		const { mkdtempSync, writeFileSync } = require("node:fs");
+		const { tmpdir } = require("node:os");
+		const { join } = require("node:path");
+		const dir = mkdtempSync(join(tmpdir(), "pz-v2-pin-"));
+		writeFileSync(join(dir, "auth.ts"), "export const timeout = 30;\n");
+		const s1 = buildEpochSummaryV2({ prefix: buildBlocks([U("u1", "check"), tcall("ra", "read", { path: "auth.ts" }), tres("ra", "read", "export const timeout = 30;\n")]), cwd: dir, durableProse: "auth.ts established timeout=30" });
+		const e2: Any[] = [U("u2", "go on")];
+		for (let k = 0; k < 8; k++) e2.push(tcall(`b${k}`, "bash", { command: `make t${k}` }), tres(`b${k}`, "bash", `ok ${k} `.repeat(20)));
+		const s2 = buildEpochSummaryV2({ prefix: buildBlocks(e2), previous: s1.text, cwd: dir, durableProse: "ran make", targetTokens: tok4(s1.text) + 60 });
+		const st = parseSummaryV2(s2.text)!;
+		expect(s2.diagnostics.budgetOmitted).toBeGreaterThan(0); // the soft target did bite
+		expect(st.epochs[0].evidence.join("\n")).toContain("read auth.ts");
+	});
+
+	test("each execution names the raw-branch request it was made under, also when the slice begins inside a request", () => {
+		const e1 = [U("x1", "benchmark A"), tcall("ba", "bash", { command: "bench" }), tres("ba", "bash", "317ms"), U("x2", "benchmark B"), tcall("bb", "bash", { command: "bench" }), tres("bb", "bash", "42ms")];
+		const e2 = [tcall("bc", "bash", { command: "bench --again" }), tres("bc", "bash", "40ms"), U("x3", "done?"), tcall("bd", "bash", { command: "git status" }), tres("bd", "bash", "clean")];
+		const branch = [...e1, ...e2].map((e) => e.sourceEntry);
+		const s1 = buildEpochSummaryV2({ prefix: buildBlocks(e1), branch: branch.slice(0, e1.length), durableProse: "y" });
+		const ev1 = parseSummaryV2(s1.text)!.epochs[0].evidence;
+		expect(ev1[0]).toMatch(/^- R1 · execution ba:1 · .*bench.*\n  Evidence: 317ms/);
+		expect(ev1[1]).toMatch(/^- R2 · execution bb:1 · .*bench.*\n  Evidence: 42ms/);
+		const ev2 = parseSummaryV2(buildEpochSummaryV2({ prefix: buildBlocks(e2), previous: s1.text, branch, durableProse: "z" }).text)!.epochs[1].evidence;
+		expect(ev2[0]).toMatch(/^- R2 · execution bc:1 /); // the slice begins inside R2: numbered from the branch, not from 1
+		expect(ev2[1]).toMatch(/^- R3 · execution bd:1 /);
+	});
+
+	test("a late result whose earlier record was dropped for budget still belongs to its execution (from the raw branch), never an orphan", () => {
+		const c1: Any[] = [U("v1", "build"), tcall("mk", "bash", { command: "make" })];
+		for (let k = 0; k < 6; k++) c1.push(tcall(`p${k}`, "bash", { command: `echo ${k}` }), tres(`p${k}`, "bash", `x${k} `.repeat(30)));
+		const branch: Any[] = c1.map((e) => e.sourceEntry);
+		const t1 = buildEpochSummaryV2({ prefix: buildBlocks(c1), branch, durableProse: "p", targetTokens: 10, maxSummaryTokens: 260 });
+		expect(t1.ok).toBe(true);
+		expect(t1.text).not.toContain("`make` · no result"); // the waiting record itself was dropped
+		const c2 = [tres("mk", "bash", "built\nCommand exited with code 0"), U("v2", "next")];
+		branch.push(...c2.map((e) => e.sourceEntry));
+		const t2 = buildEpochSummaryV2({ prefix: buildBlocks(c2), previous: t1.text, branch, durableProse: "q" });
+		expect(t2.text).not.toContain("association unresolved");
+		expect(t2.diagnostics.associationUnresolved).toBe(0);
+		expect(parseSummaryV2(t2.text)!.epochs[1].evidence[0]).toBe(`- R1 · result for execution mk:1 (call in an earlier epoch; its record there is not in this summary) · handle ${handleFor("r-mk")} · exit 0\n  Evidence: built`);
+	});
+
+	test("intent quotes are dropped before declaring request-budget-overflow: they repeat words History keeps verbatim", () => {
+		const q = "keep this exact constraint ".repeat(40);
+		const blocks = buildBlocks([U("w1", q)]);
+		const base = buildEpochSummaryV2({ prefix: blocks, durableProse: "x" });
+		const intent = [{ quote: q.trim(), role: "user" }];
+		const fits = buildEpochSummaryV2({ prefix: blocks, durableProse: "x", proposedIntents: intent, maxSummaryTokens: base.diagnostics.tokens.total + 5 });
+		expect(fits.ok).toBe(true);
+		expect(fits.diagnostics.intentsOmitted).toBe(1);
+		expect(fits.text).toContain(q.trimEnd());
+		expect(buildEpochSummaryV2({ prefix: blocks, durableProse: "x", proposedIntents: intent, maxSummaryTokens: tok4(q) - 10 }).reason).toBe("request-budget-overflow");
+	});
+
+	test("an epoch whose prose no bounded block covers keeps its requests and evidence (prose marked omitted)", () => {
+		const eps = [mkEpoch(1, 1, "request 1", "t", 1, "a ".repeat(400)), mkEpoch(2, 2, "request 2", "t", 1, "b ".repeat(1180))];
+		const bounded = boundEpochs(eps, 600);
+		expect(bounded.map((e) => e.id)).toEqual(["Epoch 2"]); // the prose bound dropped epoch 1 entirely
+		const v2 = eps.map((block, i) => ({ block, interval: "x", requests: [{ number: i + 1, text: `R${i + 1}` }], commitments: [], evidence: [`- R${i + 1} · execution e:${i}`], omitted: { routine: 0, budget: 0, sources: [] } }));
+		const out = regroupEpochsV2(v2 as Any, bounded);
+		expect(out.flatMap((e) => e.requests.map((r) => r.text))).toEqual(["R1", "R2"]);
+		expect(out[0].evidence).toEqual(["- R1 · execution e:0"]);
+		expect(out[0].block.durableProse).toMatch(/^\(omitted/);
 	});
 
 	test("request-budget-overflow fails closed when protected user requests exceed maxSummaryTokens", () => {
