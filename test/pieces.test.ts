@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { repairPayload } from "../src/guard.ts";
 import { cacheActivity, detectCold, isColdByTtl, lastMessageMs, observedTier, payloadRetention, resolveTtl } from "../src/cache.ts";
-import { classifyRecoverability, isReadOnlyBash } from "../src/classify.ts";
+import { classifyRecoverability, classifySummaryRead, isReadOnlyBash } from "../src/classify.ts";
 import { colorTail, fmtK, noticeText, renderNotice, splitDesc, type NoticeAction, type NoticeData } from "../src/notice.ts";
 import { clipMid, handleFor, KEY_LINE_MAX_CHARS, keyTexts, makePlaceholder, makePlaceholderFor, outcomeHint, pickKeyLines, shortArgs } from "../src/placeholder.ts";
 import { buildBlocks, toolCallIndex } from "../src/plan.ts";
@@ -360,6 +360,27 @@ describe("recall", () => {
 		const out = recallSections(resolveHandlesInBranch(session, [handleFor("e1")]).items, { grep: "error" });
 		expect(out.text).toBe(`[handle ${handleFor("e1")} \u00b7 bash npm test \u00b7 32 chars \u00b7 3 lines]\n[grep: 1 matching line(s) of 3]\n2: ERROR one: timeout 30s`);
 	});
+	test("branchOutputs pairs reused toolCallId with the latest preceding issuer and leaves duplicate IDs in one message unresolved", () => {
+		const branch = [
+			{ type: "message", id: "u1", message: { role: "user", content: "first" } },
+			call("a1", "shared", "bash", { command: "echo first" }),
+			res("r1", "shared", "bash", "first"),
+			{ type: "message", id: "u2", message: { role: "user", content: "second" } },
+			call("a2", "shared", "bash", { command: "echo second" }),
+			res("r2", "shared", "bash", "second"),
+			{ type: "message", id: "a3", message: { role: "assistant", content: [
+				{ type: "toolCall", id: "dup", name: "bash", arguments: { command: "echo a" } },
+				{ type: "toolCall", id: "dup", name: "bash", arguments: { command: "echo b" } },
+			] } },
+			res("r3", "dup", "bash", "ambiguous"),
+		];
+		const outs = branchOutputs(branch);
+		expect(outs[0]).toMatchObject({ entryId: "r1", label: "bash echo first", executionId: "a1:0" });
+		expect(outs[1]).toMatchObject({ entryId: "r2", label: "bash echo second", executionId: "a2:0" });
+		expect(outs[2].executionId).toBeUndefined();
+		expect(outs[2].ambiguous).toBe(true);
+		expect(outs[2].label).toBe("bash"); // does not guess which duplicate call produced it
+	});
 	test("grep without a handle searches every earlier output (before a compaction too), newest first, labelled; recall results are skipped", () => {
 		const outs = branchOutputs(session);
 		expect(outs.map((o) => o.label)).toEqual(["bash npm test", "read src/a.ts", `${zipRecallName} {"handle":"${handleFor("e1")}"}`]);
@@ -387,6 +408,7 @@ describe("recall", () => {
 		expect(searchOutputs(big, "error", { limit: 20_000 }).chars).toBe(20_000);
 		expect(sliceRecall(big[0].text, {}).body.length).toBe(20_000);
 	});
+		// a later page of a search sees the pool of its first page: an output that arrived in between does not shift the offsets
 	test("a later page of a search sees the pool of its first page: an output that arrived in between does not shift the offsets", async () => {
 		const { registerRecallTool, searchPoolOf } = await import("../src/recall.ts");
 		let def: any;
@@ -440,6 +462,57 @@ describe("recall", () => {
 		expect(hit.isError).toBe(false);
 		expect(seen.at(-1)[0]).toEqual([handleFor("e1")]);
 		expect(def.description).toContain("grep alone searches every earlier tool output");
+	});
+	test("requests selector, exact assistant handle recall, and role-aware grep scope work on raw branch without exposing hidden reasoning", async () => {
+		const { registerRecallTool, branchRequests } = await import("../src/recall.ts");
+		let def: any;
+		registerRecallTool({ registerTool: (t: any) => (def = t) } as any, { onRecall: () => {} });
+		const branch: any[] = [
+			{ type: "message", id: "u1", message: { role: "user", content: "First requirement: never drop active constraints" } },
+			{ type: "custom", id: "c_start", customType: "starter", data: {} },
+			{ type: "message", id: "a1", message: { role: "assistant", content: [
+				{ type: "thinking", thinking: "SECRET_HIDDEN_REASONING_TOKEN" },
+				{ type: "text", text: "Proposal 1: keep old tables\nProposal 2: group by epoch" },
+			] } },
+			{ type: "message", id: "u2", message: { role: "user", content: "chọn cách 2" } },
+			{ type: "message", id: "u3", message: { role: "user", content: [{ type: "image", data: "x", mimeType: "image/png" }] } },
+			call("a2", "tc1", "bash", { command: "bun test" }),
+			res("r1", "tc1", "bash", "test output: Proposal 2 verified"),
+		];
+		const reqs = branchRequests(branch);
+		expect(reqs.map((r) => [r.number, r.entryId, r.text])).toEqual([
+			[1, "u1", "First requirement: never drop active constraints"],
+			[2, "u2", "chọn cách 2"],
+			[3, "u3", "[non-text user content]"],
+		]);
+		const ctx = { sessionManager: { getBranch: () => branch } };
+		const byReq = await def.execute("t", { requests: "1-2" }, undefined, undefined, ctx);
+		expect(byReq.isError).toBe(false);
+		expect(byReq.content[0].text).toContain("R1 · user request");
+		expect(byReq.content[0].text).toContain("First requirement: never drop active constraints");
+		expect(byReq.content[0].text).toContain("R2 · user request");
+		expect(byReq.content[0].text).toContain("chọn cách 2");
+
+		// Invalid range or mutually exclusive combination is rejected
+		expect((await def.execute("t", { requests: "3-1" }, undefined, undefined, ctx)).isError).toBe(true);
+		expect((await def.execute("t", { requests: "1", handle: handleFor("u1") }, undefined, undefined, ctx)).isError).toBe(true);
+
+		// Exact assistant handle recall returns visible prose only, never thinking
+		const asstRecall = await def.execute("t", { handle: handleFor("a1") }, undefined, undefined, ctx);
+		expect(asstRecall.isError).toBe(false);
+		expect(asstRecall.content[0].text).toContain("Proposal 2: group by epoch");
+		expect(asstRecall.content[0].text).not.toContain("SECRET_HIDDEN_REASONING_TOKEN");
+
+		// Scope grep: default outputs vs assistant vs requests vs all
+		const gOut = await def.execute("t", { grep: "Proposal 2" }, undefined, undefined, ctx);
+		expect(gOut.content[0].text).toContain("1 matching line(s) in 1 output(s)");
+		const gAsst = await def.execute("t", { grep: "Proposal 2", scope: "assistant" }, undefined, undefined, ctx);
+		expect(gAsst.content[0].text).toContain("1 matching line(s) in 1 assistant message(s)");
+		expect(gAsst.content[0].text).toContain("assistant response · R1");
+		const gHidden = await def.execute("t", { grep: "SECRET_HIDDEN_REASONING_TOKEN", scope: "all" }, undefined, undefined, ctx);
+		expect(gHidden.content[0].text).toContain("Nothing matched");
+		const gAll = await def.execute("t", { grep: "Proposal 2|chọn cách 2", scope: "all" }, undefined, undefined, ctx);
+		expect(gAll.content[0].text).toContain("3 matching line(s) in 3 record(s)");
 	});
 	test("the recalled set keeps successful zip_recall results only", () => {
 		const call = (id: string, name: string, args: object) => ({ type: "message", id, message: { role: "assistant", content: [{ type: "toolCall", id: "t" + id, name, arguments: args }] } });
@@ -556,7 +629,7 @@ describe("classify", () => {
 		]) expect([c, isReadOnlyBash(c)]).toEqual([c, false]);
 		for (const c of ["find . -name '*.ts' -type f", "find src -maxdepth 2", "git diff --stat HEAD~1", "git log -p -3", "rg -n foo src", "file a.bin", "ls -la && cat a | head -5", "cat a 2>&1 | wc -l"]) expect([c, isReadOnlyBash(c)]).toEqual([c, true]);
 	});
-	test("read: rereadable iff the file is unchanged on disk; a changed or missing file is not", () => {
+	test("read: rereadable iff the file slice/truncation matches on disk; partial, truncated, and >2MB changed files are handled accurately", () => {
 		const dir = mkdtempSync(join(tmpdir(), "zip-"));
 		writeFileSync(join(dir, "f.txt"), "hello\nworld\n");
 		expect(classifyRecoverability("read", { path: "f.txt" }, "hello\nworld\n", dir)).toBe("rereadable");
@@ -565,6 +638,28 @@ describe("classify", () => {
 		expect(classifyRecoverability("read", { path: "nope.txt" }, "x", dir)).toBe("nonrereadable");
 		expect(classifyRecoverability("write", { path: "f.txt" }, "x", dir)).toBe("nonrereadable");
 		expect(classifyRecoverability("grep", {}, "x", dir)).toBe("rereadable");
+
+		// Partial read with offset & limit on 3000-line file
+		const lines3000 = Array.from({ length: 3000 }, (_, i) => `line ${i + 1}`).join("\n");
+		writeFileSync(join(dir, "long.txt"), lines3000);
+		const partialOut = Array.from({ length: 5 }, (_, i) => `line ${11 + i}`).join("\n") + "\n\n[2985 more lines in file. Use offset=16 to continue.]";
+		expect(classifyRecoverability("read", { path: "long.txt", offset: 11, limit: 5 }, partialOut, dir)).toBe("rereadable");
+		// Wrong offset with same prefix must be rejected
+		expect(classifyRecoverability("read", { path: "long.txt", offset: 12, limit: 5 }, partialOut, dir)).toBe("nonrereadable");
+
+		// Default 2000-line truncation notice
+		const head2000 = Array.from({ length: 2000 }, (_, i) => `line ${i + 1}`).join("\n") + "\n\n[Showing lines 1-2000 of 3000. Use offset=2001 to continue.]";
+		expect(classifyRecoverability("read", { path: "long.txt" }, head2000, dir)).toBe("rereadable");
+
+		// >2MB changed file must NOT be treated as rereadable via an existence shortcut
+		writeFileSync(join(dir, "huge.txt"), "NEW".repeat(750_000));
+		expect(classifyRecoverability("read", { path: "huge.txt" }, "OLD CONTENT", dir)).toBe("nonrereadable");
+
+		// Image or first-line-exceeds-limit notes are never treated as verified text reads
+		expect(classifyRecoverability("read", { path: "f.txt" }, "Read image file [image/png]", dir, [{ type: "text", text: "Read image file [image/png]" }, { type: "image", data: "x", mimeType: "image/png" }])).toBe("nonrereadable");
+		expect(classifySummaryRead("bash", { command: "git status" }, "On branch master", dir)).toEqual({ eligible: false, reason: "volatile-snapshot" });
+		expect(classifySummaryRead("bash", { command: "git show 0123456789abcdef0123456789abcdef01234567" }, "commit ...", dir)).toEqual({ eligible: false, reason: "volatile-snapshot" });
+		expect(classifySummaryRead("read", { path: "long.txt", offset: 11, limit: 5 }, partialOut, dir)).toEqual({ eligible: true, reason: "verified-matching-read" });
 	});
 });
 

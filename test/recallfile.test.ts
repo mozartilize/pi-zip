@@ -25,6 +25,7 @@ afterEach(() => ENV.forEach((k) => (saved[k] === undefined ? delete process.env[
 describe("recall files: paths, placeholder text, disk", () => {
 	test("any prefix names a recall file or a session's recall directory; nothing else does", () => {
 		expect(parseRecallPath(`~/.cache/pi-zip/recall/${SID}/k3f9a0x1qz.txt`)).toEqual({ handle: "k3f9a0x1qz" });
+		expect(parseRecallPath(`~/.cache/pi-zip/recall/${SID}/requests.txt`)).toEqual({ requests: true });
 		expect(parseRecallPath(`/home/someone-else/.cache/pi-zip/recall/${OTHER}/k3f9a0x1qz.txt`)).toEqual({ handle: "k3f9a0x1qz" });
 		expect(parseRecallPath(`$HOME/.cache/pi-zip/recall/${SID}`)).toEqual({});
 		expect(parseRecallPath(`/x/pi-zip/recall/${SID}/`)).toEqual({});
@@ -164,6 +165,7 @@ describe("recall files: paths, placeholder text, disk", () => {
 		expect(r1).toEqual({ command: "grep -n SKU-03903 /l/recall/s/k3f9a0x1qz.txt | head -5", handles: ["k3f9a0x1qz"], dir: false });
 		expect(rewriteCommand(`grep -rn foo /home/o/.cache/pi-zip/recall/${OTHER}/`, "/l/s")).toEqual({ command: "grep -rn foo /l/s/", handles: [], dir: true });
 		expect(rewriteCommand(`cat "$HOME/.cache/pi-zip/recall/${SID}"/*.txt`, "/l/s").command).toBe(`cat "/l/s"/*.txt`);
+		expect(rewriteCommand(`grep -n R2 ~/.cache/pi-zip/recall/${SID}/requests.txt`, "/l/s")).toEqual({ command: "grep -n R2 /l/s/requests.txt", handles: [], dir: false, requests: true });
 		expect(rewriteCommand(`sed -n 1,9p ~/.cache/pi-zip/recall/${SID}/k3f9a0x1qz.txt`, "/with space/s")).toEqual({ command: `sed -n 1,9p ~/.cache/pi-zip/recall/${SID}/k3f9a0x1qz.txt`, handles: ["k3f9a0x1qz"], dir: false }); // would need quoting: left alone
 		expect(rewriteCommand("ls -la src", "/l/s")).toEqual({ command: "ls -la src", handles: [], dir: false });
 		// the path starts after =, a comma or a brace: an assignment, an --opt=, a brace expansion keep their own text

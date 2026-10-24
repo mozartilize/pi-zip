@@ -11,7 +11,7 @@ import { candidateOf, decideEdits, checkEdits, clock, decideRun, inRunClock, req
 import { fmtK, Stats, noticeDesc, noticeText, type NoticeAction, type NoticeData, type ZipControl } from "./notice.ts";
 import { applyPlanToMessages, buildBlocks, countUserTurns, G0, keepRecentTokensFor, piCanCompact, piContextTokens, reserveTokensFor, sizeOf, wireTokensOf, UNIT, type Block, type Cut, type FoldTarget, type PlanOpts, type PlanResult, type RunPlan, type Scale, type SysInfo } from "./plan.ts";
 import { handleFor, PH_MARK, RECALL_TOOL } from "./placeholder.ts";
-import { branchOutputs, recalledHandlesFromBranch, resolveHandlesInBranch } from "./recall.ts";
+import { branchOutputs, formatRequestsLedger, recalledHandlesFromBranch, resolveHandlesInBranch } from "./recall.ts";
 import { cleanupRecall, commandNamesRecall, fileRecallFor, materialize, parseRecallPath, recallRoot, recallRootShown, rewriteCommand, sidDir, type FileRecall } from "./recallfile.ts";
 import { buildCut } from "./summary.ts";
 import { Judge, HINT_CUSTOM, citesWork, latestProjectedUser, latestUserText, requestOpen } from "./judge.ts";
@@ -177,6 +177,7 @@ export class Zip implements ZipControl {
 	// allowed in protected turns until committed, and the newest request's model (its larger window reads a prefix the new one cannot)
 	private switchRun: { o: PlanOpts; cal: Scale; p: PlanResult } | null = null;
 	private switchPending: (NativeRun & { key: string; waitMs: number }) | null = null;
+	private overflowFailedKeys = new Set<string>();
 	private rescueIds = new Set<string>();
 	private lastReqModel: Any = null;
 	// the idle door (armDoor): its timer, the evaluation in flight, the inputs seen, and the decision the next run carries (any run)
@@ -574,6 +575,15 @@ export class Zip implements ZipControl {
 		this.ledger({ type: "recall_file", handles: found.map((it) => it.handle), missing: handles.length - found.length, chars: found.reduce((a, it) => a + it.text.length, 0) });
 		return out;
 	}
+	/** Write `requests.txt` (raw-branch-v2 request ledger) for file-based recall when `zip_recall` is hidden. */
+	private materializeRequests(ctx: Any): string | null {
+		const sid = this.recallSid(ctx);
+		if (!sid) return null;
+		const text = formatRequestsLedger(this.branch(ctx));
+		const out = materialize(recallRoot(), sid, [{ handle: "requests", text }]);
+		this.ledger({ type: "recall_file", requests: true, chars: text.length });
+		return out.get("requests") ?? null;
+	}
 	/** Every output this session's model no longer sees in full (folded, or summarised away): what a grep, ls or find over the directory needs. */
 	private materializeAll(ctx: Any): string | null {
 		const sid = this.recallSid(ctx);
@@ -600,7 +610,10 @@ export class Zip implements ZipControl {
 			if ((name === "read" || name === "grep" || name === "find" || name === "ls") && typeof input.path === "string") {
 				const ref = parseRecallPath(input.path);
 				if (!ref) return undefined;
-				if (ref.handle) {
+				if (ref.requests) {
+					const local = this.materializeRequests(ctx);
+					if (local) input.path = local;
+				} else if (ref.handle) {
 					const local = this.materializeHandles(ctx, [ref.handle]).get(ref.handle);
 					if (local) input.path = local;
 				} else if (name !== "read") {
@@ -612,7 +625,10 @@ export class Zip implements ZipControl {
 				if (!dir) return undefined;
 				const r = rewriteCommand(input.command, dir);
 				if (r.dir) this.materializeAll(ctx);
-				else this.materializeHandles(ctx, r.handles);
+				else {
+					if (r.requests) this.materializeRequests(ctx);
+					if (r.handles.length) this.materializeHandles(ctx, r.handles);
+				}
 				input.command = r.command;
 			}
 		} catch (err) {
@@ -971,8 +987,13 @@ export class Zip implements ZipControl {
 				const call = (model: Any) => Object.create(ctx, { model: { value: model }, signal: { value: e.signal } });
 				let w = await this.roomWait(p, call(sumModel));
 				// The larger model failed (auth, quota): the new one still writes it when the prefix fits its window.
-				if (w && !w.cut.llmOk && sumModel !== ctx.model && p.scale.c * p.prefixTokens < room) w = (await this.roomWait(p, call(ctx.model))) ?? w;
-				if (!w) return e.signal?.aborted ? { cancel: true } : this.stopSwitch(ctx, "its summary could not be written");
+				if (w && !w.cut.llmOk && w.cut.reason !== "request-budget-overflow" && sumModel !== ctx.model && p.scale.c * p.prefixTokens < room) w = (await this.roomWait(p, call(ctx.model))) ?? w;
+				const overflowed = w?.cut.reason === "request-budget-overflow" || this.overflowFailedKeys.has(`${head}:${p.firstKeptEntryId}`);
+				if (!w || overflowed) {
+					return e.signal?.aborted
+						? { cancel: true }
+						: this.stopSwitch(ctx, overflowed ? "protected user requests exceed the summary budget for the new window" : "its summary could not be written");
+				}
 				got = { p, cut: w.cut };
 				waitMs += w.ms;
 				stage = rescue?.force ? "rescue-folds" : rescue ? "rescue-cut" : "summary";
@@ -1280,6 +1301,12 @@ export class Zip implements ZipControl {
 	/** The summaries a plan of this branch may take: the ready ones, and the call in flight when it reads this branch's projection. */
 	private avail(branch: Any[]): Avail[] {
 		const out: Avail[] = readyOf(branch, this.mine).map((a) => ({ key: a.key, running: false, summaryTokens: a.cut!.summaryTokens }));
+		for (const k of this.overflowFailedKeys) {
+			if (k.startsWith(`${headOf(branch)}:`)) {
+				const fk = k.slice(headOf(branch).length + 1);
+				if (!out.some((a) => a.key === fk)) out.push({ key: fk, running: true });
+			}
+		}
 		const b = this.bg;
 		if (b && !b.aborted && b.head === headOf(branch) && !out.some((a) => a.key === b.key)) out.push({ key: b.key, running: true });
 		return out;
@@ -1315,7 +1342,7 @@ export class Zip implements ZipControl {
 			const call = running ? b : this.bg;
 			return call && !call.aborted && call.head === head && call.key === key ? waitFor(call.promise, ctx?.signal) : null;
 		})());
-		return owns() && got?.firstKeptEntryId === key ? { cut: { ...got, trigger: "valve", prepared: true }, ms: performance.now() - w0 } : null;
+		return owns() && got?.firstKeptEntryId === key && got.reason !== "request-budget-overflow" ? { cut: { ...got, trigger: "valve", prepared: true }, ms: performance.now() - w0 } : null;
 
 	}
 
@@ -1529,7 +1556,7 @@ export class Zip implements ZipControl {
 			const p = candidateOf(entries, (cutAt, foldsOnly, ready) => this.opts(ctx, true, entries, 1, false, cutAt, foldsOnly, ready), this.avail(branch), "length").r.p;
 			if (p && p.cutIdx !== null) {
 				if (this.bg && (this.bg.head !== headOf(branch) || this.bg.key !== p.firstKeptEntryId)) this.discardBg("replaced");
-				const prepared = this.ready(branch).find((a) => a.key === p.firstKeptEntryId)?.cut;
+				const prepared = readyOf(branch, this.mine).find((a) => a.key === p.firstKeptEntryId)?.cut;
 				if (!prepared && (!this.bg || this.bg.aborted)) this.startBg(p, ctx, true);
 				const bg = this.bg, t0 = performance.now();
 				let cut: Cut | null = prepared ? { ...prepared, prepared: true } : null;
@@ -1541,7 +1568,7 @@ export class Zip implements ZipControl {
 						this.inRun = false;
 					}
 				}
-				if (cut && this.active()) {
+				if (cut && cut.reason !== "request-budget-overflow" && this.active()) {
 					const waitMs = performance.now() - t0;
 					const plan = valvePlanOf(p, { ...cut, trigger: "valve", prepared: true }, true, waitMs, waitMs);
 					const out = this.commit(e, ctx, plan, { t0, blocks, userTurns, usageTotal: 0, allowLatestCut: true });
@@ -1646,7 +1673,7 @@ export class Zip implements ZipControl {
 			}
 			return false;
 		}
-		if (!room && readyOf(branch, this.mine).some((a) => a.key === key)) return false;
+		if (!room && (readyOf(branch, this.mine).some((a) => a.key === key) || this.overflowFailedKeys.has(`${head}:${key}`))) return false;
 		const controller = new AbortController();
 		const prevSum = p.blocks[0]?.kind === "summary" ? p.blocks[0].tokens : 0;
 		const estUsd = (p.scale.c * Math.max(0, p.prefixTokens - prevSum) * (Number(ctx?.model?.cost?.input) || 0)) / 1e6;
@@ -1655,6 +1682,14 @@ export class Zip implements ZipControl {
 		bg.promise = buildCut(p, ctx, controller.signal)
 			.then((c) => {
 				if (bg.aborted || !c) return null;
+				if (c.reason === "request-budget-overflow") {
+					this.overflowFailedKeys.add(`${head}:${key}`);
+					const usd = c.costUsd || estUsd;
+					this.stats.summaryUsd += usd;
+					this.record({ head, key, usd, ...(c.costUsd ? {} : { estimated: true }), lost: "request-budget-overflow", error: "request-budget-overflow" });
+					this.ledger({ type: "summary_overflow", where: room ? "room" : "background", key, reason: c.reason, ...(c.overflow ?? {}) });
+					return null;
+				}
 				this.completed(c, model, head, key, estUsd, p.scale.c * c.prefixTokens);
 				this.ledger({ type: "away_summary", key, ms: c.ms, llmOk: c.llmOk, ...(c.llmOk ? {} : { llmError: c.llmError }), costUsd: c.costUsd, ...this.usageOf(c) });
 				if (!this.inRun) this.armDoor(this.liveCtx ?? ctx, true); // finished while Pi is idle: the door asks now (a run's settle asks otherwise)
@@ -1818,7 +1853,7 @@ export class Zip implements ZipControl {
 		const byId = new Map(o.blocks.map((b) => [b.entryId, b]));
 		const live = plan.folds.filter((t) => byId.has(t.entryId));
 		const stale = plan.folds.length - live.length; // e.g. Pi auto-compaction removed them from the projection
-		const cut = plan.cut && byId.has(plan.cut.firstKeptEntryId) ? plan.cut : null;
+		const cut = plan.cut && plan.cut.reason !== "request-budget-overflow" && byId.has(plan.cut.firstKeptEntryId) ? plan.cut : null;
 		if (!live.length && !cut) {
 			this.ledger({ type: "cold_noop", turnIndex: e.turnIndex, ctx: Math.round(ctxTokens), ...(stale ? { staleTargets: stale } : {}) });
 			return undefined;

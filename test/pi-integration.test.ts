@@ -564,6 +564,34 @@ describe("model-switch checkpoints through Pi hooks", () => {
 		} finally { await r.shutdown(); }
 	});
 
+	test("format v2 request-budget-overflow: retention safety wins over model switch when verbatim protected user requests exceed the summary budget", async () => {
+		defaults();
+		process.env.PI_ZIP_SUMMARY_V2 = "1";
+		const hugeUserSetup = (sm: SessionManager) => {
+			for (let i = 1; i <= 5; i++) {
+				sm.appendMessage(user(`ACTIVE-CONSTRAINT-${i}: ` + "keep every user instruction verbatim without silent dropping ".repeat(900)));
+				sm.appendMessage({ ...asst([{ type: "text", text: "ok " + "pad ".repeat(48_000) }]), usage: undefined });
+			}
+			sm.appendMessage(user("latest short prompt"));
+		};
+		const r = await rig(hugeUserSetup);
+		try {
+			await switchTo(r, 200_000);
+			const before = r.projectionMessages();
+			const decisions: Any[] = [], ledger = r.zip.ledger.bind(r.zip);
+			r.zip.ledger = (rec: Any) => { decisions.push(rec); ledger(rec); };
+			expect(await threshold(r)).toBe(true); // cancelled, never fell through to Pi's summarizer
+			expect(r.abortsInRun.n).toBe(1);
+			expect(r.projectionMessages()).toEqual(before);
+			expect(r.sm.getBranch().some((e: Any) => e.type === "compaction")).toBe(false);
+			expect(decisions.some((d) => d.type === "summary_overflow" && d.reason === "request-budget-overflow")).toBe(true);
+			expect(decisions.find((d) => d.type === "model_switch_blocked")?.reason).toContain("protected user requests exceed the summary budget");
+		} finally {
+			delete process.env.PI_ZIP_SUMMARY_V2;
+			await r.shutdown();
+		}
+	});
+
 	test("switch after Pi's threshold check aborts before network I/O in the real agent loop", async () => {
 		defaults();
 		let agent: Agent | undefined, sends = 0;

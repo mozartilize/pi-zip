@@ -106,7 +106,7 @@ export const artifactsOf = (branch: Any[]): Artifact[] =>
 export function readyOf(branch: Any[], extra: readonly Artifact[] = []): Artifact[] {
 	const head = headOf(branch);
 	const byKey = new Map<string, Artifact>();
-	for (const a of [...artifactsOf(branch), ...extra]) if (a.cut && a.head === head) byKey.set(a.key, a);
+	for (const a of [...artifactsOf(branch), ...extra]) if (a.cut && a.cut.reason !== "request-budget-overflow" && a.head === head) byKey.set(a.key, a);
 	return [...byKey.values()];
 }
 

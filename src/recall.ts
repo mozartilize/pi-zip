@@ -108,6 +108,85 @@ export interface RecallItem {
 	turn?: number;
 }
 
+export type RecallScope = "outputs" | "requests" | "assistant" | "all";
+
+export interface BranchRequest {
+	number: number; // 1-based raw user message ordinal on the ancestor branch (raw-branch-v2; includes steer/follow-up)
+	entryId: string;
+	handle: string;
+	text: string;
+	hasNonText: boolean;
+}
+
+/** Visible assistant prose only (never hidden thinking/reasoning blocks). */
+export function assistantVisibleText(content: Any): string {
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content)) return "";
+	return content
+		.filter((b: Any) => b?.type === "text" && typeof b.text === "string")
+		.map((b: Any) => b.text)
+		.join("\n");
+}
+
+/** Every raw user message entry on the ancestor branch, oldest first, numbered 1..N under raw-branch-v2. */
+export function branchRequests(branch: Any[]): BranchRequest[] {
+	const out: BranchRequest[] = [];
+	let number = 0;
+	for (const en of branch) {
+		const msg = en?.type === "message" ? en.message : null;
+		if (msg?.role !== "user") continue;
+		number++;
+		const entryId = String(en.id ?? `user-${number}`);
+		const rawText = textOf(msg.content);
+		const hasNonText = Array.isArray(msg.content) && msg.content.some((b: Any) => b?.type && b.type !== "text");
+		const text = rawText || (hasNonText ? "[non-text user content]" : "[empty user message]");
+		out.push({ number, entryId, handle: handleFor(entryId), text, hasNonText });
+	}
+	return out;
+}
+
+/** Format the branch's raw-branch-v2 request ledger for file-based recall (`requests.txt`). */
+export function formatRequestsLedger(branch: Any[]): string {
+	return branchRequests(branch)
+		.map((r) => `[R${r.number} · handle ${r.handle} · user request]\n${r.text}`)
+		.join("\n\n");
+}
+
+/** Resolve a `requests` selector ("85" or "20-41", inclusive) against the ancestor branch. */
+export function recallRequestsInBranch(
+	branch: Any[],
+	spec: string,
+	opts: { grep?: string; range?: string; offset?: unknown; limit?: unknown } = {},
+): { text: string; ok: number; missing: number; sections: RecallSectionInfo[]; handles: string[]; entryIds: string[] } {
+	const r = parseRange(spec);
+	if (!r) {
+		return {
+			text: `(invalid requests "${spec}"; use a positive request number or inclusive range, e.g. requests="85" or requests="20-41")`,
+			ok: 0,
+			missing: 1,
+			sections: [],
+			handles: [],
+			entryIds: [],
+		};
+	}
+	const all = branchRequests(branch);
+	const byNum = new Map(all.map((x) => [x.number, x]));
+	const items: RecallItem[] = [];
+	const handles: string[] = [];
+	const entryIds: string[] = [];
+	for (let n = r.from; n <= r.to; n++) {
+		const req = byNum.get(n);
+		if (!req) {
+			items.push({ handle: `R${n}`, text: null, tool: null, label: `R${n} · user request`, turn: n });
+			continue;
+		}
+		items.push({ handle: req.handle, text: req.text, tool: null, label: `R${req.number} · user request`, turn: req.number });
+		handles.push(req.handle);
+		entryIds.push(req.entryId);
+	}
+	const res = recallSections(items, opts);
+	return { ...res, handles, entryIds };
+}
 /** "[handle h · bash npm test · 812 chars · 40 lines]": the call that produced an output, so the model can tell look-alike outputs apart. */
 const sectionHead = (it: RecallItem & { text: string }) => `[handle ${it.handle}${it.label || it.tool ? " · " + (it.label ?? it.tool) : ""} · ${it.text.length} chars · ${it.text.split("\n").length} lines]`;
 
@@ -134,20 +213,41 @@ export function recallSections(items: RecallItem[], opts: { grep?: string; range
 	return { text: parts.join("\n\n"), ok, missing, sections };
 }
 
-/** Every tool output of the session branch (which spans entries before any compaction), oldest first, with the call that produced it. */
-export function branchOutputs(branch: Any[]): Array<RecallItem & { text: string; entryId: string }> {
-	const out: Array<RecallItem & { text: string; entryId: string }> = [];
-	const calls = new Map<string, Any>();
+/**Every tool output of the session branch (which spans entries before any compaction), oldest first, with the call that produced it.
+ * Uses source-order issuer matching so reused `toolCallId`s pair with the latest preceding assistant call that issued that ID
+ * unless the same assistant message issued duplicate IDs (ambiguous -> unresolved). */
+export function branchOutputs(branch: Any[]): Array<RecallItem & { text: string; entryId: string; executionId?: string; ambiguous?: boolean }> {
+	const out: Array<RecallItem & { text: string; entryId: string; executionId?: string; ambiguous?: boolean }> = [];
+	const issued = new Map<string, { call: Any; executionId: string; ambiguous: boolean }>();
 	let turn = 0;
 	for (const en of branch) {
 		const msg = en?.type === "message" ? en.message : null;
 		if (msg?.role === "user") turn++;
-		if (msg?.role === "assistant" && Array.isArray(msg.content)) for (const c of msg.content) if (c?.type === "toolCall" && c.id) calls.set(c.id, c);
+		if (msg?.role === "assistant" && Array.isArray(msg.content)) {
+			const counts = new Map<string, number>();
+			for (const c of msg.content) if (c?.type === "toolCall" && c.id) counts.set(c.id, (counts.get(c.id) ?? 0) + 1);
+			for (let pos = 0; pos < msg.content.length; pos++) {
+				const c = msg.content[pos];
+				if (c?.type !== "toolCall" || !c.id) continue;
+				const dup = (counts.get(c.id) ?? 0) > 1;
+				issued.set(c.id, { call: c, executionId: `${en.id ?? "asst"}:${pos}`, ambiguous: dup });
+			}
+		}
 		if (msg?.role !== "toolResult" || !en.id) continue;
-		const call = calls.get(msg.toolCallId);
+		const m = msg.toolCallId ? issued.get(msg.toolCallId) : undefined;
+		const call = m && !m.ambiguous ? m.call : undefined;
 		const tool = msg.toolName ?? call?.name ?? null;
 		const args = call ? shortArgs(call.arguments) : "";
-		out.push({ entryId: en.id, handle: handleFor(en.id), text: textOf(msg.content), tool, label: tool ? `${tool}${args ? " " + args : ""}` : undefined, turn: turn || undefined });
+		out.push({
+			entryId: en.id,
+			handle: handleFor(en.id),
+			text: textOf(msg.content),
+			tool,
+			label: tool ? `${tool}${args ? " " + args : ""}` : undefined,
+			turn: turn || undefined,
+			executionId: m && !m.ambiguous ? m.executionId : undefined,
+			ambiguous: m?.ambiguous ? true : undefined,
+		});
 	}
 	return out;
 }
@@ -168,13 +268,26 @@ export function resolveHandlesInBranch(branch: Any[], handles: string[]): { item
 	let turn = 0;
 	for (const en of branch) {
 		const msg = en?.type === "message" ? en.message : null;
-		if (msg?.role !== "user") continue;
-		turn++;
-		if (!en.id) continue;
-		const k = handles.indexOf(handleFor(en.id));
-		if (k < 0 || entryIds[k] !== null) continue;
-		items[k] = { handle: handles[k], text: textOf(msg.content), tool: null, label: "user request", turn };
-		entryIds[k] = en.id;
+		if (msg?.role === "user") {
+			turn++;
+			if (en.id) {
+				const k = handles.indexOf(handleFor(en.id));
+				if (k >= 0 && entryIds[k] === null) {
+					const rawText = textOf(msg.content);
+					const hasNonText = Array.isArray(msg.content) && msg.content.some((b: Any) => b?.type && b.type !== "text");
+					items[k] = { handle: handles[k], text: rawText || (hasNonText ? "[non-text user content]" : ""), tool: null, label: "user request", turn };
+					entryIds[k] = en.id;
+				}
+			}
+			continue;
+		}
+		if (msg?.role === "assistant" && en?.id) {
+			const k = handles.indexOf(handleFor(en.id));
+			if (k >= 0 && entryIds[k] === null) {
+				items[k] = { handle: handles[k], text: assistantVisibleText(msg.content), tool: null, label: "assistant response", turn: turn || undefined };
+				entryIds[k] = en.id;
+			}
+		}
 	}
 	return { items, entryIds };
 }
@@ -186,7 +299,11 @@ export function resolveHandlesInBranch(branch: Any[], handles: string[]): { item
  * `upTo` pins the pool to its first n outputs (branch order, oldest first; new outputs only append): a later page of the same search
  * passes the pool size of its first page, so an output that arrived in between cannot shift the character offsets.
  */
-export function searchOutputs(outputs: Array<RecallItem & { text: string }>, grep: string, opts: { offset?: unknown; limit?: unknown; upTo?: number } = {}): { text: string; matched: number; hits: number; chars: number; pool: number; sections: RecallSectionInfo[] } {
+export function searchOutputs(
+	outputs: Array<RecallItem & { text: string }>,
+	grep: string,
+	opts: { offset?: unknown; limit?: unknown; upTo?: number; noun?: string; plural?: string } = {},
+): { text: string; matched: number; hits: number; chars: number; pool: number; sections: RecallSectionInfo[] } {
 	const { re, literal } = grepMatcher(grep);
 	const all = outputs.filter((o) => o.tool !== RECALL_TOOL);
 	const pool = opts.upTo !== undefined && opts.upTo >= 0 && opts.upTo < all.length ? all.slice(0, opts.upTo) : all;
@@ -213,17 +330,90 @@ export function searchOutputs(outputs: Array<RecallItem & { text: string }>, gre
 		parts.push(`${sectionHead(it)}\n${got.join("\n")}`);
 		sections.push({ handle: it.handle, label: it.label ?? it.tool ?? undefined, turn: it.turn, totalLines: lines.length, shownLines: got.length, how: "grep" });
 	}
-	const head = `[grep${literal ? " (searched as literal text: the pattern is not a safe regular expression)" : ""} over all ${pool.length} earlier tool outputs (no handle given): ${hits} matching line(s) in ${sections.length} output(s), newest output first${stopped ? "; stopped early (time or hit cap), narrow the pattern or pass a handle" : ""}]\n`;
+	const noun = opts.noun ?? "output";
+	const plural = opts.plural ?? "earlier tool outputs";
+	const head = `[grep${literal ? " (searched as literal text: the pattern is not a safe regular expression)" : ""} over all ${pool.length} ${plural} (no handle given): ${hits} matching line(s) in ${sections.length} ${noun}(s), newest ${noun} first${stopped ? "; stopped early (time or hit cap), narrow the pattern or pass a handle" : ""}]\n`;
 	if (!hits) return { text: head + "Nothing matched. Try a shorter or different pattern, or pass the handle shown in a folded block or a summary.", matched: 0, hits, chars: 0, pool: pool.length, sections };
 	const page = sliceRecall(parts.join("\n\n"), { offset: opts.offset, limit: opts.limit, pageChars: SEARCH_PAGE_CHARS, narrow: "narrow the pattern, or pass one of the handles above with grep" });
 	return { text: head + page.text, matched: sections.length, hits, chars: page.body.length, pool: pool.length, sections };
 }
 
+/** Build the ordered pool of searchable records for `scope` ("outputs" | "requests" | "assistant" | "all"), oldest first. */
+export function branchSearchPool(branch: Any[], scope: RecallScope = "outputs"): Array<RecallItem & { text: string; entryId: string }> {
+	if (scope === "outputs") return branchOutputs(branch).filter((o) => o.tool !== RECALL_TOOL);
+	const out: Array<RecallItem & { text: string; entryId: string }> = [];
+	const issued = new Map<string, { call: Any; ambiguous: boolean }>();
+	let reqNum = 0;
+	for (const en of branch) {
+		const msg = en?.type === "message" ? en.message : null;
+		if (!msg) continue;
+		if (msg.role === "user") {
+			reqNum++;
+			if ((scope === "requests" || scope === "all") && en.id) {
+				const rawText = textOf(msg.content);
+				const hasNonText = Array.isArray(msg.content) && msg.content.some((b: Any) => b?.type && b.type !== "text");
+				out.push({
+					entryId: en.id,
+					handle: handleFor(en.id),
+					text: rawText || (hasNonText ? "[non-text user content]" : ""),
+					tool: null,
+					label: `R${reqNum} · user request`,
+					turn: reqNum,
+				});
+			}
+			continue;
+		}
+		if (msg.role === "assistant") {
+			if (Array.isArray(msg.content)) {
+				const counts = new Map<string, number>();
+				for (const c of msg.content) if (c?.type === "toolCall" && c.id) counts.set(c.id, (counts.get(c.id) ?? 0) + 1);
+				for (const c of msg.content) if (c?.type === "toolCall" && c.id) issued.set(c.id, { call: c, ambiguous: (counts.get(c.id) ?? 0) > 1 });
+			}
+			if ((scope === "assistant" || scope === "all") && en.id) {
+				const vis = assistantVisibleText(msg.content);
+				if (vis) out.push({ entryId: en.id, handle: handleFor(en.id), text: vis, tool: null, label: `assistant response${reqNum ? ` · R${reqNum}` : ""}`, turn: reqNum || undefined });
+			}
+			continue;
+		}
+		if (msg.role === "toolResult" && scope === "all" && en.id) {
+			const m = msg.toolCallId ? issued.get(msg.toolCallId) : undefined;
+			const call = m && !m.ambiguous ? m.call : undefined;
+			const tool = msg.toolName ?? call?.name ?? null;
+			if (tool === RECALL_TOOL) continue;
+			const args = call ? shortArgs(call.arguments) : "";
+			out.push({
+				entryId: en.id,
+				handle: handleFor(en.id),
+				text: textOf(msg.content),
+				tool,
+				label: tool ? `${tool}${args ? " " + args : ""}` : undefined,
+				turn: reqNum || undefined,
+			});
+		}
+	}
+	return out;
+}
+
+/** Search the branch under `scope` ("outputs" default, "requests", "assistant", "all"). */
+export function searchBranch(branch: Any[], grep: string, opts: { scope?: RecallScope; offset?: unknown; limit?: unknown; upTo?: number } = {}) {
+	const scope: RecallScope = opts.scope ?? "outputs";
+	const pool = branchSearchPool(branch, scope);
+	if (scope === "outputs") return searchOutputs(pool, grep, opts);
+	const labels: Record<RecallScope, { noun: string; plural: string }> = {
+		outputs: { noun: "output", plural: "earlier tool outputs" },
+		requests: { noun: "request", plural: "user requests" },
+		assistant: { noun: "assistant message", plural: "assistant messages" },
+		all: { noun: "record", plural: "branch records (requests, assistant, outputs)" },
+	};
+	return searchOutputs(pool, grep, { ...opts, ...labels[scope] });
+}
+
 /** The pool size recorded by the newest earlier search with this same pattern (its first page), for a later page of it. */
-export function searchPoolOf(branch: Any[], grep: string): number | undefined {
+export function searchPoolOf(branch: Any[], grep: string, scope: RecallScope = "outputs"): number | undefined {
 	for (let i = branch.length - 1; i >= 0; i--) {
 		const m = branch[i]?.type === "message" ? branch[i].message : null;
-		if (m?.role === "toolResult" && m.toolName === RECALL_TOOL && m.details?.search === grep && typeof m.details.pool === "number") return m.details.pool;
+		const mScope: RecallScope = m?.details?.scope ?? "outputs";
+		if (m?.role === "toolResult" && m.toolName === RECALL_TOOL && m.details?.search === grep && mScope === scope && typeof m.details.pool === "number") return m.details.pool;
 	}
 	return undefined;
 }
@@ -286,8 +476,10 @@ export function registerRecallTool(pi: ExtensionAPI, hooks: RecallHooks) {
 			properties: {
 				handle: { type: "string", description: "A handle from a folded block's marker line or a summary" },
 				handles: { type: "array", items: { type: "string" }, description: "Optional batch: several handles at once; each is returned as its own labelled section" },
-				grep: { type: "string", description: "Optional: only lines matching this case-insensitive regular expression, with line numbers (applied to every handle). Without any handle: searches every earlier tool output of the session" },
-				range: { type: "string", description: 'Optional: only this line range, e.g. "120-240" (applied to every handle)' },
+				requests: { type: "string", description: 'Optional: recall user request(s) by 1-based branch request number or inclusive range, e.g. "85" or "20-41" (mutually exclusive with handle/handles)' },
+				scope: { type: "string", enum: ["outputs", "requests", "assistant", "all"], description: 'Optional scope for grep without a handle: "outputs" (default), "requests", "assistant", or "all"' },
+				grep: { type: "string", description: "Optional: only lines matching this case-insensitive regular expression, with line numbers (applied to every handle or request). Without any handle/requests: searches earlier records of the session" },
+				range: { type: "string", description: 'Optional: only this line range, e.g. "120-240" (applied to every handle or request)' },
 				offset: { type: "number", description: "Optional: start this many characters into the (selected) text, for the next page of a large output or a very long single line (applied to every handle)" },
 				limit: { type: "number", description: `Optional: page size in characters (default ${RECALL_PAGE_CHARS}; ${SEARCH_PAGE_CHARS} for grep without a handle; at most ${RECALL_MAX_PAGE_CHARS})` },
 			},
@@ -304,23 +496,46 @@ export function registerRecallTool(pi: ExtensionAPI, hooks: RecallHooks) {
 		async execute(_id: string, params: Any, _signal: Any, _onUpdate: Any, ctx: Any): Promise<Any> {
 			const grep = params?.grep !== undefined ? String(params.grep) : undefined;
 			const range = params?.range !== undefined ? String(params.range) : undefined;
+			const requests = params?.requests !== undefined ? String(params.requests).trim() : undefined;
+			const rawScope = params?.scope !== undefined ? String(params.scope).trim() : undefined;
 			const offset = params?.offset;
 			const limit = params?.limit;
 			const handles: string[] = [];
 			if (typeof params?.handle === "string" && params.handle.trim()) handles.push(params.handle.trim());
 			if (Array.isArray(params?.handles)) for (const h of params.handles) if (typeof h === "string" && h.trim() && !handles.includes(h.trim())) handles.push(h.trim());
-			if (!handles.length && grep !== undefined && grep.trim() !== "") {
+			if (rawScope !== undefined && rawScope !== "outputs" && rawScope !== "requests" && rawScope !== "assistant" && rawScope !== "all") {
+				return { content: [{ type: "text", text: `(invalid scope "${rawScope}"; use "outputs", "requests", "assistant", or "all")` }], details: {}, isError: true };
+			}
+			const scope: RecallScope = (rawScope as RecallScope | undefined) ?? "outputs";
+			if (requests && handles.length > 0) {
+				return { content: [{ type: "text", text: "Pass either requests or handle/handles, not both." }], details: {}, isError: true };
+			}
+			if (rawScope !== undefined && (handles.length > 0 || !!requests)) {
+				return { content: [{ type: "text", text: "scope applies only to grep without handle/handles or requests." }], details: {}, isError: true };
+			}
+			if (requests !== undefined && requests !== "") {
 				try {
 					const branch = ctx.sessionManager.getBranch() as Any[];
-					const later = (int(offset) ?? 0) > 0; // a later page: search the pool its first page saw
-					const out = searchOutputs(branchOutputs(branch), grep, { offset, limit, upTo: later ? searchPoolOf(branch, grep) : undefined });
-					hooks.onRecall([], out.chars, []); // a search marks nothing as recalled: only what the model asks for by handle is kept unfolded
-					return { content: [{ type: "text", text: out.text }], details: { handles: [], search: grep, pool: out.pool, resolved: out.matched, missing: 0, sections: out.sections }, isError: false };
+					const out = recallRequestsInBranch(branch, requests, { grep, range, offset, limit });
+					if (out.ok === 0) return { content: [{ type: "text", text: out.text }], details: { requests, resolved: 0, missing: out.missing, sections: out.sections }, isError: true };
+					hooks.onRecall(out.handles, out.text.length, out.entryIds);
+					return { content: [{ type: "text", text: out.text }], details: { requests, handles: out.handles, resolved: out.ok, missing: out.missing, sections: out.sections }, isError: false };
 				} catch (err) {
 					return { content: [{ type: "text", text: `${RECALL_TOOL} failed: ${err instanceof Error ? err.message : String(err)}` }], details: {}, isError: true };
 				}
 			}
-			if (!handles.length) return { content: [{ type: "text", text: "Pass handle (one string) or handles (array), copied exactly from a folded block's marker line or a summary; or grep alone to search every earlier tool output." }], details: {}, isError: true };
+			if (!handles.length && grep !== undefined && grep.trim() !== "") {
+				try {
+					const branch = ctx.sessionManager.getBranch() as Any[];
+					const later = (int(offset) ?? 0) > 0; // a later page: search the pool its first page saw
+					const out = searchBranch(branch, grep, { scope, offset, limit, upTo: later ? searchPoolOf(branch, grep, scope) : undefined });
+					hooks.onRecall([], out.chars, []); // a search marks nothing as recalled: only what the model asks for by handle is kept unfolded
+					return { content: [{ type: "text", text: out.text }], details: { handles: [], search: grep, scope, pool: out.pool, resolved: out.matched, missing: 0, sections: out.sections }, isError: false };
+				} catch (err) {
+					return { content: [{ type: "text", text: `${RECALL_TOOL} failed: ${err instanceof Error ? err.message : String(err)}` }], details: {}, isError: true };
+				}
+			}
+			if (!handles.length) return { content: [{ type: "text", text: "Pass handle (one string), handles (array), or requests (e.g. \"1-5\"); or grep alone to search earlier session records." }], details: {}, isError: true };
 			try {
 				const { items, entryIds } = resolveHandlesInBranch(ctx.sessionManager.getBranch() as Any[], handles);
 				const out = recallSections(items, { grep, range, offset, limit });

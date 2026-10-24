@@ -592,6 +592,9 @@ export interface Cut {
 	usage?: Any;
 	ms: number; // total production time (the narrative model call included)
 	prepared?: boolean; // written in the background (a pi-zip/summary entry): its cost was counted when it was produced
+	reason?: string; // e.g. "request-budget-overflow" when protected user requests exceed the available summary budget/room
+	overflow?: { requiredTokens: number; availableTokens: number };
+	summaryDiagnostics?: Record<string, unknown>;
 }
 
 /** What a run sends from its first request on and persists verbatim at turn_end (F8). */
@@ -690,7 +693,7 @@ export function foldCandidates(blocks: Block[], calls: Calls, o: PlanOpts): [Blo
 		const call = calls.get(b.msg.toolCallId), name = call?.name ?? b.msg.toolName;
 		if (name === RECALL_TOOL || (name === "bash" && commandNamesRecall(call?.args?.command))
 			|| (["read", "grep", "find", "ls"].includes(name) && !!parseRecallPath(call?.args?.path))) continue;
-		const rereadable = () => classifyRecoverability(name ?? "", call?.args, text, o.cwd) === "rereadable";
+		const rereadable = () => classifyRecoverability(name ?? "", call?.args, text, o.cwd, (b.raw ?? b.msg).content) === "rereadable";
 		if (o.rereadOnly && !rereadable()) continue;
 		if (b.userTurn < turns - PROTECT_USER_TURNS + 1) groups[0].push(b);
 		else if (o.rescue?.force?.has(b.entryId)) groups[2].push(b);
@@ -786,7 +789,7 @@ export function plan(entries: Any[], o: PlanOpts): { f: PlanResult; c: PlanResul
 	}
 	const classify = (b: Block): Recover => {
 		const call = calls.get(b.msg.toolCallId);
-		return classifyRecoverability(call?.name ?? b.msg.toolName ?? "", call?.args, textOf((b.raw ?? b.msg).content), o.cwd);
+		return classifyRecoverability(call?.name ?? b.msg.toolName ?? "", call?.args, textOf((b.raw ?? b.msg).content), o.cwd, (b.raw ?? b.msg).content);
 	};
 	const addFold = (b: Block, trig: string): boolean => {
 		if (tokOverride.has(b.idx) || recalled.has(handleFor(b.entryId!))) return false; // F4: never refold what the model recalled
