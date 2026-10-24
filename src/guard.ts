@@ -9,6 +9,7 @@ export interface EditSet {
 	cut: number | null; // summarise blocks[0..cut-1]; blocks[cut] becomes firstKeptEntryId
 	recover?: Map<number, string | undefined>; // block idx -> "rereadable" | "nonrereadable" (needed for folds in the previous user turn)
 	inturnAge?: number; // default settings().inturnAge: an output (any class) at least this many assistant requests old may fold in a protected turn (0 = never)
+	forced?: ReadonlySet<number>; // model-switch rescue: these outputs fold whatever their turn or age (every fold stays recallable)
 }
 
 /**
@@ -54,8 +55,9 @@ export function validateEdits(blocks: Block[], plan: EditSet, userTurns: number)
 		if (b.edited) return `fold target ${i} already edited`;
 		const rereadable = plan.recover?.get(i) === "rereadable";
 		const aged = inturnAge > 0 && b.age >= inturnAge; // old enough: allowed anywhere, any class (same rule as the planner)
-		if (b.userTurn >= userTurns && !aged) return `fold target ${i} is inside the latest user turn`;
-		if (b.userTurn === userTurns - 1 && !aged && !rereadable) return `fold target ${i} is in the previous user turn and not re-readable`;
+		const forced = plan.forced?.has(i) ?? false;
+		if (b.userTurn >= userTurns && !aged && !forced) return `fold target ${i} is inside the latest user turn`;
+		if (b.userTurn === userTurns - 1 && !aged && !rereadable && !forced) return `fold target ${i} is in the previous user turn and not re-readable`;
 		if (!b.entryId) return `fold target ${i} has no entry id`;
 		if (typeof text !== "string" || !text.trim()) return `empty placeholder for ${i}`;
 	}

@@ -353,8 +353,9 @@ describe("every limit and every number on the right scale", () => {
 	test("the compaction room is Pi's trigger on the whole context: O counts toward it", () => {
 		const model = { provider: "p", id: "m", contextWindow: 200_000 }; // room = 200000 - 16384 - 8192 = 175424
 		const view = [U("u0", "q"), AX("x0", 200_000), U("u1", "q"), AX("x1", 200_000), U("u9", "next"), A("a9"), U("uN", "now")]; // ~100K of prose no fold can touch
-		const plan = (O: number) => planContext(view, { cwd: ".", promptPending: false, model, coldCap: 40_000, law: { pr: lawPrices("explicit", false), g: 2_500, pWarm: 1 }, scale: { ...UNIT, O, c: 1 } });
-		expect(plan(0)!.atRoom).toBeUndefined();
+		const plan = (O: number) => planContext(view, { cwd: ".", promptPending: false, model, coldCap: 40_000, law: { pr: lawPrices("explicit", false), g: 500, pWarm: 1 }, scale: { ...UNIT, O, c: 1 } });
+		expect(plan(0)).toBeNull(); // O = 0 leaves the 100K view below both the 175,424 room and its 80% summary threshold
+		expect(plan(50_000)!.atRoom).toBeUndefined(); // O = 50K puts the view at 150K: summary-eligible (>= 140,339), still below the room
 		expect(plan(80_000)!.atRoom).toBe(true); // system and tools count toward Pi's trigger
 		expect(plan(80_000)!.cutIdx).not.toBeNull();
 	});

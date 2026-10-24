@@ -8,6 +8,10 @@ import { A, AX, R, U, type Any } from "./helpers.ts";
 
 const ANTH = lawPrices("explicit", false)!;
 const base: PlanOpts = { cwd: ".", promptPending: false, model: { contextWindow: 1_000_000 } };
+const savedSummaryAt = process.env.PI_ZIP_SUMMARY_AT;
+process.env.PI_ZIP_SUMMARY_AT = "0"; // this file tests economic law pricing, not the pressure threshold
+import { afterAll } from "bun:test";
+afterAll(() => { if (savedSummaryAt === undefined) delete process.env.PI_ZIP_SUMMARY_AT; else process.env.PI_ZIP_SUMMARY_AT = savedSummaryAt; });
 const law = (pWarm: number, g: number) => ({ pr: ANTH, g, pWarm });
 
 describe("the whole plan's gate prices the summary call", () => {

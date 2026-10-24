@@ -2,6 +2,7 @@
 // projection of persisted edits. test/helpers.ts' own projector is NOT used here, so Pi's behaviour decides what is right.
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { createEventBus, discoverAndLoadExtensions, ExtensionRunner, ModelRegistry, ModelRuntime, SessionManager, convertToLlm } from "@earendil-works/pi-coding-agent";
+import { Agent } from "@earendil-works/pi-agent-core";
 import { createHash } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -92,6 +93,7 @@ interface RigOpts {
 	foreign?: { at: "before" | "after"; on: (e: Any, ctx: Any) => Any };
 	input?: (e: Any, ctx: Any) => Any; // another extension's input handler, loaded after pi-zip
 	latencyMs?: number; // the summary's model call takes this long
+	onAbort?: () => void; // connect abort to the real agent loop in request-safety tests
 }
 
 async function rig(setup: (sm: SessionManager) => void = populate, opts: RigOpts = {}) {
@@ -117,10 +119,11 @@ async function rig(setup: (sm: SessionManager) => void = populate, opts: RigOpts
 		const other = await loadExtensionFromFactory((api: Any) => api.on("turn_end", opts.boundary), CWD, bus, runtime, "<other-editor>");
 		extensions = [other, ...extensions];
 	}
-	const narrativeCalls: Any[] = [];
+	const narrativeCalls: Any[] = [], narrativeModels: Any[] = [];
 	const registry: Any = {
 		complete: async (_m: Any, c: Any) => {
 			narrativeCalls.push(c);
+			narrativeModels.push(_m);
 			if (opts.latencyMs) await new Promise((res) => setTimeout(res, opts.latencyMs));
 			return { stopReason: "stop", content: [{ type: "text", text: "## Decisions\nnarrative" }], usage: { cost: { total: 0 } } };
 		},
@@ -192,7 +195,7 @@ async function rig(setup: (sm: SessionManager) => void = populate, opts: RigOpts
 	};
 	runner.bindCore(
 		{ sendMessage: noop, sendUserMessage: noop, appendEntry, setSessionName: noop, getSessionName: () => undefined, setLabel: noop, getActiveTools: () => ["read", "bash", "zip_recall"], getAllTools: () => [], getSettings: () => opts.settings ?? {}, setActiveTools: noop, refreshTools: noop, getCommands: () => [], setModel: async () => false, getThinkingLevel: () => "off", setThinkingLevel: noop } as Any,
-		{ getModel: () => model, getScopedModels: () => [], isIdle: () => opts.idle !== false && !compacting && !busy, isProjectTrusted: () => true, getSignal: () => undefined, abort: () => { if (busy) abortsInRun.n++; compacting?.abort(); }, hasPendingMessages: () => false, shutdown: noop, getContextUsage: () => undefined, compact: opts.native ? piCompact : (o: Any) => o?.onError?.(new Error("rig: no compaction")), getSystemPrompt: () => "You are a coding agent." } as Any,
+		{ getModel: () => model, getScopedModels: () => [], isIdle: () => opts.idle !== false && !compacting && !busy, isProjectTrusted: () => true, getSignal: () => undefined, abort: () => { if (busy) abortsInRun.n++; compacting?.abort(); opts.onAbort?.(); }, hasPendingMessages: () => false, shutdown: noop, getContextUsage: () => undefined, compact: opts.native ? piCompact : (o: Any) => o?.onError?.(new Error("rig: no compaction")), getSystemPrompt: () => "You are a coding agent." } as Any,
 	);
 	// Pi's TUI hands raw input to the extensions' listeners in order (TuiBase.handleTerminalInput): one may consume it or replace the data
 	const inputListeners = new Set<(data: string) => Any>();
@@ -324,7 +327,7 @@ async function rig(setup: (sm: SessionManager) => void = populate, opts: RigOpts
 	if (opts.start !== false) await prompt();
 	const shutdown = () => runner.emit({ type: "session_shutdown" } as Any);
 	const setModel = (m: Any) => { model = m; };
-	return { sm, runner, request, turnEnd, settle, prompt, steer, drive, order, setModel, narrativeCalls, projectionMessages, compactions, compactCalls, foreignCalls, abortsInRun, inputListeners, typeKey, editor, shutdown, zip, checks, noticeCounts };
+	return { sm, runner, request, turnEnd, settle, prompt, steer, drive, order, setModel, narrativeCalls, narrativeModels, projectionMessages, compactions, compactCalls, foreignCalls, abortsInRun, inputListeners, typeKey, editor, shutdown, zip, checks, noticeCounts };
 }
 
 // These checks observe Pi's actual request messages and emitted transcript entries, independently of plan flags.
@@ -337,7 +340,7 @@ const assertIntegrationChecks = () => {
 	}
 };
 const saved: Record<string, string | undefined> = {};
-const ENV = { PI_ZIP_COLD_CAP: "3000", PI_ZIP_TTL_SECS: "300", PI_ZIP_IDLE_DOOR: "" }; // the shipped default: the idle door on
+const ENV = { PI_ZIP_COLD_CAP: "3000", PI_ZIP_TTL_SECS: "300", PI_ZIP_IDLE_DOOR: "", PI_ZIP_SUMMARY_AT: "0" }; // lifecycle fixtures exercise cuts directly; pressure threshold has dedicated tests
 beforeEach(() => { for (const [k, v] of Object.entries(ENV)) { saved[k] = process.env[k]; process.env[k] = v; } });
 afterEach(() => {
 	try { assertIntegrationChecks(); }
@@ -345,6 +348,245 @@ afterEach(() => {
 		integrationChecks.length = 0;
 		for (const k of Object.keys(ENV)) { if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k]; }
 	}
+});
+
+describe("model-switch checkpoints through Pi hooks", () => {
+	const setup = (sm: SessionManager) => {
+		for (let i = 1; i <= 4; i++) {
+			sm.appendMessage(user(`switch turn ${i}`));
+			if (i < 3) sm.appendMessage({ ...asst([{ type: "text", text: "prefix ".repeat(57_000) }]), usage: undefined });
+			else if (i === 3) sm.appendMessage({ ...asst([{ type: "text", text: "keep this exact suffix" }]), usage: undefined });
+		}
+	};
+	const defaults = () => { delete process.env.PI_ZIP_SUMMARY_AT; process.env.PI_ZIP_COLD_CAP = "40000"; };
+	const switchTo = async (r: Awaited<ReturnType<typeof rig>>, contextWindow: number) => {
+		const model = { ...MODEL, id: `small-${contextWindow}`, contextWindow };
+		r.setModel(model);
+		await r.runner.emit({ type: "model_select", model, previousModel: MODEL, source: "set" });
+		return model;
+	};
+	// Run Pi's real pre-next-request threshold check. Only its summarizer/storage shell is replaced by the rig's real runner and manager.
+	const threshold = async (r: Awaited<ReturnType<typeof rig>>) => {
+		let cancelled = false;
+		const host: Any = {
+			model: r.runner.createContext().model, sessionManager: r.sm,
+			settingsManager: { getCompactionSettings: () => ({ enabled: true, reserveTokens: 16_384 }) },
+			_exceedsCompactionThreshold: (AgentSession.prototype as Any)._exceedsCompactionThreshold,
+			_runAutoCompaction: async () => {
+				const result: Any = await r.runner.emit({ type: "session_before_compact", reason: "threshold", willRetry: false,
+					preparation: prepareCompaction(r.sm.getBranch() as Any, { enabled: true, reserveTokens: 16_384, keepRecentTokens: 20_000 }),
+					branchEntries: r.sm.getBranch(), signal: new AbortController().signal } as Any);
+				if (result?.cancel) { cancelled = true; return; }
+				expect(result?.compaction, "must not fall through to Pi's summarizer").toBeDefined();
+				const c = result.compaction;
+				const id = r.sm.appendCompaction(c.summary, c.firstKeptEntryId, c.tokensBefore, c.details, true, c.usage);
+				await r.runner.emit({ type: "session_compact", compactionEntry: r.sm.getEntry(id), fromExtension: true, reason: "threshold", willRetry: false } as Any);
+			},
+		};
+		await (AgentSession.prototype as Any)._compactBeforeNextAssistantResponse.call(host, { messages: r.projectionMessages() });
+		return cancelled;
+	};
+
+	test("reopened history -> 272K before the first request: pi-zip supplies the threshold summary", async () => {
+		defaults();
+		const sm = SessionManager.inMemory(CWD);
+		setup(sm);
+		sm.appendMessage({ ...asst([{ type: "text", text: "suffix ".repeat(48_000) }]), usage: undefined });
+		sm.appendMessage(user("latest unsummarised request"));
+		// Selection and failed responses are not evidence that the smaller model read this history.
+		sm.appendModelChange(MODEL.provider, "small-272000");
+		sm.appendMessage({ ...asst([], "error"), model: "small-272000", usage: undefined });
+		const r = await rig(setup, { file: [sm.getHeader(), ...sm.getEntries()], start: false });
+		try {
+			await switchTo(r, 272_000);
+			// Pi checks the threshold before agent_start restores prevKey.
+			expect(r.zip.lastModelKey).toBe(""); // no context hook/request has run in this process
+			expect(r.zip.prevKey).toBe("");
+			expect(await threshold(r)).toBe(false);
+			const c = r.sm.getBranch().find((e: Any) => e.type === "compaction");
+			expect(c?.details).toMatchObject({ by: "pi-zip", door: "model-switch" });
+			expect(r.narrativeCalls.length).toBe(1);
+			await r.prompt();
+			expect((await r.request()).some((m: Any) => m.role === "compactionSummary" && m.summary === c.summary)).toBe(true);
+			expect(r.abortsInRun.n).toBe(0);
+		} finally { await r.shutdown(); }
+	});
+
+	test("reopened history already read by the selected model is not a model switch", async () => {
+		defaults();
+		const model = { ...MODEL, id: "small-272000", contextWindow: 272_000 };
+		const r = await rig((sm) => {
+			setup(sm);
+			sm.appendMessage({ ...asst([{ type: "text", text: "already read on this model" }]), model: model.id });
+		}, { model, start: false });
+		try {
+			expect(r.zip.switchedModel(r.runner.createContext())).toBe(false);
+			const out = await r.runner.emit({ type: "session_before_compact", reason: "threshold", signal: new AbortController().signal } as Any);
+			expect(out?.compaction).toBeUndefined();
+			expect(r.narrativeCalls.length).toBe(0);
+		} finally { await r.shutdown(); }
+	});
+
+	for (const window of [200_000, 272_000]) test(`1M -> ${window}: real background artifact replaces only its prefix before the next request`, async () => {
+		defaults();
+		const r = await rig(setup);
+		try {
+			await r.request();
+			await r.zip.bg?.promise;
+			expect(r.narrativeCalls.length).toBe(1);
+			const cut = r.zip.mine.find((a: Any) => a.cut)?.cut;
+			expect(cut).toBeDefined();
+			expect(r.sm.getBranch().some((e) => e.type === "compaction")).toBe(false);
+			r.sm.appendMessage({ ...asst([{ type: "text", text: "suffix ".repeat(48_000) }]), usage: undefined });
+			r.sm.appendMessage(user("latest unsummarised request"));
+			const entries = r.sm.buildSessionProjection().entries;
+			const suffix = entries.slice(entries.findIndex((e: Any) => e.sourceEntry?.id === cut.firstKeptEntryId)).flatMap((e: Any) => e.messages);
+			await switchTo(r, window);
+			const decisions: Any[] = [], ledger = r.zip.ledger.bind(r.zip);
+			r.zip.ledger = (rec: Any) => { decisions.push(rec); ledger(rec); };
+			expect(await threshold(r), JSON.stringify(decisions)).toBe(false);
+			const sent = await r.request();
+			expect(sent.some((m: Any) => m.role === "compactionSummary" && m.summary === cut.text)).toBe(true);
+			expect(sent.slice(-suffix.length)).toEqual(suffix);
+			expect(r.narrativeCalls.length).toBe(1); // no synchronous resummary of the suffix
+			expect(r.abortsInRun.n).toBe(0);
+			expect(r.zip.stats.summaries).toBe(1);
+		} finally { await r.shutdown(); }
+	});
+
+	test("an oversized kept turn is summarised up to the current request, its narrative read by the larger previous model", async () => {
+		defaults();
+		const r = await rig(setup);
+		try {
+			await r.request(); await r.zip.bg?.promise;
+			expect(r.narrativeCalls.length).toBe(1);
+			// ~210K tokens in the previous user turn: no cut outside the two protected turns can fit 200K
+			r.sm.appendMessage({ ...asst([{ type: "text", text: "suffix ".repeat(120_000) }]), usage: undefined });
+			const latest = r.sm.appendMessage(user("latest"));
+			await switchTo(r, 200_000);
+			expect(await threshold(r)).toBe(false);
+			expect(r.abortsInRun.n).toBe(0);
+			expect(r.narrativeCalls.length).toBe(2); // written at the switch
+			expect(r.narrativeModels[1].id).toBe("m"); // the 1M model read the ~410K prefix the 200K model cannot
+			expect(JSON.stringify(r.narrativeCalls[1])).toContain("suffix suffix");
+			const comp = r.sm.getBranch().filter((e: Any) => e.type === "compaction");
+			expect(comp.length).toBe(1);
+			expect(comp[0].firstKeptEntryId).toBe(latest); // the current request itself is kept verbatim
+			const sent = await r.request();
+			expect(sent.at(-1)).toMatchObject({ role: "user", content: "latest" });
+			expect(sent.some((m: Any) => m.role === "compactionSummary")).toBe(true);
+			expect(r.abortsInRun.n).toBe(0);
+			expect(r.zip.stats.summaries).toBe(1);
+		} finally { await r.shutdown(); }
+	});
+
+	test("a running summary is waited for, then compacts its prefix without a second call", async () => {
+		defaults();
+		const r = await rig(setup, { latencyMs: 100 });
+		try {
+			await r.request();
+			expect(r.zip.bg).not.toBeNull();
+			const key = r.zip.bg.key;
+			await switchTo(r, 200_000);
+			expect(await threshold(r)).toBe(false);
+			expect(r.abortsInRun.n).toBe(0);
+			expect(r.narrativeCalls.length).toBe(1);
+			expect(r.sm.getBranch().find((e: Any) => e.type === "compaction")?.firstKeptEntryId).toBe(key);
+		} finally { await r.shutdown(); }
+	});
+
+	test("folds alone fit: Pi's compaction is cancelled without abort and the next request carries the folds", async () => {
+		defaults();
+		const tools = (sm: SessionManager) => {
+			for (let i = 1; i <= 6; i++) {
+				sm.appendMessage(user(`tool turn ${i}`));
+				sm.appendMessage({ ...asst([{ type: "text", text: "reading" }, call(`t${i}`, `cat big-${i}.log`)], "toolUse"), usage: undefined });
+				sm.appendMessage(result(`t${i}`, `big ${i}\n` + bulk(`log${i}`, 3_200)));
+				sm.appendMessage({ ...asst([{ type: "text", text: `read ${i}` }]), usage: undefined });
+			}
+			sm.appendMessage(user("now"));
+		};
+		const r = await rig(tools);
+		try {
+			await r.request();
+			await switchTo(r, 200_000);
+			const room = 200_000 - 16_384 - 8_192;
+			expect(await threshold(r)).toBe(true); // true only when Pi's own threshold check fired and pi-zip cancelled it
+			expect(r.abortsInRun.n).toBe(0);
+			expect(r.sm.getBranch().some((e: Any) => e.type === "compaction")).toBe(false);
+			const sent = await r.request();
+			expect(sent.filter(isFolded).length).toBeGreaterThan(0);
+			expect(sent.filter((m: Any) => m.role !== "system").reduce((n: number, m: Any) => n + wireTokensOf(m), 0)).toBeLessThan(room);
+			expect(r.abortsInRun.n).toBe(0);
+			expect(r.narrativeCalls.length).toBe(0);
+		} finally { await r.shutdown(); }
+	});
+
+	test("current turn too big: fold only as many of its outputs as the window needs, and persist them at turn_end", async () => {
+		defaults();
+		const r = await rig(setup);
+		try {
+			await r.request(); await r.zip.bg?.promise;
+			const latest = r.sm.appendMessage(user("latest"));
+			r.sm.appendMessage({ ...asst([{ type: "text", text: "reading both" }, call("huge", "cat huge.log"), call("big", "cat big.log")], "toolUse"), usage: undefined });
+			const huge = r.sm.appendMessage(result("huge", "huge\n" + bulk("huge", 9_000)));
+			const big = r.sm.appendMessage(result("big", "big\n" + bulk("big", 6_500)));
+			await switchTo(r, 200_000);
+			const decisions: Any[] = [], ledger = r.zip.ledger.bind(r.zip);
+			r.zip.ledger = (rec: Any) => { decisions.push(rec); ledger(rec); };
+			expect(await threshold(r), JSON.stringify(decisions.filter((d) => d.type?.startsWith("model_switch")))).toBe(false);
+			expect(decisions.find((d) => d.type === "model_switch")).toMatchObject({ stage: "rescue-folds", forced: 1 });
+			expect(r.sm.getBranch().find((e: Any) => e.type === "compaction")?.firstKeptEntryId).toBe(latest);
+			const sent = await r.request();
+			const folded = (id: string) => sent.some((m: Any) => m.role === "toolResult" && m.toolCallId === id && isFolded(m));
+			expect(folded("huge")).toBe(true); // the biggest output alone was enough
+			expect(folded("big")).toBe(false);
+			const reply = { ...asst([{ type: "text", text: "done" }]), timestamp: Date.now(), usage: undefined };
+			const drafts = await r.turnEnd(r.sm.appendMessage(reply), reply);
+			expect(decisions.some((d) => d.type === "guard_drop")).toBe(false);
+			expect(drafts.some((d: Any) => d.type === "context_edit" && d.targetId === huge)).toBe(true);
+			expect(drafts.some((d: Any) => d.type === "context_edit" && d.targetId === big)).toBe(false);
+		} finally { await r.shutdown(); }
+	});
+
+	test("the current request alone exceeds the new window: stop with the history intact and no summary call", async () => {
+		defaults();
+		const r = await rig(setup);
+		try {
+			await r.request(); await r.zip.bg?.promise;
+			r.sm.appendMessage(user("paste ".repeat(130_000)));
+			await switchTo(r, 200_000);
+			const before = r.projectionMessages();
+			expect(await threshold(r)).toBe(true);
+			expect(r.abortsInRun.n).toBe(1);
+			expect(r.projectionMessages()).toEqual(before);
+			expect(r.narrativeCalls.length).toBe(1);
+		} finally { await r.shutdown(); }
+	});
+
+	test("switch after Pi's threshold check aborts before network I/O in the real agent loop", async () => {
+		defaults();
+		let agent: Agent | undefined, sends = 0;
+		const r = await rig(setup, { onAbort: () => agent?.abort() });
+		try {
+			await r.request(); await r.zip.bg?.promise;
+			r.sm.appendMessage({ ...asst([{ type: "text", text: "suffix ".repeat(75_000) }]), usage: undefined });
+			r.sm.appendMessage(user("latest"));
+			const model = await switchTo(r, 200_000);
+			agent = new Agent({ initialState: { model, messages: r.projectionMessages() },
+				transformContext: (messages) => r.runner.emitContext(messages),
+				streamFn: (_model, _context, options) => {
+					// Pi still invokes the transport with an aborted signal; providers must honor it before network I/O.
+					options?.signal?.throwIfAborted();
+					sends++;
+					throw new Error("unsafe provider call");
+				} });
+			await agent.continue();
+			expect(sends).toBe(0);
+			expect(r.abortsInRun.n).toBe(1);
+			expect(r.zip.lastModelKey).toBe("p/m"); // an aborted preflight is not a request to the smaller model
+		} finally { await r.shutdown(); }
+	});
 });
 
 const isFolded = (m: Any) => m.role === "toolResult" && JSON.stringify(m.content).includes("[folded by pi-zip");
@@ -725,6 +967,8 @@ describe("mixed room boundary", () => {
 		const r = await rig((sm) => {
 			populate(sm, 5000);
 			for (const entry of sm.getBranch() as Any[]) if (entry.message?.role === "assistant") delete entry.message.usage;
+			// This exercises carried folds, not a downsize: the recorded requests used this same model.
+			for (const entry of sm.getBranch() as Any[]) if (entry.message?.role === "assistant") entry.message.provider = "room";
 		}, { tui: true, model: { ...MODEL, provider: "room", contextWindow: 100_000 }, latencyMs: 20 });
 		sendPrompt(r.sm, "next request");
 		const request = await r.request();
@@ -787,6 +1031,7 @@ describe("mixed room boundary", () => {
 		const r = await rig((sm) => {
 			populate(sm, 5000);
 			for (const entry of sm.getBranch() as Any[]) if (entry.message?.role === "assistant") delete entry.message.usage;
+			for (const entry of sm.getBranch() as Any[]) if (entry.message?.role === "assistant") entry.message.provider = "room-abort";
 		}, { tui: true, model: { ...MODEL, provider: "room-abort", contextWindow: 100_000 }, latencyMs: 20 });
 		sendPrompt(r.sm, "next request");
 		expect((await r.request()).some(isFolded)).toBe(true);
@@ -936,6 +1181,36 @@ for (const order of ORDERS) describe(`real Pi: a summary prepared while the user
 			const r = await rig(undefined, { file: template(agoMs), tui: true, native: false, idle: false, start: false });
 			await sleep(300);
 			expect([agoMs, r.narrativeCalls.length]).toEqual([agoMs, 0]); // old code: 1 within ms of session_start (delay max(0, last + 0.8 TTL - now) = 0)
+		}
+	});
+
+	test("in real Pi, a cold return above 40K but below 80% of the compaction room folds without starting a summary and logs summaryGate", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "pz-pressure-gate-")), ledger = join(dir, "ledger.jsonl");
+		const prevLedger = process.env.PI_ZIP_LEDGER, prevAt = process.env.PI_ZIP_SUMMARY_AT, prevCap = process.env.PI_ZIP_COLD_CAP;
+		process.env.PI_ZIP_LEDGER = ledger;
+		delete process.env.PI_ZIP_SUMMARY_AT;
+		process.env.PI_ZIP_COLD_CAP = "40000";
+		try {
+			// template(240 min) is ~90K calibrated real tokens; on a 200K window room is 175,424 and pressure starts at ~140,339.
+			const r = await rig(undefined, { file: template(240 * 60_000), tui: true, native: true, idle: true, start: false, model: { ...MODEL, contextWindow: 200_000 } });
+			await r.prompt("next request");
+			sendPrompt(r.sm, "next request");
+			const req = await r.request();
+			await sleep(50);
+			expect(req.some(isFolded)).toBe(true);
+			expect(req.some((m: Any) => m.role === "compactionSummary")).toBe(false);
+			expect(r.narrativeCalls).toHaveLength(0);
+			const rows = readFileSync(ledger, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+			const law = rows.find((x) => x.type === "law" && x.where === "run");
+			expect(law?.summaryGate).toMatchObject({ eligible: false, reason: "below-pressure", room: 175_424, threshold: 140_339 });
+			expect(law.summaryGate.afterFolds).toBeGreaterThan(law.summaryGate.target);
+			expect(law.summaryGate.afterFolds).toBeLessThan(law.summaryGate.threshold);
+			await r.shutdown();
+		} finally {
+			if (prevLedger === undefined) delete process.env.PI_ZIP_LEDGER; else process.env.PI_ZIP_LEDGER = prevLedger;
+			if (prevAt === undefined) delete process.env.PI_ZIP_SUMMARY_AT; else process.env.PI_ZIP_SUMMARY_AT = prevAt;
+			if (prevCap === undefined) delete process.env.PI_ZIP_COLD_CAP; else process.env.PI_ZIP_COLD_CAP = prevCap;
+			rmSync(dir, { recursive: true, force: true });
 		}
 	});
 

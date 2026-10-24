@@ -186,6 +186,29 @@ describe("through the extension: the free signal is learned, persisted and used;
 		expect(law.steps.at(-1).K).toBeLessThan(0);
 		expect(Object.keys(law.steps.at(-1))).toEqual(["at", "ok", "B", "A", "T", "Tsuf", "phi", "K", "eta"]);
 		expect(law.steps.at(-1).T).toBe(law.steps.at(-1).A);
+		expect(law.summaryGate).toMatchObject({ reason: "below-target", eligible: false });
+	});
+
+	test("when folds are absent and context is above coldCap but below pressure, lawLedger still records summaryGate for tuning", async () => {
+		process.env.PI_ZIP_COLD_CAP = "30000";
+		const entries = [U("u1", "one"), AX("x1", 90_000), U("u2", "two"), AX("x2", 90_000), U("u3", "three"), A("a3"), U("u4", "now")];
+		const zip = new Zip(fakePi().pi as Any);
+		const model = { provider: "p", id: "m", contextWindow: 200_000 };
+		const { ctx } = fakeCtx(entries, { model, branch: [{ type: "message", message: { role: "assistant", provider: "p", model: "m", stopReason: "stop", timestamp: Date.now() - 400_000, content: [] } }] });
+		zip.sessionStart(ctx);
+		await startZip(zip, ctx);
+		expect(await zip.context({ messages: flat(entries) }, ctx)).toBeUndefined();
+		const rows = readFileSync(process.env.PI_ZIP_LEDGER!, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+		expect(rows.find((r) => r.type === "cold_plan")).toBeUndefined();
+		const law = rows.find((r) => r.type === "law");
+		expect(law).toMatchObject({
+			where: "run",
+			pWarm: 0,
+			summaryGate: { eligible: false, reason: "below-pressure", room: 175_424, threshold: 140_339 },
+		});
+		expect(law.steps.every((s: Any) => s.at !== "summary")).toBe(true);
+		expect(law.summaryGate.afterFolds).toBeGreaterThan(law.summaryGate.target);
+		expect(law.summaryGate.afterFolds).toBeLessThan(law.summaryGate.threshold);
 	});
 });
 
