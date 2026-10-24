@@ -49,43 +49,48 @@ export function fileRecallHow(f: FileRecall): string {
 
 const SID = "[0-9A-Za-z][0-9A-Za-z_-]{0,79}";
 const SID_RE = new RegExp(`^${SID}$`);
-/** What materialize writes in a session directory: <handle>.txt, and <handle>.txt.<pid>.tmp while writing. Cleanup deletes nothing else. */
-const COPY_RE = /^[0-9a-z]{10}\.txt(\.\d+\.tmp)?$/;
-const FILE_RE = new RegExp(`(?:^|/)pi-zip/recall/${SID}/([0-9a-z]{10})\\.txt$`);
+/** What materialize writes in a session directory: <handle>.txt or requests.txt, and .<pid>.tmp while writing. Cleanup deletes nothing else. */
+const COPY_RE = /^(?:[0-9a-z]{10}|requests)\.txt(\.\d+\.tmp)?$/;
+const FILE_RE = new RegExp(`(?:^|/)pi-zip/recall/${SID}/([0-9a-z]{10}|requests)\\.txt$`);
 const DIR_RE = new RegExp(`(?:^|/)pi-zip/recall/${SID}/?$`);
 
 /** A path that names a recall file ({ handle }) or a session's recall directory ({}); null for anything else. */
-export function parseRecallPath(p: unknown): { handle?: string } | null {
+export function parseRecallPath(p: unknown): { handle?: string; requests?: boolean } | null {
 	if (typeof p !== "string") return null;
 	const f = FILE_RE.exec(p);
-	if (f) return { handle: f[1] };
+	if (f) return f[1] === "requests" ? { requests: true } : { handle: f[1] };
 	return DIR_RE.test(p) ? {} : null;
 }
 
 /** Recall paths in a shell command: a word that runs into pi-zip/recall/<session>, with /<handle>.txt or not (the directory, a glob in it).
  *  The path starts after any quote, operator, `=` (`X=<path>`, `--file=<path>`), `,`, `{` or `}` (brace expansion); `${HOME}` and the
  *  like are part of it. */
-const CMD_RE = new RegExp(`(?:\\$\\{[A-Za-z_][A-Za-z0-9_]*\\}|[^\\s'"\`<>|;&(){},=])*pi-zip/recall/${SID}(/[0-9a-z]{10}\\.txt\\b)?`, "g");
+const CMD_RE = new RegExp(`(?:\\$\\{[A-Za-z_][A-Za-z0-9_]*\\}|[^\\s'"\`<>|;&(){},=])*pi-zip/recall/${SID}(/(?:[0-9a-z]{10}|requests)\\.txt\\b)?`, "g");
 /** CMD_RE needs this literal, and the unanchored regex costs ~40 us per command (it retries every start in a word). Checking the
  *  literal first gives the same answers and keeps a scan of a long branch's commands, at every turn_end, in milliseconds. */
 const CMD_LIT = "pi-zip/recall/";
 export const commandNamesRecall = (cmd: unknown): boolean => typeof cmd === "string" && cmd.includes(CMD_LIT) && new RegExp(CMD_RE.source).test(cmd);
 /** The handles of the recall files a shell command names. */
-export const commandRecallHandles = (cmd: unknown): string[] => (typeof cmd === "string" && cmd.includes(CMD_LIT) ? [...cmd.matchAll(CMD_RE)].filter((m) => m[1]).map((m) => m[1].slice(1, 11)) : []);
+export const commandRecallHandles = (cmd: unknown): string[] =>
+	typeof cmd === "string" && cmd.includes(CMD_LIT)
+		? [...cmd.matchAll(CMD_RE)].filter((m) => m[1] && m[1] !== "/requests.txt").map((m) => m[1].slice(1, 11))
+		: [];
 
 /** The command with every recall path pointed at `localDir`, the handles it names, and whether it names the directory itself.
  *  A local directory that would need shell quoting is not written in (the shell then reads ~/.cache, where the copies are when
  *  XDG_CACHE_HOME is unset). */
-export function rewriteCommand(cmd: string, localDir: string): { command: string; handles: string[]; dir: boolean } {
+export function rewriteCommand(cmd: string, localDir: string): { command: string; handles: string[]; dir: boolean; requests?: boolean } {
 	const handles: string[] = [];
 	let dir = false;
+	let requests = false;
 	const safe = /^[\w@%+=:,./-]+$/.test(localDir);
 	const command = cmd.replace(CMD_RE, (m: string, file?: string) => {
-		if (file) handles.push(file.slice(1, 11));
+		if (file === "/requests.txt") requests = true;
+		else if (file) handles.push(file.slice(1, 11));
 		else dir = true;
 		return safe ? `${localDir}${file ?? ""}` : m;
 	});
-	return { command, handles, dir };
+	return requests ? { command, handles, dir, requests } : { command, handles, dir };
 }
 
 /** A copy on disk is the original only when it is a plain file holding exactly its bytes: a bash command may append to it or edit it
@@ -104,7 +109,7 @@ export function materialize(root: string, sid: string, items: { handle: string; 
 	} catch {}
 	const out = new Map<string, string>();
 	for (const it of items) {
-		if (!/^[0-9a-z]{10}$/.test(it.handle)) continue;
+		if (!/^(?:[0-9a-z]{10}|requests)$/.test(it.handle)) continue;
 		const file = join(dir, `${it.handle}.txt`);
 		const bytes = Buffer.from(it.text, "utf8");
 		if (!intact(file, bytes)) {

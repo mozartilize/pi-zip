@@ -277,10 +277,12 @@ export interface RecallSectionInfo {
 
 /** "ƶ unzip src/learn.ts:1-2000  /HALF_LIFE/": the same shape as Pi's own tool rows (bold name, accent argument) after the monogram;
  *  the argument says WHAT comes back (the folded output's label), not its handle. `labelOf` maps a handle to that label when known. */
-export function recallCallLine(args: { handle?: string; handles?: string[]; grep?: string; range?: string; offset?: number }, width: number, th: Th, m: Measure = plainMeasure, labelOf: (h: string) => string | undefined = () => undefined): string[] {
+export function recallCallLine(args: { handle?: string; handles?: string[]; requests?: string; scope?: string; grep?: string; range?: string; offset?: number }, width: number, th: Th, m: Measure = plainMeasure, labelOf: (h: string) => string | undefined = () => undefined): string[] {
 	const hs = [...(typeof args?.handle === "string" ? [args.handle] : []), ...(Array.isArray(args?.handles) ? args.handles.filter((h) => typeof h === "string") : [])];
 	const label = (h: string) => (labelOf(h.trim()) ?? h).replace(/^read /, ""); // "read src/a.ts" reads as "unzip src/a.ts"
-	const what = hs.length > 1 ? `${hs.length} outputs` : hs[0] ? label(hs[0]) : args?.grep ? "all outputs" : ""; // grep without a handle searches every output
+	const reqSpec = typeof args?.requests === "string" ? args.requests.trim() : "";
+	const scopeLabel = args?.scope === "requests" ? "requests" : args?.scope === "assistant" ? "assistant" : args?.scope === "all" ? "all records" : "all outputs";
+	const what = reqSpec ? `requests ${reqSpec}` : hs.length > 1 ? `${hs.length} outputs` : hs[0] ? label(hs[0]) : args?.grep ? scopeLabel : ""; // grep without a handle searches every output
 	const opt = [args?.grep ? `/${args.grep}/` : "", args?.range ? `lines ${args.range}` : "", args?.offset ? `from char ${args.offset}` : ""].filter(Boolean).join(" · ");
 	const head = `${SYM} unzip`;
 	const plain = m.cut(`${head} ${what}${opt ? "  " + opt : ""}`, width);
