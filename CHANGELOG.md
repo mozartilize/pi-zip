@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+- Format v2 request text no longer grows: a shortened row is only used when it is actually shorter than the text it
+  replaces (the omission marker is ~85 characters, so requests up to a few hundred characters stay verbatim instead of
+  becoming longer "excerpts"), and its `original` length is measured before resident-view compression.
+- Format v2 gains E2: when even minimal excerpts do not fit the hard room, whole old epochs' requests become one
+  archived-range row each (`R1–R15 archived, not resident`), oldest epochs first, never the newest epoch that holds
+  requests. Archived rows keep their raw-branch identity, so `zip_recall({ requests: "1-15" })` reads them now and the
+  next summary restores them verbatim. The terminal failure keeps the existing `request-budget-overflow` reason, and its
+  diagnostics now report a per-section token breakdown instead of charging the whole document to request text.
+- The narrative call reads a Pi `<skill>` expansion in full again, so constraints a skill carries can reach the durable
+  prose and the state; summary request rows keep the `/skill:name` short form and remain recallable.
+
 ## 0.4.15
 
 - No behavior change. Removed local machine paths, a session name and private provider names from comments, docs and

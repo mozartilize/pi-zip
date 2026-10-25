@@ -33,10 +33,11 @@ const ALIASES_PREFIX = "Command directory aliases: ";
 const LEGACY_ID = "Earlier history — epoch attribution unavailable";
 const EPOCH_HEAD_RE = /^### (?:Epochs? (\d+)(?:–(\d+))?|Earlier history — epoch attribution unavailable) · source interval (\S+) · ([^·]+?) · (.+)$/;
 const TIER_RE = /^consolidated, tier (\d+)$/;
+const OMITTED_REQ_RE = /(?:whole request: handle |\[… middle of this request omitted \(handle )([0-9a-z]{10})/;
+const ARCHIVED_RE = /^- R(\d+)(?:(?:–|-)?R(\d+))? archived, not resident \((\d+) requests?\);/;
 const REQ_HEAD_RE = /^- (?:R(\d+)|legacy R(\d+)|legacy request)(?: · handle ([0-9a-z]{10}))? · ((?:verbatim|skill references|source incomplete|(?:source incomplete · )?emergency excerpt(?: · original \d+ chars)?)(?: · skill references)?)(?: · continuation of R(\d+))?$/;
 const INTENT_ROW_RE = /^- R(\d+) · source ([0-9a-z]{10})$/;
 const OMIT_RE = /^Catalogue omissions: (\d+) routine-read-filtered; (\d+) budget-omitted(?:; sources (?:… )?(.*))?$/;
-const OMITTED_REQ_RE = /(?:whole request: handle |\[… middle of this request omitted \(handle )([0-9a-z]{10})/;
 const MAX_INTENTS = 8;
 const MAX_OMIT_SOURCES = 12;
 
@@ -408,6 +409,9 @@ export interface V2Request {
 	sourceIncomplete?: boolean;
 	emergencyExcerpt?: { originalChars: number };
 	skillReferences?: boolean;
+	/** Known to exist but not resident: the request's text was archived as a whole range to fit the hard room. Identity stays
+	 *  the raw-branch number, so the next summary rebuilds it verbatim from the branch; only the resident view is lossy. */
+	archived?: boolean;
 	continuationOf?: number;
 }
 
@@ -453,8 +457,19 @@ const omissionRow = (o: V2Epoch["omitted"]) =>
 		? `Catalogue omissions: ${o.routine} routine-read-filtered; ${o.budget} budget-omitted${o.sources.length ? `; sources ${o.sources.length > MAX_OMIT_SOURCES ? "… " : ""}${o.sources.slice(-MAX_OMIT_SOURCES).join(", ")}` : ""}`
 		: "";
 
+/** One line in place of an archived run of rows: the numbers are the recall selector, the count says how many were there. */
+const archiveRow = (rows: readonly V2Request[]): string => {
+	const nums = rows.map((r) => r.number).filter((n) => n > 0).sort((x, y) => x - y);
+	const first = nums[0] ?? 0, last = nums.at(-1) ?? 0;
+	const range = first === last ? `R${first}` : `R${first}–R${last}`;
+	return `- ${range} archived, not resident (${rows.length} request${rows.length === 1 ? "" : "s"}); zip_recall({ requests: "${first}-${last}" }) returns the exact text`;
+};
+
 export function renderEpoch(e: V2Epoch): string {
-	const out = [epochHeading(e), SUB.requests, ...(e.requests.length ? e.requests.map(requestRow) : [NONE]), "", SUB.prose, safeProse(e.block.durableProse) || NONE];
+	const resident = e.requests.filter((r) => !r.archived);
+	const archived = e.requests.filter((r) => r.archived);
+	const rows = [...resident.map(requestRow), ...(archived.length ? [archiveRow(archived)] : [])];
+	const out = [epochHeading(e), SUB.requests, ...(rows.length ? rows : [NONE]), "", SUB.prose, safeProse(e.block.durableProse) || NONE];
 	if (e.commitments.length) out.push("", SUB.commitments, ...e.commitments);
 	out.push("", SUB.evidence, ...(e.evidence.length ? e.evidence : [NONE]));
 	const om = omissionRow(e.omitted);
@@ -477,8 +492,13 @@ export function renderV2(s: V2State, file?: FileRecall): string {
 	const legend = [...s.aliases].filter(([, a]) => used.has(a)).sort((x, y) => x[1].length - y[1].length || x[1].localeCompare(y[1])).map(([d, a]) => `${a}=${d}`);
 	const allRequests = s.epochs.flatMap((e) => e.requests);
 	const truncatedCount = allRequests.filter((r) => !!r.emergencyExcerpt).length;
-	const emergencyLine = truncatedCount > 0
-		? `Requests: emergency excerpts — ${truncatedCount} of ${allRequests.length} requests shortened to fit the window; recall by R<n>/handle returns exact text.`
+	const archivedCount = allRequests.filter((r) => r.archived).length;
+	const emergencyBits = [
+		truncatedCount ? `${truncatedCount} of ${allRequests.length} requests shortened to fit the window` : "",
+		archivedCount ? `${archivedCount} of ${allRequests.length} requests archived, not resident` : "",
+	].filter(Boolean);
+	const emergencyLine = emergencyBits.length
+		? `Requests: emergency excerpts — ${emergencyBits.join("; ")}; recall by R<n>/handle returns exact text.`
 		: undefined;
 	const header = [
 		SUMMARY_V2_MARK,
@@ -598,6 +618,16 @@ export function parseSummaryV2(text: string | null): V2State | null {
 			continue;
 		}
 		if (sub === "requests") {
+			const ar = ARCHIVED_RE.exec(l);
+			if (ar) {
+				flushReq();
+				const first = Number(ar[1]), last = Number(ar[2] ?? ar[1]);
+				// One placeholder per archived number: the next prepare looks each up in the raw branch, so only the number is needed
+				// here. A range too large to expand keeps its first number, so parsing cannot be forced into a huge allocation.
+				if (last - first < 512) for (let n = first; n <= last; n++) ep.requests.push({ number: n, text: "", archived: true });
+				else ep.requests.push({ number: first, text: "", archived: true });
+				continue;
+			}
 			const m = REQ_HEAD_RE.exec(l);
 			if (m) {
 				flushReq();
@@ -718,6 +748,7 @@ export function prepareEpochV2(o: PrepareV2Options): PreparedV2 {
 	const raw = branch.length ? branchRequests(branch) : [];
 	const rawById = new Map(raw.map((r) => [r.entryId, r]));
 	const rawByHandle = new Map(raw.map((r) => [r.handle, r]));
+	const rawByNumber = new Map(raw.filter((r) => r.number > 0).map((r) => [r.number, r]));
 	const sliceFirst = o.prefix.find((b) => b.entryId)?.entryId;
 	const prevV2 = parseSummaryV2(o.previous ?? null);
 	let carried: V2Epoch[] = [];
@@ -729,6 +760,11 @@ export function prepareEpochV2(o: PrepareV2Options): PreparedV2 {
 			const hit = r.handle ? rawByHandle.get(r.handle) : undefined; // an incomplete or legacy request the branch still has: verbatim again
 			if (hit && (r.sourceIncomplete || r.number === 0 || r.emergencyExcerpt || r.skillReferences)) {
 				return { ...fromRaw(hit), ...(r.continuationOf ? { continuationOf: r.continuationOf } : {}) };
+			}
+			// an archived row carries only its number: the branch restores it verbatim, so the next render decides again whether it fits
+			if (r.archived) {
+				const n = rawByNumber.get(r.number);
+				return n ? { ...fromRaw(n), ...(r.continuationOf ? { continuationOf: r.continuationOf } : {}) } : r;
 			}
 			if (r.emergencyExcerpt && !hit) {
 				return { ...r, sourceIncomplete: true };
@@ -904,8 +940,9 @@ export interface EpochSummaryV2 {
 	diagnostics: {
 		formatVersion: "v2";
 		numbering: "raw-branch-v2";
-		requestEmergencyMode: "none" | "excerpt";
+		requestEmergencyMode: "none" | "excerpt" | "archive";
 		truncatedRequestCount: number;
+		archivedRequestCount: number;
 		originalRequestChars: number;
 		residentRequestChars: number;
 		epochs: number;
@@ -949,6 +986,9 @@ export function formatRequestExcerpt(rawText: string, targetChars: number, handl
 	const headLen = Math.floor(contentChars * 2 / 3);
 	const tailLen = contentChars - headLen;
 	const text = rawText.slice(0, headLen) + "\n" + marker + "\n" + rawText.slice(-tailLen);
+	// A shortened row that is not shorter hides text for nothing: the marker costs more than the middle it replaces, and the
+	// water-filling pass can only restore it by claiming budget it never needed. Keep the original instead.
+	if (text.length >= rawText.length) return { text: rawText, truncated: false };
 	return { text, truncated: true };
 }
 
@@ -1014,6 +1054,9 @@ const PROSE_OMITTED = "(omitted to fit the summary room; this epoch's requests a
  * they and the summary's fixed structure alone exceed `hard` the result is `request-budget-overflow`.
  */
 export function renderEpochSummaryV2(prep: PreparedV2, opts: { soft: number; hard: number; file?: FileRecall }): EpochSummaryV2 {
+	// Original request sizes are measured on the prepared text, before the resident view compresses a Pi skill expansion: counting
+	// the compressed text as the original would under-report what the user actually said (and hide the compression from telemetry).
+	const originalChars = prep.state.epochs.flatMap((e) => e.requests).reduce((n, r) => n + (r.emergencyExcerpt?.originalChars || r.text.length), 0);
 	const requests = prep.state.epochs.map((e) => e.requests.map((r) => {
 		const text = r.emergencyExcerpt || r.sourceIncomplete ? r.text : skillReference(r.text);
 		return { ...r, text, ...(text !== r.text ? { skillReferences: true } : {}) };
@@ -1124,7 +1167,8 @@ export function renderEpochSummaryV2(prep: PreparedV2, opts: { soft: number; har
 				numbering: "raw-branch-v2",
 				requestEmergencyMode: truncatedRequestCount > 0 ? "excerpt" : "none",
 				truncatedRequestCount,
-				originalRequestChars: reqs.reduce((n, r) => n + (r.emergencyExcerpt?.originalChars || r.text.length), 0),
+				archivedRequestCount: 0,
+				originalRequestChars: originalChars,
 				residentRequestChars: totalChars,
 				epochs: s.epochs.length,
 				requestCount: reqs.length,
@@ -1147,178 +1191,117 @@ export function renderEpochSummaryV2(prep: PreparedV2, opts: { soft: number; har
 		};
 	}
 
-	// Internal overflow occurred: candidate could not fit under hard room after dropping unpinned/pinned evidence,
-	// commitments, intents, prose, and state. Enter emergency request compaction (E1).
-	const origRequests = requests;
-	const flatOrig = origRequests.flat();
-	const originalRequestChars = flatOrig.reduce((n, r) => n + (r.emergencyExcerpt?.originalChars || r.text.length), 0);
+	// Internal overflow: after unpinned evidence, all evidence, commitments, intents, old prose, the newest prose and the state were
+	// dropped, the fixed structure plus verbatim requests still crossed the hard room. Request compaction runs in two steps, both
+	// deterministic and both rebuilt from the prepared state (never from the mutated `s`):
+	//   E1 — every request keeps a row; text is shortened per request by water-filling, at least MIN_EXCERPT_CHARS of each.
+	//   E2 — when even those rows do not fit, whole old epochs' requests become one range row each, oldest epochs first; the newest
+	//        epoch's requests always stay resident. Identity is the raw-branch number, so every archived request comes back verbatim
+	//        from the branch at the next compaction, and `zip_recall({ requests: "a-b" })` reads it now.
+	// Evidence, commitments and old prose do not come back in either step; their omission rows stay.
 
-	// Start building emergency state emState from prep.state:
-	// - old evidence dropped, omission counts preserved/accumulated
-	// - commitments dropped
-	// - old prose omitted
-	// - minimal excerpts for all requests
-	const emEpochs: V2Epoch[] = prep.state.epochs.map((e, i) => {
-		const omBudget = e.omitted.budget + e.evidence.length;
-		const omSources = [...e.omitted.sources, ...e.evidence.flatMap(recordHandles)];
-		const minReqs: V2Request[] = origRequests[i].map((r) => {
-			const { text: minText, truncated } = formatRequestExcerpt(r.text, MIN_EXCERPT_CHARS, r.handle, opts.file);
+	const buildEmergency = (archiveBefore: number) => {
+		const pairs: { orig: V2Request; em: V2Request }[] = [];
+		const emEpochs: V2Epoch[] = prep.state.epochs.map((e, i) => {
+			const from = requests[i];
+			const archived = i < archiveBefore && from.length > 0;
+			const minReqs: V2Request[] = [];
+			if (!archived) for (const r of from) {
+				const { text, truncated } = formatRequestExcerpt(r.text, MIN_EXCERPT_CHARS, r.handle, opts.file);
+				const em: V2Request = { ...r, text, ...(truncated ? { emergencyExcerpt: r.emergencyExcerpt ?? { originalChars: r.text.length } } : {}) };
+				minReqs.push(em);
+				pairs.push({ orig: r, em });
+			}
 			return {
-				...r,
-				text: minText,
-				...(truncated ? { emergencyExcerpt: r.emergencyExcerpt ?? { originalChars: r.text.length } } : {}),
+				...e,
+				requests: archived ? from.map((r) => ({ number: r.number, ...(r.legacyNumber ? { legacyNumber: r.legacyNumber } : {}), text: "", archived: true })) : minReqs,
+				commitments: [],
+				evidence: [],
+				omitted: { routine: e.omitted.routine, budget: e.omitted.budget + e.evidence.length, sources: [...e.omitted.sources, ...e.evidence.flatMap(recordHandles)] },
+				block: { ...e.block, durableProse: PROSE_OMITTED },
 			};
 		});
-		return {
-			...e,
-			requests: minReqs,
-			commitments: [],
-			evidence: [],
-			omitted: { routine: e.omitted.routine, budget: omBudget, sources: omSources },
-			block: { ...e.block, durableProse: PROSE_OMITTED },
-		};
-	});
+		const state: V2State = { intents: [], activeState: "", aliases: prep.state.aliases, epochs: emEpochs };
+		const fits = () => tok4(renderV2(state, opts.file)) <= hard;
 
-	const emState: V2State = {
-		intents: [],
-		activeState: "",
-		aliases: prep.state.aliases,
-		epochs: emEpochs,
+		// Sàn: add back in priority order while the minimal representation still fits.
+		// Kept order: active state -> validated intents -> newest epoch prose. Drop order is the reverse.
+		if (prep.state.activeState.trim()) {
+			state.activeState = prep.state.activeState;
+			state.activeAt = prep.state.activeAt;
+			state.activeStale = prep.state.activeStale;
+			if (!fits()) {
+				state.activeState = "";
+				delete state.activeAt;
+				delete state.activeStale;
+			}
+		}
+		const stateKept = !!state.activeState.trim();
+		let intentsKept = stateKept && prep.state.intents.length === 0;
+		if (stateKept && prep.state.intents.length > 0) {
+			state.intents = prep.state.intents;
+			if (fits()) intentsKept = true;
+			else state.intents = [];
+		}
+		const last = state.epochs.length - 1;
+		const prose = last >= 0 ? prep.state.epochs[last]?.block.durableProse : undefined;
+		if (intentsKept && prose && prose !== PROSE_OMITTED && prose !== NONE) {
+			state.epochs[last].block.durableProse = prose;
+			if (!fits()) state.epochs[last].block.durableProse = PROSE_OMITTED;
+		}
+
+		// Water-filling expansion for request text: short requests keep all of it, the rest share what is left.
+		const rem = hard - tok4(renderV2(state, opts.file));
+		if (rem > 0 && pairs.length) {
+			// The floor lengths are a snapshot: `expand` rewrites the same request objects, so every call must measure from the floor,
+			// never from what an earlier call left behind.
+			const floor = pairs.map(({ em }) => em.text.length);
+			const needed = pairs.map(({ orig }, i) => Math.max(0, orig.text.length - floor[i]));
+			const expand = (budget: number) => {
+				const extra = waterFillChars(needed, budget);
+				for (let i = 0; i < pairs.length; i++) {
+					const { orig, em } = pairs[i];
+					const ex = formatRequestExcerpt(orig.text, floor[i] + extra[i], orig.handle, opts.file);
+					em.text = ex.text;
+					// A carried excerpt keeps its own "original <n> chars": that length is the raw request's, not the excerpt's.
+					if (ex.truncated || orig.emergencyExcerpt) em.emergencyExcerpt = orig.emergencyExcerpt ?? { originalChars: orig.text.length };
+					else delete em.emergencyExcerpt;
+				}
+				return fits();
+			};
+			// Quote prefixes add overhead per newline. Search a bounded character budget, not excerpt lengths (which stop
+			// shrinking at the floor). Zero is already known to fit.
+			let low = 0, high = Math.floor(rem * 4);
+			if (!expand(high)) {
+				while (low < high) {
+					const mid = Math.ceil((low + high) / 2);
+					if (expand(mid)) low = mid;
+					else high = mid - 1;
+				}
+				expand(low);
+			}
+		}
+		return { state, pairs, size: tok4(renderV2(state, opts.file)) };
 	};
 
-	// Check if even the minimal emergency representation can fit
-	const minRequiredTokens = tok4(renderV2(emState, opts.file));
-	if (minRequiredTokens > hard) {
-		// Even minimal excerpts + mandatory summary overhead exceed the hard room: terminal failure
-		const reqs = emState.epochs.flatMap((e) => e.requests);
-		const residentChars = reqs.reduce((n, r) => n + r.text.length, 0);
-		return {
-			text: renderV2(emState, opts.file),
-			ok: false,
-			reason: "request-budget-overflow",
-			overflow: { requiredTokens: minRequiredTokens, availableTokens: hard },
-			diagnostics: {
-				formatVersion: "v2",
-				numbering: "raw-branch-v2",
-				requestEmergencyMode: "excerpt",
-				truncatedRequestCount: reqs.filter((r) => !!r.emergencyExcerpt).length,
-				originalRequestChars,
-				residentRequestChars: residentChars,
-				epochs: emState.epochs.length,
-				requestCount: reqs.length,
-				verbatimCount: reqs.filter((r) => !r.sourceIncomplete && !r.emergencyExcerpt && !r.skillReferences).length,
-				skillReferenceCount: reqs.filter((r) => r.skillReferences).length,
-				sourceIncompleteCount: reqs.filter((r) => r.sourceIncomplete).length,
-				executionCount: prep.stats.executionCount,
-				resultCount: prep.stats.resultCount,
-				lateResults: prep.stats.lateResults,
-				routineReadFiltered: prep.stats.routineReadFiltered,
-				budgetOmitted: prep.state.epochs.reduce((n, e) => n + e.evidence.length, 0),
-				associationUnresolved: prep.stats.associationUnresolved,
-				quoteAccepted: prep.stats.quoteAccepted,
-				quoteRejected: prep.stats.quoteRejected,
-				roleMismatch: prep.stats.roleMismatch,
-				proseOmitted: prep.state.epochs.length,
-				intentsOmitted: prep.state.intents.length,
-				tokens: {
-					requests: minRequiredTokens,
-					intent: 0,
-					state: 0,
-					prose: 0,
-					commitments: 0,
-					evidence: 0,
-					overhead: 0,
-					total: minRequiredTokens,
-				},
-			},
-		};
-	}
+	// E1 first; then archive one more old epoch at a time until the document fits. The first fit wins, so the least amount of
+	// request text is withheld, and the newest epoch that still holds requests stays resident: archiving it would drop the work in
+	// flight to save room for nothing. Deterministic: same branch, same room, same epochs -> same text.
+	const newestWithRequests = prep.state.epochs.reduce((last, e, i) => (e.requests.length ? i : last), -1);
+	let em = buildEmergency(0);
+	for (let k = 1; k <= newestWithRequests && em.size > hard; k++) em = buildEmergency(k);
 
-	// Sàn emergency: add back in priority order if they still fit alongside minimal requests:
-	// Priority order: activeState -> validated intents -> newest epoch prose
-	// Drop order under pressure: newest prose -> intents -> state
-	let stateKept = false;
-	if (prep.state.activeState.trim()) {
-		emState.activeState = prep.state.activeState;
-		emState.activeAt = prep.state.activeAt;
-		emState.activeStale = prep.state.activeStale;
-		if (tok4(renderV2(emState, opts.file)) <= hard) {
-			stateKept = true;
-		} else {
-			emState.activeState = "";
-			delete emState.activeAt;
-			delete emState.activeStale;
-		}
-	} else {
-		stateKept = true;
-	}
-
-	let intentsKept = stateKept && prep.state.intents.length === 0;
-	if (stateKept && prep.state.intents.length > 0) {
-		emState.intents = prep.state.intents;
-		if (tok4(renderV2(emState, opts.file)) <= hard) {
-			intentsKept = true;
-		} else {
-			emState.intents = [];
-		}
-	}
-
-	const lastIdx = emState.epochs.length - 1;
-	if (intentsKept && lastIdx >= 0) {
-		const candProse = prep.state.epochs[lastIdx]?.block.durableProse;
-		if (candProse && candProse !== PROSE_OMITTED && candProse !== NONE) {
-			emState.epochs[lastIdx].block.durableProse = candProse;
-			if (tok4(renderV2(emState, opts.file)) > hard) {
-				emState.epochs[lastIdx].block.durableProse = PROSE_OMITTED;
-			}
-		}
-	}
-
-	// 4. Water-filling expansion for request text:
-	const currentTokens = tok4(renderV2(emState, opts.file));
-	const remTokens = hard - currentTokens;
-	const flatEmReqs = emState.epochs.flatMap((e) => e.requests);
-	if (remTokens > 0) {
-		const minimum = flatEmReqs.map((r) => ({ ...r }));
-		const needed = flatOrig.map((orig, i) => Math.max(0, orig.text.length - minimum[i].text.length));
-		const expand = (budget: number) => {
-			const extra = waterFillChars(needed, budget);
-			for (let i = 0; i < flatEmReqs.length; i++) {
-				const orig = flatOrig[i], r = flatEmReqs[i];
-				const excerpt = extra[i] > 0
-					? formatRequestExcerpt(orig.text, minimum[i].text.length + extra[i], orig.handle, opts.file)
-					: { text: minimum[i].text, truncated: !!minimum[i].emergencyExcerpt };
-				r.text = excerpt.text;
-				if (excerpt.truncated || orig.emergencyExcerpt) {
-					r.emergencyExcerpt = orig.emergencyExcerpt ?? { originalChars: orig.text.length };
-				} else delete r.emergencyExcerpt;
-			}
-			return tok4(renderV2(emState, opts.file)) <= hard;
-		};
-		// Quote prefixes add overhead per newline. Search a bounded character budget, not
-		// excerpt lengths (which stop shrinking at the floor). Zero is already known to fit.
-		let low = 0, high = Math.floor(remTokens * 4);
-		if (!expand(high)) {
-			while (low < high) {
-				const mid = Math.ceil((low + high) / 2);
-				if (expand(mid)) low = mid;
-				else high = mid - 1;
-			}
-			expand(low);
-		}
-		// Marker removal can make size non-monotonic; the search keeps a verified fit,
-		// not necessarily the largest possible excerpt.
-
-	}
-
-	const finalSize = tok4(renderV2(emState, opts.file));
-	const residentRequestChars = flatEmReqs.reduce((n, r) => n + r.text.length, 0);
-	const truncatedRequestCount = flatEmReqs.filter((r) => !!r.emergencyExcerpt).length;
-	const sum = (f: (e: V2Epoch) => string) => tok4(emState.epochs.map(f).join("\n"));
+	const emReqs = em.state.epochs.flatMap((e) => e.requests);
+	const resident = emReqs.filter((r) => !r.archived);
+	const finalSize = em.size;
+	const residentRequestChars = resident.reduce((n, r) => n + r.text.length, 0);
+	const truncatedRequestCount = resident.filter((r) => !!r.emergencyExcerpt).length;
+	const archivedRequestCount = emReqs.length - resident.length;
+	const sum = (f: (e: V2Epoch) => string) => tok4(em.state.epochs.map(f).join("\n"));
 	const tokens = {
-		requests: sum((e) => e.requests.map(requestRow).join("\n")),
-		intent: tok4(emState.intents.map((i) => i.quote).join("\n")),
-		state: tok4(emState.activeState),
+		requests: sum((e) => e.requests.filter((r) => !r.archived).map(requestRow).join("\n")),
+		intent: tok4(em.state.intents.map((i) => i.quote).join("\n")),
+		state: tok4(em.state.activeState),
 		prose: sum((e) => e.block.durableProse),
 		commitments: 0,
 		evidence: 0,
@@ -1327,21 +1310,22 @@ export function renderEpochSummaryV2(prep: PreparedV2, opts: { soft: number; har
 	};
 	tokens.overhead = Math.max(0, finalSize - tokens.requests - tokens.intent - tokens.state - tokens.prose);
 	return {
-		text: renderV2(emState, opts.file),
+		text: renderV2(em.state, opts.file),
 		ok: finalSize <= hard,
 		...(finalSize > hard ? { reason: "request-budget-overflow" as const, overflow: { requiredTokens: finalSize, availableTokens: hard } } : {}),
 		diagnostics: {
 			formatVersion: "v2",
 			numbering: "raw-branch-v2",
-			requestEmergencyMode: truncatedRequestCount > 0 ? "excerpt" : "none",
+			requestEmergencyMode: archivedRequestCount > 0 ? "archive" : truncatedRequestCount > 0 ? "excerpt" : "none",
 			truncatedRequestCount,
-			originalRequestChars,
+			archivedRequestCount,
+			originalRequestChars: originalChars,
 			residentRequestChars,
-			epochs: emState.epochs.length,
-			requestCount: flatEmReqs.length,
-			verbatimCount: flatEmReqs.filter((r) => !r.sourceIncomplete && !r.emergencyExcerpt && !r.skillReferences).length,
-			skillReferenceCount: flatEmReqs.filter((r) => r.skillReferences).length,
-			sourceIncompleteCount: flatEmReqs.filter((r) => r.sourceIncomplete).length,
+			epochs: em.state.epochs.length,
+			requestCount: emReqs.length,
+			verbatimCount: resident.filter((r) => !r.sourceIncomplete && !r.emergencyExcerpt && !r.skillReferences).length,
+			skillReferenceCount: resident.filter((r) => r.skillReferences).length,
+			sourceIncompleteCount: resident.filter((r) => r.sourceIncomplete).length,
 			executionCount: prep.stats.executionCount,
 			resultCount: prep.stats.resultCount,
 			lateResults: prep.stats.lateResults,
@@ -1351,8 +1335,8 @@ export function renderEpochSummaryV2(prep: PreparedV2, opts: { soft: number; har
 			quoteAccepted: prep.stats.quoteAccepted,
 			quoteRejected: prep.stats.quoteRejected,
 			roleMismatch: prep.stats.roleMismatch,
-			proseOmitted: emState.epochs.filter((e) => e.block.durableProse === PROSE_OMITTED).length,
-			intentsOmitted: prep.state.intents.length - emState.intents.length,
+			proseOmitted: em.state.epochs.filter((e) => e.block.durableProse === PROSE_OMITTED).length,
+			intentsOmitted: prep.state.intents.length - em.state.intents.length,
 			tokens,
 		},
 	};

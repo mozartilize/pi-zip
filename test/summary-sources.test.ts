@@ -83,7 +83,7 @@ test("commitment proposals need an exact visible assistant source, not keywords 
 	expect(parsed.active).toBe("Pending");
 });
 
-test("buildCut uses the existing narrative call for sourced commitments and sends skill references", async () => {
+test("buildCut uses the existing narrative call for sourced commitments and keeps skill content in the narrative input", async () => {
 	const raw = expanded("DO NOT DUPLICATE THIS BODY", "\n\nimplement");
 	const prefix = [entry("u1", "user", raw), entry("a1", "assistant", [
 		{ type: "text", text: "Summary sẽ chỉ có request.\n明日、テストを追加します。" },
@@ -102,8 +102,12 @@ test("buildCut uses the existing narrative call for sourced commitments and send
 	const cut = await buildCut(p, ctx);
 	expect(calls).toBe(1);
 	expect(prompt).toContain(`[assistant source: ${h}]`);
-	expect(prompt).toContain("/skill:discriminating-testing");
-	expect(prompt).not.toContain("DO NOT DUPLICATE THIS BODY");
+	// The summariser reads the skill expansion as the user had it: constraints a skill carries are what durable prose and state must
+	// keep, and a `/skill:name` reference would hide them. The summary's own request row still shows the short form (recallable).
+	expect(prompt).toContain("DO NOT DUPLICATE THIS BODY");
+	expect(prompt).not.toContain("/skill:discriminating-testing");
+	expect(cut.text).toContain("/skill:discriminating-testing");
+	expect(cut.text).not.toContain("DO NOT DUPLICATE THIS BODY");
 	const commitments = parseSummaryV2(cut.text)!.epochs.flatMap(e => e.commitments);
 	expect(commitments).toEqual([`- source ${h}\n  > 明日、テストを追加します。`]);
 	ctx.modelRegistry.complete = async () => ({ stopReason: "error", errorMessage: "timeout", content: [] });

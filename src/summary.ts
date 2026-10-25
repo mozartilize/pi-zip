@@ -6,7 +6,6 @@ import { blockTime, cdAliases, clipMid, distinctLines, handleFor, keyTexts, outc
 import { type Block, type Cut, type PlanResult, callOf, NARRATIVE_CALL_MAX, NARRATIVE_MAX, settings, toolCallIndex } from "./plan.ts";
 import { assistantVisibleText, branchRequests } from "./recall.ts";
 import { type FileRecall, fileRecallHow } from "./recallfile.ts";
-import { skillReference } from "./skill-reference.ts";
 import { type EvidenceProposal, type CommitmentProposal, type IntentProposal, intentQuotesOf, parseSummaryV2, prepareEpochV2, referencesSource, regroupEpochsV2, renderEpochSummaryV2 } from "./summary-v2.ts";
 import { type Any, attempt, clamp, clip, envInt, fmtWhen, reasonsByDefault, textOf, tok4 } from "./util.ts";
 
@@ -1168,9 +1167,10 @@ export async function narrative(prefix: Block[], ctx: Any, budgetTokens: number,
 		.map((b) => {
 			const msg = b.raw && !(b.edited && !b.ours) ? b.raw : b.msg; // unfolded originals
 			if (intent && b.kind === "user") {
-				return { ...msg, content: Array.isArray(msg.content)
-					? msg.content.map((c: Any) => c?.type === "text" ? { ...c, text: skillReference(c.text) } : c)
-					: skillReference(textOf(msg.content)) };
+				// The summariser reads the user's message as it was: a Pi `<skill>` expansion is not resident-view compression, and the
+				// constraints a skill carries are exactly what the durable prose and the state have to keep. Only the summary's own
+				// request rows show `/skill:name` (lossy resident view, recallable by handle).
+				return msg;
 			}
 			if (!intent || !b.entryId || (b.kind !== "assistant" && (b.kind !== "toolResult" || msg.toolName === RECALL_TOOL))) return msg;
 			const content = Array.isArray(msg.content) ? msg.content : [{ type: "text", text: textOf(msg.content) }];
