@@ -153,7 +153,18 @@ export const lawOf = (branch: Any[], lam: Learned, pWarm: number): Law => ({ pr:
  *  scale read from the branch. P goes into the law only. */
 export function planOpts(entries: Any[], branch: Any[], env: Env, lam: Learned, pending: boolean, pWarm: number, pause: boolean, cutAt?: string, foldsOnly = false, ready?: readonly string[]): { o: PlanOpts; cal: Scale } {
 	const cal = env.scale ?? scaleOf(entries, branch, env.sys, env.model ? modelKey(env.model) : undefined);
-	return { cal, o: { pause, scale: cal, cwd: env.cwd, recalled: env.recalled, model: env.model, promptPending: pending, rereadOnly: env.rereadOnly, ...(env.fileRecall ? { fileRecall: env.fileRecall } : {}), reserve: env.reserve, steerIds: env.steerIds, law: lawOf(branch, lam, pWarm), trace: [], ...(cutAt !== undefined ? { cutAt } : {}), ...(foldsOnly ? { foldsOnly } : {}), ...(ready?.length ? { ready } : {}) } };
+	const foldedAt = newestMessageTime(entries);
+	return { cal, o: { ...(foldedAt ? { foldedAt } : {}), pause, scale: cal, cwd: env.cwd, recalled: env.recalled, model: env.model, promptPending: pending, rereadOnly: env.rereadOnly, ...(env.fileRecall ? { fileRecall: env.fileRecall } : {}), reserve: env.reserve, steerIds: env.steerIds, law: lawOf(branch, lam, pWarm), trace: [], ...(cutAt !== undefined ? { cutAt } : {}), ...(foldsOnly ? { foldsOnly } : {}), ...(ready?.length ? { ready } : {}) } };
+}
+
+/** The newest message timestamp (ms) in a projection: the session's own clock, so a re-plan of the same view stamps the same time. */
+function newestMessageTime(entries: Any[]): number | undefined {
+	let t = 0;
+	for (const pe of entries) for (const m of pe?.messages ?? []) {
+		const x = Number(m?.timestamp);
+		if (Number.isFinite(x) && x > t) t = x;
+	}
+	return t > 0 ? t : undefined;
 }
 
 /** The branch owns rent; every compaction is a rewrite, including one supplied by Pi or another extension. */

@@ -118,3 +118,16 @@ test("buildCut wires evidence selection through one narrative call, without synt
 	const failed = await buildCut(p, ctx);
 	expect(failed.text).not.toContain("Selected evidence:");
 });
+
+test("a v2 record of a source listing has no Evidence line; a test run keeps its outcome line", () => {
+	const listing = ["export interface Diag {", "\tisError?: boolean;", "\terrors: Items;", ...Array.from({ length: 60 }, (_, i) => `\tfield${i}: number;`), "}"].join("\n");
+	const run = ["bun test v1.4.3", ...Array.from({ length: 40 }, (_, i) => `(pass) case ${i}`), "", " 41 pass", " 0 fail", "Ran 41 tests across 1 file."].join("\n");
+	const blocks = buildBlocks([message("u1", "user", "inspect and test"),
+		...execution("l", "bash", { command: "sed -n 1,80p src/a.ts" }, listing),
+		...execution("t", "bash", { command: "bun test" }, run)]);
+	const text = buildEpochSummaryV2({ prefix: blocks }).text;
+	const rec = (id: string) => { const lines = text.split("\n"); const i = lines.findIndex((l) => l.includes(`handle ${handleFor(`r-${id}`)}`)); return lines.slice(i, i + 2).join("\n"); };
+	expect(rec("l")).not.toContain("Evidence:");
+	expect(text).not.toContain("isError?: boolean;");
+	expect(rec("t")).toContain("Evidence: 0 fail");
+});

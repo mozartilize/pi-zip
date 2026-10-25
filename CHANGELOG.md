@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- New placeholders say when they were folded: `[folded by pi-zip at 10-11 02:44 UTC · …]`, the newest message time of the view the
+  fold was planned from (session time, not the clock, so a re-plan of the same view renders the same bytes). Every earlier request
+  showed the output in full. Existing placeholders keep their bytes; the label is fixed-width, so fold pricing is unchanged.
+- Format v2 activity hints no longer pick identifiers that merely contain "error" (`isError?: boolean;`), separators (`===`) or
+  source lines from code listings; a source listing has no `Evidence:` line (its call head and handle identify it), while
+  outcomes, located hits (`src/a.ts:12: …`), commit lines and test counts stay. On one real session summary this removed 24 of
+  88 hints, all code or separators. Placeholder key lines and format v1 rows are unchanged.
 - Format v2 omits the redundant `verbatim` qualifier on ordinary request rows; existing summaries with the qualifier
   remain readable. Excerpts must shrink the complete rendered row, including qualifiers and quote prefixes, not just
   its body. Original lengths are measured before resident-view compression when that source text is available.

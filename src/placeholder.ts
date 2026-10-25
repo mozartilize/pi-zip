@@ -273,6 +273,7 @@ export interface PlaceholderMeta {
 	isError?: boolean;
 	noRecall?: boolean; // zip_recall is not declared to the model (`--tools` allowlist): point at re-reading instead
 	file?: FileRecall; // ... but read, grep or bash is: point at the recall file (written on demand from the session)
+	foldedAt?: number; // when the fold was planned (ms; PlanOpts.foldedAt): the output was shown in full to every request before it
 }
 
 /** Placeholder text, or null when the output is too short to be worth folding. The text is stored with the fold (context_edit),
@@ -285,7 +286,7 @@ export function makePlaceholder(text: string, tool: string, args: string, handle
 	const body = keys.map((k) => `${k.no}: ${clip(k.text, 160)}`).join("\n");
 	const outcome = outcomeHint(text, tool, meta.isError);
 	return (
-		`${PH_MARK} · ${tool}${args ? " " + args : ""}${whenLabel(meta.at, meta.turn) ? ` · ${whenLabel(meta.at, meta.turn)}` : ""}${outcome ? ` · ${outcome}` : ""} · ${text.length} chars, ${lines} lines · handle ${handle}]\n` +
+		`${PH_MARK}${meta.foldedAt ? ` at ${fmtWhen(meta.foldedAt)}` : ""} · ${tool}${args ? " " + args : ""}${whenLabel(meta.at, meta.turn) ? ` · ${whenLabel(meta.at, meta.turn)}` : ""}${outcome ? ` · ${outcome}` : ""} · ${text.length} chars, ${lines} lines · handle ${handle}]\n` +
 		(fields?.length ? `key fields kept (JSON; path: value, long strings show their end; up to ${keep}):\n${fields.join("\n")}\n` : "") +
 		(keys.length ? `key lines kept (original line numbers; up to ${keep}):\n${body}\n` : "") +
 		(meta.file
@@ -306,11 +307,30 @@ export function keyTexts(text: string, keep = 8): string[] {
 	return best ? [best.text, ...keys.filter((k) => k !== best).map((k) => k.text)] : [];
 }
 
+// A summary hint describes what a call found. The key-line heuristics above are tuned for placeholders, where a source line is a fine
+// landmark; in a one-line hint they pick "isError?: boolean;" because it contains "error". Measured on a real session summary: most
+// hints of code reads were such identifier hits, separators ("===") or arbitrary source lines.
+const ERROR_WORD_RE = /(?<![A-Za-z0-9_$])(?:errors?|fail(?:ed|ure|s)?|exception|warnings?)(?![A-Za-z0-9_$])/i;
+const SEPARATOR_RE = /^[\s=\-*_#~.|+:]*$/;
+const LOCATION_RE = /^[\w./@-]+\.[A-Za-z0-9]+:\d+:/; // "src/a.ts:12:" (grep -n, compilers): where something is, a finding
+const CODE_RE = /^(?:const|let|var|function|export|import|return|if|else|for|while|switch|case|class|interface|type|enum|private|public|protected|static|async|await|def|fn|pub|use|test|describe|it|expect)\b|^(?:\/\/|\/\*|\*\/?(?:\s|$))|[;{}(,[]\s*$|=>|;\s*\/\/|^[\w$]+\??\s*:\s*[^;]*;$/;
+const looksLikeCode = (line: string) => !LOCATION_RE.test(line.trim()) && CODE_RE.test(line.replace(/^\s*\d+(?::|\s)\s?/, "").trim());
+
+/** The one line a summary shows for a successful output: JSON key fields first, else an error-worded line (whole words, not
+ *  identifiers), an id-like line, or the first key line, skipping separators and source-code lines. None when only those remain:
+ *  the call head already says what was read, and the handle recalls it. */
+export function summaryHint(text: string, keep = 4): string | undefined {
+	const f = jsonKeyFields(text, keep, true);
+	if (f?.length) return f[0];
+	const keys = pickKeyLines(text, keep).filter((k) => !SEPARATOR_RE.test(k.text) && !looksLikeCode(k.text));
+	return (keys.find((k) => ERROR_WORD_RE.test(k.text)) ?? keys.find((k) => k.why === "id") ?? keys[0])?.text;
+}
+
 /** Placeholder for a toolResult block (null for image results, entries without an id, or short outputs). */
-export function makePlaceholderFor(b: Block, calls: Calls, keep = 8, noRecall = false, file?: FileRecall): string | null {
+export function makePlaceholderFor(b: Block, calls: Calls, keep = 8, noRecall = false, file?: FileRecall, foldedAt?: number): string | null {
 	const content = b.msg.content;
 	if (Array.isArray(content) && content.some((c: Any) => c?.type !== "text")) return null;
 	if (!b.entryId) return null;
 	const call = callOf(calls, b.msg);
-	return makePlaceholder(textOf(content), call?.name ?? b.msg.toolName ?? "tool", call ? shortArgs(call.args) : "", handleFor(b.entryId), keep, { at: blockTime(b), turn: b.userTurn, isError: !!b.msg.isError, noRecall, file });
+	return makePlaceholder(textOf(content), call?.name ?? b.msg.toolName ?? "tool", call ? shortArgs(call.args) : "", handleFor(b.entryId), keep, { at: blockTime(b), turn: b.userTurn, isError: !!b.msg.isError, noRecall, file, foldedAt });
 }

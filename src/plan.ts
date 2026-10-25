@@ -674,6 +674,9 @@ export interface PlanOpts {
 	inturnAge?: number; // default settings().inturnAge (PI_ZIP_INTURN_AGE, 60); 0 = outputs of the protected turns never fold on age
 	rereadOnly?: boolean; // zip_recall is not available to the model: fold only outputs that can be re-read (classify "rereadable")
 	fileRecall?: FileRecall; // zip_recall is hidden but read, grep or bash is active: fold as in full mode, placeholders name the recall file
+	/** Newest message time (ms) in the view this plan was made from, stamped into new placeholders: every request before it saw the
+	 *  output in full. Taken from the session, not the clock, so the same view always renders the same placeholder bytes. */
+	foldedAt?: number;
 	cutAt?: string; // cut at this entry or not at all (a summary for that cut is produced or being produced: core.ts adopt)
 	foldsOnly?: boolean; // no cut: the plan of the folds alone (its summary is not ready: core.ts unready)
 	ready?: readonly string[];
@@ -738,7 +741,7 @@ export function foldCandidates(blocks: Block[], calls: Calls, o: PlanOpts): [Blo
 /** A useful, recallable replacement; ranking cannot bypass the planner's saving check. */
 export function foldPlaceholder(b: Block, calls: Calls, o: PlanOpts): { ph: string; phTok: number } | null {
 	if (!b.entryId || (o.recalled?.size ? o.recalled.has(handleFor(b.entryId)) : false)) return null;
-	const ph = makePlaceholderFor(b, calls, o.keepLines ?? settings().keepLines, !!o.rereadOnly, o.fileRecall);
+	const ph = makePlaceholderFor(b, calls, o.keepLines ?? settings().keepLines, !!o.rereadOnly, o.fileRecall, o.foldedAt);
 	if (ph === null) return null;
 	const phTok = tokensOf({ ...b.msg, content: [{ type: "text", text: ph }] });
 	return phTok < 0.9 * b.tokens ? { ph, phTok } : null;

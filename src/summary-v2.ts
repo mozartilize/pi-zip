@@ -4,7 +4,7 @@
 // the branch cannot give back: the prose, the grouping and what was left out. The next summary parses this text and carries every old
 // epoch as written; only its prose is ever merged by a model call, its requests and evidence are joined by code.
 import { classifySummaryRead } from "./classify.ts";
-import { blockTime, cdAliases, handleFor, keyTexts, outcomeHint, RECALL_TOOL, shortArgs, whenLabel } from "./placeholder.ts";
+import { blockTime, cdAliases, handleFor, outcomeHint, RECALL_TOOL, shortArgs, summaryHint, whenLabel } from "./placeholder.ts";
 import type { Block } from "./plan.ts";
 import { assistantVisibleText, branchRequests, type BranchRequest } from "./recall.ts";
 import { skillReference } from "./skill-reference.ts";
@@ -306,7 +306,7 @@ export function collectExecutions(
 		const exitCode = exitCodeOf(rawText);
 		const differences = tool === "bash" && diffHasChanges(owner?.command, exitCode);
 		const isError = !differences && (!!b.msg?.isError || (exitCode !== undefined && exitCode !== "0"));
-		const key = keyTexts(rawText, 4)[0];
+		const key = summaryHint(rawText);
 		const ref: ExecutionResultRef = {
 			resultEntryId: rid,
 			handle: handleFor(rid),

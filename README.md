@@ -139,7 +139,7 @@ When a new request names an earlier output by its handle, or by the same full pa
 A folded output becomes a placeholder that tells the model what it was and how to get it back, rather than guess or re-run it:
 
 ```
-[folded by pi-zip · bash bun test test/api.test.ts · 10-11 02:31 UTC · exit 1, 79 passed, 2 failed · 5637 chars, 109 lines · handle k3f9a0x1qz]
+[folded by pi-zip at 10-11 02:44 UTC · bash bun test test/api.test.ts · 10-11 02:31 UTC · exit 1, 79 passed, 2 failed · 5637 chars, 109 lines · handle k3f9a0x1qz]
 key lines kept (original line numbers; up to 8):
 1: (pass) suite 0 > case parse config ...
 106: 2 fail

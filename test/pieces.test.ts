@@ -6,7 +6,7 @@ import { repairPayload } from "../src/guard.ts";
 import { cacheActivity, detectCold, isColdByTtl, lastMessageMs, observedTier, payloadRetention, resolveTtl } from "../src/cache.ts";
 import { classifyRecoverability, classifySummaryRead, isReadOnlyBash } from "../src/classify.ts";
 import { colorTail, fmtK, noticeText, renderNotice, splitDesc, type NoticeAction, type NoticeData } from "../src/notice.ts";
-import { clipMid, handleFor, KEY_LINE_MAX_CHARS, keyTexts, makePlaceholder, makePlaceholderFor, outcomeHint, pickKeyLines, shortArgs } from "../src/placeholder.ts";
+import { clipMid, handleFor, KEY_LINE_MAX_CHARS, keyTexts, makePlaceholder, makePlaceholderFor, outcomeHint, pickKeyLines, shortArgs, summaryHint } from "../src/placeholder.ts";
 import { buildBlocks, toolCallIndex } from "../src/plan.ts";
 import { A, type Any, fakeCtx, fakePi, R, startZip, U } from "./helpers.ts";
 import { branchOutputs, parseRange, recalledHandlesFromBranch, recallSections, resolveHandlesInBranch, searchOutputs, sliceRecall } from "../src/recall.ts";
@@ -1023,4 +1023,40 @@ describe("/zip status after a restart", async () => {
 		expect(zip.status(ctx)).not.toContain("since pi started");
 		expect(zip.statsLine(ctx)).toContain("this session: 3 zipped (~45K tokens), 1 summary, 1 unzip");
 	});
+});
+
+test("placeholder marker carries the fold time in UTC: fixed width, absent when unknown, byte-stable for the same stamp", () => {
+	const out = "line\n".repeat(400);
+	const at = Date.UTC(2026, 9, 25, 15, 18), folded = Date.UTC(2026, 9, 25, 15, 33);
+	const ph = makePlaceholder(out, "bash", "make", handleFor("x"), 8, { at, foldedAt: folded })!;
+	expect(ph.startsWith("[folded by pi-zip at 10-25 15:33 UTC · bash make · 10-25 15:18 UTC · ")).toBe(true);
+	// Without a known fold time the marker is the earlier one, byte for byte.
+	const plain = makePlaceholder(out, "bash", "make", handleFor("x"), 8, { at })!;
+	expect(plain.startsWith("[folded by pi-zip · bash make · 10-25 15:18 UTC · ")).toBe(true);
+	expect(ph).toBe(plain.replace("[folded by pi-zip ·", "[folded by pi-zip at 10-25 15:33 UTC ·"));
+	// Fixed width: any stamp prices the same, so the planner's savings do not depend on the time of day.
+	const other = makePlaceholder(out, "bash", "make", handleFor("x"), 8, { at, foldedAt: Date.UTC(2026, 0, 2, 3, 4) })!;
+	expect(other.length).toBe(ph.length);
+	expect(makePlaceholder(out, "bash", "make", handleFor("x"), 8, { at, foldedAt: folded })).toBe(ph);
+});
+
+test("summary hints skip identifiers that merely contain 'error', separators and source lines; findings and outcomes stay", () => {
+	const code = (lines: string[]) => lines.join("\n");
+	// Each case is a shape seen in a real v2 summary, where the placeholder heuristics picked the noise.
+	expect(summaryHint(code(["\tisError?: boolean;", "\tdiagnostics: Diag;", "}"]))).toBeUndefined();
+	expect(summaryHint(code(["160  \tisError: boolean;", "161  \tcode?: number;", "162  }"]))).toBeUndefined();
+	expect(summaryHint(code(["886:export function skeleton(", "887:\tblocks: Block[],", "888:): string {"]))).toBeUndefined();
+	expect(summaryHint(code(["\tnarrativeAt?: string; // carried forward", "\terrors: Items;"]))).toBeUndefined();
+	expect(summaryHint(code(["===", "==="]))).toBeUndefined();
+	// A located hit is a finding, not a listing; a separator before it is skipped.
+	expect(summaryHint(code(["===", "src/run.ts:991:\tconst overflowed = w?.cut.reason === \"x\";"]))).toBe("src/run.ts:991:\tconst overflowed = w?.cut.reason === \"x\";");
+	// Whole error words win over the first line; an identifier containing "error" does not.
+	expect(summaryHint(code(["bun test v1.4.3", "\tconst isError = true;", "2 tests failed:", "Ran 3 tests"]))).toBe("2 tests failed:");
+	expect(summaryHint(code(["bun test v1.4.3", "", " 0 fail", "Ran 925 tests"]))).toBe(" 0 fail");
+	expect(summaryHint(code(["6161a25 Render model-visible timestamps in explicit UTC", "ac77f77 feat(summary): retain useful context"])))
+		.toBe("6161a25 Render model-visible timestamps in explicit UTC");
+	expect(summaryHint(code(["309:#### Final failure", "310:text"]))).toBe("309:#### Final failure");
+	expect(summaryHint("(no output)")).toBe("(no output)");
+	// JSON outputs keep their key fields.
+	expect(summaryHint(JSON.stringify({ status: "ok", error: "none", items: [1, 2, 3] }))).toBe(keyTexts(JSON.stringify({ status: "ok", error: "none", items: [1, 2, 3] }), 4)[0]);
 });
