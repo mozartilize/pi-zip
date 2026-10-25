@@ -3114,8 +3114,9 @@ describe("a relay keeps the session on one account: metadata.user_id", () => {
 // no-UI behaviour moves, and each move is justified in its commit: 0.3.1's (0907ceea..., 0.3.0's decisions with 0.3.1's format, where
 // these scenarios waited for their summaries in line) became this one when 0.4.0 stopped waiting.
 describe("no UI (pi -p, json): the requests and the session of three scenarios hash to a recorded digest", () => {
-	// Append-only narrative epochs change summary text and its token counts, not the no-UI scheduling contract.
-	const NOUI_DIGEST = "5a371f039325809b7d5d843b53dce731"; // R5_PRINT_DIGEST=1 prints it (pre-epochs: f6d9629b3c18c8a4101cfd5d92bc94b1)
+	// Append-only narrative epochs change summary text and its token counts, not the no-UI scheduling contract. Explicit UTC
+	// labels do too (pre-UTC: 5a371f039325809b7d5d843b53dce731).
+	const NOUI_DIGEST = "663118104757653de4ec3ef5172a04bd"; // R5_PRINT_DIGEST=1 prints it (pre-epochs: f6d9629b3c18c8a4101cfd5d92bc94b1)
 	const sleep = (ms: number) => new Promise((res) => setTimeout(res, ms));
 	const shifted = (agoMs: number, prose: number) => {
 		const sm = SessionManager.inMemory(CWD);

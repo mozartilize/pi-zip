@@ -454,7 +454,7 @@ function mergeUsers(prev: Items, now: string[]): { lines: string[]; omitted: num
 export interface EpochBlock {
 	id: string; // "Epoch 3", or "Epochs 1–2" once consolidated
 	turns: string; // the user requests it covers: "requests 9–12", "request 5", "within request 5"
-	timestamp: string; // when its part of the conversation ended (local MM-DD HH:MM), a range once consolidated
+	timestamp: string; // when its part of the conversation ended (MM-DD HH:MM UTC), a range once consolidated
 	durableProse: string;
 	tokens: number; // chars/4 of its heading and prose
 	first?: number; // number of the first epoch it covers (0 = the narrative of an older-format or foreign summary, carried verbatim)
@@ -466,7 +466,7 @@ export interface EpochBlock {
 /** The narrative of a summary in the append-only format. */
 export interface StructuredNarrative {
 	activeState: string; // volatile: current state and open todos, reconciled with the next slice
-	activeAt?: string; // when it was written (local MM-DD HH:MM)
+	activeAt?: string; // when it was written (MM-DD HH:MM UTC)
 	activeStale?: string; // set when it was carried forward because a new one could not be written: why
 	epochs: EpochBlock[]; // durable: append-only, oldest first
 }
