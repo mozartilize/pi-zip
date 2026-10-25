@@ -750,6 +750,7 @@ export class Zip implements ZipControl {
 		this.startKind = null;
 		this.promptStart = false;
 		this.inRun = false;
+		this.memoryNoteShown = false;
 		this.writeUnwritten();
 		const s = this.version, d = { v: s.v, pi: s.pi, since: s.since }; // at the end of a run, unless the newest entry on this branch says the same
 		if (!(s.last?.v === d.v && s.last?.pi === d.pi)) attempt(() => this.pi.appendEntry(VERSION_CUSTOM, (s.last = d)), undefined);
@@ -1392,8 +1393,42 @@ export class Zip implements ZipControl {
 		}
 		this.requestStart(ctx);
 		const hinted = this.withHint(out?.messages ?? e.messages, ctx);
+		const remembered = this.withMemory(hinted ?? out?.messages ?? e.messages, ctx);
+		if (remembered) return { messages: remembered };
 		if (hinted) return { messages: hinted };
 		return out ? { messages: out.messages } : undefined;
+	}
+
+	/** A retrieval note was already put into a request of this run (later requests repeat it in the same place). */
+	private memoryNoteShown = false;
+	/** Session memory (src/memory.ts), set by index.ts: the run's retrieval packet, when one was made. */
+	memory: { current(ctx: Any): { prompt: string; text: string } | null; injected(chars: number, at: number): void; reinjected(): void } | null = null;
+
+	/**
+	 * The run's retrieval packet as one user message right after the run's prompt, in every request of the run: the same place each
+	 * time, so the requests of the run keep one cacheable prefix. Request-local (never persisted). Omitted when the prompt is no longer
+	 * in the request or the note would not fit below Pi's compaction room: retrieval never causes a compaction.
+	 */
+	private withMemory(messages: Any[], ctx: Any): Any[] | null {
+		if (!this.memory || !this.inRun) return null;
+		try {
+			const note = this.memory.current(ctx);
+			if (!note) return null;
+			const at = messages.findLastIndex((m: Any) => m?.role === "user" && textOf(m.content) === note.prompt);
+			if (at < 0) return null;
+			const msg = { role: "user", content: [{ type: "text", text: note.text }], timestamp: messages[at].timestamp };
+			const sc = this.scaleOf(ctx);
+			const body = messages.filter((m) => m?.role !== "system").reduce((n: number, m: Any) => n + wireTokensOf(m), 0);
+			const room = compactionRoom(ctx?.model, this.reserve(ctx));
+			if (room !== null && sizeOf(sc, body + wireTokensOf(msg)) > room) return null;
+			if (this.memoryNoteShown) this.memory.reinjected();
+			else this.memory.injected(note.text.length, at + 1);
+			this.memoryNoteShown = true;
+			return [...messages.slice(0, at + 1), msg, ...messages.slice(at + 1)];
+		} catch (err) {
+			this.ledger({ type: "error", where: "memory_inject", error: errText(err) });
+			return null;
+		}
 	}
 
 	/**

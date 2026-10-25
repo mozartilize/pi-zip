@@ -6,6 +6,7 @@ import { RECALL_TOOL } from "./placeholder.ts";
 import { registerRecallTool } from "./recall.ts";
 import { parseRecallPath } from "./recallfile.ts";
 import { NOTICE_CUSTOM, Zip } from "./run.ts";
+import { Memory } from "./memory.ts";
 import { markFirstLine, measure, recallCallLine, renderCard, renderState, setMeasure } from "./ui.ts";
 
 export default function piZip(pi: ExtensionAPI) {
@@ -14,6 +15,23 @@ export default function piZip(pi: ExtensionAPI) {
 	import("@earendil-works/pi-coding-agent").then((m: Any) => { zip.version.pi = String(m?.VERSION ?? ""); }, () => {}); // Pi's version, for the version entry
 	registerRecallTool(pi, zip); // stays registered even when off: earlier folds must stay recallable, and a tool-list change would bust the cache
 	registerZipCommand(pi, zip);
+	// Session memory: a deterministic ledger of the opened session (no model call) and retrieval at new prompts once a fold or a
+	// compaction has hidden earlier output. Failures never block the run.
+	const memory = new Memory((rec) => zip.ledger(rec));
+	{
+		zip.memory = memory;
+		pi.registerCommand("zip-memory", {
+			description: "pi-zip: session memory status (ledger of this session, retrieval counters)",
+			handler: async (_args: string, cctx: Any) => {
+				const text = memory.statusLine(cctx);
+				if (cctx?.ui?.notify && (cctx.mode === "tui" || cctx.mode === "rpc")) {
+					try { cctx.ui.notify(text); return; } catch {}
+				}
+				process.stderr.write(text + "\n");
+			},
+		});
+		pi.on("session_tree", (_e, ctx) => memory.catchUp(ctx, "session_tree"));
+	}
 	try {
 		// Everything pi-zip shows lives in the transcript as custom entries (never part of the model's context): fold/summary
 		// notices, state lines and the /zip card. Widths are measured with Pi's own pi-tui once it has loaded.
@@ -131,6 +149,7 @@ export default function piZip(pi: ExtensionAPI) {
 		zip.refreshFolded(ctx);
 		zip.welcome(ctx);
 		zip.armProducer(ctx);
+		memory.sessionStart(ctx);
 		return r;
 	});
 	// a prompt (typed, or an extension's sendUserMessage): Pi is idle here and waits for the handler before it starts the run, so a
@@ -146,18 +165,30 @@ export default function piZip(pi: ExtensionAPI) {
 	// the run begins at agent_start, which always fires; before_agent_start says whose run it is (Pi 1.1.0 fires it for prompts only, 1.2.0
 	// also for a run an extension's message starts with sendMessage and triggerTurn, as messageType "custom")
 	pi.on("agent_start", (_e, ctx) => zip.agentStart(ctx));
-	pi.on("agent_end", () => zip.agentEnd());
+	pi.on("agent_end", (_e, ctx) => {
+		zip.agentEnd();
+		memory.agentEnd(ctx);
+	});
 	pi.on("before_agent_start", async (e, ctx) => {
 		checkRecall(ctx);
 		zip.refreshFolded(ctx);
 		await zip.beforeAgentStart(ctx, e);
+		await memory.beforeAgentStart(ctx, e);
 		return undefined;
 	});
 	// Own native requests, and Pi's automatic threshold check after switching to a smaller model.
 	pi.on("session_before_compact", (e, ctx) => zip.sessionBeforeCompact(e, ctx));
-	pi.on("session_compact", (e, ctx) => zip.sessionCompact(e, ctx));
+	pi.on("session_compact", (e, ctx) => {
+		const r = zip.sessionCompact(e, ctx);
+		memory.catchUp(ctx, "session_compact");
+		return r;
+	});
 	pi.on("context_with_system", (e, ctx) => zip.context(e, ctx)); // the complete transcript: system messages stay where Pi put them
-	pi.on("turn_end", (e, ctx) => zip.turnEnd(e, ctx));
+	pi.on("turn_end", async (e, ctx) => {
+		const r = await zip.turnEnd(e, ctx);
+		memory.catchUp(ctx, "turn_end"); // the turn's entries are persisted by now; entries returned above are read at the next catch-up
+		return r;
+	});
 	pi.on("agent_before_settle", (e, ctx) => zip.settle(e, ctx));
 	pi.on("before_provider_request", (e, ctx) => zip.providerRequest(e, ctx));
 	pi.on("model_select", (e) => zip.modelSelect(e.model)); // a mid-run /model has no run start
@@ -165,5 +196,8 @@ export default function piZip(pi: ExtensionAPI) {
 	// Pi's idle cache warming: observed only (the return value is undefined, so Pi's own decision stands); an older Pi never fires it
 	pi.on("cache_warming_decision", (e, ctx) => zip.cacheWarmingDecision(e, ctx));
 	pi.on("message_end", (e, ctx) => zip.messageEnd(e.message, ctx));
-	pi.on("session_shutdown", () => zip.shutdown());
+	pi.on("session_shutdown", () => {
+		zip.shutdown();
+		memory.shutdown();
+	});
 }

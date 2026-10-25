@@ -33,7 +33,8 @@
   "scripts": {
     "test": "bun test",
     "build-check": "bun build src/index.ts --target=node --external '@earendil-works/*' --outfile /dev/null",
-    "mutants": "bun test/pi-integration-mutants.ts"
+    "mutants": "bun test/pi-integration-mutants.ts",
+    "index": "bun scripts/index-session.ts"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*"
