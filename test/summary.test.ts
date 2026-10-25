@@ -1428,7 +1428,7 @@ describe("emergency request compaction (E1) — deterministic overflow fallback"
 		expect(noFallback.diagnostics.verbatimCount).toBe(2);
 		expect(noFallback.text).not.toContain("emergency excerpt");
 		expect(noFallback.text).not.toContain("Requests: emergency excerpts");
-		expect(noFallback.text).toContain("· verbatim");
+		expect(noFallback.text).not.toContain("· verbatim");
 
 		// 2a. soft target does NOT trigger E1: drops evidence, but requests stay verbatim
 		const softOnly = buildEpochSummaryV2({ prefix: blocks, targetTokens: 10, maxSummaryTokens: fullTokens + 1 });
@@ -1475,12 +1475,12 @@ describe("emergency request compaction (E1) — deterministic overflow fallback"
 		// Short command kept 100% verbatim, no marker, qualifier verbatim
 		expect(reqs[0].emergencyExcerpt).toBeUndefined();
 		expect(reqs[0].text).toBe(shortCmd);
-		expect(res1.text).toContain(`- R1 · handle ${handleFor("u1")} · verbatim\n  > ${shortCmd}`);
+		expect(res1.text).toContain(`- R1 · handle ${handleFor("u1")}\n  > ${shortCmd}`);
 
 		// Medium prompt: water-filling gave it extra characters to reach full length, restoring to verbatim!
 		expect(reqs[1].emergencyExcerpt).toBeUndefined();
 		expect(reqs[1].text).toBe(medPrompt);
-		expect(res1.text).toContain(`- R2 · handle ${handleFor("u2")} · verbatim\n  > ${medPrompt}`);
+		expect(res1.text).toContain(`- R2 · handle ${handleFor("u2")}\n  > ${medPrompt}`);
 
 		// Huge log is excerpted with original char count and exact omission marker
 		const h3 = handleFor("u3");
@@ -1609,7 +1609,7 @@ describe("emergency request compaction (E1) — deterministic overflow fallback"
 		expect(cut2.ok).toBe(true);
 		expect(cut2.diagnostics.requestEmergencyMode).toBe("none");
 		expect(cut2.diagnostics.truncatedRequestCount).toBe(0);
-		expect(cut2.text).toContain(`- R1 · handle ${h1} · verbatim\n${quoteLines(hugeText)}`);
+		expect(cut2.text).toContain(`- R1 · handle ${h1}\n${quoteLines(hugeText)}`);
 		expect(cut2.text).not.toContain("emergency excerpt");
 	});
 
@@ -1634,7 +1634,7 @@ describe("emergency request compaction (E1) — deterministic overflow fallback"
 		const h1 = handleFor("u1");
 		expect(cut2.text).toContain(`- R1 · handle ${h1} · source incomplete · emergency excerpt · original ${hugeText.length} chars`);
 		expect(cut2.diagnostics.sourceIncompleteCount).toBe(1);
-		expect(cut2.text).not.toContain(`- R1 · handle ${h1} · verbatim`);
+		expect(cut2.text).not.toContain(`- R1 · handle ${h1}\n`);
 	});
 
 	test("Test 7: raw recall via zip_recall returns exact original request text, uncorrupted by emergency excerpt", () => {
@@ -1686,7 +1686,7 @@ describe("emergency request compaction (E1) — deterministic overflow fallback"
 		expect(cut.text).toContain("possibly stale: provider timeout");
 		expect((cut as Any).summaryDiagnostics.requestEmergencyMode).toBe("none");
 		expect((cut as Any).summaryDiagnostics.truncatedRequestCount).toBe(0);
-		expect(cut.text).toContain("· verbatim");
+		expect(cut.text).not.toContain("· verbatim");
 		expect(cut.text).not.toContain("emergency excerpt");
 	});
 

@@ -619,9 +619,12 @@ describe("model-switch checkpoints through Pi hooks", () => {
 	test("format v2 request-budget-overflow: retention safety wins over model switch when minimal representation exceeds the new window's room", async () => {
 		defaults();
 		process.env.PI_ZIP_SUMMARY_V2 = "1";
-		// 60 requests require ~4500 tokens of minimal structure, exceeding the 4096 room of a 20K window
+		// The planner must accept the cut while the v2 builder finds that the minimal request ledger exceeds the 4096 room of a
+		// 20K window. Measured window: at 60 requests every row fits verbatim (4095/4096), from ~64 the builder overflows, and by
+		// 120 the planner already rejects the switch as too big. 80 keeps a margin on both sides. One epoch only: E2 never archives
+		// the newest request-bearing epoch, so the cut must fail closed.
 		const manyUserSetup = (sm: SessionManager) => {
-			for (let i = 1; i <= 60; i++) {
+			for (let i = 1; i <= 80; i++) {
 				sm.appendMessage(user(`ACTIVE-CONSTRAINT-${i}: keep every user constraint verbatim without dropping`));
 				sm.appendMessage({ ...asst([{ type: "text", text: "pad ".repeat(250) }]), usage: undefined });
 			}

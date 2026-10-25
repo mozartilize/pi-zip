@@ -77,7 +77,7 @@ test("carried E1 excerpts report original lengths and remain excerpts without th
 // ---------------------------------------------------------------------------------------------------------------
 
 test("a shortened row is never longer than the text it replaces (both markers)", () => {
-	for (const file of [undefined, { dir: "/cache/s1", handle: "abcdef1234" } as any]) {
+	for (const file of [undefined, { dir: "/cache/s1", read: true, grep: false, bash: false }]) {
 		for (const n of [199, 200, 201, 220, 250, 286, 287, 288, 300, 400]) {
 			const raw = "x".repeat(n);
 			const ex = formatRequestExcerpt(raw, MIN_EXCERPT_CHARS, "abcdef1234", file);
@@ -112,30 +112,32 @@ test("E2 archives whole old epochs' request ranges when even the floors do not f
 	}
 	const branch = entries.map((e) => e.sourceEntry);
 	const first = buildEpochSummaryV2({ prefix: buildBlocks(entries.slice(0, 30)), branch });
-	const all = buildBlocks(entries);
-	const e1 = buildEpochSummaryV2({ prefix: all, branch, previous: first.text, maxSummaryTokens: 5200 });
+	const next = buildBlocks(entries.slice(30));
+	const e1 = buildEpochSummaryV2({ prefix: next, branch, previous: first.text, maxSummaryTokens: 4200 });
 	expect(e1.ok).toBe(true);
 	expect(e1.diagnostics.requestEmergencyMode).toBe("excerpt");
 	expect(e1.diagnostics.archivedRequestCount).toBe(0);
 
-	const e2 = buildEpochSummaryV2({ prefix: all, branch, previous: first.text, maxSummaryTokens: 4200 });
+	const e2 = buildEpochSummaryV2({ prefix: next, branch, previous: first.text, maxSummaryTokens: 2400 });
 	const d = e2.diagnostics;
 	expect(e2.ok).toBe(true);
 	expect(d.requestEmergencyMode).toBe("archive");
 	expect(d.archivedRequestCount).toBe(15); // the whole older epoch, never the newest one
-	expect(d.requestCount).toBe(45);
+	expect(d.requestCount).toBe(30);
 	expect(e2.text).toContain("- R1–R15 archived, not resident (15 requests); zip_recall({ requests: \"1-15\" }) returns the exact text");
-	expect(e2.text).toContain("15 of 45 requests archived, not resident");
+	expect(e2.text).toContain("15 of 30 requests archived, not resident");
 	// Only the resident rows are weight-carrying: an archived request has no row of its own.
 	const parsed = parseSummaryV2(e2.text)!;
-	expect(parsed.epochs.flatMap((e) => e.requests).filter((r) => r.archived)).toHaveLength(15);
-	expect(parsed.epochs.flatMap((e) => e.requests)).toHaveLength(45);
+	expect(parsed.epochs[0].requests).toEqual([{ number: 1, text: "", archived: { last: 15 } }]);
+	expect(parsed.epochs[1].requests.map((r) => r.number)).toEqual(Array.from({ length: 15 }, (_, i) => i + 16));
 
 	// Identity comes from the raw branch: with room again, every request is back verbatim, no excerpt and no archive.
-	const back = buildEpochSummaryV2({ prefix: all, branch, previous: e2.text });
+	const back = buildEpochSummaryV2({ prefix: [], branch, previous: e2.text });
 	expect(back.diagnostics.requestEmergencyMode).toBe("none");
 	expect(back.diagnostics.archivedRequestCount).toBe(0);
-	expect(back.diagnostics.verbatimCount).toBe(45);
+	expect(back.diagnostics.verbatimCount).toBe(30);
+	expect(parseSummaryV2(back.text)!.epochs.flatMap((e) => e.requests).map((r) => r.text))
+		.toEqual(entries.filter((e) => e.sourceEntry.message.role === "user").map((e) => e.sourceEntry.message.content));
 	expect(back.text).not.toContain("archived, not resident");
 });
 

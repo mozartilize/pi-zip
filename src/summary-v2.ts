@@ -34,8 +34,8 @@ const LEGACY_ID = "Earlier history — epoch attribution unavailable";
 const EPOCH_HEAD_RE = /^### (?:Epochs? (\d+)(?:–(\d+))?|Earlier history — epoch attribution unavailable) · source interval (\S+) · ([^·]+?) · (.+)$/;
 const TIER_RE = /^consolidated, tier (\d+)$/;
 const OMITTED_REQ_RE = /(?:whole request: handle |\[… middle of this request omitted \(handle )([0-9a-z]{10})/;
-const ARCHIVED_RE = /^- R(\d+)(?:(?:–|-)?R(\d+))? archived, not resident \((\d+) requests?\);/;
-const REQ_HEAD_RE = /^- (?:R(\d+)|legacy R(\d+)|legacy request)(?: · handle ([0-9a-z]{10}))? · ((?:verbatim|skill references|source incomplete|(?:source incomplete · )?emergency excerpt(?: · original \d+ chars)?)(?: · skill references)?)(?: · continuation of R(\d+))?$/;
+const ARCHIVED_RE = /^- R(\d+)(?:[–-]R(\d+))? archived, not resident \((\d+) requests?\);/;
+const REQ_HEAD_RE = /^- (?:R(\d+)|legacy R(\d+)|legacy request)(?: · handle ([0-9a-z]{10}))?(?: · ((?:verbatim|skill references|source incomplete|(?:source incomplete · )?emergency excerpt(?: · original \d+ chars)?)(?: · skill references)?))?(?: · continuation of R(\d+))?$/;
 const INTENT_ROW_RE = /^- R(\d+) · source ([0-9a-z]{10})$/;
 const OMIT_RE = /^Catalogue omissions: (\d+) routine-read-filtered; (\d+) budget-omitted(?:; sources (?:… )?(.*))?$/;
 const MAX_INTENTS = 8;
@@ -409,9 +409,8 @@ export interface V2Request {
 	sourceIncomplete?: boolean;
 	emergencyExcerpt?: { originalChars: number };
 	skillReferences?: boolean;
-	/** Known to exist but not resident: the request's text was archived as a whole range to fit the hard room. Identity stays
-	 *  the raw-branch number, so the next summary rebuilds it verbatim from the branch; only the resident view is lossy. */
-	archived?: boolean;
+	/** Inclusive range starting at `number`; kept compact even when the raw branch is unavailable. */
+	archived?: { last: number };
 	continuationOf?: number;
 }
 
@@ -440,10 +439,10 @@ const requestRow = (r: V2Request) => {
 	const origChars = r.emergencyExcerpt?.originalChars ? ` · original ${r.emergencyExcerpt.originalChars} chars` : "";
 	const qual = r.emergencyExcerpt
 		? (r.sourceIncomplete ? "source incomplete · emergency excerpt" : "emergency excerpt") + origChars
-		: (r.sourceIncomplete ? "source incomplete" : r.skillReferences ? "skill references" : "verbatim");
+		: (r.sourceIncomplete ? "source incomplete" : r.skillReferences ? "skill references" : "");
 	const skills = r.skillReferences && qual !== "skill references" ? " · skill references" : "";
 	const cont = r.continuationOf ? ` · continuation of R${r.continuationOf}` : "";
-	return `- ${num}${h} · ${qual}${skills}${cont}\n${quoteLines(r.text)}`;
+	return `- ${num}${h}${qual ? ` · ${qual}` : ""}${skills}${cont}\n${quoteLines(r.text)}`;
 };
 
 const epochHeading = (e: V2Epoch) => {
@@ -457,18 +456,32 @@ const omissionRow = (o: V2Epoch["omitted"]) =>
 		? `Catalogue omissions: ${o.routine} routine-read-filtered; ${o.budget} budget-omitted${o.sources.length ? `; sources ${o.sources.length > MAX_OMIT_SOURCES ? "… " : ""}${o.sources.slice(-MAX_OMIT_SOURCES).join(", ")}` : ""}`
 		: "";
 
-/** One line in place of an archived run of rows: the numbers are the recall selector, the count says how many were there. */
-const archiveRow = (rows: readonly V2Request[]): string => {
-	const nums = rows.map((r) => r.number).filter((n) => n > 0).sort((x, y) => x - y);
-	const first = nums[0] ?? 0, last = nums.at(-1) ?? 0;
-	const range = first === last ? `R${first}` : `R${first}–R${last}`;
-	return `- ${range} archived, not resident (${rows.length} request${rows.length === 1 ? "" : "s"}); zip_recall({ requests: "${first}-${last}" }) returns the exact text`;
-};
+const requestCount = (rows: readonly V2Request[]): number => rows.reduce((n, r) => n + (r.archived ? r.archived.last - r.number + 1 : 1), 0);
 
-export function renderEpoch(e: V2Epoch): string {
-	const resident = e.requests.filter((r) => !r.archived);
-	const archived = e.requests.filter((r) => r.archived);
-	const rows = [...resident.map(requestRow), ...(archived.length ? [archiveRow(archived)] : [])];
+/** Join only adjacent ranges. Gaps, resident rows and duplicate numbers must not become invented requests. */
+function compactArchives(rows: readonly V2Request[]): V2Request[] {
+	const out: V2Request[] = [];
+	for (const r of rows) {
+		const prev = out.at(-1);
+		if (prev?.archived && r.archived && prev.archived.last + 1 === r.number) prev.archived.last = r.archived.last;
+		else out.push({ ...r, ...(r.archived ? { archived: { ...r.archived } } : {}) });
+	}
+	return out;
+}
+
+const archiveRow = (r: V2Request, file?: FileRecall): string => {
+	const first = r.number, last = r.archived!.last, count = last - first + 1;
+	const range = first === last ? `R${first}` : `R${first}–R${last}`;
+	const recall = file
+		? `${file.dir}/requests.txt holds the exact text for ${range}; ${fileRecallHow(file)}`
+		: `${RECALL_TOOL}({ requests: "${first}-${last}" }) returns the exact text`;
+	return `- ${range} archived, not resident (${count} request${count === 1 ? "" : "s"}); ${recall}`;
+};
+const requestRows = (rows: readonly V2Request[], file?: FileRecall): string[] =>
+	compactArchives(rows).map((r) => r.archived ? archiveRow(r, file) : requestRow(r));
+
+export function renderEpoch(e: V2Epoch, file?: FileRecall): string {
+	const rows = requestRows(e.requests, file);
 	const out = [epochHeading(e), SUB.requests, ...(rows.length ? rows : [NONE]), "", SUB.prose, safeProse(e.block.durableProse) || NONE];
 	if (e.commitments.length) out.push("", SUB.commitments, ...e.commitments);
 	out.push("", SUB.evidence, ...(e.evidence.length ? e.evidence : [NONE]));
@@ -487,15 +500,16 @@ const recallLine = (file?: FileRecall) =>
 
 /** The whole v2 text. The alias legend names only aliases its records use. */
 export function renderV2(s: V2State, file?: FileRecall): string {
-	const epochs = s.epochs.map(renderEpoch);
+	const epochs = s.epochs.map((e) => renderEpoch(e, file));
 	const used = new Set([...epochs.join("\n").matchAll(/\[([a-z]{1,3})\] /g)].map((m) => m[1]));
 	const legend = [...s.aliases].filter(([, a]) => used.has(a)).sort((x, y) => x[1].length - y[1].length || x[1].localeCompare(y[1])).map(([d, a]) => `${a}=${d}`);
 	const allRequests = s.epochs.flatMap((e) => e.requests);
 	const truncatedCount = allRequests.filter((r) => !!r.emergencyExcerpt).length;
-	const archivedCount = allRequests.filter((r) => r.archived).length;
+	const archivedCount = requestCount(allRequests.filter((r) => r.archived));
+	const count = requestCount(allRequests);
 	const emergencyBits = [
-		truncatedCount ? `${truncatedCount} of ${allRequests.length} requests shortened to fit the window` : "",
-		archivedCount ? `${archivedCount} of ${allRequests.length} requests archived, not resident` : "",
+		truncatedCount ? `${truncatedCount} of ${count} requests shortened to fit the window` : "",
+		archivedCount ? `${archivedCount} of ${count} requests archived, not resident` : "",
 	].filter(Boolean);
 	const emergencyLine = emergencyBits.length
 		? `Requests: emergency excerpts — ${emergencyBits.join("; ")}; recall by R<n>/handle returns exact text.`
@@ -621,13 +635,12 @@ export function parseSummaryV2(text: string | null): V2State | null {
 			const ar = ARCHIVED_RE.exec(l);
 			if (ar) {
 				flushReq();
-				const first = Number(ar[1]), last = Number(ar[2] ?? ar[1]);
-				// One placeholder per archived number: the next prepare looks each up in the raw branch, so only the number is needed
-				// here. A range too large to expand keeps its first number, so parsing cannot be forced into a huge allocation.
-				if (last - first < 512) for (let n = first; n <= last; n++) ep.requests.push({ number: n, text: "", archived: true });
-				else ep.requests.push({ number: first, text: "", archived: true });
+				const first = Number(ar[1]), last = Number(ar[2] ?? ar[1]), count = Number(ar[3]);
+				if (![first, last, count].every(Number.isSafeInteger) || first < 1 || last < first || count !== last - first + 1) return null;
+				ep.requests.push({ number: first, text: "", archived: { last } });
 				continue;
 			}
+			if (l.startsWith("- R") && l.includes(" archived, not resident")) return null;
 			const m = REQ_HEAD_RE.exec(l);
 			if (m) {
 				flushReq();
@@ -700,11 +713,29 @@ export interface PrepareV2Options {
 
 export interface PreparedV2 {
 	state: V2State;
+	/** Only branch-verified identities may be newly archived by number. */
+	recallableRequests?: ReadonlyMap<number, string>;
 	referenceText: string; // what the retained narrative, state, commitments and intents say (evidence they point at is kept first)
 	stats: { quoteAccepted: number; quoteRejected: number; roleMismatch: number; routineReadFiltered: number; associationUnresolved: number; executionCount: number; resultCount: number; lateResults: number };
 }
 
 const fromRaw = (r: BranchRequest): V2Request => ({ number: r.number, handle: r.handle, entryId: r.entryId, text: r.text });
+
+/** Work is bounded by the available branch, not by the size of an archived range. Missing spans stay recallable ranges. */
+function restoreArchive(r: V2Request, raw: readonly BranchRequest[]): V2Request[] {
+	const out: V2Request[] = [];
+	let first = r.number;
+	const last = r.archived!.last;
+	for (const hit of raw) {
+		if (hit.number < first || hit.number > last) continue;
+		if (hit.number > first) out.push({ number: first, text: "", archived: { last: hit.number - 1 } });
+		out.push(fromRaw(hit));
+		if (hit.number === last) return out;
+		first = hit.number + 1;
+	}
+	out.push({ number: first, text: "", archived: { last } });
+	return out;
+}
 
 /** An older-format or foreign previous summary as one epoch: its requests (verbatim from the branch when the branch has them), its
  *  narrative and its lists, without claiming which of its parts came when. */
@@ -748,7 +779,6 @@ export function prepareEpochV2(o: PrepareV2Options): PreparedV2 {
 	const raw = branch.length ? branchRequests(branch) : [];
 	const rawById = new Map(raw.map((r) => [r.entryId, r]));
 	const rawByHandle = new Map(raw.map((r) => [r.handle, r]));
-	const rawByNumber = new Map(raw.filter((r) => r.number > 0).map((r) => [r.number, r]));
 	const sliceFirst = o.prefix.find((b) => b.entryId)?.entryId;
 	const prevV2 = parseSummaryV2(o.previous ?? null);
 	let carried: V2Epoch[] = [];
@@ -756,20 +786,11 @@ export function prepareEpochV2(o: PrepareV2Options): PreparedV2 {
 	let prevActive = "", prevActiveAt: string | undefined;
 	const aliases0 = new Map<string, string>();
 	if (prevV2) {
-		carried = prevV2.epochs.map((e) => ({ ...e, requests: e.requests.map((r) => {
-			const hit = r.handle ? rawByHandle.get(r.handle) : undefined; // an incomplete or legacy request the branch still has: verbatim again
-			if (hit && (r.sourceIncomplete || r.number === 0 || r.emergencyExcerpt || r.skillReferences)) {
-				return { ...fromRaw(hit), ...(r.continuationOf ? { continuationOf: r.continuationOf } : {}) };
-			}
-			// an archived row carries only its number: the branch restores it verbatim, so the next render decides again whether it fits
-			if (r.archived) {
-				const n = rawByNumber.get(r.number);
-				return n ? { ...fromRaw(n), ...(r.continuationOf ? { continuationOf: r.continuationOf } : {}) } : r;
-			}
-			if (r.emergencyExcerpt && !hit) {
-				return { ...r, sourceIncomplete: true };
-			}
-			return r;
+		carried = prevV2.epochs.map((e) => ({ ...e, requests: e.requests.flatMap((r): V2Request[] => {
+			if (r.archived) return restoreArchive(r, raw);
+			const hit = r.handle ? rawByHandle.get(r.handle) : undefined;
+			if (hit) return [{ ...fromRaw(hit), ...(r.continuationOf ? { continuationOf: r.continuationOf } : {}) }];
+			return [r.emergencyExcerpt ? { ...r, sourceIncomplete: true } : r];
 		}), evidence: [...e.evidence], commitments: [...e.commitments], omitted: { ...e.omitted, sources: [...e.omitted.sources] } }));
 		prevIntents = prevV2.intents;
 		prevActive = prevV2.activeState;
@@ -784,7 +805,7 @@ export function prepareEpochV2(o: PrepareV2Options): PreparedV2 {
 	}
 	// this slice's requests
 	const seen = new Set(carried.flatMap((e) => e.requests.map((r) => r.entryId).filter(Boolean) as string[]));
-	let maxNo = carried.reduce((m, e) => e.requests.reduce((n, r) => Math.max(n, r.number), m), 0);
+	let maxNo = carried.reduce((m, e) => e.requests.reduce((n, r) => Math.max(n, r.archived?.last ?? r.number), m), 0);
 	const posOf = new Map(branch.map((e, i) => [e?.id, i]));
 	const startAt = sliceFirst !== undefined ? posOf.get(sliceFirst) : undefined;
 	// the request in effect when the slice begins (it may begin inside one): the newest raw request before it
@@ -885,6 +906,7 @@ export function prepareEpochV2(o: PrepareV2Options): PreparedV2 {
 			epochs: [...carried, fresh],
 		},
 		referenceText,
+		recallableRequests: new Map(raw.map((r) => [r.number, r.handle])),
 		stats: {
 			quoteAccepted: ri.accepted,
 			quoteRejected: ri.rejected,
@@ -992,6 +1014,14 @@ export function formatRequestExcerpt(rawText: string, targetChars: number, handl
 	return { text, truncated: true };
 }
 
+/** Qualifiers and quote prefixes count too: an excerpt must reduce the complete row, not just its body. */
+function excerptRequest(raw: V2Request, targetChars: number, file?: FileRecall): V2Request {
+	const excerpt = formatRequestExcerpt(raw.text, targetChars, raw.handle, file);
+	if (!excerpt.truncated) return { ...raw };
+	const row = { ...raw, text: excerpt.text, emergencyExcerpt: raw.emergencyExcerpt ?? { originalChars: raw.text.length } };
+	return requestRow(row).length < requestRow(raw).length ? row : { ...raw };
+}
+
 /** Discrete water-filling allocation: distribute `budget` characters across items with requested `needed` characters,
  *  such that items requesting less than the fair share keep 100% of their text, and the remaining budget is distributed
  *  equally among the longer items. */
@@ -1050,8 +1080,8 @@ const PROSE_OMITTED = "(omitted to fit the summary room; this epoch's requests a
  * Fit the prepared summary. `soft`: the size the plan priced; unselected, unreferenced evidence is dropped by priority:
  * successful mutation acknowledgements, ordinary observations, then historical errors; oldest first within each tier, whole records only. `hard`: the size beyond which the
  * compacted view would not fit the model's room; above it the other evidence goes, then commitments, then the intent quotes (the
- * requests keep those words), then the prose of old epochs and last of the newest, then the state. User requests are never dropped: when
- * they and the summary's fixed structure alone exceed `hard` the result is `request-budget-overflow`.
+ * requests keep those words), then the prose of old epochs and last of the newest, then the state. Request identity is retained through
+ * excerpts and eligible archived ranges; if the permitted representation still exceeds `hard`, return `request-budget-overflow`.
  */
 export function renderEpochSummaryV2(prep: PreparedV2, opts: { soft: number; hard: number; file?: FileRecall }): EpochSummaryV2 {
 	// Original request sizes are measured on the prepared text, before the resident view compresses a Pi skill expansion: counting
@@ -1144,12 +1174,14 @@ export function renderEpochSummaryV2(prep: PreparedV2, opts: { soft: number; har
 	if (size <= hard) {
 		const text = renderV2(s, opts.file);
 		const total = size;
-		const reqs = s.epochs.flatMap((e) => e.requests);
+		const allReqs = s.epochs.flatMap((e) => e.requests);
+		const reqs = allReqs.filter((r) => !r.archived);
+		const archivedRequestCount = requestCount(allReqs.filter((r) => r.archived));
 		const totalChars = reqs.reduce((n, r) => n + r.text.length, 0);
 		const truncatedRequestCount = reqs.filter((r) => !!r.emergencyExcerpt).length;
 		const sum = (f: (e: V2Epoch) => string) => tok4(s.epochs.map(f).join("\n"));
 		const tokens = {
-			requests: sum((e) => e.requests.map(requestRow).join("\n")),
+			requests: sum((e) => requestRows(e.requests, opts.file).join("\n")),
 			intent: tok4(s.intents.map((i) => i.quote).join("\n")),
 			state: tok4(s.activeState),
 			prose: sum((e) => e.block.durableProse),
@@ -1165,13 +1197,13 @@ export function renderEpochSummaryV2(prep: PreparedV2, opts: { soft: number; har
 			diagnostics: {
 				formatVersion: "v2",
 				numbering: "raw-branch-v2",
-				requestEmergencyMode: truncatedRequestCount > 0 ? "excerpt" : "none",
+				requestEmergencyMode: archivedRequestCount > 0 ? "archive" : truncatedRequestCount > 0 ? "excerpt" : "none",
 				truncatedRequestCount,
-				archivedRequestCount: 0,
+				archivedRequestCount,
 				originalRequestChars: originalChars,
 				residentRequestChars: totalChars,
 				epochs: s.epochs.length,
-				requestCount: reqs.length,
+				requestCount: requestCount(allReqs),
 				verbatimCount: reqs.filter((r) => !r.sourceIncomplete && !r.emergencyExcerpt && !r.skillReferences).length,
 				skillReferenceCount: reqs.filter((r) => r.skillReferences).length,
 				sourceIncompleteCount: reqs.filter((r) => r.sourceIncomplete).length,
@@ -1195,26 +1227,28 @@ export function renderEpochSummaryV2(prep: PreparedV2, opts: { soft: number; har
 	// dropped, the fixed structure plus verbatim requests still crossed the hard room. Request compaction runs in two steps, both
 	// deterministic and both rebuilt from the prepared state (never from the mutated `s`):
 	//   E1 — every request keeps a row; text is shortened per request by water-filling, at least MIN_EXCERPT_CHARS of each.
-	//   E2 — when even those rows do not fit, whole old epochs' requests become one range row each, oldest epochs first; the newest
-	//        epoch's requests always stay resident. Identity is the raw-branch number, so every archived request comes back verbatim
-	//        from the branch at the next compaction, and `zip_recall({ requests: "a-b" })` reads it now.
+	//   E2 — eligible old epochs become contiguous ranges, oldest first; the newest request-bearing epoch stays resident.
+	//        Available raw requests are restored at the next compaction; missing spans retain their range identity.
 	// Evidence, commitments and old prose do not come back in either step; their omission rows stay.
 
 	const buildEmergency = (archiveBefore: number) => {
 		const pairs: { orig: V2Request; em: V2Request }[] = [];
 		const emEpochs: V2Epoch[] = prep.state.epochs.map((e, i) => {
 			const from = requests[i];
-			const archived = i < archiveBefore && from.length > 0;
+			// Do not trade away the only surviving copy of a legacy or unverified request.
+			const archived = i < archiveBefore && from.length > 0 && from.every((r) => r.archived ||
+				(Number.isSafeInteger(r.number) && r.number > 0 && !r.legacyNumber && !r.continuationOf &&
+				 !!r.handle && prep.recallableRequests?.get(r.number) === r.handle));
 			const minReqs: V2Request[] = [];
 			if (!archived) for (const r of from) {
-				const { text, truncated } = formatRequestExcerpt(r.text, MIN_EXCERPT_CHARS, r.handle, opts.file);
-				const em: V2Request = { ...r, text, ...(truncated ? { emergencyExcerpt: r.emergencyExcerpt ?? { originalChars: r.text.length } } : {}) };
+				if (r.archived) { minReqs.push(r); continue; }
+				const em = excerptRequest(r, MIN_EXCERPT_CHARS, opts.file);
 				minReqs.push(em);
 				pairs.push({ orig: r, em });
 			}
 			return {
 				...e,
-				requests: archived ? from.map((r) => ({ number: r.number, ...(r.legacyNumber ? { legacyNumber: r.legacyNumber } : {}), text: "", archived: true })) : minReqs,
+				requests: archived ? compactArchives(from.map((r) => ({ number: r.number, text: "", archived: { last: r.archived?.last ?? r.number } }))) : minReqs,
 				commitments: [],
 				evidence: [],
 				omitted: { routine: e.omitted.routine, budget: e.omitted.budget + e.evidence.length, sources: [...e.omitted.sources, ...e.evidence.flatMap(recordHandles)] },
@@ -1236,7 +1270,7 @@ export function renderEpochSummaryV2(prep: PreparedV2, opts: { soft: number; har
 				delete state.activeStale;
 			}
 		}
-		const stateKept = !!state.activeState.trim();
+		const stateKept = !prep.state.activeState.trim() || !!state.activeState.trim();
 		let intentsKept = stateKept && prep.state.intents.length === 0;
 		if (stateKept && prep.state.intents.length > 0) {
 			state.intents = prep.state.intents;
@@ -1261,10 +1295,9 @@ export function renderEpochSummaryV2(prep: PreparedV2, opts: { soft: number; har
 				const extra = waterFillChars(needed, budget);
 				for (let i = 0; i < pairs.length; i++) {
 					const { orig, em } = pairs[i];
-					const ex = formatRequestExcerpt(orig.text, floor[i] + extra[i], orig.handle, opts.file);
+					const ex = excerptRequest(orig, floor[i] + extra[i], opts.file);
 					em.text = ex.text;
-					// A carried excerpt keeps its own "original <n> chars": that length is the raw request's, not the excerpt's.
-					if (ex.truncated || orig.emergencyExcerpt) em.emergencyExcerpt = orig.emergencyExcerpt ?? { originalChars: orig.text.length };
+					if (ex.emergencyExcerpt) em.emergencyExcerpt = ex.emergencyExcerpt;
 					else delete em.emergencyExcerpt;
 				}
 				return fits();
@@ -1284,9 +1317,8 @@ export function renderEpochSummaryV2(prep: PreparedV2, opts: { soft: number; har
 		return { state, pairs, size: tok4(renderV2(state, opts.file)) };
 	};
 
-	// E1 first; then archive one more old epoch at a time until the document fits. The first fit wins, so the least amount of
-	// request text is withheld, and the newest epoch that still holds requests stays resident: archiving it would drop the work in
-	// flight to save room for nothing. Deterministic: same branch, same room, same epochs -> same text.
+	// E1 first, then the smallest oldest-first prefix of eligible epochs that fits. Protect the newest request-bearing epoch,
+	// even when a later empty epoch exists. This policy can still fail closed for a single oversized epoch.
 	const newestWithRequests = prep.state.epochs.reduce((last, e, i) => (e.requests.length ? i : last), -1);
 	let em = buildEmergency(0);
 	for (let k = 1; k <= newestWithRequests && em.size > hard; k++) em = buildEmergency(k);
@@ -1296,10 +1328,10 @@ export function renderEpochSummaryV2(prep: PreparedV2, opts: { soft: number; har
 	const finalSize = em.size;
 	const residentRequestChars = resident.reduce((n, r) => n + r.text.length, 0);
 	const truncatedRequestCount = resident.filter((r) => !!r.emergencyExcerpt).length;
-	const archivedRequestCount = emReqs.length - resident.length;
+	const archivedRequestCount = requestCount(emReqs.filter((r) => r.archived));
 	const sum = (f: (e: V2Epoch) => string) => tok4(em.state.epochs.map(f).join("\n"));
 	const tokens = {
-		requests: sum((e) => e.requests.filter((r) => !r.archived).map(requestRow).join("\n")),
+		requests: sum((e) => requestRows(e.requests, opts.file).join("\n")),
 		intent: tok4(em.state.intents.map((i) => i.quote).join("\n")),
 		state: tok4(em.state.activeState),
 		prose: sum((e) => e.block.durableProse),
@@ -1322,7 +1354,7 @@ export function renderEpochSummaryV2(prep: PreparedV2, opts: { soft: number; har
 			originalRequestChars: originalChars,
 			residentRequestChars,
 			epochs: em.state.epochs.length,
-			requestCount: emReqs.length,
+			requestCount: requestCount(emReqs),
 			verbatimCount: resident.filter((r) => !r.sourceIncomplete && !r.emergencyExcerpt && !r.skillReferences).length,
 			skillReferenceCount: resident.filter((r) => r.skillReferences).length,
 			sourceIncompleteCount: resident.filter((r) => r.sourceIncomplete).length,

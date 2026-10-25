@@ -2,14 +2,16 @@
 
 ## Unreleased
 
-- Format v2 request text no longer grows: a shortened row is only used when it is actually shorter than the text it
-  replaces (the omission marker is ~85 characters, so requests up to a few hundred characters stay verbatim instead of
-  becoming longer "excerpts"), and its `original` length is measured before resident-view compression.
-- Format v2 gains E2: when even minimal excerpts do not fit the hard room, whole old epochs' requests become one
-  archived-range row each (`R1–R15 archived, not resident`), oldest epochs first, never the newest epoch that holds
-  requests. Archived rows keep their raw-branch identity, so `zip_recall({ requests: "1-15" })` reads them now and the
-  next summary restores them verbatim. The terminal failure keeps the existing `request-budget-overflow` reason, and its
-  diagnostics now report a per-section token breakdown instead of charging the whole document to request text.
+- Format v2 omits the redundant `verbatim` qualifier on ordinary request rows; existing summaries with the qualifier
+  remain readable. Excerpts must shrink the complete rendered row, including qualifiers and quote prefixes, not just
+  its body. Original lengths are measured before resident-view compression when that source text is available.
+- Format v2 gains E2: eligible old epochs become compact archived ranges when minimal excerpts cannot fit. The newest
+  request-bearing epoch stays resident. Only branch-verified identities may be newly archived; legacy and unverified
+  text is not discarded. Ranges preserve gaps and all ordinals, including spans above 512 requests, and restore available
+  raw text on the next compaction. Missing spans stay archived, never reported as verbatim. Invalid range bounds and
+  counts are rejected without expansion. Recall instructions respect file-only mode.
+- An empty active state no longer suppresses validated intents or newest prose under emergency budgeting. Terminal
+  failures keep `request-budget-overflow`, with section-level token diagnostics for both successful and failed cuts.
 - The narrative call reads a Pi `<skill>` expansion in full again, so constraints a skill carries can reach the durable
   prose and the state; summary request rows keep the `/skill:name` short form and remain recallable.
 
