@@ -1694,7 +1694,7 @@ for (const order of ORDERS) describe(`the typed-prompt door opens at Pi's input 
 
 // 0.4.6: the idle door ("epsilon", research pi-tricks §1b variant 4). A run an extension's message starts has no idle input: before, its
 // ready summary waited for the first turn_end, so a cold return wrote the whole folded context and, a turn later, the summarized one
-// (demo 10-14 13:32: 230K, then 44K more). Now the summary goes in through Pi's compaction while Pi is idle, at the first moment the
+// (a live session, 10-14 13:32: 230K, then 44K more). Now the summary goes in through Pi's compaction while Pi is idle, at the first moment the
 // return's own decision takes it, and the next run, whoever starts it, carries that decision from its first request.
 for (const order of ORDERS) describe(`the idle door: a ready summary goes in while Pi is idle, for any next run (Pi ${order} order)`, () => {
 	const sleep = (ms: number) => new Promise((res) => setTimeout(res, ms));
@@ -1756,7 +1756,7 @@ for (const order of ORDERS) describe(`the idle door: a ready summary goes in whi
 	});
 
 	test("an old compaction by an extension since removed, followed by pi-zip's own, leaves the door open", async () => {
-		// a live session (demo) kept 6 such compactions from its first days: every native compaction was refused for good
+		// a live session kept 6 such compactions from its first days: every native compaction was refused for good
 		const { r, led } = await coldRig({ file: oldCompactions(false) });
 		expect(led.filter((x: Any) => x.type === "native_skip").map((x: Any) => x.reason), "an old foreign compaction never closes the door").toEqual([]);
 		expect(r.compactCalls.n).toBe(1);

@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.4.15
+
+- No behavior change. Removed local machine paths, a session name and private provider names from comments, docs and
+  tests.
+
 ## 0.4.14
 
 - Model-visible timestamps in folded placeholders, summary rows and narrative labels now use explicit UTC, so the same
