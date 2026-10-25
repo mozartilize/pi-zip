@@ -6,13 +6,15 @@ import { blockTime, cdAliases, clipMid, distinctLines, handleFor, keyTexts, outc
 import { type Block, type Cut, type PlanResult, callOf, NARRATIVE_CALL_MAX, NARRATIVE_MAX, settings, toolCallIndex } from "./plan.ts";
 import { assistantVisibleText, branchRequests } from "./recall.ts";
 import { type FileRecall, fileRecallHow } from "./recallfile.ts";
-import { type IntentProposal, intentQuotesOf, parseSummaryV2, prepareEpochV2, referencesSource, regroupEpochsV2, renderEpochSummaryV2 } from "./summary-v2.ts";
+import { skillReference } from "./skill-reference.ts";
+import { type EvidenceProposal, type CommitmentProposal, type IntentProposal, intentQuotesOf, parseSummaryV2, prepareEpochV2, referencesSource, regroupEpochsV2, renderEpochSummaryV2 } from "./summary-v2.ts";
 import { type Any, attempt, clamp, clip, envInt, fmtWhen, reasonsByDefault, textOf, tok4 } from "./util.ts";
 
 export const SUMMARY_MARK = "[summary of earlier conversation by pi-zip]";
 export {
 	SUMMARY_V2_DISCLAIMER, SUMMARY_V2_MARK, buildEpochSummaryV2, collectAssistantCommitments, collectExecutions, formatExecutionRecord,
-	parseSummaryV2, prepareEpochV2, referencesSource, regroupEpochsV2, renderEpochSummaryV2, resolveIntents, validateUserIntentQuote,
+	formatRequestExcerpt, MIN_EXCERPT_CHARS, parseSummaryV2, prepareEpochV2, referencesSource, regroupEpochsV2, renderEpochSummaryV2,
+	resolveIntents, validateUserIntentQuote, waterFillChars,
 	type EpochSummaryV2, type ExecutionRecord, type ExecutionResultRef, type V2Epoch, type V2State,
 } from "./summary-v2.ts";
 const POLICY_BLOCK_RE = /violate|terms of service|usage polic|content polic|acceptable use/i;
@@ -610,15 +612,15 @@ export function clipActive(text: string, maxChars: number): string {
 	return [...kept.filter((l): l is string => l !== null), ...(o || s ? [marker] : [])].join("\n");
 }
 
-const MARK_LINE = /^[\s#*_>`-]*(DECISIONS|ACTIVE|INTENT)\b[\s#*_:`-]*$/i;
+const MARK_LINE = /^[\s#*_>`-]*(DECISIONS|ACTIVE|INTENT|COMMITMENTS|EVIDENCE)\b[\s#*_:`-]*$/i;
 const ACTIVE_TOPIC = /current state|state of the work|open todo|todos|next step|blocker|in.flight|active|status/i;
 /**
  * The two parts of a narrative reply: decisions and durable facts, and the current state and open todos. Reads the marker lines the
  * prompt asks for; a reply without them is split by its headings (the older four headings included); a reply with neither is all durable.
  */
-export function parseNarrativeReply(text: string): { durable: string; active: string; intent?: string[] } {
+export function parseNarrativeReply(text: string): { durable: string; active: string; intent?: string[]; commitments?: CommitmentProposal[]; evidence?: EvidenceProposal[] } {
 	const lines = text.split("\n");
-	const d: string[] = [], a: string[] = [], i: string[] = [];
+	const d: string[] = [], a: string[] = [], i: string[] = [], c: string[] = [], e: string[] = [];
 	const marked = lines.some((l) => MARK_LINE.test(l));
 	let cur = d, sawIntent = false;
 	for (const l of lines) {
@@ -626,7 +628,7 @@ export function parseNarrativeReply(text: string): { durable: string; active: st
 		if (marked) {
 			if (m) {
 				const k = m[1].toUpperCase();
-				cur = k === "ACTIVE" ? a : k === "INTENT" ? i : d;
+				cur = k === "ACTIVE" ? a : k === "INTENT" ? i : k === "COMMITMENTS" ? c : k === "EVIDENCE" ? e : d;
 				if (k === "INTENT") sawIntent = true;
 			} else cur.push(l);
 			continue;
@@ -636,7 +638,17 @@ export function parseNarrativeReply(text: string): { durable: string; active: st
 		cur.push(l);
 	}
 	const none = (t: string) => (!t || /^\(?none\.?\)?\.?$/i.test(t) ? NONE_ROW : t);
-	return { durable: none(prose(d.join("\n"))), active: prose(a.join("\n")), ...(sawIntent ? { intent: intentQuotesOf(i) } : {}) };
+	const quotes = (lines: string[]): Array<{ sourceHandle: string; quote: string }> => {
+		const out: Array<{ sourceHandle: string; quote: string }> = [];
+		for (const line of lines) {
+			try {
+				const p = JSON.parse(line);
+				if (typeof p?.sourceHandle === "string" && typeof p?.quote === "string") out.push({ sourceHandle: p.sourceHandle, quote: p.quote });
+			} catch { /* A malformed proposal adds no record. */ }
+		}
+		return out;
+	};
+	return { durable: none(prose(d.join("\n"))), active: prose(a.join("\n")), ...(sawIntent ? { intent: intentQuotesOf(i) } : {}), ...(c.length ? { commitments: quotes(c) } : {}), ...(e.length ? { evidence: quotes(e) } : {}) };
 }
 
 /** The narrative section's body: the current state first, then the epochs, oldest first (bounded to `maxTokens` when given). */
@@ -1148,12 +1160,23 @@ export function reasoningInput(messages: Any[], limits = REASONING_LIMITS): { ad
  * re-read. Only the bounded previous active state is reconciled against this slice. `durable`/`active` = the reply's two parts.
  */
 /** `intent`: also ask for the user's own words that state what they want now (format v2's Current intent), given the previous ones. */
-export async function narrative(prefix: Block[], ctx: Any, budgetTokens: number, ownSignal?: AbortSignal, previousActive = "", intent?: { previous: string[] }): Promise<Narrative & { durable?: string; active?: string; intent?: string[] }> {
+export async function narrative(prefix: Block[], ctx: Any, budgetTokens: number, ownSignal?: AbortSignal, previousActive = "", intent?: { previous: string[] }): Promise<Narrative & { durable?: string; active?: string; intent?: string[]; commitments?: CommitmentProposal[]; evidence?: EvidenceProposal[] }> {
 	const t0 = Date.now();
 	if (!ctx.model) return { text: null, ok: false, ms: 0, costUsd: 0, error: "no current model" };
 	const rawMsgs = prefix
 		.filter((b) => b.kind !== "summary")
-		.map((b) => (b.raw && !(b.edited && !b.ours) ? b.raw : b.msg)); // the summariser reads the unfolded originals
+		.map((b) => {
+			const msg = b.raw && !(b.edited && !b.ours) ? b.raw : b.msg; // unfolded originals
+			if (intent && b.kind === "user") {
+				return { ...msg, content: Array.isArray(msg.content)
+					? msg.content.map((c: Any) => c?.type === "text" ? { ...c, text: skillReference(c.text) } : c)
+					: skillReference(textOf(msg.content)) };
+			}
+			if (!intent || !b.entryId || (b.kind !== "assistant" && (b.kind !== "toolResult" || msg.toolName === RECALL_TOOL))) return msg;
+			const content = Array.isArray(msg.content) ? msg.content : [{ type: "text", text: textOf(msg.content) }];
+			const role = b.kind === "assistant" ? "assistant" : "tool output";
+			return { ...msg, content: [{ type: "text", text: `[${role} source: ${handleFor(b.entryId)}]` }, ...content] };
+		});
 	const { messages: msgs } = reasoningInput(rawMsgs);
 	let conv: string;
 	try {
@@ -1185,7 +1208,22 @@ export async function narrative(prefix: Block[], ctx: Any, budgetTokens: number,
 			? `---INTENT---\n` +
 				`(the user's own words that state what the user wants now: copy each quote character for character from a user message in this ` +
 				`conversation slice or from <previous-intent>, keeping a previous one only while it still applies; one per line as - "exact words"; ` +
-				`at most 6; never quote assistant text or tool output; write (none) if none)\n`
+				`at most 6; never quote assistant text or tool output; write (none) if none)\n` +
+				`---COMMITMENTS---\n` +
+				`(select at most 4 explicit commitments by the assistant to perform work. A prediction about software behavior, quoted text, ` +
+				`or a description of completed work is not a commitment. Select by meaning in any language, not keywords. ` +
+				`Use only visible assistant text from this slice, never reasoning, user text or tool output. ` +
+				`Each line must be JSON: {"sourceHandle":"the message's assistant source label","quote":"exact source words"}. ` +
+				`Quotes must be complete statements, at most 200 characters each; omit any that cannot fit without changing meaning. ` +
+				`Do not invent source labels or paraphrase quotes. Write (none) if none.)\n` +
+				`---EVIDENCE---\n` +
+				`(select at most 8 tool results that support your retained findings, final verification results or still-open blockers. ` +
+				`Prefer the final verification for each distinct scope over intermediate attempts; a later narrow check does not replace a broader one. ` +
+				`A nonzero exit alone does not prove an unresolved blocker. Omit routine edit acknowledgements and exploratory source reads unless ` +
+				`a retained finding depends on their exact output. Each line must be JSON: {"sourceHandle":"the tool output source label",` +
+				`"quote":"exact evidence span, at most 200 characters"}. Quote the decisive result (such as the final test totals), ` +
+				`not a command header. Use only tool output in this slice, never assistant claims, reasoning or user text. ` +
+				`Do not invent sources or paraphrase quotes. Write (none) if none.)\n`
 			: "") +
 		`Be concrete and keep exact paths, names and numbers. Stay under about ${w.durable + w.active} words in all. Do not call tools.\n\n` +
 		REASONING_QUALIFICATION;
@@ -1274,6 +1312,8 @@ export async function buildCut(p: PlanResult, ctx: Any, signal?: AbortSignal): P
 			...(!nar.ok ? { activeStale: clip(nar.error ?? "n/a", 120) } : {}),
 			durableProse: durable,
 			...(intents ? { proposedIntents: intents } : {}),
+			...(nar.ok && nar.commitments ? { proposedCommitments: nar.commitments } : {}),
+			...(nar.ok && nar.evidence ? { proposedEvidence: nar.evidence } : {}),
 			timestamp: nowWhen ?? "time unknown",
 		});
 		// only the prose of old epochs is merged by the model; their requests and evidence are joined by code (regroupEpochsV2)

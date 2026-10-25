@@ -5,19 +5,23 @@ import { buildBlocks, callOf, NARRATIVE_CALL_MAX, NARRATIVE_MAX, plan, toolCallI
 import { lawPrices } from "../src/learn.ts";
 import { tok4 } from "../src/util.ts";
 import { handleFor, makePlaceholderFor } from "../src/placeholder.ts";
-import { resolveHandlesInBranch } from "../src/recall.ts";
+import { branchRequests, recallRequestsInBranch, resolveHandlesInBranch } from "../src/recall.ts";
 import {
 	ACTIVE_WORDS,
 	ACTIVE_INPUT_TOKENS,
 	buildEpochSummaryV2,
 	collectExecutions,
 	formatExecutionRecord,
+	formatRequestExcerpt,
+	MIN_EXCERPT_CHARS,
 	parseSummaryV2,
+	prepareEpochV2,
 	regroupEpochsV2,
 	referencesSource,
 	renderEpochSummaryV2,
 	SUMMARY_V2_MARK,
 	validateUserIntentQuote,
+	waterFillChars,
 	estimateMergeWork,
 	BUDGET,
 	buildCut,
@@ -987,7 +991,7 @@ describe("format v2: unified execution catalogue, routine-read filter, verbatim 
 		expect(col.records[0].results[0].outcome).toBe("exit 1");
 		expect(col.records[0].results[0].errorExcerpt).toContain("FAIL: assertion failed");
 		expect(col.records[1].results[0].isError).toBe(false);
-		expect(col.records[1].results[0].outcome).toBe("exit 0");
+		expect(col.records[1].results[0].outcome).toBe("exit 0, 8 passed, 0 failed");
 		expect(col.records[2].executionId).not.toBe(col.records[3].executionId);
 		expect(formatExecutionRecord(col.records[4])).toBe("- R1 · execution a4:1 · bash `sleep 10` · no result"); // the request it was made under
 	});
@@ -1186,7 +1190,7 @@ describe("format v2: unified execution catalogue, routine-read filter, verbatim 
 		const reqOnly = tok4("Q ".repeat(400));
 		const soft = buildEpochSummaryV2({ prefix: blocks, targetTokens: reqOnly + 150, maxSummaryTokens: full.diagnostics.tokens.total + 100 });
 		expect(soft.ok).toBe(true);
-		expect(soft.text).toContain("make broken"); // the error is pinned: kept while only the soft target is exceeded
+		expect(soft.text).not.toContain("make broken"); // an unreferenced historical error is not automatically an unresolved blocker
 		expect(soft.diagnostics.budgetOmitted).toBeGreaterThan(0);
 		expect(soft.text).toMatch(/Catalogue omissions: 0 routine-read-filtered; \d+ budget-omitted; sources /);
 		expect(soft.diagnostics.tokens.total).toBeGreaterThan(reqOnly + 150); // allowed above the soft target, below the hard room
@@ -1396,5 +1400,310 @@ describe("format v2: unified execution catalogue, routine-read filter, verbatim 
 		expect(cutDir.text).not.toContain("bigA.ts");
 		expect(cutDir.text).toContain(hB);
 		expect(cutDir.text).toContain("bigB.ts");
+	});
+});
+
+describe("emergency request compaction (E1) — deterministic overflow fallback", () => {
+	const quoteLines = (t: string) => t.split("\n").map((l) => "  > " + l).join("\n");
+
+	test("Test 1 & 2: exact trigger boundary (hard = required + 1 stays verbatim, hard = required - 1 enters E1, soft target never triggers E1)", () => {
+		const q1 = "Ràng buộc 1: giữ nguyên logic chuyển tiền giữa các tài khoản ".repeat(20);
+		const q2 = "Ràng buộc 2: không xóa bảng audit log cũ trong bất kỳ trường hợp nào ".repeat(20);
+		const entries = [
+			U("u1", q1),
+			tcall("b1", "bash", { command: "make test-db" }),
+			tres("b1", "bash", "pass\nCommand exited with code 0"),
+			U("u2", q2),
+			A("a2"),
+		];
+		const blocks = buildBlocks(entries);
+		const full = buildEpochSummaryV2({ prefix: blocks });
+		const fullTokens = full.diagnostics.tokens.total;
+
+		// 1. hard = required + 1: NO emergency fallback, stays 100% verbatim
+		const noFallback = buildEpochSummaryV2({ prefix: blocks, maxSummaryTokens: fullTokens + 1 });
+		expect(noFallback.ok).toBe(true);
+		expect(noFallback.diagnostics.requestEmergencyMode).toBe("none");
+		expect(noFallback.diagnostics.truncatedRequestCount).toBe(0);
+		expect(noFallback.diagnostics.verbatimCount).toBe(2);
+		expect(noFallback.text).not.toContain("emergency excerpt");
+		expect(noFallback.text).not.toContain("Requests: emergency excerpts");
+		expect(noFallback.text).toContain("· verbatim");
+
+		// 2a. soft target does NOT trigger E1: drops evidence, but requests stay verbatim
+		const softOnly = buildEpochSummaryV2({ prefix: blocks, targetTokens: 10, maxSummaryTokens: fullTokens + 1 });
+		expect(softOnly.ok).toBe(true);
+		expect(softOnly.diagnostics.requestEmergencyMode).toBe("none");
+		expect(softOnly.diagnostics.truncatedRequestCount).toBe(0);
+		expect(softOnly.diagnostics.budgetOmitted).toBeGreaterThan(0);
+		expect(softOnly.text).not.toContain("emergency excerpt");
+
+		// 2b. hard = required - 1: triggers E1 emergency mode!
+		const bareFloor = buildEpochSummaryV2({ prefix: blocks, targetTokens: 10, maxSummaryTokens: fullTokens });
+		const bareTokens = bareFloor.diagnostics.tokens.total;
+		const e1 = buildEpochSummaryV2({ prefix: blocks, targetTokens: 10, maxSummaryTokens: bareTokens - 1 });
+		expect(e1.ok).toBe(true);
+		expect(e1.diagnostics.requestEmergencyMode).toBe("excerpt");
+		expect(e1.diagnostics.truncatedRequestCount).toBeGreaterThan(0);
+		expect(e1.text).toContain("Requests: emergency excerpts — ");
+		expect(e1.text).toContain("emergency excerpt · original ");
+	});
+
+	test("Test 3: E1 deterministic water-filling allocation preserves short requests and expands medium requests while truncating long ones", () => {
+		const shortCmd = "chọn cách 2";
+		const medPrompt = "R2-VỪA-PHẢI: " + "chi tiết ràng buộc mức trung bình cần kiểm tra kỹ ".repeat(10); // ~450 chars
+		const hugeLog = "DỮ LIỆU ĐẶC TẢ LỚN: " + "log trace stack trace error details ".repeat(80); // ~2800 chars
+		const entries = [
+			U("u1", shortCmd),
+			U("u2", medPrompt),
+			U("u3", hugeLog),
+			A("a3"),
+		];
+		const blocks = buildBlocks(entries);
+		// Measure minimal tokens:
+		const minReq = buildEpochSummaryV2({ prefix: blocks, maxSummaryTokens: 100 }).overflow!.requiredTokens;
+		// Give minReq + 150 tokens (600 chars): enough for medPrompt (~250 extra chars) to expand to 100% verbatim via water-filling!
+		const room = minReq + 150;
+		const res1 = buildEpochSummaryV2({ prefix: blocks, maxSummaryTokens: room });
+		expect(res1.ok).toBe(true);
+		expect(res1.diagnostics.requestEmergencyMode).toBe("excerpt");
+		expect(res1.diagnostics.truncatedRequestCount).toBe(1); // ONLY the huge request is truncated!
+		expect(res1.diagnostics.verbatimCount).toBe(2); // short and medium are verbatim!
+
+		const parsed = parseSummaryV2(res1.text)!;
+		const reqs = parsed.epochs[0].requests;
+		// Short command kept 100% verbatim, no marker, qualifier verbatim
+		expect(reqs[0].emergencyExcerpt).toBeUndefined();
+		expect(reqs[0].text).toBe(shortCmd);
+		expect(res1.text).toContain(`- R1 · handle ${handleFor("u1")} · verbatim\n  > ${shortCmd}`);
+
+		// Medium prompt: water-filling gave it extra characters to reach full length, restoring to verbatim!
+		expect(reqs[1].emergencyExcerpt).toBeUndefined();
+		expect(reqs[1].text).toBe(medPrompt);
+		expect(res1.text).toContain(`- R2 · handle ${handleFor("u2")} · verbatim\n  > ${medPrompt}`);
+
+		// Huge log is excerpted with original char count and exact omission marker
+		const h3 = handleFor("u3");
+		expect(reqs[2].emergencyExcerpt?.originalChars).toBe(hugeLog.length);
+		expect(res1.text).toContain(`- R3 · handle ${h3} · emergency excerpt · original ${hugeLog.length} chars`);
+		expect(res1.text).toContain(`[… middle of this request omitted (handle ${h3}): zip_recall returns it whole …]`);
+
+		// Determinism: running twice produces byte-identical output
+		const res2 = buildEpochSummaryV2({ prefix: blocks, maxSummaryTokens: room });
+		expect(res2.text).toBe(res1.text);
+	});
+
+	test("Test 4: sàn emergency priority order (active state -> intents -> newest prose) under shrinking room", () => {
+		const hugeA = "Ràng buộc A: " + "yêu cầu hệ thống phải đảm bảo tính nhất quán dữ liệu ".repeat(40);
+		const hugeB = "Ràng buộc B: " + "chỉ ghi nhận thay đổi khi cả hai node đồng thuận và không xóa migration cũ ".repeat(40);
+		const entries = [U("u1", hugeA), U("u2", hugeB), A("a2")];
+		const blocks = buildBlocks(entries);
+
+		const activeState = "- [ ] verify database migration step 4";
+		const intents = [
+			{ quote: "tính nhất quán dữ liệu", role: "user" },
+			{ quote: "chỉ ghi nhận thay đổi khi cả hai node đồng thuận", role: "user" },
+			{ quote: "không xóa migration cũ", role: "user" },
+		];
+		const durableProse = "Decided on consensus protocol Raft: " + "tất cả các node phải lưu log trước khi phản hồi ".repeat(10); // ~500 chars
+		const minTokens = 403;
+
+		// 4a: Room allows all three floor items (state + intents + newest prose)
+		const resAll = buildEpochSummaryV2({
+			prefix: blocks,
+			activeState,
+			durableProse,
+			proposedIntents: intents,
+			maxSummaryTokens: 580,
+		});
+		expect(resAll.ok).toBe(true);
+		expect(resAll.text).toContain("verify database migration step 4");
+		expect(parseSummaryV2(resAll.text)!.intents.length).toBe(3);
+		expect(resAll.text).toContain("consensus protocol Raft");
+
+		// 4b: Tighten room by dropping newest prose capacity -> prose omitted, state & intents stay
+		const resNoProse = buildEpochSummaryV2({
+			prefix: blocks,
+			activeState,
+			durableProse,
+			proposedIntents: intents,
+			maxSummaryTokens: 450,
+		});
+		expect(resNoProse.ok).toBe(true);
+		expect(resNoProse.text).toContain("verify database migration step 4");
+		expect(parseSummaryV2(resNoProse.text)!.intents.length).toBe(3);
+		expect(resNoProse.text).toContain("(omitted to fit the summary room; this epoch's requests and evidence remain, and its sources are recallable)");
+
+		// 4c: Tighten room further so intents cannot fit -> intents dropped, state stays
+		const resStateOnly = buildEpochSummaryV2({
+			prefix: blocks,
+			activeState,
+			durableProse,
+			proposedIntents: intents,
+			maxSummaryTokens: 415,
+		});
+		expect(resStateOnly.ok).toBe(true);
+		expect(resStateOnly.text).toContain("verify database migration step 4");
+		expect(parseSummaryV2(resStateOnly.text)!.intents.length).toBe(0);
+		expect(resStateOnly.text).toContain("(none selected; see the verbatim requests in History)");
+
+		// 4d: Tighten room so state cannot fit -> state dropped, only minimal requests
+		const resMinOnly = buildEpochSummaryV2({
+			prefix: blocks,
+			activeState,
+			durableProse,
+			proposedIntents: intents,
+			maxSummaryTokens: minTokens,
+		});
+		expect(resMinOnly.ok).toBe(true);
+		expect(resMinOnly.text).toContain("## Current state — assistant interpretation\n(none)");
+
+		// 4e: Room below minimal representation -> terminal failure request-budget-overflow
+		const resOverflow = buildEpochSummaryV2({
+			prefix: blocks,
+			activeState,
+			durableProse,
+			proposedIntents: intents,
+			maxSummaryTokens: minTokens - 10,
+		});
+		expect(resOverflow.ok).toBe(false);
+		expect(resOverflow.reason).toBe("request-budget-overflow");
+		expect(resOverflow.overflow?.requiredTokens).toBeGreaterThanOrEqual(minTokens);
+	});
+
+	test("Test 5: round-trip parsing of emergency excerpts and recovery to full verbatim from raw branch in subsequent compaction", () => {
+		const hugeText = "Ràng buộc nghiệp vụ: " + "tài khoản nguồn phải có đủ số dư khả dụng ".repeat(60);
+		const entries1 = [U("u1", hugeText), tcall("b1", "bash", { command: "run" }), tres("b1", "bash", "ok")];
+		const branch = entries1.map((e) => e.sourceEntry);
+
+		// Compaction 1: tight room forces E1 emergency excerpt
+		const cut1 = buildEpochSummaryV2({
+			prefix: buildBlocks(entries1),
+			branch,
+			maxSummaryTokens: 350,
+		});
+		expect(cut1.ok).toBe(true);
+		expect(cut1.diagnostics.requestEmergencyMode).toBe("excerpt");
+		const h1 = handleFor("u1");
+		expect(cut1.text).toContain(`- R1 · handle ${h1} · emergency excerpt · original ${hugeText.length} chars`);
+
+		// Round-trip parse: parseSummaryV2 parses the qualifier, number and originalChars
+		const parsed1 = parseSummaryV2(cut1.text)!;
+		expect(parsed1.epochs).toHaveLength(1);
+		expect(parsed1.epochs[0].requests).toHaveLength(1);
+		const parsedReq = parsed1.epochs[0].requests[0];
+		expect(parsedReq.number).toBe(1);
+		expect(parsedReq.handle).toBe(h1);
+		expect(parsedReq.emergencyExcerpt?.originalChars).toBe(hugeText.length);
+
+		// Compaction 2 with ample room AND raw branch available:
+		// The excerpt is NEVER the canonical source: request is fully restored to raw verbatim!
+		const entries2 = [U("u2", "tiếp tục bước 2"), A("a2")];
+		branch.push(...entries2.map((e) => e.sourceEntry));
+		const cut2 = buildEpochSummaryV2({
+			prefix: buildBlocks(entries2),
+			previous: cut1.text,
+			branch,
+			maxSummaryTokens: 50_000,
+		});
+		expect(cut2.ok).toBe(true);
+		expect(cut2.diagnostics.requestEmergencyMode).toBe("none");
+		expect(cut2.diagnostics.truncatedRequestCount).toBe(0);
+		expect(cut2.text).toContain(`- R1 · handle ${h1} · verbatim\n${quoteLines(hugeText)}`);
+		expect(cut2.text).not.toContain("emergency excerpt");
+	});
+
+	test("Test 6: without raw branch, emergency excerpt is preserved as sole source with qualifier 'source incomplete · emergency excerpt'", () => {
+		const hugeText = "Ràng buộc kiểm tra: " + "dữ liệu không được null trong bất kỳ cột nào ".repeat(50);
+		const entries1 = [U("u1", hugeText), A("a1")];
+		const cut1 = buildEpochSummaryV2({
+			prefix: buildBlocks(entries1),
+			maxSummaryTokens: 350,
+		});
+		expect(cut1.text).toContain("emergency excerpt");
+
+		// Compaction 2 with NO raw branch (branch: []):
+		const entries2 = [U("u2", "bước kế tiếp"), A("a2")];
+		const cut2 = buildEpochSummaryV2({
+			prefix: buildBlocks(entries2),
+			previous: cut1.text,
+			branch: [],
+			maxSummaryTokens: 50_000,
+		});
+		expect(cut2.ok).toBe(true);
+		const h1 = handleFor("u1");
+		expect(cut2.text).toContain(`- R1 · handle ${h1} · source incomplete · emergency excerpt · original ${hugeText.length} chars`);
+		expect(cut2.diagnostics.sourceIncompleteCount).toBe(1);
+		expect(cut2.text).not.toContain(`- R1 · handle ${h1} · verbatim`);
+	});
+
+	test("Test 7: raw recall via zip_recall returns exact original request text, uncorrupted by emergency excerpt", () => {
+		const fullUserPrompt = "ĐẶC TẢ CHI TIẾT: " + "mã lỗi 403 không được hiển thị cho người dùng cuối ".repeat(50);
+		const entries = [U("u1", fullUserPrompt), A("a1")];
+		const branch = entries.map((e) => e.sourceEntry);
+
+		const cut = buildEpochSummaryV2({
+			prefix: buildBlocks(entries),
+			branch,
+			maxSummaryTokens: 200,
+		});
+		expect(cut.text).toContain("middle of this request omitted");
+
+		const reqRecall = recallRequestsInBranch(branch, "1");
+		expect(reqRecall.ok).toBe(1);
+		expect(reqRecall.text).toContain(fullUserPrompt);
+		expect(reqRecall.text).not.toContain("middle of this request omitted");
+
+		const handleRecall = resolveHandlesInBranch(branch, [handleFor("u1")]);
+		expect(handleRecall.items[0].text).toBe(fullUserPrompt);
+	});
+
+	test("Test 8: provider narrative failure does NOT trigger emergency mode when request ledger fits", async () => {
+		const userPrompt = "Yêu cầu thông thường với kích thước vừa phải";
+		const entries = [U("u1", userPrompt), tcall("b1", "bash", { command: "test" }), tres("b1", "bash", "ok")];
+		const blocks = buildBlocks(entries);
+		const p: Any = {
+			blocks,
+			calls: toolCallIndex(blocks),
+			cutIdx: 2,
+			prefixTokens: 1000,
+			summaryTokensPlanned: 4000,
+			sumTrigger: "cold",
+			summaryFormat: "v2",
+			summaryRoomTokens: 50_000,
+		};
+		const cut = await buildCut(p, {
+			model: { provider: "p", id: "m", cost: { input: 0, output: 0 } },
+			modelRegistry: {
+				complete: async () => ({
+					stopReason: "error",
+					errorMessage: "provider timeout",
+					content: [],
+				}),
+			},
+		});
+		expect(cut.llmOk).toBe(false);
+		expect(cut.text).toContain("possibly stale: provider timeout");
+		expect((cut as Any).summaryDiagnostics.requestEmergencyMode).toBe("none");
+		expect((cut as Any).summaryDiagnostics.truncatedRequestCount).toBe(0);
+		expect(cut.text).toContain("· verbatim");
+		expect(cut.text).not.toContain("emergency excerpt");
+	});
+
+	test("Test 10: diagnostics honesty reports exact truncated counts and original/resident character sums", () => {
+		const shortReq = "ngắn";
+		const longReq = "DÀI: " + "nội dung rất dài để buộc hệ thống phải cắt bớt ".repeat(60);
+		const entries = [U("u1", shortReq), U("u2", longReq), A("a2")];
+		const blocks = buildBlocks(entries);
+		const res = buildEpochSummaryV2({ prefix: blocks, maxSummaryTokens: 380 });
+		expect(res.ok).toBe(true);
+		expect(res.diagnostics.requestEmergencyMode).toBe("excerpt");
+		expect(res.diagnostics.requestCount).toBe(2);
+		expect(res.diagnostics.truncatedRequestCount).toBe(1);
+		expect(res.diagnostics.verbatimCount).toBe(1);
+		expect(res.diagnostics.originalRequestChars).toBe(shortReq.length + longReq.length);
+		expect(res.diagnostics.residentRequestChars).toBeLessThan(res.diagnostics.originalRequestChars);
+		expect(res.diagnostics.residentRequestChars).toBeGreaterThan(0);
+		expect(res.text).toContain("Requests: emergency excerpts — 1 of 2 requests shortened to fit the window");
 	});
 });

@@ -590,19 +590,46 @@ describe("model-switch checkpoints through Pi hooks", () => {
 		}
 	});
 
-	test("format v2 request-budget-overflow: retention safety wins over model switch when verbatim protected user requests exceed the new window's room", async () => {
+	test("format v2: model-switch adopts emergency excerpt summary when user requests exceed verbatim room but fit under emergency excerpt", async () => {
 		defaults();
 		process.env.PI_ZIP_SUMMARY_V2 = "1";
-		const hugeUserSetup = (sm: SessionManager) => {
+		// User requests in prefix exceed the verbatim room for 70K window, but easily fit with emergency excerpts
+		const ask = (i: number) => `ACTIVE-CONSTRAINT-${i}: ` + "yêu cầu kiểm tra logic bảo mật hệ thống ".repeat(700);
+		const r = await rig((sm: SessionManager) => {
 			for (let i = 1; i <= 5; i++) {
-				sm.appendMessage(user(`ACTIVE-CONSTRAINT-${i}: ` + "keep every user instruction verbatim without silent dropping ".repeat(2900))); // ~45K tokens each, 225K in all
-				sm.appendMessage({ ...asst([{ type: "text", text: "ok " + "pad ".repeat(48_000) }]), usage: undefined });
+				sm.appendMessage(user(ask(i)));
+				sm.appendMessage({ ...asst([{ type: "text", text: "ok " + "pad ".repeat(15_000) }]), usage: undefined });
+			}
+			sm.appendMessage(user("latest short prompt"));
+		});
+		try {
+			await switchTo(r, 70_000);
+			expect(await threshold(r)).toBe(false);
+			expect(r.abortsInRun.n).toBe(0);
+			const comp: Any = r.sm.getBranch().find((e: Any) => e.type === "compaction");
+			expect(comp?.summary.startsWith("[pi-zip summary · format v2")).toBe(true);
+			expect(comp.summary).toContain("Requests: emergency excerpts — ");
+			expect(comp.summary).toContain("emergency excerpt · original ");
+		} finally {
+			delete process.env.PI_ZIP_SUMMARY_V2;
+			await r.shutdown();
+		}
+	});
+
+	test("format v2 request-budget-overflow: retention safety wins over model switch when minimal representation exceeds the new window's room", async () => {
+		defaults();
+		process.env.PI_ZIP_SUMMARY_V2 = "1";
+		// 60 requests require ~4500 tokens of minimal structure, exceeding the 4096 room of a 20K window
+		const manyUserSetup = (sm: SessionManager) => {
+			for (let i = 1; i <= 60; i++) {
+				sm.appendMessage(user(`ACTIVE-CONSTRAINT-${i}: keep every user constraint verbatim without dropping`));
+				sm.appendMessage({ ...asst([{ type: "text", text: "pad ".repeat(250) }]), usage: undefined });
 			}
 			sm.appendMessage(user("latest short prompt"));
 		};
-		const r = await rig(hugeUserSetup);
+		const r = await rig(manyUserSetup);
 		try {
-			await switchTo(r, 200_000);
+			await switchTo(r, 20_000);
 			const before = r.projectionMessages();
 			const decisions: Any[] = [], ledger = r.zip.ledger.bind(r.zip);
 			r.zip.ledger = (rec: Any) => { decisions.push(rec); ledger(rec); };

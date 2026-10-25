@@ -7,6 +7,7 @@ import { classifySummaryRead } from "./classify.ts";
 import { blockTime, cdAliases, handleFor, keyTexts, outcomeHint, RECALL_TOOL, shortArgs, whenLabel } from "./placeholder.ts";
 import type { Block } from "./plan.ts";
 import { assistantVisibleText, branchRequests, type BranchRequest } from "./recall.ts";
+import { skillReference } from "./skill-reference.ts";
 import { type FileRecall, fileRecallHow } from "./recallfile.ts";
 import { BUDGET, bashCommands, type EpochBlock, legacyNarrative, mkEpoch, parseSummary, prose, SHORT_MARK } from "./summary.ts";
 import { type Any, clip, textOf, tok4 } from "./util.ts";
@@ -32,7 +33,7 @@ const ALIASES_PREFIX = "Command directory aliases: ";
 const LEGACY_ID = "Earlier history — epoch attribution unavailable";
 const EPOCH_HEAD_RE = /^### (?:Epochs? (\d+)(?:–(\d+))?|Earlier history — epoch attribution unavailable) · source interval (\S+) · ([^·]+?) · (.+)$/;
 const TIER_RE = /^consolidated, tier (\d+)$/;
-const REQ_HEAD_RE = /^- (?:R(\d+)|legacy R(\d+)|legacy request)(?: · handle ([0-9a-z]{10}))? · (verbatim|source incomplete)(?: · continuation of R(\d+))?$/;
+const REQ_HEAD_RE = /^- (?:R(\d+)|legacy R(\d+)|legacy request)(?: · handle ([0-9a-z]{10}))? · ((?:verbatim|skill references|source incomplete|(?:source incomplete · )?emergency excerpt(?: · original \d+ chars)?)(?: · skill references)?)(?: · continuation of R(\d+))?$/;
 const INTENT_ROW_RE = /^- R(\d+) · source ([0-9a-z]{10})$/;
 const OMIT_RE = /^Catalogue omissions: (\d+) routine-read-filtered; (\d+) budget-omitted(?:; sources (?:… )?(.*))?$/;
 const OMITTED_REQ_RE = /(?:whole request: handle |\[… middle of this request omitted \(handle )([0-9a-z]{10})/;
@@ -84,7 +85,8 @@ export interface IntentProposal {
 export function resolveIntents(props: readonly IntentProposal[], requests: readonly V2Request[]): { intents: V2Intent[]; accepted: number; rejected: number; roleMismatch: number } {
 	const intents: V2Intent[] = [];
 	let accepted = 0, rejected = 0, roleMismatch = 0;
-	const usable = requests.filter((r) => r.number > 0 && r.handle);
+	// Intent validation checks exact NFC quotes against raw/verbatim text only, never against excerpts
+	const usable = requests.filter((r) => r.number > 0 && r.handle && !r.emergencyExcerpt && !r.sourceIncomplete && !r.skillReferences);
 	for (const p of props) {
 		if (p.role && p.role !== "user") {
 			roleMismatch++;
@@ -110,27 +112,45 @@ export function resolveIntents(props: readonly IntentProposal[], requests: reado
 	return { intents, accepted, rejected, roleMismatch };
 }
 
-/** Assistant statements of what it will do, from visible prose only (never hidden reasoning): a commitment, not a completion. */
-export function collectAssistantCommitments(blocks: Block[], maxItems = 4): Array<{ sourceHandle: string; quote: string }> {
-	const out: Array<{ sourceHandle: string; quote: string }> = [];
-	const COMMIT_RE = /\b(?:i will|i'll|next i will|next i'll|we will|todo:|sẽ |tiếp theo (?:tôi|tao|mình) sẽ)\b/i;
-	for (const b of blocks) {
-		if (b.kind !== "assistant" || !b.entryId) continue;
-		const vis = assistantVisibleText((b.raw ?? b.msg)?.content);
-		for (const line of vis.split("\n")) {
-			const t = line.trim();
-			if (t && COMMIT_RE.test(t)) {
-				out.push({ sourceHandle: handleFor(b.entryId), quote: clip(t, 200) });
-				break;
-			}
-		}
+export interface CommitmentProposal { sourceHandle: string; quote: string }
+
+/** The model selects commitments; code verifies their source, not their meaning. No keyword fallback. */
+export function collectAssistantCommitments(blocks: Block[], proposals: readonly CommitmentProposal[] = []): CommitmentProposal[] {
+	const sources = new Map(blocks.filter((b) => b.kind === "assistant" && b.entryId)
+		.map((b) => [handleFor(b.entryId!), assistantVisibleText((b.raw ?? b.msg)?.content)]));
+	const out: CommitmentProposal[] = [];
+	for (const p of proposals) {
+		if (typeof p?.sourceHandle !== "string" || typeof p?.quote !== "string" || !p.quote.trim() || p.quote.length > 200) continue;
+		const source = sources.get(p.sourceHandle);
+		const quote = source && validateUserIntentQuote(source, p.quote);
+		if (!quote || out.some((c) => c.sourceHandle === p.sourceHandle && c.quote === quote)) continue;
+		out.push({ sourceHandle: p.sourceHandle, quote });
+		if (out.length === 4) break;
 	}
-	return out.slice(-maxItems);
+	return out;
 }
 
 // ---------------------------------------------------------------------------------------------------------------
 // executions
 // ---------------------------------------------------------------------------------------------------------------
+
+export interface EvidenceProposal { sourceHandle: string; quote: string }
+
+/** Select only quotes found in tool results. This verifies provenance, not the model's relevance judgement. */
+export function evidenceQuotes(blocks: Block[], proposals: readonly EvidenceProposal[] = []): Map<string, string> {
+	const sources = new Map(blocks.filter((b) => b.kind === "toolResult" && b.entryId && b.msg?.toolName !== RECALL_TOOL)
+		.map((b) => [handleFor(b.entryId!), textOf((b.raw ?? b.msg)?.content)]));
+	const out = new Map<string, string>();
+	for (const p of proposals) {
+		if (typeof p?.sourceHandle !== "string" || typeof p?.quote !== "string" || p.quote.length > 200) continue;
+		const raw = sources.get(p.sourceHandle);
+		const quote = raw && validateUserIntentQuote(raw, p.quote);
+		if (!quote || out.has(p.sourceHandle)) continue;
+		out.set(p.sourceHandle, quote);
+		if (out.size === 8) break;
+	}
+	return out;
+}
 
 export interface ExecutionResultRef {
 	resultEntryId: string;
@@ -142,6 +162,7 @@ export interface ExecutionResultRef {
 	rawText: string;
 	errorExcerpt?: string;
 	hint?: string;
+	selectedQuote?: string;
 }
 
 export interface ExecutionRecord {
@@ -172,12 +193,23 @@ export interface CollectExecutionsResult {
 	filtered: ExecutionRecord[];
 }
 
-function toolOutcome(tool: string, rawText: string, isError: boolean): string {
+const exitCodeOf = (text: string) => /(?:^|\n)Command exited with code (\d+)\s*$/.exec(text)?.[1];
+
+/** Exit 1 means differences for a direct diff command, not for arbitrary shell scripts or git diff --check. */
+function diffHasChanges(command: unknown, exitCode: string | undefined): boolean {
+	if (exitCode !== "1" || typeof command !== "string" || !/^[\w./:=+, @%-]+$/.test(command)) return false;
+	const words = command.trim().split(/\s+/);
+	if (words[0] === "diff") return true;
+	return words[0] === "git" && words[1] === "diff" &&
+		words.some((w) => ["--exit-code", "--quiet", "--no-index"].includes(w)) &&
+		!words.some((w) => ["--check", "--ext-diff", "--textconv"].includes(w));
+}
+
+function toolOutcome(tool: string, rawText: string, isError: boolean, differences = false): string {
 	if (tool === "bash") {
-		const m = /Command exited with code (\d+)/.exec(rawText);
-		if (m) return `exit ${m[1]}`;
-		if (isError) return "error";
-		return outcomeHint(rawText, tool, false) || "exit 0";
+		if (differences) return "differences (exit 1)";
+		// Preserve test counts alongside the exit status, rather than stopping at the first exit-code line.
+		return outcomeHint(rawText, tool, isError) || (isError ? "error" : "exit 0");
 	}
 	if (isError) return "error";
 	const oh = outcomeHint(rawText, tool, false);
@@ -216,6 +248,7 @@ export function collectExecutions(
 		referenceText?: string;
 		referencedHandles?: ReadonlySet<string>;
 		referencedExecutions?: ReadonlySet<string>;
+		selectedEvidence?: ReadonlyMap<string, string>;
 		filterRoutineReads?: boolean;
 		priorIssuers?: ReadonlyMap<string, string>;
 		requestNumbers?: ReadonlyMap<string, number>;
@@ -266,10 +299,12 @@ export function collectExecutions(
 		const m = cid ? issued.get(cid) : undefined;
 		const raw = (b.raw ?? b.msg)?.content;
 		const rawText = textOf(raw);
-		const isError = !!b.msg?.isError || /Command exited with code [1-9]\d*/.test(rawText);
 		const rid = b.entryId ?? `res-${b.idx}`;
 		const owner = m && !m.ambiguous ? byId.get(m.execId) : undefined;
 		const tool = owner?.tool ?? toolName;
+		const exitCode = exitCodeOf(rawText);
+		const differences = tool === "bash" && diffHasChanges(owner?.command, exitCode);
+		const isError = !differences && (!!b.msg?.isError || (exitCode !== undefined && exitCode !== "0"));
 		const key = keyTexts(rawText, 4)[0];
 		const ref: ExecutionResultRef = {
 			resultEntryId: rid,
@@ -277,8 +312,9 @@ export function collectExecutions(
 			at: blockTime(b),
 			turn: b.userTurn,
 			isError,
-			outcome: toolOutcome(tool, rawText, isError),
+			outcome: toolOutcome(tool, rawText, isError, differences),
 			rawText,
+			...(opts.selectedEvidence?.has(handleFor(rid)) ? { selectedQuote: opts.selectedEvidence.get(handleFor(rid)) } : {}),
 			...(isError ? { errorExcerpt: clip(flat(rawText), 200) } : {}),
 			...(key ? { hint: clip(flat(key), 90) } : {}),
 		};
@@ -307,7 +343,7 @@ export function collectExecutions(
 	for (const rec of records) {
 		if (rec.associationUnresolved) associationUnresolved++;
 		rec.referenced =
-			!!opts.referencedExecutions?.has(rec.executionId) || rec.results.some((r) => opts.referencedHandles?.has(r.handle)) || referencesSource(opts.referenceText ?? "", rec);
+			!!opts.referencedExecutions?.has(rec.executionId) || rec.results.some((r) => opts.referencedHandles?.has(r.handle) || opts.selectedEvidence?.has(r.handle)) || referencesSource(opts.referenceText ?? "", rec);
 		if (rec.orphan || rec.priorEpoch || rec.results.length !== 1) {
 			rec.routineReadEligible = false;
 			rec.routineReadReason = rec.orphan ? "association-unresolved" : rec.priorEpoch ? "earlier-epoch-call" : rec.results.length ? "multiple-results" : "no-result";
@@ -329,7 +365,11 @@ const callHeadOf = (rec: ExecutionRecord, aliases?: Map<string, string>) => {
 	const arg = rec.tool === "bash" && rec.command !== undefined ? `\`${shortArgs({ command: rec.command }, BUDGET.cmdChars, aliases)}\`` : rec.path !== undefined ? rec.path : shortArgs(rec.args, 60, aliases);
 	return flat(`${rec.tool}${arg ? " " + arg : ""}`);
 };
-const resultSub = (r: ExecutionResultRef, label = "") => (r.isError && r.errorExcerpt ? `  Error${label}: ${r.errorExcerpt}` : r.hint ? `  Evidence${label}: ${r.hint}` : "");
+const resultSub = (r: ExecutionResultRef, label = "") => {
+	const selected = r.selectedQuote ? `  Selected evidence${label}: ${flat(r.selectedQuote)}` : "";
+	const detail = r.isError && r.errorExcerpt ? `  Error${label}: ${r.errorExcerpt}` : !selected && r.hint ? `  Evidence${label}: ${r.hint}` : "";
+	return [detail, selected].filter(Boolean).join("\n");
+};
 
 /** One execution as one record: a first line (identity, handle(s), call, when, outcome) and indented error or evidence lines. */
 export function formatExecutionRecord(rec: ExecutionRecord, aliases?: Map<string, string>): string {
@@ -366,6 +406,8 @@ export interface V2Request {
 	entryId?: string;
 	text: string;
 	sourceIncomplete?: boolean;
+	emergencyExcerpt?: { originalChars: number };
+	skillReferences?: boolean;
 	continuationOf?: number;
 }
 
@@ -388,8 +430,17 @@ export interface V2State {
 	epochs: V2Epoch[];
 }
 
-const requestRow = (r: V2Request) =>
-	`- ${r.number > 0 ? `R${r.number}` : r.legacyNumber ? `legacy R${r.legacyNumber}` : "legacy request"}${r.handle ? ` · handle ${r.handle}` : ""} · ${r.sourceIncomplete ? "source incomplete" : "verbatim"}${r.continuationOf ? ` · continuation of R${r.continuationOf}` : ""}\n${quoteLines(r.text)}`;
+const requestRow = (r: V2Request) => {
+	const num = r.number > 0 ? `R${r.number}` : r.legacyNumber ? `legacy R${r.legacyNumber}` : "legacy request";
+	const h = r.handle ? ` · handle ${r.handle}` : "";
+	const origChars = r.emergencyExcerpt?.originalChars ? ` · original ${r.emergencyExcerpt.originalChars} chars` : "";
+	const qual = r.emergencyExcerpt
+		? (r.sourceIncomplete ? "source incomplete · emergency excerpt" : "emergency excerpt") + origChars
+		: (r.sourceIncomplete ? "source incomplete" : r.skillReferences ? "skill references" : "verbatim");
+	const skills = r.skillReferences && qual !== "skill references" ? " · skill references" : "";
+	const cont = r.continuationOf ? ` · continuation of R${r.continuationOf}` : "";
+	return `- ${num}${h} · ${qual}${skills}${cont}\n${quoteLines(r.text)}`;
+};
 
 const epochHeading = (e: V2Epoch) => {
 	const b = e.block;
@@ -424,7 +475,18 @@ export function renderV2(s: V2State, file?: FileRecall): string {
 	const epochs = s.epochs.map(renderEpoch);
 	const used = new Set([...epochs.join("\n").matchAll(/\[([a-z]{1,3})\] /g)].map((m) => m[1]));
 	const legend = [...s.aliases].filter(([, a]) => used.has(a)).sort((x, y) => x[1].length - y[1].length || x[1].localeCompare(y[1])).map(([d, a]) => `${a}=${d}`);
-	const header = [SUMMARY_V2_MARK, SUMMARY_V2_DISCLAIMER, recallLine(file), ...(legend.length ? [ALIASES_PREFIX + legend.join(", ")] : [])].join("\n");
+	const allRequests = s.epochs.flatMap((e) => e.requests);
+	const truncatedCount = allRequests.filter((r) => !!r.emergencyExcerpt).length;
+	const emergencyLine = truncatedCount > 0
+		? `Requests: emergency excerpts — ${truncatedCount} of ${allRequests.length} requests shortened to fit the window; recall by R<n>/handle returns exact text.`
+		: undefined;
+	const header = [
+		SUMMARY_V2_MARK,
+		SUMMARY_V2_DISCLAIMER,
+		...(emergencyLine ? [emergencyLine] : []),
+		recallLine(file),
+		...(legend.length ? [ALIASES_PREFIX + legend.join(", ")] : []),
+	].join("\n");
 	const intent = [INTENT_HEAD, ...(s.intents.length ? s.intents.map((i) => `- R${i.requestNumber} · source ${i.handle}\n${quoteLines(i.quote)}`) : [INTENT_NONE])].join("\n");
 	const state = [stateHead(s), safeProse(s.activeState) || NONE].join("\n");
 	return [header, intent, state, HISTORY_HEAD, ...epochs].join("\n\n");
@@ -539,12 +601,18 @@ export function parseSummaryV2(text: string | null): V2State | null {
 			const m = REQ_HEAD_RE.exec(l);
 			if (m) {
 				flushReq();
+				const qual = m[4] ?? "verbatim";
+				const isSourceIncomplete = qual.includes("source incomplete");
+				const isEmergency = qual.includes("emergency excerpt");
+				const origMatch = /original (\d+) chars/.exec(qual);
 				req = {
 					number: m[1] ? Number(m[1]) : 0,
 					...(m[2] ? { legacyNumber: Number(m[2]) } : {}),
 					...(m[3] ? { handle: m[3] } : {}),
 					text: "",
-					...(m[4] === "source incomplete" ? { sourceIncomplete: true } : {}),
+					...(isSourceIncomplete ? { sourceIncomplete: true } : {}),
+					...(qual.includes("skill references") ? { skillReferences: true } : {}),
+					...(isEmergency ? { emergencyExcerpt: { originalChars: origMatch ? Number(origMatch[1]) : 0 } } : {}),
 					...(m[5] ? { continuationOf: Number(m[5]) } : {}),
 				};
 			} else if (req && l.startsWith(QUOTE)) reqLines.push(l);
@@ -591,6 +659,8 @@ export interface PrepareV2Options {
 	durableProse?: string;
 	/** Quotes the narrative proposes for current intent. Absent: the previous intents are kept (re-checked against the requests). */
 	proposedIntents?: IntentProposal[];
+	proposedCommitments?: CommitmentProposal[];
+	proposedEvidence?: EvidenceProposal[];
 	referencedHandles?: ReadonlySet<string>;
 	referencedExecutions?: ReadonlySet<string>;
 	epochId?: number;
@@ -657,7 +727,13 @@ export function prepareEpochV2(o: PrepareV2Options): PreparedV2 {
 	if (prevV2) {
 		carried = prevV2.epochs.map((e) => ({ ...e, requests: e.requests.map((r) => {
 			const hit = r.handle ? rawByHandle.get(r.handle) : undefined; // an incomplete or legacy request the branch still has: verbatim again
-			return hit && (r.sourceIncomplete || r.number === 0) ? { ...fromRaw(hit), ...(r.continuationOf ? { continuationOf: r.continuationOf } : {}) } : r;
+			if (hit && (r.sourceIncomplete || r.number === 0 || r.emergencyExcerpt || r.skillReferences)) {
+				return { ...fromRaw(hit), ...(r.continuationOf ? { continuationOf: r.continuationOf } : {}) };
+			}
+			if (r.emergencyExcerpt && !hit) {
+				return { ...r, sourceIncomplete: true };
+			}
+			return r;
 		}), evidence: [...e.evidence], commitments: [...e.commitments], omitted: { ...e.omitted, sources: [...e.omitted.sources] } }));
 		prevIntents = prevV2.intents;
 		prevActive = prevV2.activeState;
@@ -715,7 +791,7 @@ export function prepareEpochV2(o: PrepareV2Options): PreparedV2 {
 			const m = /^- (?:R\d+ · )?execution (\S+) · .* · no result$/.exec(rec.split("\n")[0]);
 			if (m) waiting.set(m[1], { epoch: e, index });
 		});
-	const commitments = collectAssistantCommitments(o.prefix);
+	const commitments = collectAssistantCommitments(o.prefix, o.proposedCommitments);
 	const commitmentRows = commitments.map((c) => `- source ${c.sourceHandle}\n${quoteLines(c.quote)}`);
 	// intents: proposed quotes, else the previous ones; checked against every request the summary keeps
 	const allRequests = [...carried.flatMap((e) => e.requests), ...requests];
@@ -724,7 +800,8 @@ export function prepareEpochV2(o: PrepareV2Options): PreparedV2 {
 	const activeState = o.activeState ?? prevActive;
 	const referenceText = [o.durableProse ?? "", activeState, ...commitments.map((c) => c.quote), ...ri.intents.map((i) => i.quote)].join("\n");
 	const requestNumbers = new Map(requests.filter((r) => r.entryId).map((r) => [r.entryId!, r.number]));
-	const col = collectExecutions(o.prefix, { cwd: o.cwd, referenceText, referencedHandles: o.referencedHandles, referencedExecutions: o.referencedExecutions, filterRoutineReads: true, priorIssuers, requestNumbers, startRequest });
+	const selectedEvidence = evidenceQuotes(o.prefix, o.proposedEvidence);
+	const col = collectExecutions(o.prefix, { cwd: o.cwd, referenceText, referencedHandles: o.referencedHandles, referencedExecutions: o.referencedExecutions, selectedEvidence, filterRoutineReads: true, priorIssuers, requestNumbers, startRequest });
 	const aliases = cdAliases(bashCommands(o.prefix), aliases0);
 	const nextId = o.epochId ?? carried.reduce((m, e) => Math.max(m, e.block.last ?? 0), 0) + 1;
 	const evidence: string[] = [];
@@ -827,9 +904,14 @@ export interface EpochSummaryV2 {
 	diagnostics: {
 		formatVersion: "v2";
 		numbering: "raw-branch-v2";
+		requestEmergencyMode: "none" | "excerpt";
+		truncatedRequestCount: number;
+		originalRequestChars: number;
+		residentRequestChars: number;
 		epochs: number;
 		requestCount: number;
 		verbatimCount: number;
+		skillReferenceCount: number;
 		sourceIncompleteCount: number;
 		executionCount: number;
 		resultCount: number;
@@ -846,7 +928,75 @@ export interface EpochSummaryV2 {
 	};
 }
 
-const isErrorRecord = (rec: string) => /\n {2}Error|^- [^\n]* · (?:exit [1-9]\d*|error)(?: ·|$)/m.test(rec);
+export const MIN_EXCERPT_CHARS = 200;
+
+function omitMarker(handle?: string, file?: FileRecall): string {
+	const h = handle ?? "unknown";
+	return file
+		? `[… middle of this request omitted (handle ${h}): ${file.dir}/${h}.txt holds it whole …]`
+		: `[… middle of this request omitted (handle ${h}): zip_recall returns it whole …]`;
+}
+
+export function formatRequestExcerpt(rawText: string, targetChars: number, handle?: string, file?: FileRecall): { text: string; truncated: boolean } {
+	if (rawText.length <= targetChars || rawText.length <= MIN_EXCERPT_CHARS) {
+		return { text: rawText, truncated: false };
+	}
+	const marker = omitMarker(handle, file);
+	const contentChars = Math.max(MIN_EXCERPT_CHARS, targetChars - marker.length - 2);
+	if (contentChars >= rawText.length) {
+		return { text: rawText, truncated: false };
+	}
+	const headLen = Math.floor(contentChars * 2 / 3);
+	const tailLen = contentChars - headLen;
+	const text = rawText.slice(0, headLen) + "\n" + marker + "\n" + rawText.slice(-tailLen);
+	return { text, truncated: true };
+}
+
+/** Discrete water-filling allocation: distribute `budget` characters across items with requested `needed` characters,
+ *  such that items requesting less than the fair share keep 100% of their text, and the remaining budget is distributed
+ *  equally among the longer items. */
+export function waterFillChars(needed: readonly number[], budget: number): number[] {
+	const n = needed.length;
+	if (n === 0) return [];
+	if (budget <= 0) return new Array(n).fill(0);
+	const allocations = new Array(n).fill(0);
+	const unsatisfied = new Set<number>();
+	for (let i = 0; i < n; i++) if (needed[i] > 0) unsatisfied.add(i);
+	let remaining = budget;
+
+	while (unsatisfied.size > 0 && remaining > 0) {
+		const share = Math.floor(remaining / unsatisfied.size);
+		if (share === 0) {
+			for (const idx of unsatisfied) {
+				if (remaining <= 0) break;
+				allocations[idx]++;
+				remaining--;
+			}
+			break;
+		}
+		let anySatisfied = false;
+		for (const idx of Array.from(unsatisfied)) {
+			const req = needed[idx] - allocations[idx];
+			if (req <= share) {
+				allocations[idx] = needed[idx];
+				remaining -= req;
+				unsatisfied.delete(idx);
+				anySatisfied = true;
+			}
+		}
+		if (!anySatisfied) {
+			for (const idx of unsatisfied) {
+				allocations[idx] += share;
+				remaining -= share;
+			}
+		}
+	}
+	return allocations;
+}
+
+const isErrorRecord = (rec: string) => /\n {2}Error|^- [^\n]* · (?:exit [1-9]\d*|error)(?:,| ·|$)/m.test(rec);
+const selectedRecord = (rec: string) => /\n {2}Selected evidence(?: \([0-9a-z]{10}\))?: /.test(rec);
+const mutationAcknowledgement = (rec: string) => !isErrorRecord(rec) && rec.split("\n")[0].split(" · ").some((part) => /^(?:edit|write)(?: |$)/.test(part)) && / · success(?: ·|$)/.test(rec.split("\n")[0]);
 /** Handles a record names on its first line: "handle X", "handles X, Y", or an older summary's row ("- legacy · X · …", "…, X)"). */
 const recordHandles = (rec: string) => {
 	const l = rec.split("\n")[0];
@@ -857,14 +1007,18 @@ const recordHandles = (rec: string) => {
 const PROSE_OMITTED = "(omitted to fit the summary room; this epoch's requests and evidence remain, and its sources are recallable)";
 
 /**
- * Fit the prepared summary. `soft`: the size the plan priced; evidence nobody points at (no error, not named by the retained prose, state,
- * commitments or intents) is dropped, oldest epoch first, whole records only, until the text fits it. `hard`: the size beyond which the
+ * Fit the prepared summary. `soft`: the size the plan priced; unselected, unreferenced evidence is dropped by priority:
+ * successful mutation acknowledgements, ordinary observations, then historical errors; oldest first within each tier, whole records only. `hard`: the size beyond which the
  * compacted view would not fit the model's room; above it the other evidence goes, then commitments, then the intent quotes (the
  * requests keep those words), then the prose of old epochs and last of the newest, then the state. User requests are never dropped: when
  * they and the summary's fixed structure alone exceed `hard` the result is `request-budget-overflow`.
  */
 export function renderEpochSummaryV2(prep: PreparedV2, opts: { soft: number; hard: number; file?: FileRecall }): EpochSummaryV2 {
-	const s: V2State = { ...prep.state, epochs: prep.state.epochs.map((e) => ({ ...e, evidence: [...e.evidence], commitments: [...e.commitments], omitted: { ...e.omitted, sources: [...e.omitted.sources] } })) };
+	const requests = prep.state.epochs.map((e) => e.requests.map((r) => {
+		const text = r.emergencyExcerpt || r.sourceIncomplete ? r.text : skillReference(r.text);
+		return { ...r, text, ...(text !== r.text ? { skillReferences: true } : {}) };
+	}));
+	const s: V2State = { ...prep.state, epochs: prep.state.epochs.map((e, i) => ({ ...e, evidence: [...e.evidence], commitments: [...e.commitments], omitted: { ...e.omitted, sources: [...e.omitted.sources] }, requests: requests[i] })) };
 	// what the kept text says, after any prose merge: every epoch's prose and commitments, the state and the intents. An old epoch's
 	// evidence stays pinned while that epoch's own findings name it.
 	const ref = [prep.referenceText, s.activeState, ...s.intents.map((i) => i.quote), ...s.epochs.flatMap((e) => [e.block.durableProse, ...e.commitments])].join("\n");
@@ -872,27 +1026,36 @@ export function renderEpochSummaryV2(prep: PreparedV2, opts: { soft: number; har
 	let size = tok4(renderV2(s, opts.file));
 	let budgetOmitted = 0, proseOmitted = 0;
 	const drop = (pick: (rec: string) => boolean, bound: number) => {
-		for (const e of s.epochs) {
-			for (let i = 0; i < e.evidence.length && size > bound; ) {
-				const rec = e.evidence[i];
-				if (!pick(rec)) {
-					i++;
-					continue;
+		let removed: boolean;
+		do {
+			removed = false;
+			for (const e of s.epochs) {
+				for (let i = 0; i < e.evidence.length && size > bound; ) {
+					const rec = e.evidence[i];
+					if (!pick(rec)) {
+						i++;
+						continue;
+					}
+					e.evidence.splice(i, 1);
+					e.omitted.budget++;
+					e.omitted.sources.push(...recordHandles(rec));
+					budgetOmitted++;
+					removed = true;
+					size -= tok4(rec) + 1;
 				}
-				e.evidence.splice(i, 1);
-				e.omitted.budget++;
-				e.omitted.sources.push(...recordHandles(rec));
-				budgetOmitted++;
-				size -= tok4(rec) + 1;
+				if (size <= bound) break;
 			}
-			if (size <= bound) break;
-		}
-		size = tok4(renderV2(s, opts.file));
+			// Omission metadata grows as rows leave. Recheck this tier against the rendered size
+			// before dropping higher-priority rows; every retry must have removed a whole record.
+			size = tok4(renderV2(s, opts.file));
+		} while (size > bound && removed);
 	};
 	const pinned = (rec: string) => {
-		if (isErrorRecord(rec) || recordHandles(rec).some((h) => ref.includes(h))) return true;
+		if (selectedRecord(rec) || recordHandles(rec).some((h) => ref.includes(h))) return true;
 		const x = /^- (?:R\d+ · )?(?:result for )?execution (\S+)/.exec(rec)?.[1];
 		if (x && mentions(ref, x)) return true;
+		// Naming a modified file is not evidence that its edit acknowledgement matters.
+		if (mutationAcknowledgement(rec)) return false;
 		// a path or file name in the record's call ("read src/a.ts", "bash `cat a.ts`") named by the retained text: the referencesSource rule
 		const line = rec.split("\n")[0].split(" · ").filter((p) => !/^(?:- )?(?:execution|handles?|result for) /.test(p));
 		for (const t of line.join(" ").split(/\s+/)) {
@@ -903,7 +1066,13 @@ export function renderEpochSummaryV2(prep: PreparedV2, opts: { soft: number; har
 		}
 		return false;
 	};
-	if (size > soft) drop((rec) => !pinned(rec), soft);
+	// An error is a historical result, not proof of an unresolved blocker. Without a source reference
+	// or model selection it can be omitted too, after acknowledgements and ordinary observations.
+	for (const tier of [0, 1, 2]) {
+		if (size <= soft) break;
+		drop((rec) => !pinned(rec) && (mutationAcknowledgement(rec) ? 0 : isErrorRecord(rec) ? 2 : 1) === tier, soft);
+	}
+	if (size > hard) drop((rec) => !selectedRecord(rec), hard);
 	if (size > hard) drop(() => true, hard);
 	if (size > hard) {
 		for (const e of s.epochs) if (e.commitments.length) e.commitments = [];
@@ -927,44 +1096,263 @@ export function renderEpochSummaryV2(prep: PreparedV2, opts: { soft: number; har
 		s.activeState = "(omitted to fit the summary room)";
 		size = tok4(renderV2(s, opts.file));
 	}
-	const text = renderV2(s, opts.file);
-	const total = tok4(text);
-	const reqs = s.epochs.flatMap((e) => e.requests);
-	const sum = (f: (e: V2Epoch) => string) => tok4(s.epochs.map(f).join("\n"));
+	size = tok4(renderV2(s, opts.file));
+
+	if (size <= hard) {
+		const text = renderV2(s, opts.file);
+		const total = size;
+		const reqs = s.epochs.flatMap((e) => e.requests);
+		const totalChars = reqs.reduce((n, r) => n + r.text.length, 0);
+		const truncatedRequestCount = reqs.filter((r) => !!r.emergencyExcerpt).length;
+		const sum = (f: (e: V2Epoch) => string) => tok4(s.epochs.map(f).join("\n"));
+		const tokens = {
+			requests: sum((e) => e.requests.map(requestRow).join("\n")),
+			intent: tok4(s.intents.map((i) => i.quote).join("\n")),
+			state: tok4(s.activeState),
+			prose: sum((e) => e.block.durableProse),
+			commitments: sum((e) => e.commitments.join("\n")),
+			evidence: sum((e) => e.evidence.join("\n")),
+			overhead: 0,
+			total,
+		};
+		tokens.overhead = Math.max(0, total - tokens.requests - tokens.intent - tokens.state - tokens.prose - tokens.commitments - tokens.evidence);
+		return {
+			text,
+			ok: true,
+			diagnostics: {
+				formatVersion: "v2",
+				numbering: "raw-branch-v2",
+				requestEmergencyMode: truncatedRequestCount > 0 ? "excerpt" : "none",
+				truncatedRequestCount,
+				originalRequestChars: reqs.reduce((n, r) => n + (r.emergencyExcerpt?.originalChars || r.text.length), 0),
+				residentRequestChars: totalChars,
+				epochs: s.epochs.length,
+				requestCount: reqs.length,
+				verbatimCount: reqs.filter((r) => !r.sourceIncomplete && !r.emergencyExcerpt && !r.skillReferences).length,
+				skillReferenceCount: reqs.filter((r) => r.skillReferences).length,
+				sourceIncompleteCount: reqs.filter((r) => r.sourceIncomplete).length,
+				executionCount: prep.stats.executionCount,
+				resultCount: prep.stats.resultCount,
+				lateResults: prep.stats.lateResults,
+				routineReadFiltered: prep.stats.routineReadFiltered,
+				budgetOmitted,
+				associationUnresolved: prep.stats.associationUnresolved,
+				quoteAccepted: prep.stats.quoteAccepted,
+				quoteRejected: prep.stats.quoteRejected,
+				roleMismatch: prep.stats.roleMismatch,
+				proseOmitted,
+				intentsOmitted,
+				tokens,
+			},
+		};
+	}
+
+	// Internal overflow occurred: candidate could not fit under hard room after dropping unpinned/pinned evidence,
+	// commitments, intents, prose, and state. Enter emergency request compaction (E1).
+	const origRequests = requests;
+	const flatOrig = origRequests.flat();
+	const originalRequestChars = flatOrig.reduce((n, r) => n + (r.emergencyExcerpt?.originalChars || r.text.length), 0);
+
+	// Start building emergency state emState from prep.state:
+	// - old evidence dropped, omission counts preserved/accumulated
+	// - commitments dropped
+	// - old prose omitted
+	// - minimal excerpts for all requests
+	const emEpochs: V2Epoch[] = prep.state.epochs.map((e, i) => {
+		const omBudget = e.omitted.budget + e.evidence.length;
+		const omSources = [...e.omitted.sources, ...e.evidence.flatMap(recordHandles)];
+		const minReqs: V2Request[] = origRequests[i].map((r) => {
+			const { text: minText, truncated } = formatRequestExcerpt(r.text, MIN_EXCERPT_CHARS, r.handle, opts.file);
+			return {
+				...r,
+				text: minText,
+				...(truncated ? { emergencyExcerpt: r.emergencyExcerpt ?? { originalChars: r.text.length } } : {}),
+			};
+		});
+		return {
+			...e,
+			requests: minReqs,
+			commitments: [],
+			evidence: [],
+			omitted: { routine: e.omitted.routine, budget: omBudget, sources: omSources },
+			block: { ...e.block, durableProse: PROSE_OMITTED },
+		};
+	});
+
+	const emState: V2State = {
+		intents: [],
+		activeState: "",
+		aliases: prep.state.aliases,
+		epochs: emEpochs,
+	};
+
+	// Check if even the minimal emergency representation can fit
+	const minRequiredTokens = tok4(renderV2(emState, opts.file));
+	if (minRequiredTokens > hard) {
+		// Even minimal excerpts + mandatory summary overhead exceed the hard room: terminal failure
+		const reqs = emState.epochs.flatMap((e) => e.requests);
+		const residentChars = reqs.reduce((n, r) => n + r.text.length, 0);
+		return {
+			text: renderV2(emState, opts.file),
+			ok: false,
+			reason: "request-budget-overflow",
+			overflow: { requiredTokens: minRequiredTokens, availableTokens: hard },
+			diagnostics: {
+				formatVersion: "v2",
+				numbering: "raw-branch-v2",
+				requestEmergencyMode: "excerpt",
+				truncatedRequestCount: reqs.filter((r) => !!r.emergencyExcerpt).length,
+				originalRequestChars,
+				residentRequestChars: residentChars,
+				epochs: emState.epochs.length,
+				requestCount: reqs.length,
+				verbatimCount: reqs.filter((r) => !r.sourceIncomplete && !r.emergencyExcerpt && !r.skillReferences).length,
+				skillReferenceCount: reqs.filter((r) => r.skillReferences).length,
+				sourceIncompleteCount: reqs.filter((r) => r.sourceIncomplete).length,
+				executionCount: prep.stats.executionCount,
+				resultCount: prep.stats.resultCount,
+				lateResults: prep.stats.lateResults,
+				routineReadFiltered: prep.stats.routineReadFiltered,
+				budgetOmitted: prep.state.epochs.reduce((n, e) => n + e.evidence.length, 0),
+				associationUnresolved: prep.stats.associationUnresolved,
+				quoteAccepted: prep.stats.quoteAccepted,
+				quoteRejected: prep.stats.quoteRejected,
+				roleMismatch: prep.stats.roleMismatch,
+				proseOmitted: prep.state.epochs.length,
+				intentsOmitted: prep.state.intents.length,
+				tokens: {
+					requests: minRequiredTokens,
+					intent: 0,
+					state: 0,
+					prose: 0,
+					commitments: 0,
+					evidence: 0,
+					overhead: 0,
+					total: minRequiredTokens,
+				},
+			},
+		};
+	}
+
+	// Sàn emergency: add back in priority order if they still fit alongside minimal requests:
+	// Priority order: activeState -> validated intents -> newest epoch prose
+	// Drop order under pressure: newest prose -> intents -> state
+	let stateKept = false;
+	if (prep.state.activeState.trim()) {
+		emState.activeState = prep.state.activeState;
+		emState.activeAt = prep.state.activeAt;
+		emState.activeStale = prep.state.activeStale;
+		if (tok4(renderV2(emState, opts.file)) <= hard) {
+			stateKept = true;
+		} else {
+			emState.activeState = "";
+			delete emState.activeAt;
+			delete emState.activeStale;
+		}
+	} else {
+		stateKept = true;
+	}
+
+	let intentsKept = stateKept && prep.state.intents.length === 0;
+	if (stateKept && prep.state.intents.length > 0) {
+		emState.intents = prep.state.intents;
+		if (tok4(renderV2(emState, opts.file)) <= hard) {
+			intentsKept = true;
+		} else {
+			emState.intents = [];
+		}
+	}
+
+	const lastIdx = emState.epochs.length - 1;
+	if (intentsKept && lastIdx >= 0) {
+		const candProse = prep.state.epochs[lastIdx]?.block.durableProse;
+		if (candProse && candProse !== PROSE_OMITTED && candProse !== NONE) {
+			emState.epochs[lastIdx].block.durableProse = candProse;
+			if (tok4(renderV2(emState, opts.file)) > hard) {
+				emState.epochs[lastIdx].block.durableProse = PROSE_OMITTED;
+			}
+		}
+	}
+
+	// 4. Water-filling expansion for request text:
+	const currentTokens = tok4(renderV2(emState, opts.file));
+	const remTokens = hard - currentTokens;
+	const flatEmReqs = emState.epochs.flatMap((e) => e.requests);
+	if (remTokens > 0) {
+		const minimum = flatEmReqs.map((r) => ({ ...r }));
+		const needed = flatOrig.map((orig, i) => Math.max(0, orig.text.length - minimum[i].text.length));
+		const expand = (budget: number) => {
+			const extra = waterFillChars(needed, budget);
+			for (let i = 0; i < flatEmReqs.length; i++) {
+				const orig = flatOrig[i], r = flatEmReqs[i];
+				const excerpt = extra[i] > 0
+					? formatRequestExcerpt(orig.text, minimum[i].text.length + extra[i], orig.handle, opts.file)
+					: { text: minimum[i].text, truncated: !!minimum[i].emergencyExcerpt };
+				r.text = excerpt.text;
+				if (excerpt.truncated || orig.emergencyExcerpt) {
+					r.emergencyExcerpt = orig.emergencyExcerpt ?? { originalChars: orig.text.length };
+				} else delete r.emergencyExcerpt;
+			}
+			return tok4(renderV2(emState, opts.file)) <= hard;
+		};
+		// Quote prefixes add overhead per newline. Search a bounded character budget, not
+		// excerpt lengths (which stop shrinking at the floor). Zero is already known to fit.
+		let low = 0, high = Math.floor(remTokens * 4);
+		if (!expand(high)) {
+			while (low < high) {
+				const mid = Math.ceil((low + high) / 2);
+				if (expand(mid)) low = mid;
+				else high = mid - 1;
+			}
+			expand(low);
+		}
+		// Marker removal can make size non-monotonic; the search keeps a verified fit,
+		// not necessarily the largest possible excerpt.
+
+	}
+
+	const finalSize = tok4(renderV2(emState, opts.file));
+	const residentRequestChars = flatEmReqs.reduce((n, r) => n + r.text.length, 0);
+	const truncatedRequestCount = flatEmReqs.filter((r) => !!r.emergencyExcerpt).length;
+	const sum = (f: (e: V2Epoch) => string) => tok4(emState.epochs.map(f).join("\n"));
 	const tokens = {
 		requests: sum((e) => e.requests.map(requestRow).join("\n")),
-		intent: tok4(s.intents.map((i) => i.quote).join("\n")),
-		state: tok4(s.activeState),
+		intent: tok4(emState.intents.map((i) => i.quote).join("\n")),
+		state: tok4(emState.activeState),
 		prose: sum((e) => e.block.durableProse),
-		commitments: sum((e) => e.commitments.join("\n")),
-		evidence: sum((e) => e.evidence.join("\n")),
+		commitments: 0,
+		evidence: 0,
 		overhead: 0,
-		total,
+		total: finalSize,
 	};
-	tokens.overhead = Math.max(0, total - tokens.requests - tokens.intent - tokens.state - tokens.prose - tokens.commitments - tokens.evidence);
-	const over = total > hard;
+	tokens.overhead = Math.max(0, finalSize - tokens.requests - tokens.intent - tokens.state - tokens.prose);
 	return {
-		text,
-		ok: !over,
-		...(over ? { reason: "request-budget-overflow" as const, overflow: { requiredTokens: total, availableTokens: hard } } : {}),
+		text: renderV2(emState, opts.file),
+		ok: finalSize <= hard,
+		...(finalSize > hard ? { reason: "request-budget-overflow" as const, overflow: { requiredTokens: finalSize, availableTokens: hard } } : {}),
 		diagnostics: {
 			formatVersion: "v2",
 			numbering: "raw-branch-v2",
-			epochs: s.epochs.length,
-			requestCount: reqs.length,
-			verbatimCount: reqs.filter((r) => !r.sourceIncomplete).length,
-			sourceIncompleteCount: reqs.filter((r) => r.sourceIncomplete).length,
+			requestEmergencyMode: truncatedRequestCount > 0 ? "excerpt" : "none",
+			truncatedRequestCount,
+			originalRequestChars,
+			residentRequestChars,
+			epochs: emState.epochs.length,
+			requestCount: flatEmReqs.length,
+			verbatimCount: flatEmReqs.filter((r) => !r.sourceIncomplete && !r.emergencyExcerpt && !r.skillReferences).length,
+			skillReferenceCount: flatEmReqs.filter((r) => r.skillReferences).length,
+			sourceIncompleteCount: flatEmReqs.filter((r) => r.sourceIncomplete).length,
 			executionCount: prep.stats.executionCount,
 			resultCount: prep.stats.resultCount,
 			lateResults: prep.stats.lateResults,
 			routineReadFiltered: prep.stats.routineReadFiltered,
-			budgetOmitted,
+			budgetOmitted: prep.state.epochs.reduce((n, e) => n + e.evidence.length, 0),
 			associationUnresolved: prep.stats.associationUnresolved,
 			quoteAccepted: prep.stats.quoteAccepted,
 			quoteRejected: prep.stats.quoteRejected,
 			roleMismatch: prep.stats.roleMismatch,
-			proseOmitted,
-			intentsOmitted,
+			proseOmitted: emState.epochs.filter((e) => e.block.durableProse === PROSE_OMITTED).length,
+			intentsOmitted: prep.state.intents.length - emState.intents.length,
 			tokens,
 		},
 	};
