@@ -4,7 +4,7 @@
 // that. Nothing here consults the judge, and nothing here changes folding or compaction. Every failure is logged and skipped.
 import { randomUUID } from "node:crypto";
 import { Ledger, type LedgerCounts } from "./ledger/projector.ts";
-import { readSource, type SessionSource, visibleText } from "./ledger/source.ts";
+import { readSource, visibleText } from "./ledger/source.ts";
 import { sqliteAvailable } from "./ledger/db.ts";
 import { ageOf, type CallInfo, memoryTraceEnabled, RetrievalConversation } from "./retrieval/assistant.ts";
 import { type DropStats, PACKET_LIMITS, renderPacket } from "./retrieval/packet.ts";
@@ -43,6 +43,7 @@ export class Memory {
 	private failures = 0;
 	private gen = 0;
 	private backfill: ReturnType<typeof setTimeout> | null = null;
+	private backfillStep: ReturnType<typeof setImmediate> | null = null;
 	private runBackfill: (() => void) | null = null;
 	/** Resolves when the deferred session-start backfill has run (tests and diagnostics). */
 	ready: Promise<void> = Promise.resolve();
@@ -53,7 +54,6 @@ export class Memory {
 	private job: RetrievalJob | null = null;
 	/** The ledger has caught up with the session's persisted entries. */
 	private ledgerDone = true;
-	private backfillSrc: SessionSource | null = null;
 	private pumping = false;
 	stats = { prompts: 0, calls: 0, injected: 0, reinjected: 0, costUsd: 0 };
 
@@ -63,12 +63,10 @@ export class Memory {
 	sessionStart(ctx: Any) {
 		this.release();
 		this.configLogged = false;
-		this.gen++;
 		this.failures = 0;
 		this.error = "";
 		this.state = "idle";
-		this.ledgerDone = true;
-		this.backfillSrc = null;
+		this.ledgerDone = false;
 		this.sid = attempt(() => String(ctx?.sessionManager?.getSessionId?.() ?? ""), "");
 		const gen = this.gen;
 		this.ready = new Promise((done) => {
@@ -111,7 +109,6 @@ export class Memory {
 				try {
 					const r = led.reconcile(src, BACKFILL_ENTRIES); // validates the whole source, projects at most one batch
 					this.ledger = led;
-					this.backfillSrc = src;
 					this.ledgerDone = led.current(src);
 					this.log({ type: "memory_backfill", why, reconcile: r.mode, projected: r.projected, ms: Math.round(r.ms), entries: src.entries.length, done: this.ledgerDone });
 				} catch (err) {
@@ -120,11 +117,10 @@ export class Memory {
 				}
 			} else if (this.ledgerDone) {
 				const n = this.ledger.catchUp(src);
-				this.backfillSrc = src;
 				if (n) this.log({ type: "memory_ingest", why, projected: n });
-			} else this.backfillSrc = src;
+			}
 			this.state = this.ledgerDone ? "ready" : "indexing";
-			this.failures = 0;
+			if (this.ledgerDone) { this.failures = 0; this.error = ""; }
 			if (!this.configLogged) {
 				this.configLogged = true;
 				this.log({
@@ -136,40 +132,51 @@ export class Memory {
 			}
 			return this.ledger;
 		} catch (err) {
-			this.failures++;
-			this.state = "error";
-			this.error = errText(err);
-			this.release();
-			this.log({ type: "error", where: `memory/${why}`, error: this.error, failures: this.failures });
+			this.ledgerError(err, why);
 			return null;
 		}
 	}
 
-	/** Project the rest of a large first open, one batch per tick. */
+	/** Project the rest of a large first open, one batch per tick. Every callback belongs to one ledger generation. */
 	private pumpBackfill(ctx: Any, led: Ledger, why: string) {
 		if (this.pumping) return;
 		this.pumping = true;
-		const t0 = Date.now();
+		const gen = this.gen, sid = this.sid, t0 = Date.now();
+		const owns = () => gen === this.gen && this.ledger === led && this.sid === sid;
 		let projected = 0;
 		const step = () => {
-			const src = this.backfillSrc ?? attempt(() => readSource(ctx), null); // the newest read: the session keeps growing
+			if (!owns()) return; // check before clearing a handle that may now belong to another session
+			this.backfillStep = null;
 			try {
-				if (!src) return finish();
+				const src = readSource(ctx); // read again each tick: entries may arrive without a catchUp event
+				if (!src || src.sessionId !== sid) {
+					this.release();
+					this.state = "idle";
+					return;
+				}
 				projected += led.catchUp({ ...src, entries: src.entries.slice(0, Math.min(src.entries.length, led.projectedCount + BACKFILL_ENTRIES)) });
-				if (!led.current(src)) return void setImmediate(step);
+				if (!owns()) return;
+				if (!led.current(src)) { this.backfillStep = setImmediate(step); return; }
+				this.pumping = false;
+				this.ledgerDone = true;
+				this.state = "ready";
+				this.failures = 0;
+				this.error = "";
+				if (projected) this.log({ type: "memory_ingest", why: `${why}_backfill`, sessionId: sid, projected, ms: Date.now() - t0 });
 			} catch (err) {
-				this.error = errText(err);
-				this.log({ type: "error", where: `memory/${why}`, error: this.error });
+				if (owns()) this.ledgerError(err, `${why}_backfill`);
 			}
-			finish();
 		};
-		const finish = () => {
-			this.pumping = false;
-			this.ledgerDone = true;
-			this.state = "ready";
-			if (projected) this.log({ type: "memory_ingest", why: `${why}_backfill`, projected, ms: Date.now() - t0 });
-		};
-		setImmediate(step);
+		this.backfillStep = setImmediate(step);
+	}
+
+	/** A failed attempt is not completion. Reopening reconciles the committed prefix and resumes in bounded batches. */
+	private ledgerError(err: unknown, why: string) {
+		this.failures++;
+		this.state = "error";
+		this.error = errText(err);
+		this.release();
+		this.log({ type: "error", where: `memory/${why}`, sessionId: this.sid, error: this.error, failures: this.failures });
 	}
 
 	/** turn_end, session_compact, session_tree, agent_end: live ingestion of newly persisted entries. */
@@ -319,9 +326,8 @@ export class Memory {
 	}
 
 	shutdown() {
-		this.gen++;
-		this.note = null;
 		this.release();
+		this.state = "idle";
 	}
 
 	/**
@@ -371,15 +377,14 @@ export class Memory {
 	}
 
 	private release() {
+		this.gen++; // invalidate both the initial timer and every queued pump tick, even when no timer remains
 		this.cancelRetrieval();
+		if (this.backfillStep !== null) clearImmediate(this.backfillStep);
+		this.backfillStep = null;
 		this.pumping = false;
-		this.backfillSrc = null;
-		this.ledgerDone = true;
+		this.ledgerDone = false;
 		const pending = this.runBackfill;
-		if (pending) {
-			this.gen++; // the pending backfill belongs to a session being left: it resolves `ready` without indexing
-			pending();
-		}
+		if (pending) pending(); // resolves `ready` without indexing: its generation is no longer current
 		this.ledger?.close();
 		this.ledger = null;
 	}
