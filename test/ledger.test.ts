@@ -15,6 +15,41 @@ const srcOf = (s: ReturnType<typeof fakeSession>, n?: number) => {
 	return n === undefined ? src : { ...src, entries: src.entries.slice(0, n) };
 };
 
+describe("reopening a large session", () => {
+	const many = (n: number) => Array.from({ length: n }, (_, i) => user(`u${i}`, i ? `u${i - 1}` : null, `message number ${i}`));
+
+	test("an unchanged, fully indexed session of more than one batch is reused, not rebuilt", async () => {
+		const s = fakeSession(many(1203));
+		const logs: Any[] = [];
+		const first = new Memory((r) => logs.push(r));
+		first.sessionStart(s.ctx);
+		await first.ready;
+		while (first.state !== "ready") await new Promise((r) => setImmediate(r)); // the remaining batches, one per tick
+		first.shutdown();
+		const second = new Memory((r) => logs.push(r));
+		second.sessionStart(s.ctx);
+		await second.ready;
+		second.shutdown();
+		const opens = logs.filter((r) => r.type === "memory_backfill");
+		expect(opens.map((r) => [r.reconcile, r.projected, r.done])).toEqual([["rebuild", 500, false], ["reuse", 0, true]]);
+	});
+
+	test("the batch limit bounds projection only: a partial database continues, a changed prefix rebuilds one batch", () => {
+		const s = fakeSession(many(25));
+		const path = join(s.dir, "p.sqlite");
+		const a = ledgerAt(path, srcOf(s));
+		expect(a.reconcile(srcOf(s), 10)).toMatchObject({ mode: "rebuild", projected: 10 });
+		a.close(); open.pop();
+		const b = ledgerAt(path, srcOf(s));
+		expect(b.reconcile(srcOf(s), 10)).toMatchObject({ mode: "append", projected: 10 }); // 10..20, nothing dropped
+		expect(b.projectedCount).toBe(20);
+		expect(b.reconcile(srcOf(s), 10)).toMatchObject({ mode: "append", projected: 5 });
+		expect(b.current(srcOf(s))).toBe(true);
+		s.state.entries[3] = { ...s.state.entries[3], message: { ...s.state.entries[3].message, content: "edited" } };
+		expect(b.reconcile(srcOf(s), 10)).toMatchObject({ mode: "rebuild", projected: 10 });
+	});
+});
+
 describe("chunking (hand-computed windows)", () => {
 	test("7000 chars -> windows at 0, 2700, 5400 with a 300-char overlap; the last one ends at the text's end", () => {
 		const text = Array.from({ length: 7000 }, (_, i) => String.fromCharCode(97 + (i % 26))).join("");

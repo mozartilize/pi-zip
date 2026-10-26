@@ -6,7 +6,7 @@ import { join } from "node:path";
 export type Any = any;
 
 let clock = Date.UTC(2026, 0, 1);
-const E = (id: string, parentId: string | null, rest: Any) => ({ id, parentId, timestamp: new Date((clock += 1000)).toISOString(), ...rest });
+export const E = (id: string, parentId: string | null, rest: Any) => ({ id, parentId, timestamp: new Date((clock += 1000)).toISOString(), ...rest });
 const M = (id: string, parentId: string | null, message: Any) => E(id, parentId, { type: "message", message: { timestamp: clock + 1000, ...message } });
 export const user = (id: string, parentId: string | null, text: string) => M(id, parentId, { role: "user", content: text });
 export const asst = (id: string, parentId: string | null, content: Any[]) => M(id, parentId, { role: "assistant", content, stopReason: content.some((c) => c.type === "toolCall") ? "toolUse" : "stop" });

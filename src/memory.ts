@@ -9,8 +9,6 @@ import { sqliteAvailable } from "./ledger/db.ts";
 import { ageOf, type CallInfo, memoryTraceEnabled, RetrievalConversation } from "./retrieval/assistant.ts";
 import { type DropStats, PACKET_LIMITS, renderPacket } from "./retrieval/packet.ts";
 import { DEFAULT_LIMITS, hiddenOutputs, queryOf, retrieve, scopeOf } from "./retrieval/search.ts";
-import { handleFor } from "./handle.ts";
-import { recordOffers, recordRests, resting } from "./retrieval/offers.ts";
 import type { Any } from "./util.ts";
 
 export type LedgerState = "idle" | "indexing" | "ready" | "error";
@@ -111,8 +109,7 @@ export class Memory {
 				this.state = "indexing";
 				const led = Ledger.open(src);
 				try {
-					const head = { ...src, entries: src.entries.slice(0, BACKFILL_ENTRIES) };
-					const r = led.reconcile(head);
+					const r = led.reconcile(src, BACKFILL_ENTRIES); // validates the whole source, projects at most one batch
 					this.ledger = led;
 					this.backfillSrc = src;
 					this.ledgerDone = led.current(src);
@@ -240,9 +237,7 @@ export class Memory {
 			const src = readSource(ctx);
 			if (!led || !src || !led.current(src)) return void (rec.skip = led ? "ledger behind its session" : `ledger ${this.state}`);
 			let t = Date.now();
-			const r = retrieve(led.db, query, scope, DEFAULT_LIMITS, resting(led.db));
-			recordRests(led.db, r.rested);
-			if (r.rested.length) rec.rested = r.rested.map(handleFor);
+			const r = retrieve(led.db, query, scope, DEFAULT_LIMITS);
 			latency.search = Date.now() - t;
 			Object.assign(rec, { hits: r.hits, inBranch: r.inBranch, candidates: r.evidence.length, expand: DEFAULT_LIMITS.expand });
 			const evidenceLog = r.evidence.map((x) => ({
@@ -258,10 +253,6 @@ export class Memory {
 			drops = { unknownHandle: 0, empty: 0, cap: 0, notFolded: 0, notNeeded: 0 };
 			const packet = await conv.answer(e.prompt, recentContext(ctx), r.evidence, requestId, revision, drops);
 			latency.answer = Date.now() - t;
-			if (conv.decisions.length) {
-				const byRef = new Map(r.evidence.map((x) => [x.ref, x.entryId]));
-				recordOffers(led.db, conv.decisions.flatMap((d) => (byRef.has(d.ref) ? [{ entryId: byRef.get(d.ref)!, needed: d.need === "Y" }] : [])));
-			}
 			// A provider may ignore abort. Never publish its late response into another run or branch.
 			if (signal.aborted || this.job !== job || String(ctx?.sessionManager?.getSessionId?.() ?? "") !== src.sessionId) return void (rec.skip = "cancelled");
 			if (!packet) return void (rec.skip = "answer failed");
@@ -339,7 +330,12 @@ export class Memory {
 	 */
 	private logUsage(ctx: Any) {
 		const note = this.note;
-		if (!note || !this.noteShown) return;
+		if (note && !this.noteShown) {
+			// ready, but no model request came after it (a slow answer to a run that made no tool call): the note was never read
+			this.log({ type: "memory_dropped", requestId: note.requestId, deferred: note.deferred, reason: "run ended before the next model request" });
+			return;
+		}
+		if (!note) return;
 		const branch: Any[] = ctx?.sessionManager?.getBranch?.() ?? [];
 		let start = branch.length;
 		while (start > 0 && branch[start - 1]?.message?.role !== "user") start--;
@@ -362,7 +358,8 @@ export class Memory {
 		this.log({
 			type: "memory_usage", requestId: note.requestId, deferred: note.deferred, cited: note.cited,
 			recalled: [...recalled], mentioned: [...mentioned], recallCalls, assistantMessages,
-			used: recalled.size > 0 || mentioned.size > 0,
+			// naming a handle is not using it (the model may name it to say the note is wrong); only a recall counts
+			used: recalled.size > 0,
 		});
 	}
 

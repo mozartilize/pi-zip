@@ -102,6 +102,31 @@ export interface Hit extends Row {
 	rank: number;
 }
 
+/**
+ * FTS over source chunks of `entryIds` only, ranked, then limited. The filter runs before LIMIT: with a limit applied to the whole
+ * database first, visible entries and sibling branches could fill every row and leave no place for the hidden entries searched for.
+ * `kinds`: the document kinds searched (retrieval searches the assistant's earlier conclusions).
+ */
+export function ftsSearchIn(db: Db, match: string, entryIds: Iterable<string>, limit = 200, kinds: readonly string[] = ["assistant"]): Hit[] {
+	db.exec("CREATE TEMP TABLE IF NOT EXISTS search_scope (entry_id TEXT PRIMARY KEY)");
+	db.exec("BEGIN");
+	try {
+		db.exec("DELETE FROM search_scope");
+		const ins = db.prepare("INSERT OR IGNORE INTO search_scope(entry_id) VALUES(?)");
+		for (const id of entryIds) ins.run(id);
+		db.exec("COMMIT");
+	} catch (err) {
+		db.exec("ROLLBACK");
+		throw err;
+	}
+	return db.prepare(
+		`SELECT d.id, d.object_type, d.object_id, d.entry_id, d.block_index, d.chunk_index, d.char_start, d.segment_id, d.kind, d.tool, d.is_error,
+		        d.title, d.body, d.identifiers, d.seq, bm25(search_fts, ${WEIGHTS}) AS rank
+		 FROM search_fts JOIN search_docs d ON d.id = search_fts.rowid JOIN search_scope s ON s.entry_id = d.entry_id
+		 WHERE search_fts MATCH ? AND d.object_type = 'chunk' AND d.kind IN (${kinds.map(() => "?").join(", ")}) ORDER BY rank LIMIT ?`,
+	).all(match, ...kinds, limit) as Hit[];
+}
+
 export function ftsSearch(db: Db, match: string, limit = 200): Hit[] {
 	return db.prepare(
 		`SELECT d.id, d.object_type, d.object_id, d.entry_id, d.block_index, d.chunk_index, d.char_start, d.segment_id, d.kind, d.tool, d.is_error,

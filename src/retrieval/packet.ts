@@ -17,12 +17,14 @@ const clip = (s: string, n: number) => {
 	return s.length > n ? s.slice(0, n - 1) + "…" : s;
 };
 
-/** The status a finding may carry given what it cites: only a tool result can support "verified"; reasoning alone is "uncertain". */
+/**
+ * A finding's status comes from what it cites, not from the model's word: a cited tool result (an error output too: it showed the
+ * error) is "verified" (rendered "seen in output"); an earlier conclusion or other prose is "historical" ("earlier conclusion"); reasoning alone is
+ * "uncertain". The model can only lower a status to "uncertain", never raise one.
+ */
 export function statusFor(asked: unknown, cited: Evidence[]): FindingStatus {
-	if (!cited.length || cited.every((e) => e.kind === "thinking")) return "uncertain";
-	const want: FindingStatus = asked === "verified" || asked === "uncertain" ? asked : "historical";
-	if (want === "verified" && !cited.some((e) => e.kind === "tool_result" && !e.isError)) return "historical";
-	return want;
+	if (!cited.length || cited.every((e) => e.kind === "thinking") || asked === "uncertain") return "uncertain";
+	return cited.some((e) => e.kind === "tool_result") ? "verified" : "historical";
 }
 
 /** Why the model's reply lost items: a cited handle that was never retrieved, or a cap. Filled for the tuning log. */
@@ -66,7 +68,7 @@ export const PACKET_TAIL =
  * How a status reads in the note. "verified" means a tool output showed it at the time it was recorded, not that it holds now; the
  * note says so in words, next to the item's age.
  */
-export const STATUS_LABEL: Record<string, string> = { verified: "seen in output", historical: "earlier claim", uncertain: "uncertain" };
+export const STATUS_LABEL: Record<string, string> = { verified: "seen in output", historical: "earlier conclusion", uncertain: "uncertain" };
 
 /** `ages`: handle -> "38 min ago", so the main model sees how old each cited fact is. */
 export function renderPacket(p: RetrievalPacket, ages: Map<string, string> = new Map()): string | null {

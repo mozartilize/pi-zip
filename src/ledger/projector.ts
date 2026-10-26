@@ -70,8 +70,12 @@ export class Ledger {
 		return { session_id: src.sessionId, header_hash: sha256(JSON.stringify(src.header ?? null)), schema_version: SCHEMA_VERSION, projector_version: PROJECTOR_VERSION };
 	}
 
-	/** Bring the database in line with the opened session's complete persisted entry list (reuse, append or rebuild). */
-	reconcile(src: SessionSource): ReconcileResult {
+	/**
+	 * Bring the database in line with the opened session's complete persisted entry list (reuse, append or rebuild). The validity
+	 * check always reads the whole list; `limit` only bounds how many entries this call projects (a large first open projects in
+	 * batches). Passing a shortened list instead would make a complete database look longer than its source and force a rebuild.
+	 */
+	reconcile(src: SessionSource, limit = Infinity): ReconcileResult {
 		const t0 = performance.now();
 		const id = this.identity(src);
 		const entries = src.entries;
@@ -92,17 +96,18 @@ export class Ledger {
 			return { mode: "reuse", projected: 0, ms: performance.now() - t0 };
 		}
 		const from = same ? count : 0;
+		const end = Math.min(entries.length, from + Math.max(0, limit));
 		tx(this.db, () => {
 			if (!same) {
 				resetDb(this.db);
 				for (const [k, v] of Object.entries(id)) setMeta(this.db, k, v);
 			}
 			setMeta(this.db, "source_file", src.file);
-			this.project(src, from, entries.length);
+			this.project(src, from, end);
 		});
-		this.seen = entries.length;
-		this.lastId = entries.length ? entries[entries.length - 1].id : null;
-		return { mode: same ? "append" : "rebuild", projected: entries.length - from, ms: performance.now() - t0 };
+		this.seen = end;
+		this.lastId = end ? entries[end - 1].id : null;
+		return { mode: same ? "append" : "rebuild", projected: end - from, ms: performance.now() - t0 };
 	}
 
 	/** Live ingestion: project entries appended since the last reconcile or catch-up. Falls back to a reconcile when the source no
