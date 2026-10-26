@@ -1,7 +1,7 @@
 // Candidate search over the opened session's ledger, scoped to the active branch. What is searched is the assistant's earlier
-// conclusions (its final answer of each user turn), once they are hidden from the model's context: a conclusion is written in the
-// user's language and states what the turn established, so the user's next prompt matches it, where it rarely matches the raw tool
-// output behind it. A tool result is a candidate only when the prompt names its handle.
+// conclusions (its final answer of each user turn) and hidden tool outputs on the active branch, combined with referential graph
+// traversal (file paths and code symbols in the prompt linked via tool call arguments and identifiers). Mid-turn assistant text and
+// sibling branches are excluded.
 import { handleFor, handleTokens } from "../handle.ts";
 import type { Db } from "../ledger/db.ts";
 import { CHUNK_CHARS, ftsSearchIn, type Hit, matchExpr } from "../ledger/fts.ts";
@@ -54,17 +54,24 @@ export interface Evidence {
 	at: number;
 }
 
-/** `ftsRows`: FTS rows read per prompt, after the hidden-conclusion filter. */
+/** `ftsRows`: FTS rows read per prompt, after the active-branch hidden scope filter. */
 export interface SearchLimits { candidates: number; expand: number; excerptChars: number; ftsRows: number }
-export const DEFAULT_LIMITS: SearchLimits = { candidates: 8, expand: 6, excerptChars: 1200, ftsRows: 400 };
+export const DEFAULT_LIMITS: SearchLimits = { candidates: 8, expand: 6, excerptChars: 1500, ftsRows: 400 };
 
 /** Diacritics removed, for comparison only: "tiếp tục" -> "tiep tuc", "đ" -> "d". */
 export const fold = (s: string) => s.normalize("NFD").replace(/\p{M}+/gu, "").replace(/đ/g, "d").replace(/Đ/g, "D");
 
+const WORD_RE = /[\p{L}\p{N}_]+/gu;
+
+/** Normalized word sequence of an excerpt, used to skip duplicate tool outputs. */
+function excerptKey(text: string): string {
+	return (fold(text.toLowerCase()).match(WORD_RE) ?? []).join(" ");
+}
+
 /** How many of `tokens` occur in `text` (both folded). */
 export function matchedOf(tokens: string[], text: string): number {
 	if (!tokens.length) return 0;
-	const words = new Set(fold(text.toLowerCase()).match(/[\p{L}\p{N}_]+/gu) ?? []);
+	const words = new Set(fold(text.toLowerCase()).match(WORD_RE) ?? []);
 	return tokens.filter((w) => words.has(fold(w))).length;
 }
 
@@ -89,18 +96,74 @@ function sourceSlice(e: Any, blockIndex: number | null, charStart: number | null
 	return b.text.slice(start, start + CHUNK_CHARS);
 }
 
-/** About `n` characters from a little before the first query term found (whole text when it fits). */
+/**
+ * About `n` characters anchored around the densest / most specific query-term match in `text` (whole text when it fits). Weighting
+ * distinct matched terms by length and local rarity prevents a common query word near offset 0 from displacing the specific passage.
+ */
 export function window(text: string, terms: string[], n: number): string {
 	const flat = text.replace(/\s+/g, " ").trim();
 	if (flat.length <= n) return flat;
-	const low = flat.toLowerCase();
-	let at = -1;
-	for (const w of terms) {
-		const i = low.indexOf(w.toLowerCase());
-		if (i >= 0 && (at < 0 || i < at)) at = i;
+	const want = new Set(terms.map((t) => fold(t.toLowerCase())));
+	const hits: Array<{ at: number; len: number; term: string }> = [];
+	const tf = new Map<string, number>();
+	for (const m of flat.matchAll(WORD_RE)) {
+		const w = fold(m[0].toLowerCase());
+		if (want.has(w)) {
+			hits.push({ at: m.index ?? 0, len: m[0].length, term: w });
+			tf.set(w, (tf.get(w) ?? 0) + 1);
+		}
 	}
-	const start = Math.max(0, Math.min(flat.length - n, (at < 0 ? 0 : at) - Math.min(80, Math.floor(n / 3)))); // the match near the front: shorter quotes keep it
-	return `${start > 0 ? "…" : ""}${flat.slice(start, start + n)}${start + n < flat.length ? "…" : ""}`;
+	const lead = Math.min(80, Math.floor(n / 3));
+	if (!hits.length) {
+		const low = flat.toLowerCase();
+		let at = -1;
+		for (const w of terms) {
+			const i = low.indexOf(w.toLowerCase());
+			if (i >= 0 && (at < 0 || i < at)) at = i;
+		}
+		const start = Math.max(0, Math.min(flat.length - n, (at < 0 ? 0 : at) - lead));
+		return `${start > 0 ? "…" : ""}${flat.slice(start, start + n)}${start + n < flat.length ? "…" : ""}`;
+	}
+	const weight = (t: string) => Math.max(1, Math.min(8, t.length)) / Math.sqrt(tf.get(t) ?? 1);
+	const counts = new Map<string, number>();
+	let lo = 0, hi = 0, score = 0;
+	let best = { score: -1, start: 0 };
+	for (const anchor of hits) {
+		const start = Math.max(0, Math.min(flat.length - n, anchor.at - lead));
+		while (hi < hits.length && hits[hi].at + hits[hi].len <= start + n) {
+			const c = counts.get(hits[hi].term) ?? 0;
+			if (c === 0) score += weight(hits[hi].term);
+			counts.set(hits[hi].term, c + 1);
+			hi++;
+		}
+		while (lo < hi && hits[lo].at < start) {
+			const c = (counts.get(hits[lo].term) ?? 1) - 1;
+			if (c === 0) score -= weight(hits[lo].term);
+			counts.set(hits[lo].term, c);
+			lo++;
+		}
+		if (score > best.score + 1e-9) best = { score, start };
+	}
+	return `${best.start > 0 ? "…" : ""}${flat.slice(best.start, best.start + n)}${best.start + n < flat.length ? "…" : ""}`;
+}
+
+/** Extract explicit file paths and code identifiers (snake_case, camelCase, PascalCase) from a user prompt for graph traversal. */
+export function promptReferences(text: string): { paths: string[]; symbols: string[] } {
+	const paths = [
+		...new Set(
+			(text.match(/@?[\w.-]+\/[\w./-]+|@?[\w.-]+\.(?:ts|js|py|sh|yml|yaml|json|md|sql|toml)\b/gi) ?? [])
+				.map((p) => p.replace(/^@/, "").replace(/\/+$/, "").toLowerCase())
+				.filter((p) => p.length >= 3),
+		),
+	];
+	const symbols = [
+		...new Set(
+			(text.match(/\b[a-zA-Z_]\w*_[a-zA-Z0-9_]+\b|\b[a-z]+[A-Z][a-zA-Z0-9]*\b|\b[A-Z][a-z0-9]+[A-Z][a-zA-Z0-9]*\b/g) ?? [])
+				.map((s) => s.toLowerCase())
+				.filter((s) => s.length >= 4),
+		),
+	];
+	return { paths, symbols };
 }
 
 /** A loaded skill arrives inside the prompt as a <skill ...>...</skill> block: its text is the skill file, not the user's request. */
@@ -114,15 +177,16 @@ export const userText = (prompt: string) => prompt.replace(/<skill\b[^>]*>[\s\S]
 export const QUERY_HEAD = 32, QUERY_TAIL = 96;
 
 /** The query of one prompt, from the user's own words. Nothing is filtered by language (no stopwords). */
-export interface Query { tokens: string[]; handles: string[] }
+export interface Query { tokens: string[]; handles: string[]; paths?: string[]; symbols?: string[] }
 export function queryOf(prompt: string): Query {
 	const own = userText(prompt);
-	const words = [...new Set(own.toLowerCase().match(/[\p{L}\p{N}_]+/gu) ?? [])]; // distinct, first-occurrence order
-	if (words.length <= QUERY_HEAD + QUERY_TAIL) return { tokens: words, handles: [...new Set(handleTokens(own))] };
+	const refs = promptReferences(own);
+	const words = [...new Set(own.toLowerCase().match(WORD_RE) ?? [])]; // distinct, first-occurrence order
+	if (words.length <= QUERY_HEAD + QUERY_TAIL) return { tokens: words, handles: [...new Set(handleTokens(own))], ...refs };
 	// head: the first distinct words; tail: the distinct words nearest the end, in prompt order, none repeated from the head
 	const head = words.slice(0, QUERY_HEAD), inHead = new Set(head);
 	const tail: string[] = [];
-	const all = own.toLowerCase().match(/[\p{L}\p{N}_]+/gu) ?? [];
+	const all = own.toLowerCase().match(WORD_RE) ?? [];
 	const seen = new Set<string>();
 	for (let i = all.length - 1; i >= 0 && tail.length < QUERY_TAIL; i--) {
 		const w = all[i];
@@ -130,35 +194,160 @@ export function queryOf(prompt: string): Query {
 		seen.add(w);
 		tail.push(w);
 	}
-	return { tokens: [...head, ...tail.reverse()], handles: [...new Set(handleTokens(own))] };
+	return { tokens: [...head, ...tail.reverse()], handles: [...new Set(handleTokens(own))], ...refs };
+}
+
+function fuseChannels(...lists: string[][]): string[] {
+	const sums = new Map<string, number>();
+	for (const list of lists) {
+		list.forEach((id, i) => sums.set(id, (sums.get(id) ?? 0) + 1 / (60 + i + 1)));
+	}
+	return [...sums].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).map(([id]) => id);
 }
 
 /**
- * Hidden conclusions on the active branch that match the prompt, best first, one item per conclusion; plus, first, every hidden entry
- * whose handle the prompt names (each kept on its own, also several from one step). The model decides which items are needed.
+ * Hidden conclusions and tool outputs on the active branch that match the prompt (via FTS5 and referential graph traversal over file
+ * paths / code symbols), best first; plus, first, every hidden entry whose handle the prompt names (each kept on its own, also several
+ * from one step). Multi-chunk matches on a chosen entry merge up to 3 passages. The model decides which items are needed.
  */
 export function retrieve(db: Db, q: Query, scope: Scope, limits: SearchLimits = DEFAULT_LIMITS): { evidence: Evidence[]; hits: number; inBranch: number } {
 	const tokens = q.tokens;
 	const match = matchExpr(tokens);
 	const usable = (id: string) => scope.branch.has(id) && scope.hidden.has(id) && !scope.visible.has(id);
+	const isToolOutput = (id: string) => {
+		const e = scope.entry(id);
+		return e?.message?.role === "toolResult" || e?.type === "bashExecution";
+	};
 	// A handle in the prompt names one entry: resolve it through the ledger, not through the text (a handle appears in no document).
 	const named = handleDocs(db, q.handles).filter((h) => h.entry_id && usable(h.entry_id));
-	const eligible = [...scope.conclusions.keys()].filter(usable);
-	const hits = match ? ftsSearchIn(db, match, eligible, limits.ftsRows, ["assistant"]) : [];
-	const picked = new Map<string, { hit: Hit; exact: boolean }>();
-	for (const hit of named) if (!picked.has(hit.entry_id!)) picked.set(hit.entry_id!, { hit, exact: true });
-	for (const hit of hits) if (picked.size < limits.candidates + named.length && !picked.has(hit.entry_id!)) picked.set(hit.entry_id!, { hit, exact: false });
+	const eligible = [
+		...new Set([
+			...[...scope.conclusions.keys()].filter(usable),
+			...[...scope.hidden.keys()].filter((id) => usable(id) && isToolOutput(id)),
+		]),
+	];
+	const hits = match ? ftsSearchIn(db, match, eligible, limits.ftsRows, ["assistant", "tool_result"]) : [];
+	const byObj = new Map<string, Hit>(hits.map((h) => [String(h.object_id), h]));
+
+	// Referential graph traversal: resolve file paths and code symbols in the prompt against hidden tool_result chunks.
+	const paths = q.paths ?? [], symbols = q.symbols ?? [];
+	const graphList: string[] = [];
+	if ((paths.length || symbols.length) && eligible.length) {
+		const eligibleSet = new Set(eligible);
+		const toolDocs = (db.prepare("SELECT *, 0 AS rank FROM search_docs WHERE object_type = 'chunk' AND kind = 'tool_result'").all() as Hit[])
+			.filter((d) => d.entry_id && eligibleSet.has(String(d.entry_id)));
+		for (const d of toolDocs) if (!byObj.has(String(d.object_id))) byObj.set(String(d.object_id), d);
+		const lexicalTop = hits.slice(0, 40).map((h) => String(h.object_id));
+		const lexRank = (id: string) => {
+			const i = lexicalTop.indexOf(id);
+			return i >= 0 ? i : 9999;
+		};
+		const addGraph = (id: string) => {
+			if (id && !graphList.includes(id) && graphList.length < 30) graphList.push(id);
+		};
+		const byEntryBlockChunk = new Map(toolDocs.map((d) => [`${d.entry_id}:${d.block_index}:${d.chunk_index}`, String(d.object_id)]));
+		for (const ref of paths) {
+			const base = ref.split("/").pop() ?? "";
+			if (base.length < 3) continue;
+			const matchingBlocks = [
+				...new Set(
+					toolDocs
+						.filter((d) => {
+							const idents = String(d.identifiers ?? "").toLowerCase();
+							const title = String(d.title ?? "").toLowerCase();
+							return (
+								idents.endsWith(ref) ||
+								idents.includes(`/${base}`) ||
+								title.includes(ref) ||
+								(Number(d.chunk_index) === 0 && String(d.body ?? "").slice(0, 400).toLowerCase().includes(base))
+							);
+						})
+						.sort((a, b) => (b.tool === "read" ? 1 : 0) - (a.tool === "read" ? 1 : 0) || Number(b.seq) - Number(a.seq) || Number(a.chunk_index) - Number(b.chunk_index))
+						.map((d) => `${d.entry_id}:${d.block_index}`),
+				),
+			];
+			for (const eb of matchingBlocks.slice(0, 1)) {
+				for (const ci of [0, 1]) {
+					const objId = byEntryBlockChunk.get(`${eb}:${ci}`);
+					if (objId) addGraph(objId);
+				}
+			}
+		}
+		for (const sym of symbols) {
+			const matching = toolDocs
+				.filter((d) => String(d.title ?? "").toLowerCase().includes(sym) && String(d.body ?? "").toLowerCase().includes(sym))
+				.sort((a, b) => Number(b.seq) - Number(a.seq) || lexRank(String(a.object_id)) - lexRank(String(b.object_id)) || Number(a.chunk_index) - Number(b.chunk_index));
+			for (const d of matching.slice(0, 2)) addGraph(String(d.object_id));
+		}
+	}
+
+	const lexicalIds = hits.slice(0, 40).map((h) => String(h.object_id));
+	const fusedIds = graphList.length
+		? [...fuseChannels(lexicalIds, graphList), ...hits.slice(40).map((h) => String(h.object_id)).filter((id) => !graphList.includes(id))]
+		: hits.map((h) => String(h.object_id));
+
+	const sliceText = (h: Hit, exact: boolean): string => {
+		const entryId = h.entry_id!;
+		const e = scope.entry(entryId);
+		const isConclusion = scope.conclusions.has(entryId);
+		return isConclusion && exact
+			? textBlocks(e).filter((b) => b.kind === "assistant").map((b) => b.text).join("\n")
+			: sourceSlice(e, h.block_index, h.char_start) || h.body;
+	};
+
+	const picked = new Map<string, { hit: Hit; exact: boolean; passages: Array<{ blockIndex: number; chunkIndex: number; excerpt: string; text: string }> }>();
+	const seenExcerpts = new Set<string>();
+
+	for (const hit of named) {
+		const entryId = hit.entry_id!;
+		if (picked.has(entryId)) continue;
+		const text = sliceText(hit, true);
+		const excerpt = window(text, tokens, limits.excerptChars);
+		const key = excerptKey(excerpt);
+		if (key) seenExcerpts.add(key);
+		picked.set(entryId, { hit, exact: true, passages: [{ blockIndex: Number(hit.block_index ?? 0), chunkIndex: Number(hit.chunk_index ?? 0), excerpt, text }] });
+	}
+
+	// Pass 1: pick up to limits.candidates distinct entries from the fused ranking, skipping duplicate excerpt content.
+	for (const objId of fusedIds) {
+		if (picked.size >= limits.candidates + named.length) break;
+		const hit = byObj.get(objId);
+		if (!hit?.entry_id || picked.has(hit.entry_id)) continue;
+		const text = sliceText(hit, false);
+		const excerpt = window(text, tokens, limits.excerptChars);
+		const key = excerptKey(excerpt);
+		if (!key || seenExcerpts.has(key)) continue;
+		seenExcerpts.add(key);
+		picked.set(hit.entry_id, { hit, exact: false, passages: [{ blockIndex: Number(hit.block_index ?? 0), chunkIndex: Number(hit.chunk_index ?? 0), excerpt, text }] });
+	}
+
+	// Pass 2: attach up to 2 additional matching chunks for chosen tool_result entries from the top fused candidates.
+	if (limits.excerptChars >= 1200) {
+		const subWindow = Math.min(1200, limits.excerptChars);
+		for (const objId of fusedIds.slice(0, 16)) {
+			const hit = byObj.get(objId);
+			if (!hit?.entry_id || scope.conclusions.has(hit.entry_id)) continue;
+			const cur = picked.get(hit.entry_id);
+			if (!cur || cur.exact || cur.passages.length >= 3) continue;
+			const bi = Number(hit.block_index ?? 0), ci = Number(hit.chunk_index ?? 0);
+			if (cur.passages.some((p) => p.blockIndex === bi && p.chunkIndex === ci)) continue;
+			const text = sliceText(hit, false);
+			const excerpt = window(text, tokens, subWindow);
+			const key = excerptKey(excerpt);
+			if (!key || seenExcerpts.has(key)) continue;
+			seenExcerpts.add(key);
+			cur.passages.push({ blockIndex: bi, chunkIndex: ci, excerpt, text });
+		}
+	}
+
 	const ranked = [...picked.values()].slice(0, Math.max(limits.candidates, named.length));
 	const evidence = ranked.map((c, i): Evidence => {
 		const h = c.hit, entryId = h.entry_id!;
 		const e = scope.entry(entryId);
 		const role = e?.type === "message" ? e.message?.role : null;
 		const isConclusion = scope.conclusions.has(entryId);
-		// Preserve the winning FTS block/chunk: an earlier common word in the full answer must not displace the matched passage.
-		// Explicit handles have no winning text match; for conclusions, quote prose rather than the first (possibly thinking) block.
-		const text = isConclusion && c.exact
-			? textBlocks(e).filter((b) => b.kind === "assistant").map((b) => b.text).join("\n")
-			: sourceSlice(e, h.block_index, h.char_start) || h.body;
+		const orderedPassages = [...c.passages].sort((a, b) => a.blockIndex - b.blockIndex || a.chunkIndex - b.chunkIndex);
+		const combinedText = orderedPassages.map((p) => p.text).join("\n");
 		return {
 			ref: `E${i + 1}`,
 			handle: handleFor(entryId),
@@ -167,18 +356,18 @@ export function retrieve(db: Db, q: Query, scope: Scope, limits: SearchLimits = 
 			kind: isConclusion ? "assistant" : h.kind,
 			tool: h.tool,
 			title: isConclusion ? (scope.conclusions.get(entryId) ? `answer to: "${clip(scope.conclusions.get(entryId)!, 160)}"` : "earlier conclusion") : titleOf(scope, entryId, h),
-			excerpt: window(text, tokens, limits.excerptChars),
+			excerpt: orderedPassages.map((p) => p.excerpt).join(" … "),
 			outcome: role === "toolResult" ? outcomeHint(textBlocks(e).map((b) => b.text).join("\n"), String(h.tool ?? ""), !!h.is_error) : "",
 			isError: !!h.is_error,
 			folded: role === "toolResult",
-			matched: matchedOf(tokens, text),
+			matched: matchedOf(tokens, combinedText),
 			exact: c.exact,
 			context: i < limits.expand ? contextOf(db, h, scope) : [],
 			seq: Number(h.seq ?? 0),
 			at: Date.parse(e?.timestamp ?? "") || 0,
 		};
 	});
-	return { evidence, hits: named.length + hits.length, inBranch: named.length + hits.length };
+	return { evidence, hits: named.length + hits.length + graphList.length, inBranch: named.length + hits.length + graphList.length };
 }
 
 const clip = (s: string, n: number) => {

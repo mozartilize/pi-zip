@@ -91,16 +91,58 @@ describe("retrieve", () => {
 		expect(named.excerpt).not.toContain("private hypothesis");
 	});
 
-	test("only hidden conclusions on the active branch are candidates: visible, sibling-branch and mid-turn text are not", () => {
+	test("only hidden conclusions and tool outputs on the active branch are candidates: visible, sibling-branch and mid-turn text are not", () => {
 		const { s, l } = indexed(withSibling(), { leaf: "om", hidden: [...COMPACTED, "a6"] });
 		const ids = (prompt: string) => retrieve(l.db, q(prompt), scopeOf(s.ctx)).evidence.map((e) => e.entryId);
 		expect(ids("how were the sockets fixed")).toEqual(["a3"]); // a6 matches too, on the sibling branch
-		expect(ids("running first")).toEqual([]); // a1: hidden, matching, but not a conclusion
-		expect(ids("PASS 12 tests")).toEqual([]); // a hidden tool output is not searched
+		expect(ids("running first")).toEqual([]); // a1: hidden, matching, but mid-turn assistant text (not a conclusion or tool output)
+		expect(ids("PASS 12 tests")).toEqual(["r3"]); // a hidden tool output on the active branch is a candidate
 		s.state.leaf = "a6"; // /tree to the sibling: no compaction on that branch, so nothing there is hidden
 		expect(ids("how were the sockets fixed")).toEqual([]);
 		const shown = indexed(withSibling(), { leaf: "om" }); // nothing hidden: a3 is in the view
 		expect(retrieve(shown.l.db, q("how were the sockets fixed"), scopeOf(shown.s.ctx)).evidence).toEqual([]);
+	});
+
+	test("referential graph traversal links file paths and symbols in the prompt to hidden tool outputs and merges multi-chunk passages", () => {
+		const chunk0 = "# CUTOVER VERSION of cloudformation-v0.yml\n" + "header_line: true\n".repeat(170);
+		const chunk1 = "Parameters:\n  CreateServer:\n    Default: 'true'\n";
+		const entries: Any[] = [
+			user("u1", null, "read cutover template"),
+			asst("a1", "u1", [call("c1", "read", { path: "sftp_auth_migration/cloudformation.cutover.yml" })]),
+			result("r_cfn", "a1", "c1", "read", chunk0 + chunk1),
+			asst("a2", "r_cfn", [{ type: "text", text: "Cutover template inspected." }]),
+		];
+		let parent = "a2";
+		for (let i = 1; i <= 6; i++) {
+			entries.push(
+				user(`u_p${i}`, parent, `sftp_auth_migration check ${i}`),
+				asst(`a_p${i}`, `u_p${i}`, [{ type: "text", text: `Everything in sftp_auth_migration is working fine without surprise (${i}).` }]),
+			);
+			parent = `a_p${i}`;
+		}
+		// Duplicate tool output with identical content should be deduplicated
+		entries.push(
+			user("u_dup", parent, "run status"),
+			asst("a_dup", "u_dup", [call("cd1", "bash", { command: "git status" }), call("cd2", "bash", { command: "git status" })]),
+			result("r_dup1", "a_dup", "cd1", "bash", "nothing to commit, working tree clean"),
+			result("r_dup2", "r_dup1", "cd2", "bash", "nothing to commit, working tree clean"),
+			E("cm", "r_dup2", { type: "compaction", summary: "s", firstKeptEntryId: "cm", tokensBefore: 1000 }),
+		);
+		const { s: sess, l } = indexed(entries);
+		sess.sm.buildSessionProjection = () => buildSessionProjection(sess.state.entries, sess.state.leaf);
+		const ev = retrieve(
+			l.db,
+			q("reevaluate @sftp_auth_migration/cloudformation-v0.yml, make sure everything is working fine without surprise"),
+			scopeOf(sess.ctx),
+		).evidence;
+		const cfn = ev.find((e) => e.entryId === "r_cfn");
+		expect(cfn).toBeDefined();
+		expect(ev.indexOf(cfn!)).toBeLessThan(3); // promoted to the top by referential graph traversal
+		expect(cfn!.excerpt).toContain("cloudformation-v0.yml");
+		expect(cfn!.excerpt).toContain("Default: 'true'"); // second chunk merged into the same evidence item
+
+		const dupEv = retrieve(l.db, q("nothing to commit working tree clean"), scopeOf(sess.ctx)).evidence;
+		expect(dupEv.filter((e) => e.entryId === "r_dup1" || e.entryId === "r_dup2")).toHaveLength(1);
 	});
 
 	test("a conclusion is quoted from its own text and titled by the request it answered", () => {
