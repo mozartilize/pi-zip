@@ -659,6 +659,11 @@ export interface PlanOpts {
 	law?: Law; // prices, g and P(warm): the only input that depends on P; default: the explicit class ratios at P = 0
 	pause?: boolean; // a return after a pause (the absence outlived the requested cache lifetime) or a model switch: the previous user turn's re-readable outputs may fold
 	trace?: (LawTerms & { where: "summary" | "plan" | "guard"; cut?: boolean; ready?: boolean; key?: string })[]; // every law evaluation is pushed here (ledger)
+	/** Ledger only: candidate eligibility and the final application decision, populated by core.decideEdits. */
+	foldDecision?: {
+		reason: "selected" | "back-to-back" | "guard-rejected" | "no-plan";
+		outputs: Array<{ h: string; age: number; verdict: Verdict | "unscored"; group: number | null; planned: boolean; selected: boolean }>;
+	};
 	/** Output diagnostic, overwritten on each plan; sizes are calibrated whole-context tokens. */
 	summaryGate?: { before: number; afterFolds: number; target: number; threshold: number | null; prepareThreshold: number | null; room: number | null; eligible: boolean; prepareEligible: boolean; checkpoint?: { key: string; after: number; advance: number; refresh: boolean }; reason: "folds-only" | "unknown-window" | "below-target" | "below-pressure" | "prepare-only" | "pressure" };
 	reserve?: number; // Pi's compaction reserveTokens (default 16384)

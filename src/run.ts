@@ -459,6 +459,7 @@ export class Zip implements ZipControl {
 		this.ledger({
 			type: "law", where, g: Math.round(l.g), pWarm: rd(l.pWarm), survSrc: where === "run" ? this.survSrc : "in-run", cls: pr.cls, wr: rd(pr.w / pr.r), prSrc: pr.src,
 			...(sg ? { summaryGate: sg } : {}),
+			...(o.foldDecision ? { foldDecision: o.foldDecision } : {}),
 			steps: (o.trace ?? []).map((t) => ({ at: t.where, ok: t.ok, B: Math.round(t.B), A: Math.round(t.A), T: Math.round(t.T), ...(t.Tsuf !== undefined ? { Tsuf: Math.round(t.Tsuf) } : {}), phi: rd(t.phi), K: rd(t.K), eta: rd(t.eta) })),
 		});
 	}
@@ -502,7 +503,7 @@ export class Zip implements ZipControl {
 
 	// ---- events ----------------------------------------------------------------------------------------------
 	sessionStart(ctx: Any) {
-		this.judge.stop();
+		this.judge.stop("session-changed");
 		this.judge = new Judge((rec) => this.ledger(rec));
 		this.ledgerSid = this.sessionId(ctx); // this session's ledger file, before the first record names it
 		this.rotateLedger();
@@ -638,7 +639,7 @@ export class Zip implements ZipControl {
 	}
 
 	shutdown() {
-		this.judge.stop();
+		this.judge.stop("shutdown");
 		this.cancelTimer();
 		this.cancelDoor();
 		this.ranHere = false; // a door reading its clock now never arms again
@@ -746,7 +747,7 @@ export class Zip implements ZipControl {
 	private promptStart = false;
 
 	agentEnd() {
-		this.judge.stop();
+		this.judge.stop("run-ended", true);
 		this.startKind = null;
 		this.promptStart = false;
 		this.inRun = false;
@@ -1573,7 +1574,7 @@ export class Zip implements ZipControl {
 	/** Settle writes pending artifact records and prepares another return in every mode. A repaired length stop has one chance to
 	 *  take that summary at this boundary: once Pi has omitted the truncated assistant, the resulting tool context is runnable again. */
 	async settle(e: Any, ctx: Any): Promise<Any> {
-		this.judge.stop();
+		this.judge.stop("settle", true);
 		this.inRun = false;
 		const branch = this.branch(ctx), entries = e.context.contextEntries;
 		const latestIdx = branch.findLastIndex((en: Any) => en?.type === "message" && en.message?.role === "assistant");
@@ -1953,7 +1954,7 @@ export class Zip implements ZipControl {
 
 	/** Pi's model_select (/model, cycling, restore): a switch in the middle of a run is not seen by any run start. */
 	modelSelect(model: Any) {
-		this.judge.stop();
+		this.judge.stop("model-changed");
 		this.judge.verdicts.clear();
 		if (this.inRun) this.judge.startRun();
 		if (model) this.model = model;
@@ -2153,7 +2154,7 @@ export class Zip implements ZipControl {
 	setOff(off: boolean): string {
 		this.off = off;
 		if (!off && this.inRun) this.judge.startRun();
-		if (off) { this.judge.stop(); this.runPlan = null; this.runEdits = false; this.cancelTimer(); this.cancelDoor(); this.discardBg("off"); }
+		if (off) { this.judge.stop("disabled"); this.runPlan = null; this.runEdits = false; this.cancelTimer(); this.cancelDoor(); this.discardBg("off"); }
 		this.persistState();
 		return off ? `${PRODUCT}: off. Nothing is folded or summarised and requests are left untouched; earlier folds stay recallable (/zip on to resume)` : `${PRODUCT}: on`;
 	}

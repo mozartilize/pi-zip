@@ -52,6 +52,8 @@ export interface ParsedVerdict {
 	 */
 	abstained: number;
 	diag: VerdictDiag;
+	/** facts-v1 only: the accepted "<active><finished><lookup>" answer of each handle (absent: missing, duplicate or malformed). */
+	triples?: Map<string, string>;
 }
 
 /** Policy-code counts before lookup validation; fact protocols derive these codes from answers, not citations. */
@@ -568,6 +570,7 @@ export function parseFacts(text: string, known: ReadonlySet<string>, evidence: r
 	}
 	if (!valid) throw new Error("Judge response has no fact lines");
 	const verdicts = new Map<string, Verdict>(), nOk = new Map<string, boolean>(), locator = new Map<string, string | null>();
+	const triples = new Map<string, string>();
 	let abstained = 0;
 	for (const h of known) {
 		const info = meta.get(h), rows = hits.get(h);
@@ -579,6 +582,7 @@ export function parseFacts(text: string, known: ReadonlySet<string>, evidence: r
 		const [active, finished, lookup] = rows[0];
 		const triple = `${active}${finished}${lookup}`;
 		facts[triple] = (facts[triple] ?? 0) + 1;
+		triples.set(h, triple);
 		if (triple.includes("U")) abstained++;
 		const code = lookup === "Y" ? "N" : active === "Y" ? "H" : finished === "Y" && active === "N" && lookup === "N" ? "C" : "U";
 		diag.raw[code]++;
@@ -595,7 +599,7 @@ export function parseFacts(text: string, known: ReadonlySet<string>, evidence: r
 			diag.n.push({ handle: h, ev: span.id, result: folded ? "need" : "live" });
 		} else verdicts.set(h, code === "C" ? "cold" : "hot");
 	}
-	return { verdicts, nOk, locator, abstained, diag };
+	return { verdicts, nOk, locator, abstained, diag, triples };
 }
 
 /** Historical evidence-v1 parser, retained only for saved-capture replay. */
@@ -749,20 +753,26 @@ export class Judge {
 	private controller: AbortController | null = null;
 	private pending: Promise<void> | null = null;
 	private pendingHandles = new Set<string>();
+	/** Snapshot flush before a safe run-end abort; never used for scope/session invalidation. */
+	private partial: { controller: AbortController; flush: () => void } | null = null;
 	private readonly sessionId = randomUUID();
 	private lastHintNote = "";
+	private skipStamp = "";
 
 	constructor(private readonly ledger: (record: Record<string, unknown>) => void, private readonly timeoutMs = 30_000) {}
 
 	startRun() {
-		this.stop();
+		this.stop("run-replaced");
 		this.run = true;
 		this.failures = 0;
+		this.skipStamp = "";
 	}
-	stop() {
+	stop(reason = "invalidated", keepPartial = false) {
+		// Publish only what was received before the boundary, while this generation is still valid.
+		if (keepPartial && this.partial?.controller === this.controller) this.partial.flush();
 		this.run = false;
 		this.generation++;
-		this.controller?.abort();
+		this.controller?.abort(reason);
 		this.consumed = true; // an ended run drops lookup notes that were not sent
 	}
 	get running() { return this.pending; }
@@ -848,7 +858,7 @@ export class Judge {
 		}
 		this.prevRefs = refs;
 		this.prevRecalled = new Set(opts.recalled ?? []);
-		if (invalidatePending) { this.generation++; this.controller?.abort(); }
+		if (invalidatePending) { this.generation++; this.controller?.abort(scopeChanged ? "scope-changed" : "evidence-changed"); }
 		// Superseded outputs are cold by rule, at every boundary and below every gate: no model call is needed or asked for them.
 		const superseded = this.index.superseded;
 		if (synced.rebuilt) {
@@ -861,15 +871,25 @@ export class Judge {
 			const slot = this.index.meta.get(h);
 			if (slot) this.verdicts.set(h, { v: "cold", atReq: reqCount, locator: slot.locator, nOk: false, fixed: true });
 		}
+		const skip = (reason: string, handles: string[] = []) => {
+			// Repeated boundaries with the same gate and candidate set add no diagnostic information.
+			const stamp = `${this.generation}:${reason}:${handles.join(",")}`;
+			if (stamp === this.skipStamp) return;
+			this.skipStamp = stamp;
+			this.ledger({ type: "judge_skip", reason, reqCount, contextTokens, coldCap, judgeAge: this.judgeAge,
+				handles, sinceLastCall: Number.isFinite(this.lastReq) ? reqCount - this.lastReq : null });
+		};
 		// Observe invalidations even below pressure/cadence gates and while a provider is still running.
-		if (this.pending || this.failures >= 2 || contextTokens < 0.8 * coldCap) return;
+		if (this.pending) return skip("pending");
+		if (this.failures >= 2) return skip("failure-limit");
+		if (contextTokens < 0.8 * coldCap) return skip("below-pressure");
 		const stale = (h: string) => !this.verdicts.has(h) || (!this.verdicts.get(h)!.fixed && reqCount - this.verdicts.get(h)!.atReq > 20);
 		const handleOf = (b: Block) => (b.idx !== undefined && this.index.slots[b.idx]?.entryId === b.entryId && this.index.slots[b.idx]?.handle) || handleFor(b.entryId!);
 		const eligible = [...new Set(foldCandidates(blocks, calls, opts).flat())]
 			.filter((b) => b.age >= this.judgeAge && stale(handleOf(b)));
 		const selected = new Set([...this.citedFolded].filter(stale));
 		const foldedHit = selected.size > 0;
-		if (eligible.length < 5 && !foldedHit) return;
+		if (eligible.length < 5 && !foldedHit) return skip("batch-too-small", eligible.map(handleOf));
 		const growth = (handles: Iterable<string>) => {
 			let tokens = 0;
 			for (const h of handles) {
@@ -879,14 +899,15 @@ export class Judge {
 			return tokens;
 		};
 		// Reject cheap cadence misses before constructing any placeholders or catalogue rows.
-		if (reqCount - this.lastReq < 8 && growth(new Set([...selected, ...eligible.map(handleOf)])) < 10_000) return;
+		if (reqCount - this.lastReq < 8 && growth(new Set([...selected, ...eligible.map(handleOf)])) < 10_000) return skip("cadence", [...selected, ...eligible.map(handleOf)]);
 		for (const b of eligible) if (foldPlaceholder(b, calls, opts)) selected.add(handleOf(b));
 		const eligibleCount = selected.size - (foldedHit ? [...selected].filter((h) => this.citedFolded.has(h)).length : 0);
-		if (eligibleCount < 5 && !foldedHit) return;
+		if (eligibleCount < 5 && !foldedHit) return skip("insufficient-saving-candidates", [...selected]);
 		const addedTokens = growth(selected);
-		if (reqCount - this.lastReq < 8 && addedTokens < 10_000) return;
+		if (reqCount - this.lastReq < 8 && addedTokens < 10_000) return skip("cadence", [...selected]);
 		const input = judgeInput(blocks, calls, firstPrompt, 6000, this.catalogue, reqCount, cwd, selected);
-		if (!input.manifest.size) return;
+		if (!input.manifest.size) return skip("empty-input");
+		this.skipStamp = "";
 		this.catalogue = input.catalogue;
 		this.lastReq = reqCount;
 		for (const h of input.manifest) this.sentTokens.set(h, input.catalogue.get(h)!.tokens);
@@ -905,6 +926,48 @@ export class Judge {
 		let model: Any, usage: Any, error: string | undefined, costUsd = 0, maxTokens: number | undefined, stopReason: string | undefined, level: string | undefined;
 		let reply: string | undefined, diag: VerdictDiag | undefined;
 		const counts = { cold: 0, hot: 0, need: 0, unknown: 0 };
+		// One row per catalogue handle: its answer triple ("-" when the reply had no valid line for it), the verdict, and whether it
+		// was applied (a fixed verdict is kept). Lets a later reader tie a fold back to the facts the judge gave for that output.
+		let perHandle: Array<{ h: string; f: string; v: Verdict; folded: boolean; tool?: string; fixed?: true; applied: boolean }> | undefined;
+		let streamed = "", toolAttempt = false, partial = false, applied = 0, salvaged = false;
+		const apply = (parsed: ParsedVerdict, interrupted: boolean) => {
+			diag = parsed.diag;
+			const current = generation === this.generation && this.run && this.scope === scope;
+			if (current) this.consumed = false;
+			perHandle = [...parsed.verdicts].map(([h, v]) => {
+				const fixed = this.verdicts.get(h)?.fixed === true;
+				// Incomplete or duplicate rows must not become cold, nor erase an existing valid judgment.
+				const use = current && !fixed && (!interrupted || parsed.triples?.has(h) === true);
+				if (use) {
+					this.verdicts.set(h, { v, atReq: reqCount, locator: parsed.locator.get(h) ?? null, nOk: parsed.nOk.get(h) ?? false });
+					applied++;
+					if (v !== "warm") counts[v]++;
+				}
+				return { h, f: parsed.triples?.get(h) ?? "-", v, folded: meta.get(h)?.folded === true,
+					tool: this.catalogue.get(h)?.label?.slice(0, 80), ...(fixed ? { fixed: true as const } : {}), applied: use };
+			});
+			counts.unknown = parsed.abstained;
+			if (current) this.stats.unknown += parsed.abstained;
+			return current;
+		};
+		const salvage = () => {
+			if (salvaged || applied || toolAttempt) return;
+			const text = reply ?? streamed;
+			const newline = text.lastIndexOf("\n");
+			if (newline < 0) return; // an interrupted final row, even syntactically valid, is not complete
+			const closed = text.slice(0, newline + 1), tail = text.slice(newline + 1);
+			// Retain a trailing known-handle prefix as malformed: it can invalidate an earlier duplicate row.
+			const prefix = /^([0-9a-z]{1,10})(?:\s|$)/.exec(tail);
+			const unfinished = prefix ? [...known].filter((h) => h.startsWith(prefix[1])).map((h) => `${h} incomplete`).join("\n") : "";
+			const input = closed + unfinished;
+			try {
+				const parsed = parseFacts(input, known, evidence, meta);
+				partial = true;
+				salvaged = apply(parsed, true);
+				reply = text;
+			} catch { /* no usable closed rows: keep prior verdicts unchanged */ }
+		};
+		this.partial = { controller, flush: salvage };
 		try {
 			const available: Any[] = await ctx.modelRegistry.getAvailable();
 			signal.throwIfAborted();
@@ -923,41 +986,45 @@ export class Judge {
 			const options = { maxTokens, signal, cacheRetention: "short", sessionId: this.sessionId };
 			const sendLevel = level && level !== "off";
 			if (sendLevel && !ctx.modelRegistry.streamSimple) throw new Error("This Pi cannot set the judge thinking level");
-			const res = sendLevel
-				? await ctx.modelRegistry.streamSimple(model, context, { ...options, reasoning: level }).result()
-				: level === "off" && ctx.modelRegistry.streamSimple
-					? await ctx.modelRegistry.streamSimple(model, context, options).result()
-					: await ctx.modelRegistry.complete(model, context, options);
+			let res: Any;
+			if (ctx.modelRegistry.streamSimple) {
+				const stream = ctx.modelRegistry.streamSimple(model, context, sendLevel ? { ...options, reasoning: level } : options);
+				if (stream[Symbol.asyncIterator]) {
+					for await (const event of stream) {
+						if (event.type.startsWith("toolcall_")) toolAttempt = true;
+						if (event.type === "text_delta" || event.type === "text_end") {
+							streamed = textOf(event.partial?.content ?? []);
+						}
+					}
+				}
+				res = await stream.result();
+			} else res = await ctx.modelRegistry.complete(model, context, options);
 			usage = res.usage;
 			stopReason = res.stopReason;
 			costUsd = Number(usage?.cost?.total) || 0;
 			this.stats.costUsd += costUsd;
+			toolAttempt ||= res.content?.some((c: Any) => c.type === "toolCall") === true;
+			// Providers may drop partial content in the terminal aborted response; keep the streamed snapshot in that case.
+			const returned = textOf(res.content ?? []);
+			reply = (signal.aborted || ["error", "aborted", "length"].includes(res.stopReason)) && streamed.length > returned.length ? streamed : returned || streamed;
 			signal.throwIfAborted();
 			if (["error", "aborted", "length"].includes(res.stopReason)) throw new Error(res.errorMessage || `Judge stopped: ${res.stopReason}`);
-			if (res.content?.some((c: Any) => c.type === "toolCall")) throw new Error("Judge attempted a tool call");
-			reply = textOf(res.content).trim();
-			const parsed = parseFacts(reply, known, evidence, meta);
-			diag = parsed.diag;
-			if (generation !== this.generation || !this.run) throw new Error("Judge result belongs to an ended run");
-			if (this.scope !== scope) throw new Error("Judge result belongs to an outdated request");
-			this.consumed = false;
-			for (const [h, v] of parsed.verdicts) {
-				if (this.verdicts.get(h)?.fixed) continue;
-				this.verdicts.set(h, { v, atReq: reqCount, locator: parsed.locator.get(h) ?? null, nOk: parsed.nOk.get(h) ?? false });
-				if (v !== "warm") counts[v]++;
-			}
-			// Counted from the reply, not from applied verdicts: a handle the loop above skipped as fixed still adds,
-			// and a decisive row with one U fact overlaps counts.hot or counts.need.
-			counts.unknown = parsed.abstained;
-			this.stats.unknown += parsed.abstained;
+			if (toolAttempt) throw new Error("Judge attempted a tool call");
+			if (!apply(parseFacts(reply, known, evidence, meta), false)) throw new Error("Judge result belongs to an outdated run or request");
 			this.failures = 0;
 		} catch (err) {
 			error = err instanceof Error ? err.message : String(err);
-			if (generation === this.generation) { this.failures++; this.stats.errors++; }
+			if (signal.aborted || ["error", "aborted", "length"].includes(stopReason ?? "") || streamed) salvage();
+			if (!applied && generation === this.generation) { this.failures++; this.stats.errors++; }
 		} finally {
-			// A reply that did not parse keeps its head; a parsed one keeps only the tallies and the first N lines with their outcome.
+			if (this.partial?.controller === controller) this.partial = null;
+			// An interrupted call retains only complete, validated rows from a still-current snapshot.
 			this.ledger({ type: "judge", model: model ? `${model.provider}/${model.id}` : undefined, level, ms: Date.now() - started, maxTokens, stopReason,
 				outputTokens: usage?.output, reasoningTokens: usage?.reasoning, costUsd, usage, counts, ...why,
+				streamChars: streamed.length, partial, applied,
+				resultDisposition: applied ? (partial ? "partial-applied" : "applied") : generation !== this.generation || !this.run || this.scope !== scope ? "stale" : "no-usable-rows",
+				...(signal.aborted ? { cancelReason: String(signal.reason) } : {}),
+				...(perHandle ? { verdicts: perHandle } : {}),
 				...(diag ? { diag: { ...diag, n: diag.n.slice(0, 10) } } : {}), ...(error ? { error } : {}),
 				...(error && reply !== undefined && !diag ? { replyHead: reply.slice(0, 300) } : {}) });
 		}

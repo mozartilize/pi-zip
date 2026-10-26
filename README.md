@@ -104,7 +104,15 @@ Every notice, the chart's rules and the size scale are described in [docs/detail
 
 ## Ledger
 
-Every decision is also written as one JSON line per event, in a file per Pi session: `~/.pi/agent/pi-zip/logs/<session>.log` (`PI_ZIP_CACHE_STATS` and `PI_CODING_AGENT_DIR` move it like the learned cache data). This is the only place a failure that never reaches the terminal shows up: the `error` of a `judge` record (a refused call, a reply that does not parse), a `summary` call that failed, a fold that refused, an edit another extension made. Nothing reads it back; pi-zip never depends on it.
+Every decision is also written as one JSON line per event, in a file per Pi session: `~/.pi/agent/pi-zip/logs/<session>.log` (`PI_ZIP_CACHE_STATS` and `PI_CODING_AGENT_DIR` move it like the learned cache data). This is the only place a failure that never reaches the terminal shows up: the `error` of a `judge` record (a refused call, a reply that does not parse), a `summary` call that failed, a fold that refused, an edit another extension made. A parsed `judge` record also lists `verdicts`: per output its handle, tool, answer triple (`f`, active/finished/lookup, `-` when the reply had no valid line), resulting verdict and folded state, so a later fold can be traced to the facts behind it. Nothing reads it back; pi-zip never depends on it.
+
+The folding trace has three stages:
+
+- `judge_skip`: why no call was started (`pending`, `below-pressure`, `batch-too-small`, `cadence`, `failure-limit`, or insufficient candidates). It includes request count and eligible handles where available. Repeated identical skips are suppressed.
+- `judge`: each `verdicts` row has `applied`, so a parsed answer can be distinguished from a verdict stored for planning. `streamChars`, `partial`, `applied` (count), `cancelReason`, and `resultDisposition` show what survived an interruption. `partial-applied` means some received rows were retained; `stale` means they were logged but not applied.
+- `law.foldDecision`: per output, handle `h`, request-age, current verdict (`unscored` if none), eligibility `group` (`0`: older turns, `1`: pause-readable, `2`: aged protected-turn output; `null`: ineligible), `planned` (proposed by an application plan), and `selected` (accepted for application). Its overall reason distinguishes `guard-rejected`, `back-to-back`, `no-plan`, and `selected`. The existing `law.steps` explain the cache cost; the later `fold` record confirms persistence. Trigger names `cold` and `valve` describe cache probability, not who classified an output.
+
+Judge calls consume text stream events when available. On settle/run end they retain complete newline-terminated fact rows before aborting. Timeout, error, and length stops can retain such rows too. Missing, malformed, duplicate, and unfinished rows do not replace existing verdicts; fixed rule-based verdicts remain protected. Scope/dependency changes, session/model changes, shutdown, and disabling pi-zip invalidate the snapshot instead. The provider is still cancelled; this does not wait for the remainder of its response.
 
 - `PI_ZIP_LEDGER=/path/to/file` writes that file instead, and `PI_ZIP_LEDGER=off` (or `0`) writes nothing.
 - A session file that grew past 8 MB is rotated at the next session start: the old one stays as `<name>.1`.

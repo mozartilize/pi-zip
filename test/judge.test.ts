@@ -466,6 +466,12 @@ describe("fact classification", () => {
 		expect(r.judge.verdicts.get(h(2))?.v).toBe("hot");
 		expect(r.records.find((x) => x.type === "judge")).toMatchObject({ protocol: "facts-v1", counts: { cold: 1, hot: 1, need: 0, unknown: 1 }, diag: { raw: { C: 1, H: 1, N: 0, U: 0 }, facts: { NYN: 1, YUN: 1 } } });
 		expect(r.judge.stats.unknown).toBe(1);
+		// per handle: the triple ties each verdict to its output; a handle the reply skipped shows "-" and stays warm
+		const rows = r.records.find((x) => x.type === "judge").verdicts as Any[];
+		expect(rows.find((x) => x.h === h(1))).toMatchObject({ f: "NYN", v: "cold", folded: false });
+		expect(rows.find((x) => x.h === h(2))).toMatchObject({ f: "YUN", v: "hot" });
+		expect(rows.find((x) => x.h === h(1)).tool).toMatch(/^bash /);
+		expect(rows.filter((x) => x.h !== h(1) && x.h !== h(2)).every((x) => x.f === "-" && x.v === "warm")).toBe(true);
 	});
 });
 
@@ -562,6 +568,27 @@ describe("judge folds keep the existing decision", () => {
 				expect(b.p.ctxAfterFolds).toBeLessThanOrEqual(a.p.ctxAfterFolds);
 			}
 		}
+	});
+
+	test("fold diagnostics separate unscored, ineligible, guard-rejected, back-to-back and selected outputs", () => {
+		const entries = longTurn(72), opts = plannerOpts(entries, { coldCap: 4000 });
+		const run = (rent: number, justEdited = false) => decideEdits({
+			at: "turn_end", justEdited, pWarm: 1, entries, ready: [],
+			opts: () => ({ o: { ...opts, trace: [], rent, verdicts: new Map([[h(1), "cold"], [h(70), "cold"]]),
+				law: { pr: lawPrices("explicit", false), g: 1_000_000_000, pWarm: 1 } } }),
+		});
+		const rejected = run(0);
+		expect(rejected.p).toBeNull();
+		expect(rejected.o.foldDecision!.reason).toBe("guard-rejected");
+		expect(rejected.o.foldDecision!.outputs.find((x) => x.h === h(1))).toMatchObject({ verdict: "cold", group: 2, planned: true, selected: false });
+		expect(rejected.o.foldDecision!.outputs.find((x) => x.h === h(70))).toMatchObject({ verdict: "cold", group: null, planned: false, selected: false });
+		expect(rejected.o.foldDecision!.outputs.find((x) => x.h === h(2))!.verdict).toBe("unscored");
+		const selected = run(1_000_000_000_000);
+		expect(selected.o.foldDecision!.reason).toBe("selected");
+		expect(selected.o.foldDecision!.outputs.find((x) => x.h === h(1))!.selected).toBe(true);
+		const b2b = run(1_000_000_000_000, true);
+		expect(b2b.o.foldDecision!.reason).toBe("back-to-back");
+		expect(b2b.o.foldDecision!.outputs.every((x) => !x.selected)).toBe(true);
 	});
 
 	test("carried placeholders keep their bytes even when a verdict changes", () => {
@@ -668,6 +695,89 @@ describe("incremental judge selection", () => {
 });
 
 describe("background judge", () => {
+	// The provider loses content on abort, so only consuming text events can retain these rows.
+	function streamedRig(text: string, timeout = 30_000) {
+		const r = rig(undefined, timeout), sent = deferred(), terminal = deferred();
+		(r.ctx.modelRegistry as Any).streamSimple = () => ({
+			async *[Symbol.asyncIterator]() {
+				// Split within a handle and across row boundaries. Consume cumulative snapshots, not deltas twice.
+				let cumulative = "";
+				for (const part of [text.slice(0, 4), text.slice(4, 23), text.slice(23)]) {
+					cumulative += part;
+					yield { type: "text_delta", delta: part, partial: { content: [{ type: "text", text: cumulative }] } };
+				}
+				sent.resolve({});
+				await terminal.promise;
+			},
+			result: () => terminal.promise,
+		});
+		return { ...r, sent: sent.promise, finish: (stopReason = "aborted") => terminal.resolve({ content: [], stopReason, usage: {} }) };
+	}
+
+	test("run end salvages complete current rows before abort; missing, malformed and duplicate rows retain previous verdicts", async () => {
+		const r = streamedRig(`${h(1)} N Y N\n${h(2)} N Y N\n${h(3)} N Y\n${h(1)} N`);
+		// stale previous judgments trigger re-evaluation but must survive omissions/invalid rows in an interrupted reply.
+		for (const i of [1, 3, 4]) r.judge.verdicts.set(h(i), { v: "hot", atReq: 0, locator: null, nOk: false });
+		r.run(); await r.sent;
+		r.judge.stop("settle", true);
+		expect(r.judge.verdicts.get(h(2))).toMatchObject({ v: "cold", atReq: 24 });
+		for (const i of [1, 3, 4]) expect(r.judge.verdicts.get(h(i))).toMatchObject({ v: "hot", atReq: 0 });
+		r.finish(); await r.judge.running;
+		expect(r.records[0]).toMatchObject({ partial: true, applied: 1, resultDisposition: "partial-applied", cancelReason: "settle" });
+		expect(r.records[0].verdicts.find((v: Any) => v.h === h(1))).toMatchObject({ f: "-", applied: false });
+		expect(r.records[0].verdicts.find((v: Any) => v.h === h(2))).toMatchObject({ f: "NYN", v: "cold", applied: true });
+	});
+
+	test("timeout, error, and length retain newline-terminated facts, never the final unclosed row or fixed judgments", async () => {
+		for (const reason of ["timeout", "error", "length"]) {
+			const r = streamedRig(`${h(1)} N Y N\n${h(2)} Y N N\n${h(3)} N Y N`, reason === "timeout" ? 5 : 30_000);
+			r.judge.verdicts.set(h(1), { v: "hot", atReq: 0, locator: null, nOk: false });
+			r.run(); await r.sent;
+			// An external fixed judgment must not be overwritten by the model's snapshot.
+			r.judge.verdicts.set(h(1), { v: "hot", atReq: 24, locator: null, nOk: false, fixed: true });
+			if (reason === "timeout") await new Promise((resolve) => setTimeout(resolve, 15));
+			r.finish(reason === "timeout" ? "aborted" : reason); await r.judge.running;
+			expect(r.judge.verdicts.get(h(1))?.v).toBe("hot");
+			expect(r.judge.verdicts.get(h(2))?.v).toBe("hot");
+			expect(r.judge.verdicts.has(h(3))).toBe(false); // complete-looking but no final newline
+			expect(r.records[0]).toMatchObject({ partial: true, applied: 1, resultDisposition: "partial-applied" });
+			expect(r.records[0].verdicts.find((v: Any) => v.h === h(1))).toMatchObject({ fixed: true, applied: false });
+		}
+	});
+
+	test("scope, evidence and session invalidation log partial rows but never apply them", async () => {
+		for (const reason of ["scope", "evidence", "session"]) {
+			const r = streamedRig(`${h(1)} N Y N\n`);
+			r.run(); await r.sent;
+			if (reason === "session") r.judge.stop("session-changed");
+			else {
+				const entries = longTurn(24);
+				if (reason === "scope") entries.push(U("steer", "a different task"));
+				else {
+					entries.push(A("dependency", []));
+					entries.at(-1)!.messages[0].content = [{ type: "text", text: `Need ${h(1)} specifically now` }];
+				}
+				r.run(26, buildBlocks(entries), 0); // invalidation must work even below pressure
+			}
+			r.finish(); await r.judge.running;
+			expect(r.judge.verdicts.has(h(1))).toBe(false);
+			const record = r.records.find((x) => x.type === "judge");
+			expect(record).toMatchObject({ applied: 0, resultDisposition: "stale" });
+			expect(record.verdicts.find((v: Any) => v.h === h(1))).toMatchObject({ f: "NYN", applied: false });
+		}
+	});
+
+	test("skip logs distinguish pressure from candidate gates and suppress repeated identical skips", () => {
+		const r = rig();
+		r.run(24, r.blocks, 1000);
+		r.run(25, r.blocks, 1000);
+		expect(r.records).toEqual([expect.objectContaining({ type: "judge_skip", reason: "below-pressure", reqCount: 24 })]);
+		r.run(26, r.blocks, 40_000, { inturnAge: 0 });
+		expect(r.records[1]).toMatchObject({ type: "judge_skip", reason: "batch-too-small", handles: [] });
+		expect(r.calls).toHaveLength(0);
+		r.judge.stop();
+	});
+
 	test("one exact folded handle triggers without a locator or five eligible outputs", async () => {
 		const r = rig();
 		const entries = longTurn(1);
@@ -725,9 +835,12 @@ describe("background judge", () => {
 		d.resolve(textReply(JSON.stringify({ cold: [h(1)], hot: [], need: [] })));
 		await r.judge.running;
 		expect(r.judge.verdicts.size).toBe(0);
-		expect(r.records[0].error).toBeDefined();
-		expect(r.records[0].replyHead).toBeUndefined(); // aborted before the reply was read
-		expect(r.records[0]).toMatchObject({ reqCount: 24, eligible: expect.any(Number), known: expect.any(Number), inputTokens: expect.any(Number) });
+		const record = r.records.find((x) => x.type === "judge");
+		expect(record.error).toBeDefined();
+		expect(record.replyHead).toBeDefined(); // keep returned bytes for tracing, even after abort
+		expect(record).toMatchObject({ applied: 0, resultDisposition: "no-usable-rows" });
+		expect(record).toMatchObject({ reqCount: 24, eligible: expect.any(Number), known: expect.any(Number), inputTokens: expect.any(Number) });
+		expect(r.records.find((x) => x.type === "judge_skip")).toMatchObject({ reason: "pending", reqCount: 40 });
 		const bad = rig(async () => textReply('{"cold":[]}'));
 		bad.run(); await bad.judge.running;
 		expect(bad.records[0]).toMatchObject({ error: "Judge response has no fact lines", replyHead: '{"cold":[]}' });
@@ -818,10 +931,15 @@ describe("background judge", () => {
 		const thinking = { ...model, reasoning: true };
 		const r = rig();
 		r.ctx.modelRegistry.getAvailable = () => [thinking];
-		(r.ctx.modelRegistry as Any).streamSimple = () => { throw new Error("default must not set a level"); };
+		const streamed: Any[] = [];
+		(r.ctx.modelRegistry as Any).streamSimple = (_m: Any, _c: Any, options: Any) => {
+			streamed.push(options);
+			return { result: async () => textReply() };
+		};
 		r.run(); await r.judge.running;
-		expect(r.calls.length).toBe(1);
-		expect(r.calls[0][2].reasoning).toBeUndefined();
+		expect(r.calls.length).toBe(0);
+		expect(streamed).toHaveLength(1);
+		expect(streamed[0].reasoning).toBeUndefined();
 		expect(r.records[0].error).toBeUndefined();
 	});
 
@@ -938,11 +1056,15 @@ describe("Zip integration", () => {
 		const { pi } = fakePi({ sendMessage: (...args: Any[]) => calls.push(args) });
 		const { ctx } = fakeCtx(entries, { model, modelRegistry: { getAvailable: () => [model], complete: () => d.promise } });
 		const zip = new Zip(pi); zip.sessionStart(ctx); await startZip(zip, ctx);
+		const records: Any[] = [];
+		zip.ledger = (record) => records.push(record);
 		const message = { role: "assistant", stopReason: "toolUse" };
 		zip.messageEnd(message, ctx);
 		await zip.turnEnd({ message, entries: [], context: { contextEntries: entries } }, ctx);
 		await flush();
 		expect(zip.card(ctx).judge?.calls).toBe(1);
+		// Wiring check: the production shell emits the candidate diagnostics from the decision core.
+		expect(records.find((r) => r.type === "law" && r.where === "turn_end").foldDecision.outputs.length).toBeGreaterThan(0);
 		zip.setOff(true);
 		d.resolve(textReply(JSON.stringify({ cold: [h(1)], hot: [], need: [h(2)] })));
 		await flush();
