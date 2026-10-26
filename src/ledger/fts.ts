@@ -103,11 +103,10 @@ export interface Hit extends Row {
 }
 
 /**
- * FTS over source chunks of `entryIds` only, ranked, then limited. The filter runs before LIMIT: with a limit applied to the whole
+ * Replace the temp scope table with `entryIds`. Searches join on it so the filter runs before LIMIT: with a limit applied to the whole
  * database first, visible entries and sibling branches could fill every row and leave no place for the hidden entries searched for.
- * `kinds`: the document kinds searched (retrieval searches the assistant's earlier conclusions).
  */
-export function ftsSearchIn(db: Db, match: string, entryIds: Iterable<string>, limit = 200, kinds: readonly string[] = ["assistant"]): Hit[] {
+export function setSearchScope(db: Db, entryIds: Iterable<string>) {
 	db.exec("CREATE TEMP TABLE IF NOT EXISTS search_scope (entry_id TEXT PRIMARY KEY)");
 	db.exec("BEGIN");
 	try {
@@ -119,12 +118,31 @@ export function ftsSearchIn(db: Db, match: string, entryIds: Iterable<string>, l
 		db.exec("ROLLBACK");
 		throw err;
 	}
-	return db.prepare(
+}
+
+/**
+ * FTS over source chunks of `entryIds` only, ranked, then limited. With `perEntry` > 0 at most that many chunks of one entry are
+ * kept before LIMIT, so a few long outputs with many matching chunks cannot fill every row and push a short, relevant entry out.
+ */
+export function ftsSearchIn(db: Db, match: string, entryIds: Iterable<string>, limit = 200, kinds: readonly string[] = ["assistant"], perEntry = 0): Hit[] {
+	setSearchScope(db, entryIds);
+	return ftsSearchScoped(db, match, limit, kinds, perEntry);
+}
+
+/** FTS over the current `search_scope` (see setSearchScope). */
+export function ftsSearchScoped(db: Db, match: string, limit = 200, kinds: readonly string[] = ["assistant"], perEntry = 0): Hit[] {
+	const base =
 		`SELECT d.id, d.object_type, d.object_id, d.entry_id, d.block_index, d.chunk_index, d.char_start, d.segment_id, d.kind, d.tool, d.is_error,
 		        d.title, d.body, d.identifiers, d.seq, bm25(search_fts, ${WEIGHTS}) AS rank
 		 FROM search_fts JOIN search_docs d ON d.id = search_fts.rowid JOIN search_scope s ON s.entry_id = d.entry_id
-		 WHERE search_fts MATCH ? AND d.object_type = 'chunk' AND d.kind IN (${kinds.map(() => "?").join(", ")}) ORDER BY rank LIMIT ?`,
-	).all(match, ...kinds, limit) as Hit[];
+		 WHERE search_fts MATCH ? AND d.object_type = 'chunk' AND d.kind IN (${kinds.map(() => "?").join(", ")})`;
+	if (perEntry > 0) {
+		return db.prepare(
+			`SELECT * FROM (SELECT x.*, ROW_NUMBER() OVER (PARTITION BY x.entry_id ORDER BY x.rank) AS per_entry FROM (${base}) x)
+			 WHERE per_entry <= ? ORDER BY rank LIMIT ?`,
+		).all(match, ...kinds, perEntry, limit) as Hit[];
+	}
+	return db.prepare(`${base} ORDER BY rank LIMIT ?`).all(match, ...kinds, limit) as Hit[];
 }
 
 export function ftsSearch(db: Db, match: string, limit = 200): Hit[] {

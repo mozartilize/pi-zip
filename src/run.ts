@@ -495,6 +495,7 @@ export class Zip implements ZipControl {
 			}
 		} catch {}
 		this.conflict = found;
+		if (found) this.memory?.cancelRetrieval(); // paused: a retrieval in flight could never be injected
 		if (found && !this.conflictNoticed) {
 			this.conflictNoticed = true;
 			this.stateLine(ctx, "paused", `${found} also manages context, so pi-zip only guards requests · to use pi-zip: pi remove the other one`, true);
@@ -705,6 +706,7 @@ export class Zip implements ZipControl {
 	/** before_agent_start: the prompt's run (its input carried the decision), or on Pi 1.2.0 a run an extension's message starts
 	 *  (messageType "custom"), which begins here, once, as a driven run. */
 	async beforeAgentStart(ctx: Any, e?: Any): Promise<void> {
+		this.detectConflict(ctx);
 		this.judgePrompt = typeof e?.prompt === "string" ? e.prompt : "";
 		this.runStarts++;
 		if (e?.messageType === "custom") {

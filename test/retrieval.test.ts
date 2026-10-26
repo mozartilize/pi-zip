@@ -120,13 +120,21 @@ describe("retrieve", () => {
 			);
 			parent = `a_p${i}`;
 		}
-		// Duplicate tool output with identical content should be deduplicated
+		// Duplicate tool output with identical provenance (same tool + arguments + error state) should be deduplicated,
+		// while an identical output from a different command/file must be preserved independently.
 		entries.push(
 			user("u_dup", parent, "run status"),
-			asst("a_dup", "u_dup", [call("cd1", "bash", { command: "git status" }), call("cd2", "bash", { command: "git status" })]),
+			asst("a_dup", "u_dup", [
+				call("cd1", "bash", { command: "git status" }),
+				call("cd2", "bash", { command: "git status" }),
+				call("cd3", "write", { path: "src/a.ts" }),
+				call("cd4", "write", { path: "src/b.ts" }),
+			]),
 			result("r_dup1", "a_dup", "cd1", "bash", "nothing to commit, working tree clean"),
 			result("r_dup2", "r_dup1", "cd2", "bash", "nothing to commit, working tree clean"),
-			E("cm", "r_dup2", { type: "compaction", summary: "s", firstKeptEntryId: "cm", tokensBefore: 1000 }),
+			result("r_write_a", "r_dup2", "cd3", "write", "Successfully wrote 128 bytes"),
+			result("r_write_b", "r_write_a", "cd4", "write", "Successfully wrote 128 bytes"),
+			E("cm", "r_write_b", { type: "compaction", summary: "s", firstKeptEntryId: "cm", tokensBefore: 1000 }),
 		);
 		const { s: sess, l } = indexed(entries);
 		sess.sm.buildSessionProjection = () => buildSessionProjection(sess.state.entries, sess.state.leaf);
@@ -143,6 +151,97 @@ describe("retrieve", () => {
 
 		const dupEv = retrieve(l.db, q("nothing to commit working tree clean"), scopeOf(sess.ctx)).evidence;
 		expect(dupEv.filter((e) => e.entryId === "r_dup1" || e.entryId === "r_dup2")).toHaveLength(1);
+
+		const diffProvEv = retrieve(l.db, q("Successfully wrote 128 bytes"), scopeOf(sess.ctx)).evidence;
+		expect(diffProvEv.filter((e) => e.entryId === "r_write_a" || e.entryId === "r_write_b")).toHaveLength(2);
+	});
+
+	test("per-entry FTS diversity prevents a few multi-chunk tool outputs from crowding out a relevant short entry, and path traversal returns multiple versions and deep chunks", () => {
+		const noisyBlock = ("retry connection pool saturation log line\n".repeat(90) + "\n").repeat(6); // >6 chunks per noisy output
+		const entries: Any[] = [
+			user("u0", null, "read old and new config"),
+			asst("a0", "u0", [
+				call("c_old", "read", { path: "config/app.yml" }),
+				call("c_new", "read", { path: "config/app.yml" }),
+			]),
+			result("r_old", "a0", "c_old", "read", "version: 1\nlegacy_flag: enabled\n"),
+			result(
+				"r_new",
+				"r_old",
+				"c_new",
+				"read",
+				"version: 2\n" + "padding_line: 0\n".repeat(450) + "deep_setting:\n  rollout_percentage: 42\n",
+			),
+		];
+		let parent = "r_new";
+		for (let i = 1; i <= 4; i++) {
+			entries.push(
+				asst(`an_${i}`, parent, [call(`cn_${i}`, "bash", { command: `run-bench-${i}` })]),
+				result(`rn_${i}`, `an_${i}`, `cn_${i}`, "bash", noisyBlock),
+			);
+			parent = `rn_${i}`;
+		}
+		entries.push(
+			asst("a_target", parent, [call("c_target", "bash", { command: "check-retry" })]),
+			result("r_target", "a_target", "c_target", "bash", "retry backoff cap is 1500ms"),
+			E("cm", "r_target", { type: "compaction", summary: "s", firstKeptEntryId: "cm", tokensBefore: 1000 }),
+		);
+		const { s: sess, l } = indexed(entries);
+		sess.sm.buildSessionProjection = () => buildSessionProjection(sess.state.entries, sess.state.leaf);
+
+		// Even with small ftsRows=15, 4 noisy outputs (each with >6 matching chunks) cannot crowd out r_target because perEntry=3 caps each at 3 rows.
+		const divEv = retrieve(l.db, q("retry"), scopeOf(sess.ctx), { candidates: 8, expand: 6, excerptChars: 1500, ftsRows: 15 }).evidence;
+		expect(divEv.some((e) => e.entryId === "r_target")).toBe(true);
+
+		// Path traversal over config/app.yml surfaces both r_old and r_new; even when the prompt has no keyword from the deep chunk,
+		// the deep chunk of r_new is still reachable when the prompt asks about rollout_percentage, and a path-only prompt still merges
+		// the continuation chunk (chunk 1) of a multi-chunk file read.
+		const pathEv = retrieve(l.db, q("check config/app.yml rollout_percentage and legacy_flag"), scopeOf(sess.ctx)).evidence;
+		const oldHit = pathEv.find((e) => e.entryId === "r_old");
+		const newHit = pathEv.find((e) => e.entryId === "r_new");
+		expect(oldHit?.excerpt).toContain("legacy_flag: enabled");
+		expect(newHit?.excerpt).toContain("rollout_percentage: 42");
+	});
+
+	test("graph traversal does not scan unrelated tool_result rows in search_docs, and a path with no keyword match still merges its continuation chunk", () => {
+		const chunk0 = "# File: config/service.yml\n" + "header_line: 1\n".repeat(220);
+		const chunk1 = "second_chunk_marker: 9001\n";
+		const entries: Any[] = [
+			user("u1", null, "read service config"),
+			asst("a1", "u1", [call("c1", "read", { path: "config/service.yml" })]),
+			result("r_svc", "a1", "c1", "read", chunk0 + chunk1),
+			// Visible unrelated tool result: must never be scanned or returned
+			user("u_vis", "r_svc", "unrelated"),
+			asst("a_vis", "u_vis", [call("c_vis", "read", { path: "config/other.yml" })]),
+			result("r_vis", "a_vis", "c_vis", "read", "other_file_body: true"),
+			E("cm", "r_svc", { type: "compaction", summary: "s", firstKeptEntryId: "u_vis", tokensBefore: 1000 }),
+		];
+		const { s: sess, l } = indexed(entries);
+		sess.sm.buildSessionProjection = () => buildSessionProjection(sess.state.entries, sess.state.leaf);
+
+		// Prompt mentions ONLY the path config/service.yml (no words from chunk1): graph traversal still pulls chunk0 + chunk1.
+		const ev = retrieve(l.db, q("inspect @config/service.yml again"), scopeOf(sess.ctx)).evidence;
+		const svc = ev.find((e) => e.entryId === "r_svc");
+		expect(svc?.excerpt).toContain("second_chunk_marker: 9001");
+		expect(ev.some((e) => e.entryId === "r_vis")).toBe(false);
+
+		const plans = (
+			l.db
+				.prepare(
+					`EXPLAIN QUERY PLAN
+					 SELECT DISTINCT r.entry_id AS entry_id, MAX(r.tool = 'read') AS is_read, MAX(r.seq) AS seq
+					 FROM nodes f
+					 JOIN edges t ON t.dst_id = f.id AND t.type = 'touches_file'
+					 JOIN edges a ON a.src_id = t.src_id AND a.type = 'answered_by'
+					 JOIN search_docs r ON r.entry_id = substr(a.dst_id, 7) AND r.object_type = 'chunk' AND r.kind = 'tool_result'
+					 JOIN search_scope s ON s.entry_id = r.entry_id
+					 WHERE f.kind = 'file' AND (f.canonical_key = ? COLLATE NOCASE OR f.canonical_key LIKE ? ESCAPE '\\')
+					 GROUP BY r.entry_id ORDER BY is_read DESC, seq DESC LIMIT 3`,
+				)
+				.all("config/service.yml", "%/config/service.yml") as Array<{ detail: string }>
+		).map((r) => r.detail);
+		expect(plans.some((d) => /SCAN r\b|SCAN search_docs/i.test(d))).toBe(false);
+		expect(plans.some((d) => /SEARCH r USING INDEX search_docs_entry/i.test(d))).toBe(true);
 	});
 
 	test("a conclusion is quoted from its own text and titled by the request it answered", () => {
@@ -570,6 +669,23 @@ describe("Memory at a new user prompt", () => {
 			await handlers.get("agent_end")!({}, ctx);
 			expect(mem.statusLine(ctx)).toContain(`indexed_entries=${s.state.entries.length}`);
 			await prompt(); expect(calls).toBe(2);
+
+			// Extension conflict ("paused" state): zip.active() is false even when zip.off is false, so before_agent_start must not call retrieval,
+			// and an in-flight retrieval started before the conflict appeared must be aborted immediately when conflict is detected.
+			await cmd("on");
+			let conflictFinish!: (res: Any) => void;
+			(reg as Any).complete = (_m: Any, _c: Any, options: Any) => {
+				calls++; signal = options.signal;
+				return new Promise((resolve) => { conflictFinish = resolve; });
+			};
+			await prompt(); // starts call #3, which stays in flight after the 1ms foreground wait
+			expect(calls).toBe(3);
+			expect(signal.aborted).toBe(false);
+			(pi as Any).getAllTools = () => [{ name: "context_prune", sourceInfo: { path: "/ext/context-prune/index.ts" } }];
+			await prompt(); // detects conflict -> aborts in-flight call #3 and skips starting a new call
+			expect(signal.aborted).toBe(true);
+			expect(calls).toBe(3);
+			conflictFinish(reply);
 		} finally {
 			await handlers.get("session_shutdown")?.({}, ctx);
 			start.mockRestore(); ledger.mockRestore(); rmSync(s.dir, { recursive: true, force: true });

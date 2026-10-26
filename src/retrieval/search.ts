@@ -4,7 +4,7 @@
 // sibling branches are excluded.
 import { handleFor, handleTokens } from "../handle.ts";
 import type { Db } from "../ledger/db.ts";
-import { CHUNK_CHARS, ftsSearchIn, type Hit, matchExpr } from "../ledger/fts.ts";
+import { CHUNK_CHARS, ftsSearchScoped, type Hit, matchExpr, setSearchScope } from "../ledger/fts.ts";
 import { textBlocks } from "../ledger/source.ts";
 import { outcomeHint } from "../outcome.ts";
 import type { Any } from "../util.ts";
@@ -197,6 +197,78 @@ export function queryOf(prompt: string): Query {
 	return { tokens: [...head, ...tail.reverse()], handles: [...new Set(handleTokens(own))], ...refs };
 }
 
+/** FTS rows kept per entry before LIMIT, so ranking spreads over entries rather than chunks of one long output. */
+const PER_ENTRY_ROWS = 3;
+/** Graph traversal bounds: entries per path or symbol, chunks per entry. */
+const GRAPH_ENTRIES = 3, GRAPH_CHUNKS = 2;
+const HIT_COLS = "d.id, d.object_type, d.object_id, d.entry_id, d.block_index, d.chunk_index, d.char_start, d.segment_id, d.kind, d.tool, d.is_error, d.title, d.body, d.identifiers, d.seq";
+const likeEscape = (s: string) => s.replace(/[\\%_]/g, (c) => `\\${c}`);
+const ftsPhrase = (s: string) => `"${s.replace(/"/g, '""')}"`;
+
+/**
+ * Hidden tool-output entries reached from the prompt's file paths and code symbols, without reading output text into memory:
+ * file nodes are matched by key (a path suffix scans file nodes only, one row per distinct file), the rest goes through indexes.
+ * - path -> `file` node (exact key or path suffix) -> `touches_file` <- tool call -> `answered_by` -> result entry; when no recorded
+ *   call touched it (a renamed copy, a file read through a shell), a phrase match on the file name in the scoped FTS stands in;
+ * - symbol -> scoped FTS phrase in both the call title and the output body.
+ * Several matching entries per reference are kept (newest first, reads first), and from each entry the chunks that best match the
+ * prompt, or its first chunk when none does. Requires `search_scope` to hold the eligible entries.
+ */
+function graphCandidates(db: Db, q: Query, lexical: Hit[]): Hit[] {
+	const out: Hit[] = [];
+	const seen = new Set<string>();
+	const add = (h: Hit) => {
+		const id = String(h.object_id);
+		if (!seen.has(id) && out.length < 30) { seen.add(id); out.push(h); }
+	};
+	const bestByEntry = new Map<string, Hit[]>();
+	for (const h of lexical) {
+		const list = bestByEntry.get(String(h.entry_id)) ?? [];
+		if (list.length < GRAPH_CHUNKS) list.push(h);
+		bestByEntry.set(String(h.entry_id), list);
+	}
+	const firstChunks = db.prepare(
+		`SELECT ${HIT_COLS}, 0 AS rank FROM search_docs d WHERE d.entry_id = ? AND d.object_type = 'chunk' AND d.kind = 'tool_result'
+		 ORDER BY d.block_index, d.chunk_index LIMIT ?`,
+	);
+	const addEntry = (entryId: string) => {
+		const best = bestByEntry.get(entryId) ?? [];
+		for (const h of best) add(h);
+		if (best.length < GRAPH_CHUNKS) {
+			for (const h of firstChunks.all(entryId, GRAPH_CHUNKS) as Hit[]) {
+				if (out.length >= 30) break;
+				add(h);
+			}
+		}
+	};
+	const byFile = db.prepare(
+		`SELECT DISTINCT r.entry_id AS entry_id, MAX(r.tool = 'read') AS is_read, MAX(r.seq) AS seq
+		 FROM nodes f
+		 JOIN edges t ON t.dst_id = f.id AND t.type = 'touches_file'
+		 JOIN edges a ON a.src_id = t.src_id AND a.type = 'answered_by'
+		 JOIN search_docs r ON r.entry_id = substr(a.dst_id, 7) AND r.object_type = 'chunk' AND r.kind = 'tool_result'
+		 JOIN search_scope s ON s.entry_id = r.entry_id
+		 WHERE f.kind = 'file' AND (f.canonical_key = ? COLLATE NOCASE OR f.canonical_key LIKE ? ESCAPE '\\')
+		 GROUP BY r.entry_id ORDER BY is_read DESC, seq DESC LIMIT ?`,
+	);
+	for (const ref of q.paths ?? []) {
+		const base = ref.split("/").pop() ?? "";
+		if (base.length < 3) continue;
+		const entries = (byFile.all(ref, `%/${likeEscape(ref)}`, GRAPH_ENTRIES) as Array<{ entry_id: string }>).map((r) => String(r.entry_id));
+		if (!entries.length) {
+			// No recorded call touched this path: the file name as a phrase (identifiers, call title, then body) stands in.
+			for (const h of ftsSearchScoped(db, ftsPhrase(base), GRAPH_ENTRIES, ["tool_result"], 1)) entries.push(String(h.entry_id));
+		}
+		for (const id of entries) addEntry(id);
+	}
+	for (const sym of q.symbols ?? []) {
+		const hits = ftsSearchScoped(db, `title : ${ftsPhrase(sym)} AND body : ${ftsPhrase(sym)}`, GRAPH_ENTRIES * GRAPH_CHUNKS, ["tool_result"], GRAPH_CHUNKS);
+		hits.sort((a, b) => Number(b.seq) - Number(a.seq) || a.rank - b.rank);
+		for (const h of hits) add(h);
+	}
+	return out;
+}
+
 function fuseChannels(...lists: string[][]): string[] {
 	const sums = new Map<string, number>();
 	for (const list of lists) {
@@ -226,65 +298,27 @@ export function retrieve(db: Db, q: Query, scope: Scope, limits: SearchLimits = 
 			...[...scope.hidden.keys()].filter((id) => usable(id) && isToolOutput(id)),
 		]),
 	];
-	const hits = match ? ftsSearchIn(db, match, eligible, limits.ftsRows, ["assistant", "tool_result"]) : [];
+	// One scope for every query below: SQL filters to the hidden active-branch entries before ranking and LIMIT.
+	setSearchScope(db, eligible);
+	// At most PER_ENTRY_ROWS chunks per entry: a few long outputs matching on every chunk cannot fill all rows.
+	const hits = match ? ftsSearchScoped(db, match, limits.ftsRows, ["assistant", "tool_result"], PER_ENTRY_ROWS) : [];
 	const byObj = new Map<string, Hit>(hits.map((h) => [String(h.object_id), h]));
 
-	// Referential graph traversal: resolve file paths and code symbols in the prompt against hidden tool_result chunks.
-	const paths = q.paths ?? [], symbols = q.symbols ?? [];
-	const graphList: string[] = [];
-	if ((paths.length || symbols.length) && eligible.length) {
-		const eligibleSet = new Set(eligible);
-		const toolDocs = (db.prepare("SELECT *, 0 AS rank FROM search_docs WHERE object_type = 'chunk' AND kind = 'tool_result'").all() as Hit[])
-			.filter((d) => d.entry_id && eligibleSet.has(String(d.entry_id)));
-		for (const d of toolDocs) if (!byObj.has(String(d.object_id))) byObj.set(String(d.object_id), d);
-		const lexicalTop = hits.slice(0, 40).map((h) => String(h.object_id));
-		const lexRank = (id: string) => {
-			const i = lexicalTop.indexOf(id);
-			return i >= 0 ? i : 9999;
-		};
-		const addGraph = (id: string) => {
-			if (id && !graphList.includes(id) && graphList.length < 30) graphList.push(id);
-		};
-		const byEntryBlockChunk = new Map(toolDocs.map((d) => [`${d.entry_id}:${d.block_index}:${d.chunk_index}`, String(d.object_id)]));
-		for (const ref of paths) {
-			const base = ref.split("/").pop() ?? "";
-			if (base.length < 3) continue;
-			const matchingBlocks = [
-				...new Set(
-					toolDocs
-						.filter((d) => {
-							const idents = String(d.identifiers ?? "").toLowerCase();
-							const title = String(d.title ?? "").toLowerCase();
-							return (
-								idents.endsWith(ref) ||
-								idents.includes(`/${base}`) ||
-								title.includes(ref) ||
-								(Number(d.chunk_index) === 0 && String(d.body ?? "").slice(0, 400).toLowerCase().includes(base))
-							);
-						})
-						.sort((a, b) => (b.tool === "read" ? 1 : 0) - (a.tool === "read" ? 1 : 0) || Number(b.seq) - Number(a.seq) || Number(a.chunk_index) - Number(b.chunk_index))
-						.map((d) => `${d.entry_id}:${d.block_index}`),
-				),
-			];
-			for (const eb of matchingBlocks.slice(0, 1)) {
-				for (const ci of [0, 1]) {
-					const objId = byEntryBlockChunk.get(`${eb}:${ci}`);
-					if (objId) addGraph(objId);
-				}
-			}
-		}
-		for (const sym of symbols) {
-			const matching = toolDocs
-				.filter((d) => String(d.title ?? "").toLowerCase().includes(sym) && String(d.body ?? "").toLowerCase().includes(sym))
-				.sort((a, b) => Number(b.seq) - Number(a.seq) || lexRank(String(a.object_id)) - lexRank(String(b.object_id)) || Number(a.chunk_index) - Number(b.chunk_index));
-			for (const d of matching.slice(0, 2)) addGraph(String(d.object_id));
-		}
-	}
+	// Referential graph traversal: file paths and code symbols in the prompt -> hidden tool outputs, through indexed SQL only.
+	const graphList = eligible.length ? graphCandidates(db, q, hits) : [];
+	for (const h of graphList) if (!byObj.has(String(h.object_id))) byObj.set(String(h.object_id), h);
+	const graphIds = graphList.map((h) => String(h.object_id));
 
 	const lexicalIds = hits.slice(0, 40).map((h) => String(h.object_id));
-	const fusedIds = graphList.length
-		? [...fuseChannels(lexicalIds, graphList), ...hits.slice(40).map((h) => String(h.object_id)).filter((id) => !graphList.includes(id))]
+	const fusedIds = graphIds.length
+		? [...fuseChannels(lexicalIds, graphIds), ...hits.slice(40).map((h) => String(h.object_id)).filter((id) => !graphIds.includes(id))]
 		: hits.map((h) => String(h.object_id));
+	// Duplicate content is dropped only when its provenance is the same too: kind, issuing call (title carries name and
+	// arguments) and error state. Two writes to different files that both print "Success" stay two items.
+	const dedupKey = (h: Hit, excerpt: string) => {
+		const content = excerptKey(excerpt);
+		return content ? `${h.kind}\u0000${h.title}\u0000${h.is_error ? 1 : 0}\u0000${content}` : "";
+	};
 
 	const sliceText = (h: Hit, exact: boolean): string => {
 		const entryId = h.entry_id!;
@@ -303,7 +337,7 @@ export function retrieve(db: Db, q: Query, scope: Scope, limits: SearchLimits = 
 		if (picked.has(entryId)) continue;
 		const text = sliceText(hit, true);
 		const excerpt = window(text, tokens, limits.excerptChars);
-		const key = excerptKey(excerpt);
+		const key = dedupKey(hit, excerpt);
 		if (key) seenExcerpts.add(key);
 		picked.set(entryId, { hit, exact: true, passages: [{ blockIndex: Number(hit.block_index ?? 0), chunkIndex: Number(hit.chunk_index ?? 0), excerpt, text }] });
 	}
@@ -315,7 +349,7 @@ export function retrieve(db: Db, q: Query, scope: Scope, limits: SearchLimits = 
 		if (!hit?.entry_id || picked.has(hit.entry_id)) continue;
 		const text = sliceText(hit, false);
 		const excerpt = window(text, tokens, limits.excerptChars);
-		const key = excerptKey(excerpt);
+		const key = dedupKey(hit, excerpt);
 		if (!key || seenExcerpts.has(key)) continue;
 		seenExcerpts.add(key);
 		picked.set(hit.entry_id, { hit, exact: false, passages: [{ blockIndex: Number(hit.block_index ?? 0), chunkIndex: Number(hit.chunk_index ?? 0), excerpt, text }] });
@@ -333,7 +367,7 @@ export function retrieve(db: Db, q: Query, scope: Scope, limits: SearchLimits = 
 			if (cur.passages.some((p) => p.blockIndex === bi && p.chunkIndex === ci)) continue;
 			const text = sliceText(hit, false);
 			const excerpt = window(text, tokens, subWindow);
-			const key = excerptKey(excerpt);
+			const key = dedupKey(hit, excerpt);
 			if (!key || seenExcerpts.has(key)) continue;
 			seenExcerpts.add(key);
 			cur.passages.push({ blockIndex: bi, chunkIndex: ci, excerpt, text });
@@ -367,7 +401,7 @@ export function retrieve(db: Db, q: Query, scope: Scope, limits: SearchLimits = 
 			at: Date.parse(e?.timestamp ?? "") || 0,
 		};
 	});
-	return { evidence, hits: named.length + hits.length + graphList.length, inBranch: named.length + hits.length + graphList.length };
+	return { evidence, hits: named.length + hits.length + graphIds.length, inBranch: named.length + hits.length + graphIds.length };
 }
 
 const clip = (s: string, n: number) => {
