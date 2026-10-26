@@ -369,7 +369,8 @@ export class Memory {
 		});
 	}
 
-	private cancelRetrieval() {
+	/** Discard only retrieval work and its note; deterministic indexing continues while /zip is off. */
+	cancelRetrieval() {
 		this.job?.controller.abort();
 		this.job = null;
 		this.note = null;
@@ -411,10 +412,11 @@ function attempt<T>(f: () => T, fallback: T): T {
 
 /** The previous user request and the newest assistant reply on the active branch, clipped: enough to resolve "fix it again". */
 export function recentContext(ctx: Any): string {
-	const branch: Any[] = attempt(() => ctx?.sessionManager?.getBranch?.() ?? [], []);
+	// Redundancy is judged against the model view, not raw history that compaction may have removed or replaced.
+	const messages: Any[] = attempt(() => (ctx?.sessionManager?.buildSessionProjection?.()?.entries ?? []).flatMap((e: Any) => e.messages ?? []), []);
 	let user = "", asst = "";
-	for (let i = branch.length - 1; i >= 0 && (!user || !asst); i--) {
-		const m = branch[i]?.type === "message" ? branch[i].message : null;
+	for (let i = messages.length - 1; i >= 0 && (!user || !asst); i--) {
+		const m = messages[i];
 		if (!asst && m?.role === "assistant") asst = visibleText(m);
 		if (!user && m?.role === "user") user = visibleText(m);
 	}

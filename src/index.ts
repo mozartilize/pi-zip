@@ -173,7 +173,7 @@ export default function piZip(pi: ExtensionAPI) {
 		checkRecall(ctx);
 		zip.refreshFolded(ctx);
 		await zip.beforeAgentStart(ctx, e);
-		await memory.beforeAgentStart(ctx, e);
+		if (!zip.off) await memory.beforeAgentStart(ctx, e);
 		return undefined;
 	});
 	// Own native requests, and Pi's automatic threshold check after switching to a smaller model.

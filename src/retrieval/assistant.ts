@@ -147,8 +147,11 @@ export async function retrievalModel(ctx: Any): Promise<{ model: Any; level?: st
 		? available.find((m) => `${m.provider}/${m.id}` === ref.ref)
 		: available.filter((m) => m.provider === ctx?.model?.provider && m.contextWindow >= 32_000 && Number.isFinite(m.cost?.input)).sort((a, b) => a.cost.input - b.cost.input)[0] ?? ctx?.model;
 	if (!model) return null;
-	// an explicit ":level" in the shared setting applies here too; without one, nothing is sent (no inherited judge default)
-	return { model, level: ref?.level ? reasoningFor(model, ref.level, ctx?.modelRegistry) : undefined };
+	// An explicit ":level" in the shared setting applies here too. Without one, ask for "low" when the model supports reasoning:
+	// the provider default spent the whole output budget on hidden reasoning and could not finish within the retrieval timeout.
+	// A non-reasoning model (or one without capability metadata) keeps the provider default: nothing is sent.
+	const level = reasoningFor(model, ref?.level ?? "low", ctx?.modelRegistry);
+	return { model, level: ref?.level || level !== "off" ? level : undefined };
 }
 
 /** One model call: timing, cost, and returned text. Raw reply logging defaults on during tuning; PI_ZIP_MEMORY_TRACE=0 disables it. */
@@ -170,7 +173,7 @@ export interface CallInfo {
 }
 
 /**
- * One conversation for one prompt: one bounded call. Timeout PI_ZIP_RETRIEVAL_TIMEOUT_MS (default 20 s), output cap 1500 tokens, the
+ * One conversation for one prompt: one bounded call. Timeout PI_ZIP_RETRIEVAL_TIMEOUT_MS (default 20 s), output cap 4000 tokens, the
  * run's signal, no tools. The search itself is local (src/retrieval/search.ts); the model only reads what it returned.
  */
 export class RetrievalConversation {
@@ -198,10 +201,11 @@ export class RetrievalConversation {
 			info.level = this.level;
 			const timeout = Number(process.env.PI_ZIP_RETRIEVAL_TIMEOUT_MS) > 0 ? Number(process.env.PI_ZIP_RETRIEVAL_TIMEOUT_MS) : 20_000;
 			const sig = AbortSignal.any([AbortSignal.timeout(timeout), ...(this.signal ? [this.signal] : [])]);
-			const maxTokens = Math.min(1500, Number(this.model.maxTokens) > 0 ? Number(this.model.maxTokens) : 1500);
+			const maxTokens = Math.min(4000, Number(this.model.maxTokens) > 0 ? Number(this.model.maxTokens) : 4000);
 			const user = { role: "user", content: [{ type: "text", text }], timestamp: Date.now() };
 			const context = { systemPrompt: RETRIEVAL_SYSTEM, messages: [...this.messages, user] };
 			const options = { maxTokens, signal: sig, cacheRetention: "short" };
+			sig.throwIfAborted(); // cancellation may arrive while model selection is awaiting the registry
 			const reg = this.ctx.modelRegistry;
 			const res: Any = this.level && reg.streamSimple
 				? await reg.streamSimple(this.model, context, { ...options, reasoning: this.level }).result()

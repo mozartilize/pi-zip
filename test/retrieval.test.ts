@@ -1,10 +1,12 @@
-import { afterAll, afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { rmSync } from "node:fs";
+import piZip from "../src/index.ts";
 import { join } from "node:path";
 import { buildSessionProjection } from "../node_modules/@earendil-works/pi-coding-agent/dist/core/session-manager.js";
 import { handleFor } from "../src/handle.ts";
 import { Ledger } from "../src/ledger/projector.ts";
 import { readSource } from "../src/ledger/source.ts";
-import { Memory } from "../src/memory.ts";
+import { Memory, recentContext } from "../src/memory.ts";
 import { renderPacket, statusFor, validate } from "../src/retrieval/packet.ts";
 import { answerInput, parseReply, recordedAt, requestText, RetrievalConversation, type NeedDecision } from "../src/retrieval/assistant.ts";
 import { conclusionsOf, DEFAULT_LIMITS, type Evidence, queryOf, retrieve, scopeOf } from "../src/retrieval/search.ts";
@@ -36,6 +38,57 @@ describe("retrieve", () => {
 		expect([...c.entries()]).toEqual([["a3", "fix the retry timeout in src/retry.ts"]]); // a1's "Running the tests first" is not; u3's turn has none
 		const tail = conclusionsOf([user("u1", null, "q1"), asst("a1", "u1", [{ type: "text", text: "answer one" }]), user("u2", "a1", "q2"), asst("a2", "u2", [{ type: "text", text: "answer two" }])]);
 		expect([...tail.entries()]).toEqual([["a1", "q1"], ["a2", "q2"]]); // the branch's last turn ends at the branch end
+	});
+
+	test("unfinished work cannot be a conclusion, even after an earlier completed answer in the same turn", () => {
+		for (const reason of ["toolUse", "aborted", "error", "length", undefined]) {
+			const early = asst("early", "u", [{ type: "text", text: "Preliminary answer" }]);
+			const unfinished = asst("pending", "early", [{ type: "text", text: "I will check retries" }]);
+			unfinished.message.stopReason = reason;
+			const entries = [user("u", null, "diagnose retry"), early, unfinished];
+			expect([...conclusionsOf(entries)]).toEqual([]);
+			expect([...conclusionsOf([...entries, user("next", "pending", "another task")])]).toEqual([]);
+			const final = asst("done", "pending", [{ type: "text", text: "Retries fail because the socket is closed" }]);
+			expect([...conclusionsOf([...entries, final])]).toEqual([["done", "diagnose retry"]]);
+		}
+		const preamble = asst("work", "u", [{ type: "text", text: "Running tests" }, call("c", "bash", { command: "false" })]);
+		preamble.message.stopReason = "stop"; // even a misleading terminal reason cannot turn a tool call into an answer
+		expect([...conclusionsOf([user("u", null, "diagnose retry"), preamble, result("r", "work", "c", "bash", "FAIL"), user("next", "r", "next")])]).toEqual([]);
+	});
+
+	test("recent context uses projected text only, never compacted history or a raw replacement", () => {
+		const s = fakeSession([
+			user("u", null, "hidden request sentinel"),
+			asst("a", "u", [{ type: "text", text: "hidden answer sentinel" }]),
+			E("cm", "a", { type: "compaction", firstKeptEntryId: "cm", summary: "summary", tokensBefore: 100 }),
+		]);
+		s.sm.buildSessionProjection = () => buildSessionProjection(s.state.entries, s.state.leaf);
+		expect(recentContext(s.ctx)).toBe("");
+		s.state.entries.push(user("v", "cm", "visible request"), asst("b", "v", [{ type: "text", text: "raw answer sentinel" }]),
+			E("edit", "b", { type: "context_edit", targetId: "b", replacement: { content: [{ type: "text", text: "projected answer" }] } }));
+		s.state.leaf = "edit";
+		expect(recentContext(s.ctx)).toBe("previous user request: visible request\nlatest assistant reply: projected answer");
+		s.sm.buildSessionProjection = () => { throw new Error("no view"); };
+		expect(recentContext(s.ctx)).toBe(""); // no fallback to invisible raw text
+	});
+
+	test("long conclusions retain the winning FTS passage rather than an earlier common query word", () => {
+		const cause = "The mutex approach failed because lock ownership outlived the socket.";
+		const entries = [user("u", null, "explain the experiment"),
+			asst("a", "u", [{ type: "thinking", thinking: "private hypothesis" },
+				{ type: "text", text: "Why this project exists: " + "unrelated background detail ".repeat(200) + cause }]),
+			E("cm", "a", { type: "compaction", firstKeptEntryId: "cm", summary: "summary", tokensBefore: 2000 })];
+		const { s, l } = indexed(entries);
+		s.sm.buildSessionProjection = () => buildSessionProjection(s.state.entries, s.state.leaf);
+		const [e] = retrieve(l.db, q("why mutex failed"), scopeOf(s.ctx)).evidence;
+		expect(e.entryId).toBe("a");
+		expect(e.excerpt).toContain(cause);
+		expect(e.excerpt).not.toContain("Why this project exists");
+		expect(e.excerpt).not.toContain("private hypothesis");
+		const [named] = retrieve(l.db, q(handleFor("a")), scopeOf(s.ctx)).evidence;
+		expect(named.kind).toBe("assistant");
+		expect(named.excerpt).toContain("Why this project exists");
+		expect(named.excerpt).not.toContain("private hypothesis");
 	});
 
 	test("only hidden conclusions on the active branch are candidates: visible, sibling-branch and mid-turn text are not", () => {
@@ -276,15 +329,17 @@ describe("packet validation", () => {
 });
 
 /** A model registry that answers each call from `replies` in order and records every context it was sent. */
-function registry(replies: Array<string | Error>) {
-	const sent: Any[] = [];
-	const model = { provider: "p", id: "cheap", contextWindow: 100_000, cost: { input: 0.1 }, maxTokens: 4000 };
+function registry(replies: Array<string | Error>, modelOver: Partial<Any> = {}) {
+	const sent: Any[] = [], options: Any[] = [];
+	const model = { provider: "p", id: "cheap", contextWindow: 100_000, cost: { input: 0.1 }, maxTokens: 8000, ...modelOver };
 	return {
 		sent,
+		options,
 		reg: {
 			getAvailable: async () => [model],
-			complete: async (_m: Any, context: Any) => {
+			complete: async (_m: Any, context: Any, opts: Any) => {
 				sent.push(structuredClone(context));
+				if (opts) options.push({ ...opts });
 				const r = replies[sent.length - 1];
 				if (r instanceof Error) throw r;
 				return { role: "assistant", stopReason: "stop", content: [{ type: "text", text: r ?? "{}" }], usage: { cost: { total: 0.001 } } };
@@ -300,6 +355,9 @@ afterAll(() => { if (AMBIENT_MODEL !== undefined) process.env.PI_ZIP_JUDGE_MODEL
 
 describe("Memory at a new user prompt", () => {
 	const PROMPT = "how were the sockets fixed?";
+	// The one call's reply: a finding from the earlier conclusion a3.
+	const ANSWER = '{"needed":[{"evidence":"E1","reason":"The request asks how the sockets were fixed."}],"findings":[{"summary":"Earlier the retry timeout was fixed by closing sockets in the pool.","evidence":["E1"],"status":"historical"}],"folded":[]}';
+
 	async function run(replies: Array<string | Error>, e: Any = { messageType: "user", prompt: PROMPT }, o: Parameters<typeof fakeSession>[1] = { hidden: COMPACTED }, entries: Any[] = withSibling()) {
 		const s = fakeSession(entries, { leaf: "om", ...o });
 		const { sent, reg } = registry(replies);
@@ -387,8 +445,96 @@ describe("Memory at a new user prompt", () => {
 		expect(retrieval.drops.notNeeded).toBe(2);
 	});
 
-	// The one call's reply: a finding from the earlier conclusion a3.
-	const ANSWER = '{"needed":[{"evidence":"E1","reason":"The request asks how the sockets were fixed."}],"findings":[{"summary":"Earlier the retry timeout was fixed by closing sockets in the pool.","evidence":["E1"],"status":"historical"}],"folded":[]}';
+	test("reasoning level: low by default on reasoning models, explicit level wins, non-reasoning models send none", async () => {
+		const cases: Array<[Partial<Any>, string | undefined, string | undefined]> = [
+			[{ reasoning: true }, undefined, "low"],
+			[{ reasoning: true }, "p/cheap:high", "high"],
+			[{ reasoning: false }, undefined, undefined],
+			[{}, undefined, undefined], // no capability metadata: provider default
+		];
+		for (const [over, setting, expected] of cases) {
+			if (setting) process.env.PI_ZIP_JUDGE_MODEL = setting; else delete process.env.PI_ZIP_JUDGE_MODEL;
+			const s = fakeSession(withSibling(), { leaf: "om", hidden: COMPACTED });
+			const { options, reg } = registry([ANSWER], over);
+			const streamed: Any[] = [];
+			(reg as Any).streamSimple = (_m: Any, _c: Any, opts: Any) => {
+				streamed.push({ ...opts });
+				return { result: async () => ({ role: "assistant", stopReason: "stop", content: [{ type: "text", text: ANSWER }], usage: {} }) };
+			};
+			const ctx = { ...s.ctx, modelRegistry: reg };
+			const mem = new Memory(() => {});
+			mem.sessionStart(ctx);
+			await mem.beforeAgentStart(ctx, { messageType: "user", prompt: PROMPT });
+			const sentOpts = [...streamed, ...options];
+			expect(sentOpts).toHaveLength(1);
+			expect(sentOpts[0].reasoning).toBe(expected);
+			mem.shutdown();
+			rmSync(s.dir, { recursive: true, force: true });
+		}
+		delete process.env.PI_ZIP_JUDGE_MODEL;
+	});
+
+	test("retrieval caps maxTokens at 4000 to leave headroom for reasoning models and complete JSON", async () => {
+		const s = fakeSession(withSibling(), { leaf: "om", hidden: COMPACTED });
+		const { options, reg } = registry([ANSWER], { maxTokens: 16_384 });
+		const mem = new Memory(() => {});
+		mem.sessionStart({ ...s.ctx, modelRegistry: reg });
+		await mem.beforeAgentStart({ ...s.ctx, modelRegistry: reg }, { messageType: "user", prompt: PROMPT });
+		expect(options[0]).toMatchObject({ maxTokens: 4000 });
+		mem.shutdown();
+		rmSync(s.dir, { recursive: true, force: true });
+	});
+
+	test("zip off gates calls, cancels in-flight retrieval, drops ready notes, and leaves indexing active", async () => {
+		const s = fakeSession(withSibling(), { leaf: "om", hidden: COMPACTED });
+		const { reg } = registry([]), { pi, handlers } = fakePi();
+		const ctx = { ...s.ctx, modelRegistry: reg, getSystemPrompt: () => "", ui: { notify: () => {} }, mode: "tui" };
+		const previousWait = process.env.PI_ZIP_RETRIEVAL_WAIT_MS;
+		process.env.PI_ZIP_RETRIEVAL_WAIT_MS = "1";
+		let mem!: Memory, calls = 0, signal!: AbortSignal, finish!: (res: Any) => void, logged!: () => void;
+		const completed = new Promise<void>((resolve) => { logged = resolve; });
+		const logs: Any[] = [];
+		const originalStart = Memory.prototype.sessionStart;
+		const start = spyOn(Memory.prototype, "sessionStart").mockImplementation(function (this: Memory, c: Any) { mem = this; originalStart.call(this, c); });
+		const ledger = spyOn(Zip.prototype, "ledger").mockImplementation((r) => { logs.push(r); if (r.type === "memory_retrieval" && r.deferred) logged(); });
+		const reply = { role: "assistant", stopReason: "stop", content: [{ type: "text", text: ANSWER }] };
+		(reg as Any).complete = (_m: Any, _c: Any, options: Any) => {
+			calls++; signal = options.signal;
+			return calls === 1 ? new Promise((resolve) => { finish = resolve; }) : Promise.resolve(reply);
+		};
+		try {
+			piZip(pi);
+			await handlers.get("session_start")!({}, ctx);
+			await mem.ready;
+			const cmd = (s: string) => handlers.get("cmd:zip")!.handler(s, ctx);
+			const prompt = () => handlers.get("before_agent_start")!({ messageType: "user", prompt: PROMPT }, ctx);
+			await cmd("off"); await prompt();
+			expect(calls).toBe(0);
+			await cmd("on"); await prompt();
+			expect(calls).toBe(1);
+			expect(signal.aborted).toBe(false);
+			await cmd("off");
+			expect(signal.aborted).toBe(true);
+			await cmd("on"); // enabling again must not resurrect the cancelled result
+			finish(reply); await completed;
+			expect(mem.current(ctx)).toBeNull();
+			expect(logs.find((r) => r.type === "memory_retrieval").skip).toBe("cancelled");
+			await prompt();
+			expect(calls).toBe(2);
+			expect(mem.current(ctx)).not.toBeNull();
+			await cmd("off");
+			expect(mem.current(ctx)).toBeNull();
+			s.state.entries.push(user("new", "om", "index while disabled")); s.state.leaf = "new";
+			await handlers.get("agent_end")!({}, ctx);
+			expect(mem.statusLine(ctx)).toContain(`indexed_entries=${s.state.entries.length}`);
+			await prompt(); expect(calls).toBe(2);
+		} finally {
+			await handlers.get("session_shutdown")?.({}, ctx);
+			start.mockRestore(); ledger.mockRestore(); rmSync(s.dir, { recursive: true, force: true });
+			if (previousWait === undefined) delete process.env.PI_ZIP_RETRIEVAL_WAIT_MS;
+			else process.env.PI_ZIP_RETRIEVAL_WAIT_MS = previousWait;
+		}
+	});
 
 	test("slow retrieval releases the foreground, but only the current live run can receive its result", async () => {
 		const prev = process.env.PI_ZIP_RETRIEVAL_WAIT_MS;
@@ -493,7 +639,7 @@ describe("injection into the run's requests", () => {
 		ctx.model = { ...ctx.model, contextWindow };
 		const zip = new Zip(pi);
 		const seen = { injected: 0, reinjected: 0 };
-		zip.memory = { current: () => note, injected: () => { seen.injected++; }, reinjected: () => { seen.reinjected++; } };
+		zip.memory = { current: () => note, injected: () => { seen.injected++; }, reinjected: () => { seen.reinjected++; }, cancelRetrieval: () => { note = null; } };
 		return { zip, ctx, entries, prompt, seen: () => seen, setNote: (next: typeof note) => { note = next; } };
 	}
 

@@ -1403,7 +1403,7 @@ export class Zip implements ZipControl {
 	/** A retrieval note was already put into a request of this run (later requests repeat it in the same place). */
 	private memoryNoteShown = false;
 	/** Session memory (src/memory.ts), set by index.ts: the run's retrieval packet, when one was made. */
-	memory: { current(ctx: Any): { prompt: string; text: string } | null; injected(chars: number, at: number): void; reinjected(): void } | null = null;
+	memory: { current(ctx: Any): { prompt: string; text: string } | null; injected(chars: number, at: number): void; reinjected(): void; cancelRetrieval(): void } | null = null;
 
 	/**
 	 * The run's retrieval packet as one user message right after the run's prompt, in every request of the run: the same place each
@@ -2154,9 +2154,9 @@ export class Zip implements ZipControl {
 	setOff(off: boolean): string {
 		this.off = off;
 		if (!off && this.inRun) this.judge.startRun();
-		if (off) { this.judge.stop("disabled"); this.runPlan = null; this.runEdits = false; this.cancelTimer(); this.cancelDoor(); this.discardBg("off"); }
+		if (off) { this.memory?.cancelRetrieval(); this.judge.stop("disabled"); this.runPlan = null; this.runEdits = false; this.cancelTimer(); this.cancelDoor(); this.discardBg("off"); }
 		this.persistState();
-		return off ? `${PRODUCT}: off. Nothing is folded or summarised and requests are left untouched; earlier folds stay recallable (/zip on to resume)` : `${PRODUCT}: on`;
+		return off ? `${PRODUCT}: off. Nothing is folded or summarised, retrieval is stopped and requests are left untouched; earlier folds stay recallable (/zip on to resume)` : `${PRODUCT}: on`;
 	}
 	toggleQuiet(): string {
 		this.quiet = !this.quiet;

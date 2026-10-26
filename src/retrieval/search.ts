@@ -24,8 +24,8 @@ export interface Scope {
 	compacted: boolean;
 	/** Positive evidence of hiding, with visible entries excluded. Absence alone is not enough. */
 	hidden: Map<string, "folded" | "compacted">;
-	/** Conclusion entry id -> the user request it answered. A conclusion is the last assistant message with text before the next user
-	 *  message (or the end of the branch); an assistant message with text that is followed by more work in the same turn is not one. */
+	/** Conclusion entry id -> the user request it answered. Only a completed text answer without tool calls qualifies; subsequent
+	 *  assistant/tool work in the same turn invalidates it until a new completed answer arrives. */
 	conclusions: Map<string, string>;
 	/** Source entry by id (canonical session entries). */
 	entry: (id: string) => Any | undefined;
@@ -154,8 +154,9 @@ export function retrieve(db: Db, q: Query, scope: Scope, limits: SearchLimits = 
 		const e = scope.entry(entryId);
 		const role = e?.type === "message" ? e.message?.role : null;
 		const isConclusion = scope.conclusions.has(entryId);
-		// a conclusion is quoted from its own text (not its thinking or call arguments); any other entry from the matching slice
-		const text = isConclusion
+		// Preserve the winning FTS block/chunk: an earlier common word in the full answer must not displace the matched passage.
+		// Explicit handles have no winning text match; for conclusions, quote prose rather than the first (possibly thinking) block.
+		const text = isConclusion && c.exact
 			? textBlocks(e).filter((b) => b.kind === "assistant").map((b) => b.text).join("\n")
 			: sourceSlice(e, h.block_index, h.char_start) || h.body;
 		return {
@@ -163,7 +164,7 @@ export function retrieve(db: Db, q: Query, scope: Scope, limits: SearchLimits = 
 			handle: handleFor(entryId),
 			entryId,
 			hidden: scope.hidden.get(entryId)!,
-			kind: h.kind,
+			kind: isConclusion ? "assistant" : h.kind,
 			tool: h.tool,
 			title: isConclusion ? (scope.conclusions.get(entryId) ? `answer to: "${clip(scope.conclusions.get(entryId)!, 160)}"` : "earlier conclusion") : titleOf(scope, entryId, h),
 			excerpt: window(text, tokens, limits.excerptChars),
@@ -268,7 +269,7 @@ export function scopeOf(ctx: Any): Scope {
 	return { branch: new Set(byId.keys()), visible, folded, hidden, conclusions: conclusionsOf(branch), compacted: !!compaction, entry: (id) => byId.get(id) ?? sm?.getEntry?.(id) };
 }
 
-/** Each user turn's last assistant message with text, mapped to that turn's request text (branch order, root first). */
+/** Each user turn's completed final answer, mapped to its request (branch order, root first). */
 export function conclusionsOf(branch: Any[]): Map<string, string> {
 	const out = new Map<string, string>();
 	let request = "", last: string | null = null;
@@ -278,7 +279,10 @@ export function conclusionsOf(branch: Any[]): Map<string, string> {
 			if (last) out.set(last, request);
 			request = textBlocks(e).map((b) => b.text).join("\n");
 			last = null;
-		} else if (m?.role === "assistant" && textBlocks(e).some((b) => b.kind === "assistant" && b.text.trim())) last = e.id;
+		} else if (m?.role === "assistant") {
+			const blocks = textBlocks(e);
+			last = m.stopReason === "stop" && !blocks.some((b) => b.kind === "tool_call") && blocks.some((b) => b.kind === "assistant" && b.text.trim()) ? e.id : null;
+		} else if (m?.role === "toolResult") last = null;
 	}
 	if (last) out.set(last, request);
 	return out;
