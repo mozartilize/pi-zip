@@ -25,29 +25,30 @@ Do not judge whether visible context is already sufficient; only check if the re
 TASK 2: FORMULATE SEARCH QUERIES
 Otherwise, generate 3 to 5 targeted keyword queries covering the facets relevant to the request:
 - "what": Core subjects, files, symbols, config keys, error codes, interfaces.
-- "why": Requirements, design decisions, rationales, constraints, rules behind the current behavior.
+- "why": Governing specifications, requirements, design decisions, rationales, rules, and code reviews behind the feature's behavior.
 - "how": Implementation details, functions, test commands, scripts, verification steps.
-- "when": Historical events, commits, version changes, reverts, earlier review findings (e.g. P1, R37).
+- "when": Historical events, commits, version changes, reverts, earlier review findings (e.g. PR-12, RFC-5, audit findings).
 
 QUERY RULES:
 1. VERBATIM TERMS: Use exact identifiers, function names, file paths, and distinctive phrases that would literally appear in source code or logs.
 2. NO GENERIC STOPWORDS: Never include words like "code", "file", "fix", "error", "issue", "explain", "why", "how", "check", "update", or bare numbers.
-3. VERIFICATION OF CLAIMS OR ANALYSES: When the request asks whether a claim, review, or bug analysis is correct ("đúng không?", "is this right?", "verify this"):
-   The authority for correctness is the project's SPECIFICATIONS, REQUIREMENTS, DESIGN DECISIONS, or ACCEPTED REVIEWS that govern the implementation.
-   Do NOT search for the superficial metrics, benchmark numbers, chunk indices, or test case IDs mentioned inside the claim (e.g., ignore "Case 8", "Chunk 0", "28f6e901").
-   Instead, identify the actual feature, logic, or policy being evaluated (e.g. textBlocks, thinking in retrieval, FTS candidate pool), and query for the original SPECIFICATIONS, REQUIREMENTS, RULES, and DESIGN DECISIONS that established why it was built that way.
+3. GOVERNING SPECS & DECISIONS (REVIEWS, INVESTIGATIONS, CLAIMS):
+   When reviewing code, investigating bugs or failures, auditing claims, or asking why behavior changed:
+   The authoritative source of truth is the project's SPECIFICATIONS, REQUIREMENTS, DESIGN DECISIONS, PLANS, and ACCEPTED CODE REVIEWS that govern or changed the implementation.
+   Do NOT search for superficial metrics, test case numbers, chunk indices, line counts, or incidental details mentioned inside a quote or problem report (e.g., ignore "item 4", "chunk 2", "0x7f8a", "benchmark row 12").
+   Instead, identify the core feature, logic, or policy at issue (e.g. authMiddleware, retryPolicy, connectionPool, rateLimiter), and query for the original SPECIFICATIONS, REQUIREMENTS, RULES, PLANS, and DESIGN DECISIONS that established why it behaves that way.
 4. MULTI-QUESTION COVERAGE: Cover all distinct questions or subjects in the request (e.g. if the request asks both about a command/tool and a code decision, generate queries for each).
 5. BILINGUAL FUSION: Combine English technical terms (code, paths, commands) and the user's natural language terms (decisions, requirements) within the same facet query. Do NOT split into redundant English-only and native-language-only queries; emit 3 to 5 strong, unified queries.
 6. LENGTH: 4 to 8 distinctive keywords or 2-3 word phrases per query, most specific first. At most ${PLAN_LIMITS.queries} queries.
 
-Example input: "> The reasoning default can still disable thinking. what does that mean?"
+Example input: "> The connection retry limit was lowered to 2; that was left as configured. why was that done?"
 Example output:
 {
   "continue": false,
   "queries": [
-    {"facet": "what", "keywords": ["judgeReasoning", "disable thinking", "thinkingEnabled", "src/judge.ts"]},
-    {"facet": "why", "keywords": ["lowest supported level", "reasoning off", "thinkingLevelMap"]},
-    {"facet": "how", "keywords": ["streamSimple", "sendLevel", "reasoningFor", "PI_ZIP_JUDGE_MODEL"]}
+    {"facet": "what", "keywords": ["maxRetries", "retryLimit", "src/net/client.ts", "RETRY_CONFIG"]},
+    {"facet": "why", "keywords": ["retry budget", "thundering herd", "connection exhaustion postmortem"]},
+    {"facet": "how", "keywords": ["executeWithRetry", "backoffDelay", "test/client.test.ts"]}
   ]
 }
 
