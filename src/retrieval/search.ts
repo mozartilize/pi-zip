@@ -40,6 +40,8 @@ export interface Evidence {
 	tool: string | null;
 	title: string;
 	excerpt: string;
+	/** Source-ordered passages, kept separate so packing can share text and budget each passage without splitting it. */
+	passages?: string[];
 	/** A tool result's whole-output outcome ("exit 1, 21 passed, 1 failed"), read from the full output, not the excerpt. */
 	outcome: string;
 	isError: boolean;
@@ -405,6 +407,7 @@ export function retrieve(db: Db, q: Query, scope: Scope, limits: SearchLimits = 
 			tool: h.tool,
 			title: isConclusion ? (scope.conclusions.get(entryId) ? `answer to: "${clip(scope.conclusions.get(entryId)!, 160)}"` : "earlier conclusion") : titleOf(scope, entryId, h),
 			excerpt: orderedPassages.map((p) => p.excerpt).join(" … "),
+			passages: orderedPassages.map((p) => p.excerpt),
 			outcome: role === "toolResult" ? outcomeHint(textBlocks(e).map((b) => b.text).join("\n"), String(h.tool ?? ""), !!h.is_error) : "",
 			isError: !!h.is_error,
 			folded: role === "toolResult",

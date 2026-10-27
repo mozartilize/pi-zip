@@ -8,7 +8,7 @@ import { Ledger } from "../src/ledger/projector.ts";
 import { readSource } from "../src/ledger/source.ts";
 import { Memory, recentContext } from "../src/memory.ts";
 import { renderPacket, statusFor, validate } from "../src/retrieval/packet.ts";
-import { answerInput, parseReply, recordedAt, requestText, RetrievalConversation, type NeedDecision } from "../src/retrieval/assistant.ts";
+import { ANSWER_INSTRUCTIONS, answerInput, buildAnswerInput, EVIDENCE_CHARS, parseReply, recordedAt, requestText, RetrievalConversation, type NeedDecision } from "../src/retrieval/assistant.ts";
 import { conclusionsOf, DEFAULT_LIMITS, type Evidence, GRAPH_REFERENCE_LIMIT, queryOf, retrieve, scopeOf } from "../src/retrieval/search.ts";
 import { Zip } from "../src/run.ts";
 import { A, fakeCtx, fakePi, flat, startZip, U } from "./helpers.ts";
@@ -337,7 +337,7 @@ describe("retrieve", () => {
 		const [a3] = retrieve(l.db, q("sockets"), scopeOf(s.ctx)).evidence;
 		expect(a3).toMatchObject({ kind: "assistant", hidden: "compacted", handle: handleFor("a3"), folded: false, excerpt: "Fixed by closing sockets in the pool.",
 			title: 'answer to: "fix the retry timeout in src/retry.ts"' });
-		expect(answerInput("x", "", [a3])).toContain(`E1 conclusion — answer to: "fix the retry timeout in src/retry.ts"`);
+		expect(answerInput("x", "", [a3])).toContain(`E1 conclusion [handle ${handleFor("a3")}] — answer to: "fix the retry timeout in src/retry.ts"`);
 	});
 
 	test("the hidden boundary follows Pi's own projection; with no projection nothing is hidden", () => {
@@ -431,6 +431,81 @@ describe("retrieve", () => {
 
 const ev = (over: Partial<Evidence>): Evidence => ({ at: 0, outcome: "", ref: "E1", handle: "h000000001", entryId: "x", hidden: "compacted", kind: "tool_result", tool: "bash", title: "tool result bash npm test", excerpt: "", isError: false, folded: false, matched: 2, exact: false, context: [], seq: 0, ...over });
 
+describe("evidence packing", () => {
+	test("packs sources before extra passages/thinking and skips oversized items without blocking later evidence", () => {
+		const first = "primary_a " + "a".repeat(5900), extra = "optional_a " + "b".repeat(5900);
+		const second = "primary_b " + "c".repeat(5900);
+		const evidence = [
+			ev({ excerpt: [first, extra].join(" … "), passages: [first, extra], context: ["unverified " + "d".repeat(5000)] }),
+			ev({ ref: "E2", handle: "second0000", entryId: "second", excerpt: second, passages: [second] }),
+			ev({ ref: "E3", handle: "huge000000", entryId: "huge", excerpt: "x".repeat(20_000) }),
+			ev({ ref: "E4", handle: "last000000", entryId: "last", excerpt: "small_late_fact: 719" }),
+		];
+		const packed = buildAnswerInput("compare results", "recent task", evidence);
+		expect(packed.sent.map((e) => e.ref)).toEqual(["E1", "E2", "E4"]);
+		expect(packed.sent[0].excerpt).toBe(first);
+		expect(packed.sent[0].context).toEqual([]);
+		expect(packed.text).toContain("small_late_fact: 719");
+		expect(packed.text).not.toContain(extra);
+		expect(packed.text).not.toContain("E3 tool_result");
+		expect(packed.evidenceChars).toBeLessThanOrEqual(EVIDENCE_CHARS);
+		expect(evidence[0].excerpt).toBe([first, extra].join(" … ")); // no mutation of the retrieved source
+	});
+
+	test("shares a common passage once while retaining per-execution handles, times, outcomes and independent citations", () => {
+		const common = "identical_quoted_body " + "shared ".repeat(350);
+		const evidence = [
+			ev({ ref: "E1", handle: "old0000000", entryId: "old", at: Date.UTC(2026, 0, 1), outcome: "exit 1, 1 failed", isError: true,
+				excerpt: [common, "old_only_detail"].join(" … "), passages: [common, "old_only_detail"] }),
+			ev({ ref: "E2", handle: "new0000000", entryId: "new", at: Date.UTC(2026, 0, 2), outcome: "exit 0, 2 passed", folded: true,
+				excerpt: [common, "new_only_detail"].join(" … "), passages: [common, "new_only_detail"] }),
+			ev({ ref: "E3", handle: "other00000", entryId: "other", excerpt: common, passages: [common] }),
+			ev({ ref: "E99", handle: "shown00000", entryId: "shown", hidden: undefined as Any, excerpt: common }),
+		];
+		const packed = buildAnswerInput("compare executions", "", evidence, Date.UTC(2026, 0, 3));
+		expect(packed.sharedPassages).toBe(1);
+		expect(packed.text.split(common)).toHaveLength(2); // once in the actual serialized payload, not just in an internal group map
+		expect(packed.text).toContain("excerpt for E1, E2, E3:");
+		expect(packed.text).toContain("[handle old0000000]"); expect(packed.text).toContain("[handle new0000000]");
+		expect(packed.text).toContain("recorded 2026-01-01 00:00 UTC"); expect(packed.text).toContain("recorded 2026-01-02 00:00 UTC");
+		expect(packed.text).toContain("exit 1, 1 failed"); expect(packed.text).toContain("exit 0, 2 passed");
+		expect(packed.text).toContain("old_only_detail"); expect(packed.text).toContain("new_only_detail");
+		expect(packed.text).not.toContain("E99");
+		expect(packed.sent.map((e) => e.handle)).toEqual(["old0000000", "new0000000", "other00000"]);
+		const packet = parseReply(JSON.stringify({ needed: [{ evidence: "E2", reason: "new run is needed" }], findings: [
+			{ summary: "new result", evidence: ["E2"] }, { summary: "old must not be implicitly granted", evidence: ["E1"] },
+		], folded: [{ evidence: "E2", reason: "exact new run" }] }), packed.sent, "r", "v")!;
+		expect(packet.findings.map((f) => f.sourceHandles)).toEqual([["new0000000"]]);
+		expect(packet.foldedCandidates.map((f) => f.handle)).toEqual(["new0000000"]);
+		const comparison = parseReply(JSON.stringify({ needed: [
+			{ evidence: "E1", reason: "compare the old run" }, { evidence: "E2", reason: "compare the new run" },
+		], findings: [{ summary: "outcome changed", evidence: ["E1", "E2"] }] }), packed.sent, "r", "v")!;
+		expect(comparison.findings[0].sourceHandles).toEqual(["old0000000", "new0000000"]);
+	});
+
+	test("the 16k evidence budget excludes the separately bounded request/recent header", () => {
+		const quote = "large_complete_quote " + "x".repeat(EVIDENCE_CHARS - 600);
+		const packed = buildAnswerInput("long_request ".repeat(1000), "recent_context ".repeat(1000), [ev({ excerpt: quote })]);
+		expect(packed.sent.map((e) => e.ref)).toEqual(["E1"]);
+		expect(packed.text).toContain(quote);
+		expect(packed.evidenceChars).toBeLessThanOrEqual(EVIDENCE_CHARS);
+		expect(packed.text.length).toBeGreaterThan(EVIDENCE_CHARS);
+	});
+
+	test("text sharing preserves case and punctuation differences in code, and bounds the header separately from evidence", () => {
+		const packed = buildAnswerInput("p".repeat(100_000), "r".repeat(100_000), [
+			ev({ excerpt: "return getUserId(a);" }),
+			ev({ ref: "E2", handle: "different0", excerpt: "return getUserid(a);" }), // case alone differs
+			ev({ ref: "E3", handle: "punct00000", excerpt: "return getUserId(a)!" }), // punctuation alone differs
+		]);
+		expect(packed.passages).toBe(3); expect(packed.sharedPassages).toBe(0);
+		expect(packed.text).toContain("return getUserId(a);"); expect(packed.text).toContain("return getUserid(a);");
+		expect(packed.text).toContain("return getUserId(a)!");
+		expect(packed.text).not.toContain("r".repeat(1801));
+		expect(packed.text.length).toBeLessThanOrEqual(EVIDENCE_CHARS + ANSWER_INSTRUCTIONS.length + 4000 + 1800 + 512);
+	});
+});
+
 describe("packet validation", () => {
 	test("each item and each cited handle says when it was recorded, against the request time", () => {
 		const now = Date.UTC(2026, 9, 25, 21, 33);
@@ -440,9 +515,9 @@ describe("packet validation", () => {
 			ev({ ref: "E3", handle: "cccccccccc", at: 0 }),
 		], now);
 		expect(input).toContain("NEW USER REQUEST (2026-10-25 21:33 UTC)");
-		expect(input).toContain("E1 tool_result bash — tool result bash npm test (recorded 2026-10-25 20:55 UTC, 38 min before this request)");
+		expect(input).toContain("E1 tool_result bash [handle h000000001] — tool result bash npm test (recorded 2026-10-25 20:55 UTC, 38 min before this request)");
 		expect(input).toContain("(recorded 2026-10-24 21:33 UTC, 24 h before this request)");
-		expect(input).toContain("E3 tool_result bash — tool result bash npm test (recorded at an unknown time)");
+		expect(input).toContain("E3 tool_result bash [handle cccccccccc] — tool result bash npm test (recorded at an unknown time)");
 		expect(recordedAt(now + 60_000, now)).toContain("0 min before"); // clock skew never reads as negative
 		const text = renderPacket({ requestId: "r", ledgerRevision: "v", findings: [{ summary: "s", sourceHandles: ["aaaaaaaaa1", "bbbbbbbbbb"], status: "historical" }], foldedCandidates: [] },
 			new Map([["aaaaaaaaa1", "38 min ago"]]))!;
@@ -495,6 +570,7 @@ describe("packet validation", () => {
 		const packet = await conv.answer("request", "", evidence, "r", "v");
 		expect(sent[0].messages[0].content[0].text).not.toContain("E2 tool_result");
 		expect(conv.stats.evidenceItems).toBe(1);
+		expect(conv.stats.sentRefs).toEqual(["E1"]);
 		expect(packet!.findings).toEqual([]);
 		expect(conv.decisions.map((d) => d.ref)).toEqual(["E1"]);
 	});
@@ -862,7 +938,7 @@ describe("Memory at a new user prompt", () => {
 	test("history: search then one call; the note cites the hidden conclusion's real handle", async () => {
 		const { sent, note, retrieval } = await run([ANSWER]);
 		const input = sent[0].messages[0].content[0].text;
-		expect(input).toContain(`E1 conclusion — answer to: "fix the retry timeout in src/retry.ts"`);
+		expect(input).toContain(`E1 conclusion [handle ${handleFor("a3")}] — answer to: "fix the retry timeout in src/retry.ts"`);
 		expect(input).toContain(PROMPT);
 		expect(input).not.toContain("sibling branch");
 		expect(note!.text).toMatch(new RegExp(`Evidence: ${handleFor("a3")} \\([0-9.]+ (min|h|d) ago\\) \\[earlier conclusion\\]`));
