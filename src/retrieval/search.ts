@@ -61,7 +61,7 @@ export interface Evidence {
 
 /** `ftsRows`: FTS rows read per prompt, after the active-branch hidden scope filter. */
 export interface SearchLimits { candidates: number; expand: number; excerptChars: number; ftsRows: number }
-export const DEFAULT_LIMITS: SearchLimits = { candidates: 12, expand: 6, excerptChars: 1500, ftsRows: 400 };
+export const DEFAULT_LIMITS: SearchLimits = { candidates: 32, expand: 6, excerptChars: 1500, ftsRows: 400 };
 
 /** Diacritics removed, for comparison only: "tiếp tục" -> "tiep tuc", "đ" -> "d". */
 export const fold = (s: string) => s.normalize("NFD").replace(/\p{M}+/gu, "").replace(/đ/g, "d").replace(/Đ/g, "D");
@@ -191,7 +191,7 @@ export const userText = (prompt: string) => prompt.replace(/<skill\b[^>]*>[\s\S]
 export const QUERY_HEAD = 32, QUERY_TAIL = 96;
 
 /** One planner query: keywords and short phrases of one facet (what/why/how/when) in one language. */
-export interface KeywordSet { facet?: string; lang?: string; keywords: string[] }
+export interface KeywordSet { aspect?: string; facet?: string; lang?: string; keywords: string[] }
 
 /** The query of one prompt: the user's own words (no stopwords), and the planner's keyword sets when there is a plan. */
 export interface Query { tokens: string[]; handles: string[]; paths?: string[]; symbols?: string[]; sets?: KeywordSet[] }
@@ -300,8 +300,8 @@ const SEARCH_KINDS = ["user", "assistant", "thinking", "tool_call", "tool_result
  * the request's own words. Matched in body and identifiers only: titles are labels ("assistant reasoning", "tool call bash") that
  * would otherwise rank every item of a kind by a common word.
  */
-export function searchesOf(q: Query): Array<{ match: string; tokens: string[] }> {
-	const runs: Array<{ match: string; tokens: string[] }> = [];
+export function searchesOf(q: Query): Array<{ aspect: string; facet: string; match: string; tokens: string[] }> {
+	const runs: Array<{ aspect: string; facet: string; match: string; tokens: string[] }> = [];
 	for (const s of q.sets?.length ? q.sets : [{ keywords: q.tokens }]) {
 		const tokens = new Set<string>(), phrases: string[] = [];
 		for (const k of s.keywords) {
@@ -310,7 +310,7 @@ export function searchesOf(q: Query): Array<{ match: string; tokens: string[] }>
 			if (w.length > 1) phrases.push(k);
 		}
 		const expr = matchExpr([...tokens], phrases);
-		if (expr) runs.push({ match: `{body identifiers} : (${expr})`, tokens: [...tokens] });
+		if (expr) runs.push({ aspect: String(s.aspect ?? "").trim(), facet: String(s.facet ?? "").trim(), match: `{body identifiers} : (${expr})`, tokens: [...tokens] });
 	}
 	return runs;
 }
@@ -340,11 +340,11 @@ export function retrieve(db: Db, q: Query, scope: Scope, limits: SearchLimits = 
 	const runs = searchesOf(q);
 	const perRun = Math.max(40, Math.floor(limits.ftsRows / Math.max(1, runs.length)));
 	// At most PER_ENTRY_ROWS chunks per entry: a few long outputs matching on every chunk cannot fill all rows.
-	const lists = runs.map((r) => ({ tokens: r.tokens, hits: eligible.length ? ftsSearchScoped(db, r.match, perRun, SEARCH_KINDS, PER_ENTRY_ROWS) : [] }));
+	const lists: Array<{ aspect: string; facet: string; tokens: string[]; hits: Hit[] }> = runs.map((r) => ({ aspect: r.aspect, facet: r.facet, tokens: r.tokens, hits: eligible.length ? ftsSearchScoped(db, r.match, perRun, SEARCH_KINDS, PER_ENTRY_ROWS) : [] }));
 	const allTokens = [...new Set([...q.tokens, ...runs.flatMap((r) => r.tokens)])];
 	// Referential graph traversal: file paths and code symbols in the prompt -> hidden tool outputs, through indexed SQL only.
 	const graphList = eligible.length ? graphCandidates(db, q, lists.flatMap((l) => l.hits)) : [];
-	if (graphList.length) lists.push({ tokens: allTokens, hits: graphList });
+	if (graphList.length) lists.push({ aspect: "graph", facet: "", tokens: allTokens, hits: graphList });
 	const hitCount = lists.reduce((n, l) => n + l.hits.length, 0);
 
 	// Identical excerpts from separate executions can hide different outcomes or dates; keep their handles independently.
@@ -375,16 +375,36 @@ export function retrieve(db: Db, q: Query, scope: Scope, limits: SearchLimits = 
 		picked.set(hit.entry_id!, { hit, exact: true, tokens: allTokens, passages: [passage(hit, true, allTokens, limits.excerptChars)!] });
 	}
 	const cap = limits.candidates + named.length;
-	const ordered = lists.map((l) => {
-		const byEntry = new Map<string, Hit[]>();
-		for (const h of l.hits) {
-			if (!h.entry_id) continue;
-			const group = byEntry.get(h.entry_id) ?? [];
-			group.push(h);
-			byEntry.set(h.entry_id, group);
+	// Round-robin, two levels: within one aspect (its what/why/how/when queries compete for that aspect's slots), then across
+	// aspects (each sub-question of the request gets its own slots). A flat merge let one aspect whose queries match many records
+	// (benchmark logs, long tool outputs) take the candidates of an aspect about a design decision that fewer records mention.
+	const byAspect = new Map<string, typeof lists>();
+	for (const l of lists) byAspect.set(l.aspect, [...(byAspect.get(l.aspect) ?? []), l]);
+	const aspects: Array<Array<{ entryId: string; hits: Hit[]; tokens: string[] }>> = [];
+	for (const group of byAspect.values()) {
+		// the "why" query of an aspect goes first: design decisions and requirements are what a question about behavior needs
+		const streams = [...group].sort((a, b) => (b.facet === "why" ? 1 : 0) - (a.facet === "why" ? 1 : 0)).map((l) => {
+			const byEntry = new Map<string, Hit[]>();
+			for (const h of l.hits) {
+				if (!h.entry_id) continue;
+				byEntry.set(h.entry_id, [...(byEntry.get(h.entry_id) ?? []), h]);
+			}
+			return { tokens: l.tokens, entries: [...byEntry.entries()] };
+		});
+		const order: Array<{ entryId: string; hits: Hit[]; tokens: string[] }> = [], seen = new Set<string>();
+		for (let depth = 0, more = true; more; depth++) {
+			more = false;
+			for (const st of streams) {
+				if (depth >= st.entries.length) continue;
+				more = true;
+				const [entryId, hits] = st.entries[depth];
+				if (seen.has(entryId)) continue;
+				seen.add(entryId);
+				order.push({ entryId, hits, tokens: st.tokens });
+			}
 		}
-		return { tokens: l.tokens, entries: [...byEntry.entries()] };
-	});
+		if (order.length) aspects.push(order);
+	}
 	// every list's chunks of one entry, so a graph continuation chunk can join an entry an FTS search found first
 	const chunksOf = new Map<string, Hit[]>();
 	for (const l of lists) for (const h of l.hits) if (h.entry_id) chunksOf.set(h.entry_id, [...(chunksOf.get(h.entry_id) ?? []), h]);
@@ -408,19 +428,19 @@ export function retrieve(db: Db, q: Query, scope: Scope, limits: SearchLimits = 
 	};
 	for (let depth = 0, more = true; more && picked.size < cap; depth++) {
 		more = false;
-		for (const l of ordered) {
+		for (const order of aspects) {
 			if (picked.size >= cap) break;
-			if (depth >= l.entries.length) continue;
+			if (depth >= order.length) continue;
 			more = true;
-			const [entryId, hits] = l.entries[depth];
-			if (picked.has(entryId) || !take(hits, l.tokens)) continue;
+			const { entryId, hits, tokens } = order[depth];
+			if (picked.has(entryId) || !take(hits, tokens)) continue;
 			// one hop: a matched call brings the output it produced (its title then shows the call)
 			const res = pairedResult(db, hits[0]);
 			if (res && usable(res) && !picked.has(res) && picked.size < cap) {
 				const rows = db.prepare(
 					`SELECT ${HIT_COLS}, 0 AS rank FROM search_docs d WHERE d.entry_id = ? AND d.object_type = 'chunk' AND d.kind = 'tool_result' ORDER BY d.block_index, d.chunk_index LIMIT 1`,
 				).all(res) as Hit[];
-				if (rows.length) take(rows, l.tokens);
+				if (rows.length) take(rows, tokens);
 			}
 		}
 	}

@@ -717,7 +717,7 @@ describe("Memory at a new user prompt", () => {
 		const input = sent[1].messages[0].content[0].text;
 		expect(input).toContain(`conclusion [handle ${handleFor("a3")}] — answer to: "fix the retry timeout in src/retry.ts"`);
 		expect(input).not.toContain("sibling branch");
-		expect(retrieval.queries).toEqual([{ facet: "how", lang: "en", keywords: ["sockets", "fixed"] }]);
+		expect(retrieval.queries).toEqual([{ aspect: "", facet: "how", lang: "en", keywords: ["sockets", "fixed"] }]);
 		expect(retrieval.calls.map((c: Any) => c.step)).toEqual(["plan", "answer"]);
 		expect(note).toMatchObject({ found: true });
 		expect(note!.text).toMatch(new RegExp(`Evidence: ${handleFor("a3")} \\([0-9.]+ (min|h|d) ago\\) \\[earlier conclusion\\]`));
@@ -873,7 +873,7 @@ describe("Memory at a new user prompt", () => {
 			await mem.settled();
 			const sentOpts = [...streamed, ...options];
 			expect(sentOpts.map((o) => o.reasoning)).toEqual([plan, answer]);
-			expect(sentOpts.map((o) => o.maxTokens)).toEqual([1500, 4000]);
+			expect(sentOpts.map((o) => o.maxTokens)).toEqual([2500, 4000]);
 			mem.shutdown();
 			rmSync(s.dir, { recursive: true, force: true });
 		}

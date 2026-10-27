@@ -41,7 +41,7 @@ If nothing is needed, reply {"needed":[],"findings":[],"folded":[]}.`;
 
 export interface NeedDecision { ref: string; need: "Y" | "N" | "U"; reason: string };
 
-export const EVIDENCE_CHARS = 24_000;
+export const EVIDENCE_CHARS = 48_000;
 const RECENT_CHARS = 1800;
 
 /** Trace is on during tuning. Set PI_ZIP_MEMORY_TRACE=0 to exclude raw reply text. */
@@ -301,7 +301,7 @@ export class RetrievalConversation {
 
 	/** The planner call: a continuation verdict and keyword queries. Null on any failure (the caller searches the request's own words). */
 	async plan(request: string, tail: string): Promise<Plan | null> {
-		const reply = await this.ask("plan", planInput(request, tail), { lowest: true, maxTokens: 1500 });
+		const reply = await this.ask("plan", planInput(request, tail), { lowest: true, maxTokens: 2500 });
 		if (reply === null) return null;
 		const p = parsePlan(reply);
 		if (!p) this.calls[this.calls.length - 1].error = "reply is not a valid plan";

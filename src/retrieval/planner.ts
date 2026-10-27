@@ -6,7 +6,7 @@ import { visibleText } from "../ledger/source.ts";
 import type { Any } from "../util.ts";
 import type { KeywordSet } from "./search.ts";
 
-export const PLAN_LIMITS = { queries: 8, keywords: 12, keywordChars: 80 };
+export const PLAN_LIMITS = { queries: 16, keywords: 12, keywordChars: 80, aspects: 4 };
 
 export const PLAN_SYSTEM =
 	"You are an expert search query planner for a coding agent's session history. Your job is to determine whether a user request " +
@@ -23,7 +23,12 @@ If the new request is purely an acknowledgement, confirmation, or simple instruc
 Do not judge whether visible context is already sufficient; only check if the request itself is a trivial continuation.
 
 TASK 2: FORMULATE SEARCH QUERIES
-Otherwise, generate 3 to 5 targeted keyword queries covering the facets relevant to the request:
+Otherwise, first split the request into its distinct sub-questions (aspects): one aspect per separate thing the request asks about
+(one claim to verify, one component, one incident, one requirement). Name each aspect with 1-3 words.
+Then, for each aspect, write its queries. Every aspect gets at least:
+- "what": the aspect's own terms, files, symbols.
+- "why": the specifications, requirements, design decisions or reviews that govern that aspect (Rule 3).
+Add "how" and "when" for the aspect when the request needs steps, commands, versions, or chronology.
 - "what": Core subjects, files, symbols, config keys, error codes, interfaces.
 - "why": Governing specifications, requirements, design decisions, rationales, rules, and code reviews behind the feature's behavior.
 - "how": Implementation details, functions, test commands, scripts, verification steps.
@@ -31,24 +36,25 @@ Otherwise, generate 3 to 5 targeted keyword queries covering the facets relevant
 
 QUERY RULES:
 1. VERBATIM TERMS: Use exact identifiers, function names, file paths, and distinctive phrases that would literally appear in source code or logs.
-2. NO GENERIC STOPWORDS: Never include words like "code", "file", "fix", "error", "issue", "explain", "why", "how", "check", "update", or bare numbers.
-3. GOVERNING SPECS & DECISIONS (REVIEWS, INVESTIGATIONS, CLAIMS):
-   When reviewing code, investigating bugs or failures, auditing claims, or asking why behavior changed:
-   The authoritative source of truth is the project's SPECIFICATIONS, REQUIREMENTS, DESIGN DECISIONS, PLANS, and ACCEPTED CODE REVIEWS that govern or changed the implementation.
-   Do NOT search for superficial metrics, test case numbers, chunk indices, line counts, or incidental details mentioned inside a quote or problem report (e.g., ignore "item 4", "chunk 2", "0x7f8a", "benchmark row 12").
-   Instead, identify the core feature, logic, or policy at issue (e.g. authMiddleware, retryPolicy, connectionPool, rateLimiter), and query for the original SPECIFICATIONS, REQUIREMENTS, RULES, PLANS, and DESIGN DECISIONS that established why it behaves that way.
+2. NO GENERIC STOPWORDS OR ANECDOTAL LABELS: Never include words like "code", "file", "fix", "error", "issue", "explain", "why", "how", "check", "update", or labels naming individual test cases, runs, or chunks (e.g. any word matching case, chunk, step, or item followed by a number).
+3. INVESTIGATING CLAIMS, BUGS, OR BEHAVIOR:
+   When an analysis, review, or user report claims that a function or component behaves incorrectly (e.g. "function X mistakenly includes Y" or "component Z drops W"):
+   Always query for the ORIGINAL SPECIFICATIONS, DESIGN DECISIONS, REQUIREMENTS, or ACCEPTED CODE REVIEWS of that component to check its intended contract:
+   - Identify the component at issue and query for its specification and governing design rationales (e.g. why it was designed to include or exclude that data, what its contract specifies).
+   - Focus on the governing design policy and rules, not on the incidental log metrics or sample data quoted in the report.
 4. MULTI-QUESTION COVERAGE: Cover all distinct questions or subjects in the request (e.g. if the request asks both about a command/tool and a code decision, generate queries for each).
-5. BILINGUAL FUSION: Combine English technical terms (code, paths, commands) and the user's natural language terms (decisions, requirements) within the same facet query. Do NOT split into redundant English-only and native-language-only queries; emit 3 to 5 strong, unified queries.
-6. LENGTH: 4 to 8 distinctive keywords or 2-3 word phrases per query, most specific first. At most ${PLAN_LIMITS.queries} queries.
+5. BILINGUAL FUSION: Combine English technical terms (code, paths, commands) and the user's natural language terms (decisions, requirements) within the same facet query. Do NOT split into redundant English-only and native-language-only queries; emit 3 to 4 strong, unified queries in total.
+6. ONE ASPECT PER QUERY: tag every query with the name of the sub-question it serves ("aspect"). Up to 4 aspects, each with its what and why (plus how/when); at most ${PLAN_LIMITS.queries} queries in total.
+7. LENGTH: 4 to 8 distinctive keywords or 2-3 word phrases per query, most specific first.
 
 Example input: "> The connection retry limit was lowered to 2; that was left as configured. why was that done?"
 Example output:
 {
   "continue": false,
   "queries": [
-    {"facet": "what", "keywords": ["maxRetries", "retryLimit", "src/net/client.ts", "RETRY_CONFIG"]},
-    {"facet": "why", "keywords": ["retry budget", "thundering herd", "connection exhaustion postmortem"]},
-    {"facet": "how", "keywords": ["executeWithRetry", "backoffDelay", "test/client.test.ts"]}
+    {"aspect": "retry limit", "facet": "what", "keywords": ["maxRetries", "retryLimit", "src/net/client.ts", "RETRY_CONFIG"]},
+    {"aspect": "retry limit", "facet": "why", "keywords": ["retry budget", "thundering herd", "connection exhaustion postmortem"]},
+    {"aspect": "retry limit", "facet": "how", "keywords": ["executeWithRetry", "backoffDelay", "test/client.test.ts"]}
   ]
 }
 
@@ -69,7 +75,7 @@ export function parsePlan(reply: string): Plan | null {
 		const keywords = [...new Set((Array.isArray(q?.keywords) ? q.keywords : [])
 			// a keyword without a letter ("#9", "9444") matches any record with that number
 			.map((k: unknown) => str(k, PLAN_LIMITS.keywordChars)).filter((k: string) => /\p{L}/u.test(k)) as string[])].slice(0, PLAN_LIMITS.keywords);
-		return keywords.length ? [{ facet: str(q?.facet, 12), lang: str(q?.lang, 12), keywords }] : [];
+		return keywords.length ? [{ aspect: str(q?.aspect, 40), facet: str(q?.facet, 12), lang: str(q?.lang, 12), keywords }] : [];
 	}).slice(0, PLAN_LIMITS.queries);
 	return queries.length ? { continue: false, queries } : null;
 }
