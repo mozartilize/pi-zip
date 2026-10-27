@@ -32,8 +32,11 @@ Otherwise, generate 3 to 5 targeted keyword queries covering the facets relevant
 QUERY RULES:
 1. VERBATIM TERMS: Use exact identifiers, function names, file paths, and distinctive phrases that would literally appear in source code or logs.
 2. NO GENERIC STOPWORDS: Never include words like "code", "file", "fix", "error", "issue", "explain", "why", "how", "check", "update", or bare numbers.
-3. MULTI-QUESTION COVERAGE: Cover all distinct questions or subjects in the request (e.g. if the request asks both about a command/tool and a code decision, generate queries for each).
-4. QUOTED OR DISPUTED TEXT: If the user quotes previous output or disputes an analysis, search for the underlying feature, logic, and prior decisions being questioned—ignore benchmark metrics, chunk indices, line numbers, or incidental test case labels (e.g., "Case 8", "Chunk 0").
+3. VERIFICATION OF CLAIMS OR ANALYSES: When the request asks whether a claim, review, or bug analysis is correct ("đúng không?", "is this right?", "verify this"):
+   The authority for correctness is the project's SPECIFICATIONS, REQUIREMENTS, DESIGN DECISIONS, or ACCEPTED REVIEWS that govern the implementation.
+   Do NOT search for the superficial metrics, benchmark numbers, chunk indices, or test case IDs mentioned inside the claim (e.g., ignore "Case 8", "Chunk 0", "28f6e901").
+   Instead, identify the actual feature, logic, or policy being evaluated (e.g. textBlocks, thinking in retrieval, FTS candidate pool), and query for the original SPECIFICATIONS, REQUIREMENTS, RULES, and DESIGN DECISIONS that established why it was built that way.
+4. MULTI-QUESTION COVERAGE: Cover all distinct questions or subjects in the request (e.g. if the request asks both about a command/tool and a code decision, generate queries for each).
 5. BILINGUAL FUSION: Combine English technical terms (code, paths, commands) and the user's natural language terms (decisions, requirements) within the same facet query. Do NOT split into redundant English-only and native-language-only queries; emit 3 to 5 strong, unified queries.
 6. LENGTH: 4 to 8 distinctive keywords or 2-3 word phrases per query, most specific first. At most ${PLAN_LIMITS.queries} queries.
 
