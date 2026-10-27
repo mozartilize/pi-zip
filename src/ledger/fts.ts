@@ -131,18 +131,23 @@ export function ftsSearchIn(db: Db, match: string, entryIds: Iterable<string>, l
 
 /** FTS over the current `search_scope` (see setSearchScope). */
 export function ftsSearchScoped(db: Db, match: string, limit = 200, kinds: readonly string[] = ["assistant"], perEntry = 0): Hit[] {
-	const base =
-		`SELECT d.id, d.object_type, d.object_id, d.entry_id, d.block_index, d.chunk_index, d.char_start, d.segment_id, d.kind, d.tool, d.is_error,
-		        d.title, d.body, d.identifiers, d.seq, bm25(search_fts, ${WEIGHTS}) AS rank
-		 FROM search_fts JOIN search_docs d ON d.id = search_fts.rowid JOIN search_scope s ON s.entry_id = d.entry_id
+	const columns = `d.id, d.object_type, d.object_id, d.entry_id, d.block_index, d.chunk_index, d.char_start, d.segment_id, d.kind, d.tool, d.is_error,
+		 d.title, d.body, d.identifiers, d.seq`;
+	const from = `FROM search_fts JOIN search_docs d ON d.id = search_fts.rowid JOIN search_scope s ON s.entry_id = d.entry_id
 		 WHERE search_fts MATCH ? AND d.object_type = 'chunk' AND d.kind IN (${kinds.map(() => "?").join(", ")})`;
 	if (perEntry > 0) {
+		// Rank only ids and scores, then fetch text after LIMIT: long chunk bodies must not travel through the window sort.
 		return db.prepare(
-			`SELECT * FROM (SELECT x.*, ROW_NUMBER() OVER (PARTITION BY x.entry_id ORDER BY x.rank) AS per_entry FROM (${base}) x)
-			 WHERE per_entry <= ? ORDER BY rank LIMIT ?`,
+			`SELECT ${columns}, picked.rank FROM (
+			 SELECT id, rank FROM (
+			  SELECT x.*, ROW_NUMBER() OVER (PARTITION BY entry_id ORDER BY rank, id) AS per_entry FROM (
+			   SELECT d.id, d.entry_id, bm25(search_fts, ${WEIGHTS}) AS rank ${from}
+			  ) x
+			 ) WHERE per_entry <= ? ORDER BY rank, id LIMIT ?
+			) picked JOIN search_docs d ON d.id = picked.id ORDER BY picked.rank, d.id`,
 		).all(match, ...kinds, perEntry, limit) as Hit[];
 	}
-	return db.prepare(`${base} ORDER BY rank LIMIT ?`).all(match, ...kinds, limit) as Hit[];
+	return db.prepare(`SELECT ${columns}, bm25(search_fts, ${WEIGHTS}) AS rank ${from} ORDER BY rank, d.id LIMIT ?`).all(match, ...kinds, limit) as Hit[];
 }
 
 export function ftsSearch(db: Db, match: string, limit = 200): Hit[] {

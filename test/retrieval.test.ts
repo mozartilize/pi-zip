@@ -9,7 +9,7 @@ import { readSource } from "../src/ledger/source.ts";
 import { Memory, recentContext } from "../src/memory.ts";
 import { renderPacket, statusFor, validate } from "../src/retrieval/packet.ts";
 import { answerInput, parseReply, recordedAt, requestText, RetrievalConversation, type NeedDecision } from "../src/retrieval/assistant.ts";
-import { conclusionsOf, DEFAULT_LIMITS, type Evidence, queryOf, retrieve, scopeOf } from "../src/retrieval/search.ts";
+import { conclusionsOf, DEFAULT_LIMITS, type Evidence, GRAPH_REFERENCE_LIMIT, queryOf, retrieve, scopeOf } from "../src/retrieval/search.ts";
 import { Zip } from "../src/run.ts";
 import { A, fakeCtx, fakePi, flat, startZip, U } from "./helpers.ts";
 import { asst, call, E, fakeSession, fixtureEntries, result, user, type Any } from "./memory-fixture.ts";
@@ -120,8 +120,7 @@ describe("retrieve", () => {
 			);
 			parent = `a_p${i}`;
 		}
-		// Duplicate tool output with identical provenance (same tool + arguments + error state) should be deduplicated,
-		// while an identical output from a different command/file must be preserved independently.
+		// Even identical commands/outputs are separate executions with their own handles and timestamps.
 		entries.push(
 			user("u_dup", parent, "run status"),
 			asst("a_dup", "u_dup", [
@@ -150,7 +149,7 @@ describe("retrieve", () => {
 		expect(cfn!.excerpt).toContain("Default: 'true'"); // second chunk merged into the same evidence item
 
 		const dupEv = retrieve(l.db, q("nothing to commit working tree clean"), scopeOf(sess.ctx)).evidence;
-		expect(dupEv.filter((e) => e.entryId === "r_dup1" || e.entryId === "r_dup2")).toHaveLength(1);
+		expect(dupEv.filter((e) => e.entryId === "r_dup1" || e.entryId === "r_dup2")).toHaveLength(2);
 
 		const diffProvEv = retrieve(l.db, q("Successfully wrote 128 bytes"), scopeOf(sess.ctx)).evidence;
 		expect(diffProvEv.filter((e) => e.entryId === "r_write_a" || e.entryId === "r_write_b")).toHaveLength(2);
@@ -182,7 +181,7 @@ describe("retrieve", () => {
 			parent = `rn_${i}`;
 		}
 		entries.push(
-			asst("a_target", parent, [call("c_target", "bash", { command: "check-retry" })]),
+			asst("a_target", parent, [call("c_target", "bash", { command: "check-backoff" })]),
 			result("r_target", "a_target", "c_target", "bash", "retry backoff cap is 1500ms"),
 			E("cm", "r_target", { type: "compaction", summary: "s", firstKeptEntryId: "cm", tokensBefore: 1000 }),
 		);
@@ -242,6 +241,95 @@ describe("retrieve", () => {
 		).map((r) => r.detail);
 		expect(plans.some((d) => /SCAN r\b|SCAN search_docs/i.test(d))).toBe(false);
 		expect(plans.some((d) => /SEARCH r USING INDEX search_docs_entry/i.test(d))).toBe(true);
+	});
+
+	test("long pasted code cannot exhaust graph lookups or displace explicit references in the new request", () => {
+		const code = Array.from({ length: 1000 }, (_, i) => `const pastedSymbol${i} = read('src/pasted_${i}.ts');`).join("\n");
+		const parsed = q(`\`\`\`ts\n${code}\n\`\`\`\nCompare \`getUserId\` in @src/auth.ts with \`oldUserId\`.`);
+		expect(parsed.paths).toContain("src/auth.ts");
+		expect(parsed.symbols?.slice(0, 2)).toEqual(["olduserid", "getuserid"]);
+		expect(parsed.paths!.length).toBeLessThanOrEqual(GRAPH_REFERENCE_LIMIT);
+		expect(parsed.symbols!.length).toBeLessThanOrEqual(GRAPH_REFERENCE_LIMIT);
+
+		const { s, l } = indexed(fixtureEntries(), { leaf: "om", hidden: COMPACTED });
+		const queries: string[] = [];
+		// Count SQL executions, not prepares: the path statement is prepared once but executed per reference.
+		const db = {
+			exec: l.db.exec.bind(l.db), close: l.db.close.bind(l.db),
+			prepare(sql: string) {
+				const st = l.db.prepare(sql);
+				return { run: st.run.bind(st), get: st.get.bind(st), all: (...params: unknown[]) => {
+					queries.push(sql + JSON.stringify(params));
+					return st.all(...params);
+				} };
+			},
+		};
+		// Bypass queryOf: the traversal boundary itself must cap and deduplicate a manually constructed Query too.
+		const paths = ["src/missing.ts", "SRC\\missing.ts", ...Array.from({ length: 1000 }, (_, i) => `src/missing${i}.ts`)];
+		const symbols = ["missingSymbol", "MISSINGSYMBOL", ...Array.from({ length: 1000 }, (_, i) => `missingSymbol${i}`)];
+		retrieve(db, { tokens: [], handles: [], paths, symbols }, scopeOf(s.ctx));
+		expect(queries.filter((sql) => sql.includes("FROM nodes f"))).toHaveLength(GRAPH_REFERENCE_LIMIT);
+		expect(queries.filter((sql) => sql.includes("{body identifiers}"))).toHaveLength(GRAPH_REFERENCE_LIMIT);
+		expect(queries.filter((sql) => sql.includes("FROM search_fts"))).toHaveLength(GRAPH_REFERENCE_LIMIT * 2);
+	});
+
+	test("symbol boost accepts body-only and identifier-only matches without requiring the call title to contain the symbol", () => {
+		const entries = [
+			user("u", null, "inspect auth"),
+			asst("a", "u", [call("c1", "read", { path: "src/auth.ts" }), call("c2", "read", { path: "src/getUserId.ts" })]),
+			result("body", "a", "c1", "read", "function getUserId() { return 17; }"),
+			result("identifier", "body", "c2", "read", "export default 42;"),
+			E("cm", "identifier", { type: "compaction", summary: "s", firstKeptEntryId: "cm", tokensBefore: 1 }),
+		];
+		const { s, l } = indexed(entries);
+		s.sm.buildSessionProjection = () => buildSessionProjection(s.state.entries, s.state.leaf);
+		const evidence = retrieve(l.db, { tokens: [], handles: [], symbols: ["getUserId"] }, scopeOf(s.ctx)).evidence;
+		// No lexical query: these can only come from symbol-specific lookup.
+		expect(evidence.map((e) => e.entryId).sort()).toEqual(["body", "identifier"]);
+	});
+
+	test("Windows graph keys in existing databases match slash, backslash and absolute prompt paths", () => {
+		const entries = [
+			user("u", null, "inspect config"),
+			asst("a", "u", [call("c", "read", { path: "config/service.yml" })]),
+			result("r", "a", "c", "read", "port: 9021"),
+			E("cm", "r", { type: "compaction", summary: "s", firstKeptEntryId: "cm", tokensBefore: 1 }),
+		];
+		const { s, l } = indexed(entries);
+		s.sm.buildSessionProjection = () => buildSessionProjection(s.state.entries, s.state.leaf);
+		// Simulate an existing DB produced on Windows; edge IDs are opaque and do not need to be rewritten.
+		l.db.prepare("UPDATE nodes SET canonical_key = ? WHERE kind = 'file'").run(String.raw`C:\Users\dev\project\config\service.yml`);
+		// Disable lexical/fallback matches so success proves traversal through the stored Windows file node.
+		l.db.exec("INSERT INTO search_fts(search_fts) VALUES('delete-all')");
+		for (const path of ["config/service.yml", String.raw`config\service.yml`, String.raw`C:\Users\dev\project\config\service.yml`]) {
+			const query = q(`inspect @${path}`);
+			expect(query.paths).toEqual([path.replace(/\\/g, "/").toLowerCase()]);
+			expect(retrieve(l.db, { ...query, tokens: [] }, scopeOf(s.ctx)).evidence.map((e) => e.entryId)).toEqual(["r"]);
+		}
+	});
+
+	test("equal excerpts from repeated commands retain both execution times, handles and whole-output outcomes", () => {
+		const prefix = "retry regression summary\n" + "padding\n".repeat(600);
+		const entries = [
+			user("u", null, "test twice"),
+			asst("a1", "u", [call("c1", "bash", { command: "bun test" })]),
+			{ ...result("old", "a1", "c1", "bash", prefix + "21 pass\n1 fail"), timestamp: "2026-01-01T00:00:00Z" },
+			asst("a2", "old", [call("c2", "bash", { command: "bun test" })]),
+			{ ...result("new", "a2", "c2", "bash", prefix + "22 pass\n0 fail"), timestamp: "2026-01-02T00:00:00Z" },
+			E("cm", "new", { type: "compaction", summary: "s", firstKeptEntryId: "cm", tokensBefore: 1 }),
+		];
+		const { s, l } = indexed(entries);
+		s.sm.buildSessionProjection = () => buildSessionProjection(s.state.entries, s.state.leaf);
+		const evidence = retrieve(l.db, q("retry"), scopeOf(s.ctx), { ...DEFAULT_LIMITS, excerptChars: 120 }).evidence;
+		const old = evidence.find((e) => e.entryId === "old")!, newer = evidence.find((e) => e.entryId === "new")!;
+		expect(old).toBeDefined(); expect(newer).toBeDefined();
+		expect(old.excerpt).toBe(newer.excerpt); // identical passage, but the rest of each output is different
+		expect(old.at).toBe(Date.UTC(2026, 0, 1)); expect(newer.at).toBe(Date.UTC(2026, 0, 2));
+		expect(old.outcome).toBe("exit 0, 21 passed, 1 failed"); expect(newer.outcome).toBe("exit 0, 22 passed, 0 failed");
+		expect(old.handle).toBe(handleFor("old")); expect(newer.handle).toBe(handleFor("new"));
+		const input = answerInput("compare old and new tests", "", evidence);
+		expect(input).toContain(`${old.ref} tool_result bash`); expect(input).toContain(`${newer.ref} tool_result bash`);
+		expect(input).toContain("21 passed, 1 failed"); expect(input).toContain("22 passed");
 	});
 
 	test("a conclusion is quoted from its own text and titled by the request it answered", () => {

@@ -63,7 +63,7 @@ export const fold = (s: string) => s.normalize("NFD").replace(/\p{M}+/gu, "").re
 
 const WORD_RE = /[\p{L}\p{N}_]+/gu;
 
-/** Normalized word sequence of an excerpt, used to skip duplicate tool outputs. */
+/** Normalized words for suppressing repeated passages within one source entry, never across executions. */
 function excerptKey(text: string): string {
 	return (fold(text.toLowerCase()).match(WORD_RE) ?? []).join(" ");
 }
@@ -147,23 +147,32 @@ export function window(text: string, terms: string[], n: number): string {
 	return `${best.start > 0 ? "…" : ""}${flat.slice(best.start, best.start + n)}${best.start + n < flat.length ? "…" : ""}`;
 }
 
-/** Extract explicit file paths and code identifiers (snake_case, camelCase, PascalCase) from a user prompt for graph traversal. */
+/** Hard query budget, including callers that construct Query directly. Paths and symbols each get six lookups at most. */
+export const GRAPH_REFERENCE_LIMIT = 6;
+const graphPath = (p: string) => p.replace(/^@/, "").replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+function boundedReferences(values: string[], path: boolean): string[] {
+	const out = new Set<string>();
+	for (const value of values) {
+		const ref = path ? graphPath(value) : value.toLowerCase();
+		if (ref.length >= (path ? 3 : 4) && ref.length <= 1024) out.add(ref);
+		if (out.size >= GRAPH_REFERENCE_LIMIT) break;
+	}
+	return [...out];
+}
+
+/** Prefer explicit inline references and the end of the request outside fenced code over pasted code/diffs. */
 export function promptReferences(text: string): { paths: string[]; symbols: string[] } {
-	const paths = [
-		...new Set(
-			(text.match(/@?[\w.-]+\/[\w./-]+|@?[\w.-]+\.(?:ts|js|py|sh|yml|yaml|json|md|sql|toml)\b/gi) ?? [])
-				.map((p) => p.replace(/^@/, "").replace(/\/+$/, "").toLowerCase())
-				.filter((p) => p.length >= 3),
-		),
-	];
-	const symbols = [
-		...new Set(
-			(text.match(/\b[a-zA-Z_]\w*_[a-zA-Z0-9_]+\b|\b[a-z]+[A-Z][a-zA-Z0-9]*\b|\b[A-Z][a-z0-9]+[A-Z][a-zA-Z0-9]*\b/g) ?? [])
-				.map((s) => s.toLowerCase())
-				.filter((s) => s.length >= 4),
-		),
-	];
-	return { paths, symbols };
+	const prose = text.replace(/```[^\n]*\n[\s\S]*?(?:```|$)|~~~[^\n]*\n[\s\S]*?(?:~~~|$)/g, " ");
+	const inline = [...prose.matchAll(/`([^`\n]+)`|@[^\s`]+/g)].map((m) => m[1] ?? m[0]).join("\n");
+	const paths: string[] = [], symbols: string[] = [];
+	for (const part of [inline, prose, text]) {
+		const normalized = part.replace(/\\/g, "/");
+		const pathPattern = /@?(?:[A-Za-z]:)?\/?[\w.-]+\/[\w./-]+|@?[\w.-]+\.(?:ts|js|py|sh|yml|yaml|json|md|sql|toml)\b/gi;
+		paths.push(...(normalized.match(pathPattern) ?? []).reverse());
+		const withoutPaths = normalized.replace(pathPattern, " ");
+		symbols.push(...(withoutPaths.match(/\b[a-zA-Z_]\w*_[a-zA-Z0-9_]+\b|\b[a-z]+[A-Z][a-zA-Z0-9]*\b|\b[A-Z][a-z0-9]+[A-Z][a-zA-Z0-9]*\b/g) ?? []).reverse());
+	}
+	return { paths: boundedReferences(paths, true), symbols: boundedReferences(symbols, false) };
 }
 
 /** A loaded skill arrives inside the prompt as a <skill ...>...</skill> block: its text is the skill file, not the user's request. */
@@ -210,11 +219,13 @@ const ftsPhrase = (s: string) => `"${s.replace(/"/g, '""')}"`;
  * file nodes are matched by key (a path suffix scans file nodes only, one row per distinct file), the rest goes through indexes.
  * - path -> `file` node (exact key or path suffix) -> `touches_file` <- tool call -> `answered_by` -> result entry; when no recorded
  *   call touched it (a renamed copy, a file read through a shell), a phrase match on the file name in the scoped FTS stands in;
- * - symbol -> scoped FTS phrase in both the call title and the output body.
+ * - symbol -> scoped FTS phrase in the output body or identifiers (the call title need not contain it).
  * Several matching entries per reference are kept (newest first, reads first), and from each entry the chunks that best match the
  * prompt, or its first chunk when none does. Requires `search_scope` to hold the eligible entries.
  */
 function graphCandidates(db: Db, q: Query, lexical: Hit[]): Hit[] {
+	const paths = boundedReferences(q.paths ?? [], true), symbols = boundedReferences(q.symbols ?? [], false);
+	if (!paths.length && !symbols.length) return [];
 	const out: Hit[] = [];
 	const seen = new Set<string>();
 	const add = (h: Hit) => {
@@ -248,10 +259,13 @@ function graphCandidates(db: Db, q: Query, lexical: Hit[]): Hit[] {
 		 JOIN edges a ON a.src_id = t.src_id AND a.type = 'answered_by'
 		 JOIN search_docs r ON r.entry_id = substr(a.dst_id, 7) AND r.object_type = 'chunk' AND r.kind = 'tool_result'
 		 JOIN search_scope s ON s.entry_id = r.entry_id
-		 WHERE f.kind = 'file' AND (f.canonical_key = ? COLLATE NOCASE OR f.canonical_key LIKE ? ESCAPE '\\')
+		 WHERE f.kind = 'file' AND (replace(f.canonical_key, char(92), '/') = ? COLLATE NOCASE
+		 OR replace(f.canonical_key, char(92), '/') LIKE ? ESCAPE '\\')
 		 GROUP BY r.entry_id ORDER BY is_read DESC, seq DESC LIMIT ?`,
 	);
-	for (const ref of q.paths ?? []) {
+	// Normalize separators at lookup, including legacy Windows keys: no projection change or database rebuild needed.
+	for (const ref of paths) {
+		if (out.length >= 30) break;
 		const base = ref.split("/").pop() ?? "";
 		if (base.length < 3) continue;
 		const entries = (byFile.all(ref, `%/${likeEscape(ref)}`, GRAPH_ENTRIES) as Array<{ entry_id: string }>).map((r) => String(r.entry_id));
@@ -261,8 +275,9 @@ function graphCandidates(db: Db, q: Query, lexical: Hit[]): Hit[] {
 		}
 		for (const id of entries) addEntry(id);
 	}
-	for (const sym of q.symbols ?? []) {
-		const hits = ftsSearchScoped(db, `title : ${ftsPhrase(sym)} AND body : ${ftsPhrase(sym)}`, GRAPH_ENTRIES * GRAPH_CHUNKS, ["tool_result"], GRAPH_CHUNKS);
+	for (const sym of symbols) {
+		if (out.length >= 30) break;
+		const hits = ftsSearchScoped(db, `{body identifiers} : ${ftsPhrase(sym)}`, GRAPH_ENTRIES * GRAPH_CHUNKS, ["tool_result"], GRAPH_CHUNKS);
 		hits.sort((a, b) => Number(b.seq) - Number(a.seq) || a.rank - b.rank);
 		for (const h of hits) add(h);
 	}
@@ -313,11 +328,10 @@ export function retrieve(db: Db, q: Query, scope: Scope, limits: SearchLimits = 
 	const fusedIds = graphIds.length
 		? [...fuseChannels(lexicalIds, graphIds), ...hits.slice(40).map((h) => String(h.object_id)).filter((id) => !graphIds.includes(id))]
 		: hits.map((h) => String(h.object_id));
-	// Duplicate content is dropped only when its provenance is the same too: kind, issuing call (title carries name and
-	// arguments) and error state. Two writes to different files that both print "Success" stay two items.
+	// Identical excerpts from separate executions can hide different outcomes or dates; keep their handles independently.
 	const dedupKey = (h: Hit, excerpt: string) => {
 		const content = excerptKey(excerpt);
-		return content ? `${h.kind}\u0000${h.title}\u0000${h.is_error ? 1 : 0}\u0000${content}` : "";
+		return content ? `${h.entry_id}\u0000${content}` : "";
 	};
 
 	const sliceText = (h: Hit, exact: boolean): string => {
@@ -342,7 +356,7 @@ export function retrieve(db: Db, q: Query, scope: Scope, limits: SearchLimits = 
 		picked.set(entryId, { hit, exact: true, passages: [{ blockIndex: Number(hit.block_index ?? 0), chunkIndex: Number(hit.chunk_index ?? 0), excerpt, text }] });
 	}
 
-	// Pass 1: pick up to limits.candidates distinct entries from the fused ranking, skipping duplicate excerpt content.
+	// Pass 1: pick up to limits.candidates distinct source entries from the fused ranking.
 	for (const objId of fusedIds) {
 		if (picked.size >= limits.candidates + named.length) break;
 		const hit = byObj.get(objId);
