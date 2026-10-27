@@ -1,9 +1,11 @@
-// Candidate search over the opened session's ledger, scoped to the active branch. What is searched is the assistant's earlier
-// conclusions (its final answer of each user turn) and hidden tool outputs on the active branch, combined with referential graph
-// traversal (file paths and code symbols in the prompt linked via tool call arguments and identifiers). Mid-turn assistant text and
-// sibling branches are excluded.
+// Candidate search over the opened session's ledger, scoped to the hidden entries of the active branch: user requests, assistant
+// text (completed answers and mid-turn notes), reasoning, tool calls and tool outputs. One FTS search per keyword set of the planner
+// (or one over the request's own words when there is no plan), merged round-robin so that each set's best entries come first, one
+// candidate per source entry; plus referential graph traversal (file paths and code symbols in the prompt). Sibling branches and
+// anything the model view still shows are excluded.
 import { handleFor, handleTokens } from "../handle.ts";
 import type { Db } from "../ledger/db.ts";
+import { nodeId } from "../ledger/graph.ts";
 import { CHUNK_CHARS, ftsSearchScoped, type Hit, matchExpr, setSearchScope } from "../ledger/fts.ts";
 import { textBlocks } from "../ledger/source.ts";
 import { outcomeHint } from "../outcome.ts";
@@ -22,7 +24,8 @@ export interface Scope {
 	folded: Set<string>;
 	/** The branch has a compaction: the messages it replaced are no longer in the model view either. */
 	compacted: boolean;
-	/** Positive evidence of hiding, with visible entries excluded. Absence alone is not enough. */
+	/** Searchable history: every entry before the latest compaction record (also the part it kept in view), plus folded entries.
+	 *  Positive marks only: absence from the view alone is not enough. */
 	hidden: Map<string, "folded" | "compacted">;
 	/** Conclusion entry id -> the user request it answered. Only a completed text answer without tool calls qualifies; subsequent
 	 *  assistant/tool work in the same turn invalidates it until a new completed answer arrives. */
@@ -36,7 +39,7 @@ export interface Evidence {
 	handle: string; // handleFor(entryId): resolves with zip_recall for tool results, user requests and assistant text
 	entryId: string;
 	hidden: "folded" | "compacted";
-	kind: string; // user | assistant | thinking | tool_call | tool_result | custom | segment
+	kind: string; // user | assistant (a completed answer) | assistant_text (mid-turn) | thinking | tool_call | tool_result | custom
 	tool: string | null;
 	title: string;
 	excerpt: string;
@@ -58,7 +61,7 @@ export interface Evidence {
 
 /** `ftsRows`: FTS rows read per prompt, after the active-branch hidden scope filter. */
 export interface SearchLimits { candidates: number; expand: number; excerptChars: number; ftsRows: number }
-export const DEFAULT_LIMITS: SearchLimits = { candidates: 8, expand: 6, excerptChars: 1500, ftsRows: 400 };
+export const DEFAULT_LIMITS: SearchLimits = { candidates: 12, expand: 6, excerptChars: 1500, ftsRows: 400 };
 
 /** Diacritics removed, for comparison only: "tiếp tục" -> "tiep tuc", "đ" -> "d". */
 export const fold = (s: string) => s.normalize("NFD").replace(/\p{M}+/gu, "").replace(/đ/g, "d").replace(/Đ/g, "D");
@@ -187,8 +190,11 @@ export const userText = (prompt: string) => prompt.replace(/<skill\b[^>]*>[\s\S]
  */
 export const QUERY_HEAD = 32, QUERY_TAIL = 96;
 
-/** The query of one prompt, from the user's own words. Nothing is filtered by language (no stopwords). */
-export interface Query { tokens: string[]; handles: string[]; paths?: string[]; symbols?: string[] }
+/** One planner query: keywords and short phrases of one facet (what/why/how/when) in one language. */
+export interface KeywordSet { facet?: string; lang?: string; keywords: string[] }
+
+/** The query of one prompt: the user's own words (no stopwords), and the planner's keyword sets when there is a plan. */
+export interface Query { tokens: string[]; handles: string[]; paths?: string[]; symbols?: string[]; sets?: KeywordSet[] }
 export function queryOf(prompt: string): Query {
 	const own = userText(prompt);
 	const refs = promptReferences(own);
@@ -286,139 +292,170 @@ function graphCandidates(db: Db, q: Query, lexical: Hit[]): Hit[] {
 	return out;
 }
 
-function fuseChannels(...lists: string[][]): string[] {
-	const sums = new Map<string, number>();
-	for (const list of lists) {
-		list.forEach((id, i) => sums.set(id, (sums.get(id) ?? 0) + 1 / (60 + i + 1)));
+/** Every kind a hidden source can be found by. Reasoning and tool calls can lead to a candidate; the answer call labels them. */
+const SEARCH_KINDS = ["user", "assistant", "thinking", "tool_call", "tool_result", "custom"] as const;
+
+/**
+ * The FTS searches of one query: one per planner keyword set (its tokens, plus each multi-word keyword as a phrase), else one over
+ * the request's own words. Matched in body and identifiers only: titles are labels ("assistant reasoning", "tool call bash") that
+ * would otherwise rank every item of a kind by a common word.
+ */
+export function searchesOf(q: Query): Array<{ match: string; tokens: string[] }> {
+	const runs: Array<{ match: string; tokens: string[] }> = [];
+	for (const s of q.sets?.length ? q.sets : [{ keywords: q.tokens }]) {
+		const tokens = new Set<string>(), phrases: string[] = [];
+		for (const k of s.keywords) {
+			const w = k.toLowerCase().match(WORD_RE) ?? [];
+			for (const t of w) tokens.add(t);
+			if (w.length > 1) phrases.push(k);
+		}
+		const expr = matchExpr([...tokens], phrases);
+		if (expr) runs.push({ match: `{body identifiers} : (${expr})`, tokens: [...tokens] });
 	}
-	return [...sums].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).map(([id]) => id);
+	return runs;
+}
+
+/** The hidden result entry that answered the tool call of a matched call chunk (one hop over the ledger's answered_by edge). */
+function pairedResult(db: Db, h: Hit): string | null {
+	if (h.kind !== "tool_call" || !h.entry_id || h.block_index === null) return null;
+	const row = db.prepare("SELECT dst_id FROM edges WHERE src_id = ? AND type = 'answered_by' LIMIT 1").get(nodeId.call(h.entry_id, Number(h.block_index)));
+	const dst = row ? String(row.dst_id) : "";
+	return dst.startsWith("entry:") ? dst.slice(6) : null;
 }
 
 /**
- * Hidden conclusions and tool outputs on the active branch that match the prompt (via FTS5 and referential graph traversal over file
- * paths / code symbols), best first; plus, first, every hidden entry whose handle the prompt names (each kept on its own, also several
- * from one step). Multi-chunk matches on a chosen entry merge up to 3 passages. The model decides which items are needed.
+ * Hidden sources on the active branch that match the query, best first: every hidden entry whose handle the prompt names (each kept
+ * on its own, also several from one step), then the searches merged round-robin: the first entry of each search, then the second of
+ * each, and so on, one candidate per source entry. Merging by rank rather than by summed score keeps an entry that only one facet
+ * finds (a decision found by "why", a command found by "how") above entries every facet matches a little. A matched tool call brings
+ * its hidden result right after it. Up to 3 passages of one entry (its matching chunks in that search). The model decides need.
  */
 export function retrieve(db: Db, q: Query, scope: Scope, limits: SearchLimits = DEFAULT_LIMITS): { evidence: Evidence[]; hits: number; inBranch: number } {
-	const tokens = q.tokens;
-	const match = matchExpr(tokens);
-	const usable = (id: string) => scope.branch.has(id) && scope.hidden.has(id) && !scope.visible.has(id);
-	const isToolOutput = (id: string) => {
-		const e = scope.entry(id);
-		return e?.message?.role === "toolResult" || e?.type === "bashExecution";
-	};
+	const usable = (id: string) => scope.branch.has(id) && scope.hidden.has(id);
 	// A handle in the prompt names one entry: resolve it through the ledger, not through the text (a handle appears in no document).
 	const named = handleDocs(db, q.handles).filter((h) => h.entry_id && usable(h.entry_id));
-	const eligible = [
-		...new Set([
-			...[...scope.conclusions.keys()].filter(usable),
-			...[...scope.hidden.keys()].filter((id) => usable(id) && isToolOutput(id)),
-		]),
-	];
+	const eligible = [...scope.hidden.keys()].filter(usable);
 	// One scope for every query below: SQL filters to the hidden active-branch entries before ranking and LIMIT.
 	setSearchScope(db, eligible);
+	const runs = searchesOf(q);
+	const perRun = Math.max(40, Math.floor(limits.ftsRows / Math.max(1, runs.length)));
 	// At most PER_ENTRY_ROWS chunks per entry: a few long outputs matching on every chunk cannot fill all rows.
-	const hits = match ? ftsSearchScoped(db, match, limits.ftsRows, ["assistant", "tool_result"], PER_ENTRY_ROWS) : [];
-	const byObj = new Map<string, Hit>(hits.map((h) => [String(h.object_id), h]));
-
+	const lists = runs.map((r) => ({ tokens: r.tokens, hits: eligible.length ? ftsSearchScoped(db, r.match, perRun, SEARCH_KINDS, PER_ENTRY_ROWS) : [] }));
+	const allTokens = [...new Set([...q.tokens, ...runs.flatMap((r) => r.tokens)])];
 	// Referential graph traversal: file paths and code symbols in the prompt -> hidden tool outputs, through indexed SQL only.
-	const graphList = eligible.length ? graphCandidates(db, q, hits) : [];
-	for (const h of graphList) if (!byObj.has(String(h.object_id))) byObj.set(String(h.object_id), h);
-	const graphIds = graphList.map((h) => String(h.object_id));
+	const graphList = eligible.length ? graphCandidates(db, q, lists.flatMap((l) => l.hits)) : [];
+	if (graphList.length) lists.push({ tokens: allTokens, hits: graphList });
+	const hitCount = lists.reduce((n, l) => n + l.hits.length, 0);
 
-	const lexicalIds = hits.slice(0, 40).map((h) => String(h.object_id));
-	const fusedIds = graphIds.length
-		? [...fuseChannels(lexicalIds, graphIds), ...hits.slice(40).map((h) => String(h.object_id)).filter((id) => !graphIds.includes(id))]
-		: hits.map((h) => String(h.object_id));
 	// Identical excerpts from separate executions can hide different outcomes or dates; keep their handles independently.
 	const dedupKey = (h: Hit, excerpt: string) => {
 		const content = excerptKey(excerpt);
 		return content ? `${h.entry_id}\u0000${content}` : "";
 	};
-
 	const sliceText = (h: Hit, exact: boolean): string => {
-		const entryId = h.entry_id!;
-		const e = scope.entry(entryId);
-		const isConclusion = scope.conclusions.has(entryId);
-		return isConclusion && exact
+		const e = scope.entry(h.entry_id!);
+		return scope.conclusions.has(h.entry_id!) && exact
 			? textBlocks(e).filter((b) => b.kind === "assistant").map((b) => b.text).join("\n")
 			: sourceSlice(e, h.block_index, h.char_start) || h.body;
 	};
-
-	const picked = new Map<string, { hit: Hit; exact: boolean; passages: Array<{ blockIndex: number; chunkIndex: number; excerpt: string; text: string }> }>();
+	type Passage = { blockIndex: number; chunkIndex: number; excerpt: string; text: string };
+	const picked = new Map<string, { hit: Hit; exact: boolean; tokens: string[]; passages: Passage[] }>();
 	const seenExcerpts = new Set<string>();
+	const passage = (h: Hit, exact: boolean, tokens: string[], n: number): Passage | null => {
+		const text = sliceText(h, exact);
+		const excerpt = window(text, tokens, n);
+		const key = dedupKey(h, excerpt);
+		if (!exact && (!key || seenExcerpts.has(key))) return null;
+		if (key) seenExcerpts.add(key);
+		return { blockIndex: Number(h.block_index ?? 0), chunkIndex: Number(h.chunk_index ?? 0), excerpt, text };
+	};
 
 	for (const hit of named) {
-		const entryId = hit.entry_id!;
-		if (picked.has(entryId)) continue;
-		const text = sliceText(hit, true);
-		const excerpt = window(text, tokens, limits.excerptChars);
-		const key = dedupKey(hit, excerpt);
-		if (key) seenExcerpts.add(key);
-		picked.set(entryId, { hit, exact: true, passages: [{ blockIndex: Number(hit.block_index ?? 0), chunkIndex: Number(hit.chunk_index ?? 0), excerpt, text }] });
+		if (picked.has(hit.entry_id!)) continue;
+		picked.set(hit.entry_id!, { hit, exact: true, tokens: allTokens, passages: [passage(hit, true, allTokens, limits.excerptChars)!] });
 	}
-
-	// Pass 1: pick up to limits.candidates distinct source entries from the fused ranking.
-	for (const objId of fusedIds) {
-		if (picked.size >= limits.candidates + named.length) break;
-		const hit = byObj.get(objId);
-		if (!hit?.entry_id || picked.has(hit.entry_id)) continue;
-		const text = sliceText(hit, false);
-		const excerpt = window(text, tokens, limits.excerptChars);
-		const key = dedupKey(hit, excerpt);
-		if (!key || seenExcerpts.has(key)) continue;
-		seenExcerpts.add(key);
-		picked.set(hit.entry_id, { hit, exact: false, passages: [{ blockIndex: Number(hit.block_index ?? 0), chunkIndex: Number(hit.chunk_index ?? 0), excerpt, text }] });
-	}
-
-	// Pass 2: attach up to 2 additional matching chunks for chosen tool_result entries from the top fused candidates.
-	if (limits.excerptChars >= 1200) {
-		const subWindow = Math.min(1200, limits.excerptChars);
-		for (const objId of fusedIds.slice(0, 16)) {
-			const hit = byObj.get(objId);
-			if (!hit?.entry_id || scope.conclusions.has(hit.entry_id)) continue;
-			const cur = picked.get(hit.entry_id);
-			if (!cur || cur.exact || cur.passages.length >= 3) continue;
-			const bi = Number(hit.block_index ?? 0), ci = Number(hit.chunk_index ?? 0);
-			if (cur.passages.some((p) => p.blockIndex === bi && p.chunkIndex === ci)) continue;
-			const text = sliceText(hit, false);
-			const excerpt = window(text, tokens, subWindow);
-			const key = dedupKey(hit, excerpt);
-			if (!key || seenExcerpts.has(key)) continue;
-			seenExcerpts.add(key);
-			cur.passages.push({ blockIndex: bi, chunkIndex: ci, excerpt, text });
+	const cap = limits.candidates + named.length;
+	const ordered = lists.map((l) => {
+		const byEntry = new Map<string, Hit[]>();
+		for (const h of l.hits) {
+			if (!h.entry_id) continue;
+			const group = byEntry.get(h.entry_id) ?? [];
+			group.push(h);
+			byEntry.set(h.entry_id, group);
+		}
+		return { tokens: l.tokens, entries: [...byEntry.entries()] };
+	});
+	// every list's chunks of one entry, so a graph continuation chunk can join an entry an FTS search found first
+	const chunksOf = new Map<string, Hit[]>();
+	for (const l of lists) for (const h of l.hits) if (h.entry_id) chunksOf.set(h.entry_id, [...(chunksOf.get(h.entry_id) ?? []), h]);
+	const subWindow = Math.min(1200, limits.excerptChars);
+	const take = (own: Hit[], tokens: string[]): boolean => {
+		const hits = [...own, ...(chunksOf.get(own[0].entry_id!) ?? []).filter((h) => !own.some((o) => o.object_id === h.object_id))];
+		const first = passage(hits[0], false, tokens, limits.excerptChars);
+		if (!first) return false;
+		const c = { hit: hits[0], exact: false, tokens, passages: [first] };
+		picked.set(hits[0].entry_id!, c);
+		// extra passages for tool outputs only: prose and reasoning are quoted from their winning passage
+		if (limits.excerptChars >= 1200 && hits[0].kind === "tool_result") {
+			for (const h of hits.slice(1)) {
+				if (c.passages.length >= 3) break;
+				if (c.passages.some((p) => p.blockIndex === Number(h.block_index ?? 0) && p.chunkIndex === Number(h.chunk_index ?? 0))) continue;
+				const more = passage(h, false, tokens, subWindow);
+				if (more) c.passages.push(more);
+			}
+		}
+		return true;
+	};
+	for (let depth = 0, more = true; more && picked.size < cap; depth++) {
+		more = false;
+		for (const l of ordered) {
+			if (picked.size >= cap) break;
+			if (depth >= l.entries.length) continue;
+			more = true;
+			const [entryId, hits] = l.entries[depth];
+			if (picked.has(entryId) || !take(hits, l.tokens)) continue;
+			// one hop: a matched call brings the output it produced (its title then shows the call)
+			const res = pairedResult(db, hits[0]);
+			if (res && usable(res) && !picked.has(res) && picked.size < cap) {
+				const rows = db.prepare(
+					`SELECT ${HIT_COLS}, 0 AS rank FROM search_docs d WHERE d.entry_id = ? AND d.object_type = 'chunk' AND d.kind = 'tool_result' ORDER BY d.block_index, d.chunk_index LIMIT 1`,
+				).all(res) as Hit[];
+				if (rows.length) take(rows, l.tokens);
+			}
 		}
 	}
 
-	const ranked = [...picked.values()].slice(0, Math.max(limits.candidates, named.length));
+	const ranked = [...picked.values()].slice(0, cap);
 	const evidence = ranked.map((c, i): Evidence => {
 		const h = c.hit, entryId = h.entry_id!;
 		const e = scope.entry(entryId);
 		const role = e?.type === "message" ? e.message?.role : null;
-		const isConclusion = scope.conclusions.has(entryId);
+		const isConclusion = scope.conclusions.has(entryId) && (c.exact || h.kind === "assistant");
 		const orderedPassages = [...c.passages].sort((a, b) => a.blockIndex - b.blockIndex || a.chunkIndex - b.chunkIndex);
 		const combinedText = orderedPassages.map((p) => p.text).join("\n");
+		const kind = isConclusion ? "assistant" : h.kind === "assistant" ? "assistant_text" : h.kind;
 		return {
 			ref: `E${i + 1}`,
 			handle: handleFor(entryId),
 			entryId,
 			hidden: scope.hidden.get(entryId)!,
-			kind: isConclusion ? "assistant" : h.kind,
+			kind,
 			tool: h.tool,
-			title: isConclusion ? (scope.conclusions.get(entryId) ? `answer to: "${clip(scope.conclusions.get(entryId)!, 160)}"` : "earlier conclusion") : titleOf(scope, entryId, h),
+			title: isConclusion ? (scope.conclusions.get(entryId) ? `answer to: "${clip(scope.conclusions.get(entryId)!, 160)}"` : "earlier conclusion")
+				: kind === "user" ? "earlier user request" : titleOf(scope, entryId, h),
 			excerpt: orderedPassages.map((p) => p.excerpt).join(" … "),
 			passages: orderedPassages.map((p) => p.excerpt),
 			outcome: role === "toolResult" ? outcomeHint(textBlocks(e).map((b) => b.text).join("\n"), String(h.tool ?? ""), !!h.is_error) : "",
 			isError: !!h.is_error,
 			folded: role === "toolResult",
-			matched: matchedOf(tokens, combinedText),
+			matched: matchedOf(c.tokens, combinedText),
 			exact: c.exact,
-			context: i < limits.expand ? contextOf(db, h, scope) : [],
+			context: i < limits.expand && kind !== "thinking" ? contextOf(db, h, scope) : [],
 			seq: Number(h.seq ?? 0),
 			at: Date.parse(e?.timestamp ?? "") || 0,
 		};
 	});
-	return { evidence, hits: named.length + hits.length + graphIds.length, inBranch: named.length + hits.length + graphIds.length };
+	return { evidence, hits: named.length + hitCount, inBranch: named.length + hitCount };
 }
 
 const clip = (s: string, n: number) => {
@@ -466,7 +503,7 @@ function contextOf(db: Db, h: Hit, scope: Scope): string[] {
 	return out;
 }
 
-/** Count positively hidden entries. An absent entry or a compaction record alone cannot open the gate. */
+/** Count searchable history entries (before the latest compaction, or folded). An entry merely absent from the view does not count. */
 export function hiddenOutputs(scope: Scope): number {
 	return scope.hidden.size;
 }
@@ -496,13 +533,13 @@ export function scopeOf(ctx: Any): Scope {
 	const byId = new Map<string, Any>(branch.map((e: Any) => [e?.id, e]));
 	const hidden = new Map<string, "folded" | "compacted">();
 	const compaction = [...branch].reverse().find((e) => e?.type === "compaction");
-	// Pi stores a compaction that keeps nothing before it with firstKeptEntryId = its own id; an id that is null or not on the branch
-	// keeps nothing either (Pi's buildContextEntries never finds it). In both cases every entry before the compaction is summarized.
-	const kept = compaction ? branch.findIndex((e) => e.id === compaction.firstKeptEntryId) : -1;
-	const boundary = !compaction ? -1 : kept >= 0 ? kept : branch.findIndex((e) => e.id === compaction.id);
+	// Everything on the active branch before the latest compaction record is searchable, including the part the compaction kept in
+	// view (from firstKeptEntryId on): the note is advisory, and the main model may have lost track of retained text too. Branch
+	// order, not timestamps: it is the active branch's own time order, and an entry without a timestamp still has a place in it.
+	const boundary = compaction ? branch.findIndex((e) => e.id === compaction.id) : -1;
 	if (projected) {
 		for (const e of branch.slice(0, Math.max(0, boundary))) {
-			if (!visible.has(e.id) && textBlocks(e).length) hidden.set(e.id, "compacted");
+			if (textBlocks(e).length) hidden.set(e.id, "compacted");
 		}
 		for (const id of folded) if (byId.has(id) && !visible.has(id) && textBlocks(byId.get(id)).length) hidden.set(id, "folded");
 	}

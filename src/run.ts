@@ -753,7 +753,8 @@ export class Zip implements ZipControl {
 		this.startKind = null;
 		this.promptStart = false;
 		this.inRun = false;
-		this.memoryNoteShown = false;
+		this.memoryPendingShown = false;
+		this.memoryFinalAt = null;
 		this.writeUnwritten();
 		const s = this.version, d = { v: s.v, pi: s.pi, since: s.since }; // at the end of a run, unless the newest entry on this branch says the same
 		if (!(s.last?.v === d.v && s.last?.pi === d.pi)) attempt(() => this.pi.appendEntry(VERSION_CUSTOM, (s.last = d)), undefined);
@@ -1402,15 +1403,31 @@ export class Zip implements ZipControl {
 		return out ? { messages: out.messages } : undefined;
 	}
 
-	/** A retrieval note was already put into a request of this run (later requests repeat it in the same place). */
-	private memoryNoteShown = false;
-	/** Session memory (src/memory.ts), set by index.ts: the run's retrieval packet, when one was made. */
-	memory: { current(ctx: Any): { prompt: string; text: string } | null; injected(chars: number, at: number): void; reinjected(): void; cancelRetrieval(): void } | null = null;
+	/**
+	 * Where this run's retrieval notes went (indexes into Pi's own messages, which never contain them): the pending note right after
+	 * the prompt once shown; the findings at `finalAt`, the end of the request that first carried them. Later requests repeat both in
+	 * the same places.
+	 */
+	private memoryPendingShown = false;
+	private memoryFinalAt: number | null = null;
+	/** Session memory (src/memory.ts), set by index.ts: the run's retrieval note, when one was made. */
+	memory: {
+		current(ctx: Any): { prompt: string; pending?: string; text: string | null; found?: boolean; delivered?: boolean } | null;
+		injected(chars: number, at: number, kind?: "pending" | "final"): void; reinjected(): void; cancelRetrieval(): void;
+		awaitNote?(ctx: Any, signal?: AbortSignal): Promise<string | null>;
+	} | null = null;
+
+	/** zip_recall with no arguments: the run's retrieval findings, waited for; null when the run has no retrieval. */
+	retrievalNote = (ctx: Any, signal?: AbortSignal): Promise<string | null> =>
+		this.memory?.awaitNote && this.inRun ? this.memory.awaitNote(ctx, signal) : Promise.resolve(null);
 
 	/**
-	 * The run's retrieval packet as one user message right after the run's prompt, in every request of the run: the same place each
-	 * time, so the requests of the run keep one cacheable prefix. Request-local (never persisted). Omitted when the prompt is no longer
-	 * in the request or the note would not fit below Pi's compaction room: retrieval never causes a compaction.
+	 * The run's retrieval notes as user messages, in every request of the run, each at the same place every time so the requests of the
+	 * run keep one cacheable prefix: the pending note right after the prompt; the findings appended at the end of the first request
+	 * after they are ready (never inserted earlier, which would change what was already sent; in the run's first request that is right
+	 * after the prompt). Findings already returned by zip_recall are not repeated. Request-local (never persisted).
+	 * Omitted when the prompt is no longer in the request or the notes would not fit below Pi's compaction room: retrieval never causes
+	 * a compaction.
 	 */
 	private withMemory(messages: Any[], ctx: Any): Any[] | null {
 		if (!this.memory || !this.inRun) return null;
@@ -1419,15 +1436,33 @@ export class Zip implements ZipControl {
 			if (!note) return null;
 			const at = messages.findLastIndex((m: Any) => m?.role === "user" && textOf(m.content) === note.prompt);
 			if (at < 0) return null;
-			const msg = { role: "user", content: [{ type: "text", text: note.text }], timestamp: messages[at].timestamp };
+			const ts = messages[at].timestamp;
+			const msg = (text: string) => ({ role: "user", content: [{ type: "text", text }], timestamp: ts });
+			const ready = note.text !== null && note.text !== undefined;
+			let pending = this.memoryPendingShown, finalAt = this.memoryFinalAt;
+			// findings go at the end of the first request after they are ready (right after the prompt when that is the first request);
+			// "nothing relevant" only closes a pending note that was shown
+			if (finalAt === null && ready && !note.delivered && (pending || note.found !== false)) finalAt = messages.length;
+			if (!pending && finalAt === null && !ready && note.pending) pending = true;
+			if (finalAt !== null && finalAt > messages.length) finalAt = null; // the run's messages were rebuilt: keep what still fits
+			const inserts: Array<[number, Any]> = [];
+			if (pending && note.pending) inserts.push([at + 1, msg(note.pending)]);
+			if (finalAt !== null && note.text) inserts.push([finalAt, msg(note.text)]);
+			if (!inserts.length) return null;
 			const sc = this.scaleOf(ctx);
 			const body = messages.filter((m) => m?.role !== "system").reduce((n: number, m: Any) => n + wireTokensOf(m), 0);
 			const room = compactionRoom(ctx?.model, this.reserve(ctx));
-			if (room !== null && sizeOf(sc, body + wireTokensOf(msg)) > room) return null;
-			if (this.memoryNoteShown) this.memory.reinjected();
-			else this.memory.injected(note.text.length, at + 1);
-			this.memoryNoteShown = true;
-			return [...messages.slice(0, at + 1), msg, ...messages.slice(at + 1)];
+			if (room !== null && sizeOf(sc, body + inserts.reduce((n, [, m]) => n + wireTokensOf(m), 0)) > room) return null;
+			const repeat = (pending && this.memoryPendingShown) || (finalAt !== null && this.memoryFinalAt !== null);
+			if (pending && !this.memoryPendingShown) this.memory.injected(note.pending!.length, at + 1, "pending");
+			if (finalAt !== null && this.memoryFinalAt === null) this.memory.injected(note.text!.length, finalAt, "final");
+			if (repeat) this.memory.reinjected();
+			this.memoryPendingShown = pending;
+			this.memoryFinalAt = finalAt;
+			const out = [...messages];
+			// the findings first (finalAt >= at + 1), so inserting the pending note does not shift them; at one index it comes first
+			for (const [i, m] of inserts.reverse()) out.splice(i, 0, m);
+			return out;
 		} catch (err) {
 			this.ledger({ type: "error", where: "memory_inject", error: errText(err) });
 			return null;

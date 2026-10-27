@@ -1,7 +1,8 @@
-// The retrieval assistant: one isolated, tool-less model call per new user prompt. pi-zip builds the search query from the prompt's own
-// words and searches locally; the model then reads the numbered evidence and writes grounded findings, or nothing.
+// The retrieval assistant: two isolated, tool-less model calls per new user prompt. The planner (planner.ts) writes keyword queries,
+// pi-zip searches locally, and the answer call reads the numbered evidence and writes grounded findings, or nothing.
 // It runs only on read (a new user prompt), never on write, and never decides what is stored.
 import { modelRef, reasoningFor } from "../model-pick.ts";
+import { parsePlan, type Plan, planInput } from "./planner.ts";
 import type { Any } from "../util.ts";
 import { type DropStats, PACKET_LIMITS, type RetrievalPacket, validate } from "./packet.ts";
 import { type Evidence, userText } from "./search.ts";
@@ -12,7 +13,9 @@ export const RETRIEVAL_SYSTEM =
 	"Reasoning excerpts are unverified hypotheses, not results. Historical tool results describe the workspace as it was then, not now. " +
 	"Always reply with a single JSON object and nothing else.";
 
-export const ANSWER_INSTRUCTIONS = `The evidence items are earlier conclusions and hidden tool outputs from this session that the model can no longer see.
+export const ANSWER_INSTRUCTIONS = `The evidence items are earlier records of this session that the model can no longer see: user requests, assistant
+conclusions and mid-turn notes, reasoning, tool calls and tool outputs. A user request item shows what the user asked or decided then.
+A reasoning item is an unverified hypothesis: never report it as a result.
 Evaluate each item independently for the new request. Then summarize only the needed items.
 An item is needed when the new request depends on what it concluded or showed (a decision, a measured result, a file or config
 detail, an explanation, a stated cause or plan) and the visible context does not already supply it.
@@ -39,7 +42,7 @@ If nothing is needed, reply {"needed":[],"findings":[],"folded":[]}.`;
 
 export interface NeedDecision { ref: string; need: "Y" | "N" | "U"; reason: string };
 
-export const EVIDENCE_CHARS = 16_000;
+export const EVIDENCE_CHARS = 24_000;
 const RECENT_CHARS = 1800;
 
 /** Trace is on during tuning. Set PI_ZIP_MEMORY_TRACE=0 to exclude raw reply text. */
@@ -80,7 +83,7 @@ export function buildAnswerInput(prompt: string, recent: string, evidence: Evide
 	const budget = EVIDENCE_CHARS;
 	const sources = evidence.filter((e) => e.hidden);
 	const header = (e: Evidence) =>
-		`${e.ref} ${e.kind === "assistant" ? "conclusion" : e.kind}${e.tool ? ` ${e.tool}` : ""}${e.isError ? " ERROR" : ""}${e.folded ? " folded" : ""} [handle ${e.handle}] — ${e.title}${e.outcome ? ` [whole output: ${e.outcome}]` : ""} (${recordedAt(e.at, now)})`;
+		`${e.ref} ${KIND_LABEL[e.kind] ?? e.kind}${e.tool ? ` ${e.tool}` : ""}${e.isError ? " ERROR" : ""}${e.folded ? " folded" : ""} [handle ${e.handle}] — ${e.title}${e.outcome ? ` [whole output: ${e.outcome}]` : ""} (${recordedAt(e.at, now)})`;
 	const bySource = new Map<string, string[]>();
 	const owners = new Map<string, Map<string, Evidence>>();
 	for (const e of sources) {
@@ -142,6 +145,12 @@ export function buildAnswerInput(prompt: string, recent: string, evidence: Evide
 	return { text: head + body, sent, evidenceChars: body.length, passages: selected.size,
 		sharedPassages: [...selected].filter((part) => part.length > 0 && owners.get(part)!.size > 1).length };
 }
+
+/** How an evidence kind reads in the answer input. */
+const KIND_LABEL: Record<string, string> = {
+	assistant: "conclusion", assistant_text: "assistant mid-turn text", user: "user request", thinking: "reasoning (unverified)",
+	tool_call: "tool call", tool_result: "tool_result", custom: "extension message",
+};
 
 /** The model's reply mapped to a packet (E ids -> handles), then validated against the evidence. Null when it does not parse. */
 export function parseReply(reply: string, evidence: Evidence[], requestId: string, revision: string, drops?: DropStats, decisions: NeedDecision[] = []): RetrievalPacket | null {
@@ -209,7 +218,7 @@ export async function retrievalModel(ctx: Any): Promise<{ model: Any; level?: st
 
 /** One model call: timing, cost, and returned text. Raw reply logging defaults on during tuning; PI_ZIP_MEMORY_TRACE=0 disables it. */
 export interface CallInfo {
-	step: "answer";
+	step: "plan" | "answer";
 	model?: string;
 	level?: string;
 	ms: number;
@@ -230,7 +239,6 @@ export interface CallInfo {
  * run's signal, no tools. The search itself is local (src/retrieval/search.ts); the model only reads what it returned.
  */
 export class RetrievalConversation {
-	private messages: Any[] = [];
 	private model: Any = null;
 	private level: string | undefined;
 	readonly calls: CallInfo[] = [];
@@ -239,7 +247,7 @@ export class RetrievalConversation {
 
 	constructor(private ctx: Any, private signal?: AbortSignal) {}
 
-	private async ask(step: CallInfo["step"], text: string): Promise<string | null> {
+	private async ask(step: CallInfo["step"], text: string, o: { lowest?: boolean; maxTokens?: number } = {}): Promise<string | null> {
 		const t0 = Date.now();
 		const info: CallInfo = { step, ms: 0, costUsd: 0 };
 		this.calls.push(info);
@@ -251,17 +259,20 @@ export class RetrievalConversation {
 				this.level = picked.level;
 			}
 			info.model = `${this.model.provider}/${this.model.id}`;
-			info.level = this.level;
+			// The planner runs at the lowest level the model supports: it only extracts keywords, and the main model waits for it.
+			// A model that gets no level for the answer call gets none here either.
+			const level = o.lowest && this.level !== undefined ? reasoningFor(this.model, "off", this.ctx?.modelRegistry) ?? this.level : this.level;
+			info.level = level;
 			const timeout = Number(process.env.PI_ZIP_RETRIEVAL_TIMEOUT_MS) > 0 ? Number(process.env.PI_ZIP_RETRIEVAL_TIMEOUT_MS) : 20_000;
 			const sig = AbortSignal.any([AbortSignal.timeout(timeout), ...(this.signal ? [this.signal] : [])]);
-			const maxTokens = Math.min(4000, Number(this.model.maxTokens) > 0 ? Number(this.model.maxTokens) : 4000);
+			const maxTokens = Math.min(o.maxTokens ?? 4000, Number(this.model.maxTokens) > 0 ? Number(this.model.maxTokens) : 4000);
 			const user = { role: "user", content: [{ type: "text", text }], timestamp: Date.now() };
-			const context = { systemPrompt: RETRIEVAL_SYSTEM, messages: [...this.messages, user] };
+			const context = { systemPrompt: RETRIEVAL_SYSTEM, messages: [user] };
 			const options = { maxTokens, signal: sig, cacheRetention: "short" };
 			sig.throwIfAborted(); // cancellation may arrive while model selection is awaiting the registry
 			const reg = this.ctx.modelRegistry;
-			const res: Any = this.level && reg.streamSimple
-				? await reg.streamSimple(this.model, context, { ...options, reasoning: this.level }).result()
+			const res: Any = level && reg.streamSimple
+				? await reg.streamSimple(this.model, context, { ...options, reasoning: level }).result()
 				: await reg.complete(this.model, context, options);
 			const u = res?.usage ?? {};
 			info.costUsd = Number(u?.cost?.total) || 0;
@@ -277,7 +288,6 @@ export class RetrievalConversation {
 			sig.throwIfAborted();
 			if (["error", "aborted", "length"].includes(String(res?.stopReason))) throw new Error(res?.errorMessage || `retrieval stopped: ${res?.stopReason}`);
 			if ((res?.content ?? []).some((c: Any) => c?.type === "toolCall")) throw new Error("retrieval model attempted a tool call");
-			this.messages.push(user, { ...res, content: [{ type: "text", text: reply }] });
 			return reply;
 		} catch (err) {
 			info.error = err instanceof Error ? err.message : String(err);
@@ -290,7 +300,16 @@ export class RetrievalConversation {
 	/** The input size, for the log (how close the call came to its caps). */
 	stats = { inputChars: 0, evidenceChars: 0, evidenceItems: 0, sentRefs: [] as string[], passages: 0, sharedPassages: 0 };
 
-	/** The one call. Null on any failure (the run goes on without retrieval). `drops` counts what validation removed. */
+	/** The planner call: a continuation verdict and keyword queries. Null on any failure (the caller searches the request's own words). */
+	async plan(request: string, tail: string): Promise<Plan | null> {
+		const reply = await this.ask("plan", planInput(request, tail), { lowest: true, maxTokens: 1500 });
+		if (reply === null) return null;
+		const p = parsePlan(reply);
+		if (!p) this.calls[this.calls.length - 1].error = "reply is not a valid plan";
+		return p;
+	}
+
+	/** The answer call. Null on any failure (the run goes on without retrieval). `drops` counts what validation removed. */
 	async answer(prompt: string, recent: string, evidence: Evidence[], requestId: string, revision: string, drops?: DropStats): Promise<RetrievalPacket | null> {
 		const input = buildAnswerInput(prompt, recent, evidence);
 		this.stats.inputChars = input.text.length;

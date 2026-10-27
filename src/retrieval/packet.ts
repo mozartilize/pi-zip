@@ -1,7 +1,7 @@
 // The retrieval packet: validated findings and folded-output handles, rendered as one short request-local note.
 import type { Evidence } from "./search.ts";
 
-export type FindingStatus = "verified" | "historical" | "uncertain";
+export type FindingStatus = "verified" | "historical" | "request" | "uncertain";
 
 export interface RetrievalPacket {
 	requestId: string;
@@ -19,12 +19,13 @@ const clip = (s: string, n: number) => {
 
 /**
  * A finding's status comes from what it cites, not from the model's word: a cited tool result (an error output too: it showed the
- * error) is "verified" (rendered "seen in output"); an earlier conclusion or other prose is "historical" ("earlier conclusion"); reasoning alone is
- * "uncertain". The model can only lower a status to "uncertain", never raise one.
+ * error) is "verified" (rendered "seen in output"); user requests alone are "request" ("earlier user request"); an earlier conclusion or other
+ * prose is "historical" ("earlier conclusion"); reasoning alone is "uncertain". The model can only lower a status to "uncertain", never raise one.
  */
 export function statusFor(asked: unknown, cited: Evidence[]): FindingStatus {
 	if (!cited.length || cited.every((e) => e.kind === "thinking") || asked === "uncertain") return "uncertain";
-	return cited.some((e) => e.kind === "tool_result") ? "verified" : "historical";
+	if (cited.some((e) => e.kind === "tool_result")) return "verified";
+	return cited.every((e) => e.kind === "user") ? "request" : "historical";
 }
 
 /** Why the model's reply lost items: a cited handle that was never retrieved, or a cap. Filled for the tuning log. */
@@ -68,7 +69,7 @@ export const PACKET_TAIL =
  * How a status reads in the note. "verified" means a tool output showed it at the time it was recorded, not that it holds now; the
  * note says so in words, next to the item's age.
  */
-export const STATUS_LABEL: Record<string, string> = { verified: "seen in output", historical: "earlier conclusion", uncertain: "uncertain" };
+export const STATUS_LABEL: Record<string, string> = { verified: "seen in output", historical: "earlier conclusion", request: "earlier user request", uncertain: "uncertain" };
 
 /** `ages`: handle -> "38 min ago", so the main model sees how old each cited fact is. */
 export function renderPacket(p: RetrievalPacket, ages: Map<string, string> = new Map()): string | null {

@@ -456,6 +456,8 @@ export function recalledHandlesFromBranch(branch: Any[]): Set<string> {
 export interface RecallHooks {
 	onRecall(handles: string[], chars: number, entryIds: (string | null)[]): void;
 	labelOf?(handle: string): string | undefined; // "read src/learn.ts" for a handle folded in this branch
+	/** No arguments: the current run's historical retrieval findings, waited for; null when the run has none. */
+	retrievalNote?(ctx: Any, signal?: AbortSignal): Promise<string | null>;
 }
 
 export function registerRecallTool(pi: ExtensionAPI, hooks: RecallHooks) {
@@ -470,7 +472,8 @@ export function registerRecallTool(pi: ExtensionAPI, hooks: RecallHooks) {
 			"A summary that quotes a very long user request with its middle left out names that request's handle too: recall returns the whole request. " +
 			'For a part, add grep (case-insensitive regular expression; matching lines with line numbers) or range (e.g. "120-240"). ' +
 			"No handle at hand? grep alone searches every earlier tool output of the session and labels each match with its output's handle and command. " +
-			"Large results come in pages of characters: when a page says more is left, call again with offset.",
+			"Large results come in pages of characters: when a page says more is left, call again with offset. " +
+			"With no arguments: wait for the pending historical retrieval of the current request (a pi-zip note says when one is running) and return its findings.",
 		parameters: {
 			type: "object",
 			properties: {
@@ -493,7 +496,7 @@ export function registerRecallTool(pi: ExtensionAPI, hooks: RecallHooks) {
 			const secs: RecallSectionInfo[] = Array.isArray(result?.details?.sections) ? result.details.sections : [];
 			return lines((w) => recallResultLines(secs, text, !!options?.expanded, w, theme, measure));
 		},
-		async execute(_id: string, params: Any, _signal: Any, _onUpdate: Any, ctx: Any): Promise<Any> {
+		async execute(_id: string, params: Any, signal: Any, _onUpdate: Any, ctx: Any): Promise<Any> {
 			const grep = params?.grep !== undefined ? String(params.grep) : undefined;
 			const range = params?.range !== undefined ? String(params.range) : undefined;
 			const requests = params?.requests !== undefined ? String(params.requests).trim() : undefined;
@@ -535,7 +538,11 @@ export function registerRecallTool(pi: ExtensionAPI, hooks: RecallHooks) {
 					return { content: [{ type: "text", text: `${RECALL_TOOL} failed: ${err instanceof Error ? err.message : String(err)}` }], details: {}, isError: true };
 				}
 			}
-			if (!handles.length) return { content: [{ type: "text", text: "Pass handle (one string), handles (array), or requests (e.g. \"1-5\"); or grep alone to search earlier session records." }], details: {}, isError: true };
+			if (!handles.length && !requests && grep === undefined && hooks.retrievalNote) {
+				const note = await hooks.retrievalNote(ctx, signal ?? undefined).catch(() => null);
+				if (note !== null) return { content: [{ type: "text", text: note }], details: { retrieval: true, sections: [] }, isError: false };
+			}
+			if (!handles.length) return { content: [{ type: "text", text: "Pass handle (one string), handles (array), or requests (e.g. \"1-5\"); or grep alone to search earlier session records. (No historical retrieval is pending for this request.)" }], details: {}, isError: true };
 			try {
 				const { items, entryIds } = resolveHandlesInBranch(ctx.sessionManager.getBranch() as Any[], handles);
 				const out = recallSections(items, { grep, range, offset, limit });

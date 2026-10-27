@@ -91,15 +91,16 @@ describe("retrieve", () => {
 		expect(named.excerpt).not.toContain("private hypothesis");
 	});
 
-	test("only hidden conclusions and tool outputs on the active branch are candidates: visible, sibling-branch and mid-turn text are not", () => {
+	test("every text before the latest compaction on the active branch is a candidate (requests, mid-turn text, reasoning, outputs); sibling-branch text is not", () => {
 		const { s, l } = indexed(withSibling(), { leaf: "om", hidden: [...COMPACTED, "a6"] });
 		const ids = (prompt: string) => retrieve(l.db, q(prompt), scopeOf(s.ctx)).evidence.map((e) => e.entryId);
-		expect(ids("how were the sockets fixed")).toEqual(["a3"]); // a6 matches too, on the sibling branch
-		expect(ids("running first")).toEqual([]); // a1: hidden, matching, but mid-turn assistant text (not a conclusion or tool output)
-		expect(ids("PASS 12 tests")).toEqual(["r3"]); // a hidden tool output on the active branch is a candidate
+		expect(ids("how were the sockets fixed")).toContain("a3");
+		expect(ids("how were the sockets fixed")).not.toContain("a6"); // a6 matches too, on the sibling branch
+		expect(retrieve(l.db, q("running first"), scopeOf(s.ctx)).evidence.map((e) => [e.entryId, e.kind])).toEqual([["a1", "assistant_text"]]); // mid-turn text
+		expect(ids("PASS 12 tests")[0]).toBe("r3"); // a hidden tool output on the active branch is a candidate
 		s.state.leaf = "a6"; // /tree to the sibling: no compaction on that branch, so nothing there is hidden
 		expect(ids("how were the sockets fixed")).toEqual([]);
-		const shown = indexed(withSibling(), { leaf: "om" }); // nothing hidden: a3 is in the view
+		const shown = indexed(fixtureEntries().slice(0, 7)); // no compaction and no fold: nothing is searchable
 		expect(retrieve(shown.l.db, q("how were the sockets fixed"), scopeOf(shown.s.ctx)).evidence).toEqual([]);
 	});
 
@@ -334,22 +335,23 @@ describe("retrieve", () => {
 
 	test("a conclusion is quoted from its own text and titled by the request it answered", () => {
 		const { s, l } = indexed(fixtureEntries(), { leaf: "om", hidden: COMPACTED });
-		const [a3] = retrieve(l.db, q("sockets"), scopeOf(s.ctx)).evidence;
+		const a3 = retrieve(l.db, q("sockets"), scopeOf(s.ctx)).evidence.find((e) => e.entryId === "a3")!;
 		expect(a3).toMatchObject({ kind: "assistant", hidden: "compacted", handle: handleFor("a3"), folded: false, excerpt: "Fixed by closing sockets in the pool.",
 			title: 'answer to: "fix the retry timeout in src/retry.ts"' });
-		expect(answerInput("x", "", [a3])).toContain(`E1 conclusion [handle ${handleFor("a3")}] — answer to: "fix the retry timeout in src/retry.ts"`);
+		expect(answerInput("x", "", [{ ...a3, ref: "E1" }])).toContain(`E1 conclusion [handle ${handleFor("a3")}] — answer to: "fix the retry timeout in src/retry.ts"`);
 	});
 
 	test("the hidden boundary follows Pi's own projection; with no projection nothing is hidden", () => {
 		const s = fakeSession(fixtureEntries(), { leaf: "om" });
 		s.sm.buildSessionProjection = () => buildSessionProjection(s.state.entries, s.state.leaf);
 		const real = scopeOf(s.ctx);
-		expect([...real.hidden.keys()].sort()).toEqual(["a1", "a2", "a3", "r1", "r2", "r3", "u1"]);
-		expect(real.visible.has("u3")).toBe(true); // firstKept is retained
+		// everything before the compaction record, also the kept part from firstKept u3 on (still visible, but searchable)
+		expect([...real.hidden.keys()].sort()).toEqual(["a1", "a2", "a3", "a4", "r1", "r2", "r3", "r4", "u1", "u3"]);
+		expect(real.visible.has("u3")).toBe(true);
 		const l = Ledger.open(readSource(s.ctx)!, join(s.dir, "x.sqlite"));
 		open.push(l);
 		l.reconcile(readSource(s.ctx)!);
-		expect(retrieve(l.db, q("sockets fixed"), real).evidence.map((e) => e.entryId)).toEqual(["a3"]);
+		expect(retrieve(l.db, q("sockets fixed"), real).evidence.map((e) => e.entryId).sort()).toEqual(["a1", "a3"]); // a1: its reasoning names sockets; a5 (after the compaction) is not searched
 		s.sm.buildSessionProjection = () => { throw new Error("projection unavailable"); };
 		expect(retrieve(l.db, q("sockets fixed"), scopeOf(s.ctx)).evidence).toEqual([]);
 	});
@@ -396,17 +398,17 @@ describe("retrieve", () => {
 		expect(queryOf("<skill>a</skill> one <skill>b</skill> two").tokens).toEqual(["one", "two"]); // two blocks, text between kept
 	});
 
-	test("visible conclusions that outrank a hidden one cannot fill the FTS rows before it is considered", () => {
+	test("entries after the latest compaction record are not candidates, even when they rank higher", () => {
 		const entries: Any[] = [user("u1", null, "start"), asst("a1", "u1", [{ type: "text", text: "retry happened once" }])];
-		let parent = "a1";
-		for (let i = 2; i <= 6; i++) { // five visible conclusions that rank higher for "retry"
+		entries.push(E("cm", "a1", { type: "compaction", summary: "s", firstKeptEntryId: "a1", tokensBefore: 1 }));
+		let parent = "cm";
+		for (let i = 2; i <= 6; i++) { // five later conclusions that rank higher for "retry"
 			entries.push(user(`u${i}`, parent, "again"), asst(`a${i}`, `u${i}`, [{ type: "text", text: "retry retry retry retry" }]));
 			parent = `a${i}`;
 		}
-		entries.push(E("cm", parent, { type: "compaction", summary: "s", firstKeptEntryId: "u2", tokensBefore: 1 })); // positive mark of hiding
-		const { s: sess, l } = indexed(entries, { hidden: ["u1", "a1"] });
+		const { s: sess, l } = indexed(entries, { hidden: ["u1"] });
 		const ev = retrieve(l.db, q("retry"), scopeOf(sess.ctx), { ...DEFAULT_LIMITS, ftsRows: 2 }).evidence;
-		expect(ev.map((e) => e.entryId)).toEqual(["a1"]);
+		expect(ev.map((e) => e.entryId)).toEqual(["a1"]); // a1 is kept in view by the compaction, and still searchable
 	});
 
 	test("a compaction that keeps nothing before it hides everything before it, as Pi's own projection does", () => {
@@ -419,11 +421,30 @@ describe("retrieve", () => {
 		}
 	});
 
-	test("handles in the prompt name their outputs exactly, each kept, also two results of one step; a visible one is not repeated", () => {
+	test("planner keyword sets merge round-robin (an entry one facet finds is not buried), and a matched call brings its result", () => {
+		const entries: Any[] = [user("u1", null, "start")];
+		let parent = "u1";
+		for (const id of ["a1", "a2", "a3"]) { // match two sets each: summed fusion would rank all three above y
+			entries.push(asst(id, parent, [{ type: "text", text: "alpha beta alpha beta" }]));
+			parent = id;
+		}
+		entries.push(asst("y", parent, [{ type: "text", text: "the gamma decision was taken because of the outage" }]),
+			asst("c", "y", [call("k1", "bash", { command: "deployxyz --prod" })]), result("r", "c", "k1", "bash", "ok done"),
+			E("cm", "r", { type: "compaction", summary: "s", firstKeptEntryId: "cm", tokensBefore: 1 }));
+		const { s: sess, l } = indexed(entries);
+		sess.sm.buildSessionProjection = () => buildSessionProjection(sess.state.entries, sess.state.leaf);
+		const ids = retrieve(l.db, { tokens: [], handles: [], sets: [{ keywords: ["alpha"] }, { keywords: ["beta"] }, { keywords: ["gamma"] }] }, scopeOf(sess.ctx)).evidence.map((e) => e.entryId);
+		expect(ids.indexOf("y")).toBeGreaterThanOrEqual(0);
+		expect(ids.indexOf("y")).toBeLessThan(ids.indexOf("a3"));
+		const hop = retrieve(l.db, { tokens: [], handles: [], sets: [{ keywords: ["deployxyz"] }] }, scopeOf(sess.ctx)).evidence;
+		expect(hop.map((e) => [e.entryId, e.kind])).toEqual([["c", "tool_call"], ["r", "tool_result"]]); // "ok done" matches nothing itself
+	});
+
+	test("handles in the prompt name their outputs exactly, each kept, also two results of one step", () => {
 		const { s: sess, l } = indexed(fixtureEntries(), { leaf: "om", folded: ["r1", "r2"] });
 		const [h1, h2, h3] = [handleFor("r1"), handleFor("r2"), handleFor("r3")]; // r1, r2: both results of a1's calls
 		const ev = retrieve(l.db, q(`compare ${h2} with ${h1} and ${h3}`), scopeOf(sess.ctx)).evidence;
-		expect(ev.map((e) => [e.entryId, e.exact, e.folded])).toEqual([["r2", true, true], ["r1", true, true]]); // r3 is visible
+		expect(ev.map((e) => [e.entryId, e.exact, e.folded])).toEqual([["r2", true, true], ["r1", true, true], ["r3", true, true]]); // r3: before the compaction
 	});
 
 
@@ -433,12 +454,13 @@ const ev = (over: Partial<Evidence>): Evidence => ({ at: 0, outcome: "", ref: "E
 
 describe("evidence packing", () => {
 	test("packs sources before extra passages/thinking and skips oversized items without blocking later evidence", () => {
-		const first = "primary_a " + "a".repeat(5900), extra = "optional_a " + "b".repeat(5900);
-		const second = "primary_b " + "c".repeat(5900);
+		const n = Math.floor(EVIDENCE_CHARS * 0.37); // two primaries fit, a third passage does not
+		const first = "primary_a " + "a".repeat(n), extra = "optional_a " + "b".repeat(n);
+		const second = "primary_b " + "c".repeat(n);
 		const evidence = [
-			ev({ excerpt: [first, extra].join(" … "), passages: [first, extra], context: ["unverified " + "d".repeat(5000)] }),
+			ev({ excerpt: [first, extra].join(" … "), passages: [first, extra], context: ["unverified " + "d".repeat(n)] }),
 			ev({ ref: "E2", handle: "second0000", entryId: "second", excerpt: second, passages: [second] }),
-			ev({ ref: "E3", handle: "huge000000", entryId: "huge", excerpt: "x".repeat(20_000) }),
+			ev({ ref: "E3", handle: "huge000000", entryId: "huge", excerpt: "x".repeat(EVIDENCE_CHARS + 4000) }),
 			ev({ ref: "E4", handle: "last000000", entryId: "last", excerpt: "small_late_fact: 719" }),
 		];
 		const packed = buildAnswerInput("compare results", "recent task", evidence);
@@ -483,7 +505,7 @@ describe("evidence packing", () => {
 		expect(comparison.findings[0].sourceHandles).toEqual(["old0000000", "new0000000"]);
 	});
 
-	test("the 16k evidence budget excludes the separately bounded request/recent header", () => {
+	test("the evidence budget excludes the separately bounded request/recent header", () => {
 		const quote = "large_complete_quote " + "x".repeat(EVIDENCE_CHARS - 600);
 		const packed = buildAnswerInput("long_request ".repeat(1000), "recent_context ".repeat(1000), [ev({ excerpt: quote })]);
 		expect(packed.sent.map((e) => e.ref)).toEqual(["E1"]);
@@ -566,7 +588,7 @@ describe("packet validation", () => {
 			findings: [{ summary: "invented from unsent item", evidence: ["E2"] }],
 		})]);
 		const conv = new RetrievalConversation({ modelRegistry: reg, model: { provider: "p" } });
-		const evidence = [ev({ excerpt: "small" }), ev({ ref: "E2", handle: "bbbbbbbbbb", excerpt: "x".repeat(16_000) })];
+		const evidence = [ev({ excerpt: "small" }), ev({ ref: "E2", handle: "bbbbbbbbbb", excerpt: "x".repeat(EVIDENCE_CHARS) })];
 		const packet = await conv.answer("request", "", evidence, "r", "v");
 		expect(sent[0].messages[0].content[0].text).not.toContain("E2 tool_result");
 		expect(conv.stats.evidenceItems).toBe(1);
@@ -660,8 +682,10 @@ afterAll(() => { if (AMBIENT_MODEL !== undefined) process.env.PI_ZIP_JUDGE_MODEL
 
 describe("Memory at a new user prompt", () => {
 	const PROMPT = "how were the sockets fixed?";
-	// The one call's reply: a finding from the earlier conclusion a3.
+	// The planner's reply, then the answer call's reply: a finding from the earlier conclusion.
+	const PLAN = JSON.stringify({ continue: false, queries: [{ facet: "how", lang: "en", keywords: ["sockets", "fixed"] }] });
 	const ANSWER = '{"needed":[{"evidence":"E1","reason":"The request asks how the sockets were fixed."}],"findings":[{"summary":"Earlier the retry timeout was fixed by closing sockets in the pool.","evidence":["E1"],"status":"historical"}],"folded":[]}';
+	const isPlan = (context: Any) => String(context?.messages?.[0]?.content?.[0]?.text ?? "").startsWith("You prepare keyword searches");
 
 	async function run(replies: Array<string | Error>, e: Any = { messageType: "user", prompt: PROMPT }, o: Parameters<typeof fakeSession>[1] = { hidden: COMPACTED }, entries: Any[] = withSibling()) {
 		const s = fakeSession(entries, { leaf: "om", ...o });
@@ -671,6 +695,7 @@ describe("Memory at a new user prompt", () => {
 		const mem = new Memory((r) => logs.push(r));
 		mem.sessionStart(ctx);
 		await mem.beforeAgentStart(ctx, e);
+		await mem.settled();
 		const note = mem.current(ctx);
 		mem.shutdown();
 		return { sent, note, logs, retrieval: logs.find((r) => r.type === "memory_retrieval"), ctx };
@@ -685,15 +710,97 @@ describe("Memory at a new user prompt", () => {
 		expect(answerInput("x", "", [e])).toContain("[whole output: exit 1, 21 passed, 1 failed]");
 	});
 
-	test("a prepared note that no request carried is logged as dropped, with no usage record", async () => {
+	test("plan, then search, then the answer: the planner's keywords are the query and the note cites the real handle", async () => {
+		const { sent, note, retrieval } = await run([PLAN, ANSWER]);
+		expect(sent.map(isPlan)).toEqual([true, false]);
+		expect(sent[0].messages[0].content[0].text).toContain(PROMPT);
+		const input = sent[1].messages[0].content[0].text;
+		expect(input).toContain(`conclusion [handle ${handleFor("a3")}] — answer to: "fix the retry timeout in src/retry.ts"`);
+		expect(input).not.toContain("sibling branch");
+		expect(retrieval.queries).toEqual([{ facet: "how", lang: "en", keywords: ["sockets", "fixed"] }]);
+		expect(retrieval.calls.map((c: Any) => c.step)).toEqual(["plan", "answer"]);
+		expect(note).toMatchObject({ found: true });
+		expect(note!.text).toMatch(new RegExp(`Evidence: ${handleFor("a3")} \\([0-9.]+ (min|h|d) ago\\) \\[earlier conclusion\\]`));
+		expect(note!.text).not.toContain(handleFor("a6"));
+		expect(retrieval).toMatchObject({ findings: 1, folded: 0, stage: "prepared" });
+	});
+
+	test("a continuation ends after the plan; an invalid plan falls back to the request's words; nothing found costs no answer call", async () => {
+		const cont = await run(['{"continue":true,"queries":[]}']);
+		expect([cont.sent.length, cont.note, cont.retrieval.skip]).toEqual([1, null, "continuation"]);
+		const fallback = await run(["not json", ANSWER]);
+		expect(fallback.sent.length).toBe(2);
+		expect(fallback.retrieval.terms).toContain("sockets");
+		const none = await run([JSON.stringify({ continue: false, queries: [{ keywords: ["zzzqqq"] }] })]);
+		expect([none.sent.length, none.note, none.retrieval.skip]).toEqual([1, null, "no candidates"]);
+	});
+
+	test("the main model waits for the plan and the search only; the answer runs on, and only the current live run receives it", async () => {
+		for (const action of ["keep", "end", "tree", "compact", "session", "shutdown", "new-prompt"]) {
+			const s = fakeSession(withSibling(), { leaf: "om", hidden: COMPACTED });
+			const { reg } = registry([]);
+			const finishers: Array<(r: Any) => void> = [];
+			const finish = (r: Any) => finishers.forEach((f) => f(r));
+			let signal: AbortSignal | undefined;
+			(reg as Any).complete = (_m: Any, context: Any, options: Any) => {
+				if (isPlan(context)) return Promise.resolve({ role: "assistant", stopReason: "stop", content: [{ type: "text", text: PLAN }] });
+				signal ??= options.signal; // the first run's answer call
+				return new Promise((resolve) => { finishers.push(resolve); }); // deliberately ignores abort
+			};
+			const ctx = { ...s.ctx, modelRegistry: reg };
+			const mem = new Memory(() => {});
+			try {
+				mem.sessionStart(ctx);
+				await mem.beforeAgentStart(ctx, { messageType: "user", prompt: PROMPT });
+				const settled = mem.settled();
+				expect(mem.current(ctx)).toMatchObject({ text: null, pending: expect.stringContaining("zip_recall") });
+				if (action === "end") mem.agentEnd(ctx);
+				if (action === "tree") mem.catchUp(ctx, "session_tree");
+				if (action === "compact") mem.catchUp(ctx, "session_compact");
+				if (action === "session") mem.sessionStart(ctx);
+				if (action === "shutdown") mem.shutdown();
+				if (action === "new-prompt") await mem.beforeAgentStart(ctx, { messageType: "user", prompt: "zzzqqq wwwyyy" });
+				finish({ role: "assistant", stopReason: "stop", content: [{ type: "text", text: ANSWER }] });
+				await settled;
+				if (action === "keep") expect(mem.current(ctx)).toMatchObject({ found: true });
+				else {
+					expect(signal!.aborted).toBe(true);
+					expect(mem.current(ctx)?.prompt ?? null).not.toBe(PROMPT); // a new prompt may have its own note, never this one
+				}
+			} finally { mem.shutdown(); }
+		}
+	});
+
+	test("zip_recall with no arguments waits for the findings, which then are not injected again", async () => {
 		const s = fakeSession(withSibling(), { leaf: "om", hidden: COMPACTED });
-		const { reg } = registry([ANSWER]);
+		const { reg } = registry([]);
+		let finish!: (r: Any) => void;
+		(reg as Any).complete = (_m: Any, context: Any) => isPlan(context)
+			? Promise.resolve({ role: "assistant", stopReason: "stop", content: [{ type: "text", text: PLAN }] })
+			: new Promise((resolve) => { finish = resolve; });
 		const ctx = { ...s.ctx, modelRegistry: reg };
 		const logs: Any[] = [];
 		const mem = new Memory((r) => logs.push(r));
 		mem.sessionStart(ctx);
 		await mem.beforeAgentStart(ctx, { messageType: "user", prompt: PROMPT });
-		expect(mem.current(ctx)).not.toBeNull();
+		const waiting = mem.awaitNote(ctx);
+		finish({ role: "assistant", stopReason: "stop", content: [{ type: "text", text: ANSWER }] });
+		const text = await waiting;
+		expect(text).toContain(handleFor("a3"));
+		expect(mem.current(ctx)).toMatchObject({ delivered: true });
+		expect(logs.find((r) => r.type === "memory_wait")).toMatchObject({ ready: true, found: true });
+		mem.shutdown();
+	});
+
+	test("findings that never reached the model are logged as dropped, with no usage record", async () => {
+		const s = fakeSession(withSibling(), { leaf: "om", hidden: COMPACTED });
+		const { reg } = registry([PLAN, ANSWER]);
+		const ctx = { ...s.ctx, modelRegistry: reg };
+		const logs: Any[] = [];
+		const mem = new Memory((r) => logs.push(r));
+		mem.sessionStart(ctx);
+		await mem.beforeAgentStart(ctx, { messageType: "user", prompt: PROMPT });
+		await mem.settled();
 		mem.agentEnd(ctx); // no injected() call
 		const id = logs.find((r) => r.type === "memory_retrieval").requestId;
 		expect(logs.filter((r) => r.type === "memory_dropped")).toEqual([expect.objectContaining({ requestId: id })]);
@@ -704,18 +811,18 @@ describe("Memory at a new user prompt", () => {
 	test("the trace keeps the note text, and agent_end records whether the run used the cited handles", async () => {
 		for (const [used, recall, name] of [[true, true, true], [false, false, false], [false, false, true]] as const) {
 			const s = fakeSession(withSibling(), { leaf: "om", hidden: COMPACTED });
-			const { reg } = registry([ANSWER]);
+			const { reg } = registry([PLAN, ANSWER]);
 			const ctx = { ...s.ctx, modelRegistry: reg };
 			const logs: Any[] = [];
 			const mem = new Memory((r) => logs.push(r));
 			mem.sessionStart(ctx);
 			await mem.beforeAgentStart(ctx, { messageType: "user", prompt: PROMPT });
+			await mem.settled();
 			const note = mem.current(ctx)!;
 			const retrieval = logs.find((r) => r.type === "memory_retrieval");
 			expect(retrieval.note).toBe(note.text);
 			const h = handleFor("a3");
-			mem.injected(note.text.length, 1);
-			// the run: the prompt, then a recall of the cited handle (or of something else), then a final answer naming it (or not)
+			mem.injected(note.text!.length, 1);
 			const msg = (id: string, parentId: string, message: Any) => ({ type: "message", id, parentId, timestamp: "2026-01-01T00:00:00Z", message });
 			s.state.entries.push(
 				msg("p1", "om", { role: "user", content: [{ type: "text", text: PROMPT }] }),
@@ -730,82 +837,64 @@ describe("Memory at a new user prompt", () => {
 			expect(usage.mentioned).toEqual(name ? [h] : []); // named only: recorded, but not "used"
 			mem.shutdown();
 		}
-		// a note that never went into a request gets no usage record
-		const { logs } = await run([ANSWER]);
-		expect(logs.some((r) => r.type === "memory_usage")).toBe(false);
 	});
 
 	test("rejected items stay in the trace but never enter the note", async () => {
-		const reply = JSON.stringify({
-			needed: [],
-			findings: [{ summary: "must not inject", evidence: ["E1"] }],
-			folded: [{ evidence: "E1", reason: "must not inject" }],
-		});
-		const { sent, note, retrieval } = await run([reply]);
-		expect(sent).toHaveLength(1);
-		expect(note).toBeNull();
+		const reply = JSON.stringify({ needed: [], findings: [{ summary: "must not inject", evidence: ["E1"] }], folded: [{ evidence: "E1", reason: "must not inject" }] });
+		const { sent, note, retrieval } = await run([PLAN, reply]);
+		expect(sent).toHaveLength(2);
+		expect(note).toMatchObject({ found: false, text: expect.not.stringContaining("must not inject") });
 		expect(retrieval.skip).toBe("nothing relevant");
 		expect(retrieval.evidence[0]).toMatchObject({ hidden: "compacted", cited: false });
-		expect(retrieval.decisions[0].need).toBe("N");
+		expect(retrieval.decisions.every((d: Any) => d.need === "N")).toBe(true);
 		expect(retrieval.drops.notNeeded).toBe(2);
 	});
 
-	test("reasoning level: low by default on reasoning models, explicit level wins, non-reasoning models send none", async () => {
-		const cases: Array<[Partial<Any>, string | undefined, string | undefined]> = [
-			[{ reasoning: true }, undefined, "low"],
-			[{ reasoning: true }, "p/cheap:high", "high"],
-			[{ reasoning: false }, undefined, undefined],
-			[{}, undefined, undefined], // no capability metadata: provider default
+	test("reasoning: the planner at the lowest level, the answer low by default; explicit level wins; non-reasoning models send none", async () => {
+		const cases: Array<[Partial<Any>, string | undefined, string | undefined, string | undefined]> = [
+			[{ reasoning: true }, undefined, "off", "low"],
+			[{ reasoning: true }, "p/cheap:high", "off", "high"],
+			[{ reasoning: false }, undefined, undefined, undefined],
+			[{}, undefined, undefined, undefined], // no capability metadata: provider default
 		];
-		for (const [over, setting, expected] of cases) {
+		for (const [over, setting, plan, answer] of cases) {
 			if (setting) process.env.PI_ZIP_JUDGE_MODEL = setting; else delete process.env.PI_ZIP_JUDGE_MODEL;
 			const s = fakeSession(withSibling(), { leaf: "om", hidden: COMPACTED });
-			const { options, reg } = registry([ANSWER], over);
+			const { options, reg } = registry([PLAN, ANSWER], over);
 			const streamed: Any[] = [];
-			(reg as Any).streamSimple = (_m: Any, _c: Any, opts: Any) => {
+			(reg as Any).streamSimple = (_m: Any, c: Any, opts: Any) => {
 				streamed.push({ ...opts });
-				return { result: async () => ({ role: "assistant", stopReason: "stop", content: [{ type: "text", text: ANSWER }], usage: {} }) };
+				return { result: async () => ({ role: "assistant", stopReason: "stop", content: [{ type: "text", text: isPlan(c) ? PLAN : ANSWER }], usage: {} }) };
 			};
 			const ctx = { ...s.ctx, modelRegistry: reg };
 			const mem = new Memory(() => {});
 			mem.sessionStart(ctx);
 			await mem.beforeAgentStart(ctx, { messageType: "user", prompt: PROMPT });
+			await mem.settled();
 			const sentOpts = [...streamed, ...options];
-			expect(sentOpts).toHaveLength(1);
-			expect(sentOpts[0].reasoning).toBe(expected);
+			expect(sentOpts.map((o) => o.reasoning)).toEqual([plan, answer]);
+			expect(sentOpts.map((o) => o.maxTokens)).toEqual([1500, 4000]);
 			mem.shutdown();
 			rmSync(s.dir, { recursive: true, force: true });
 		}
 		delete process.env.PI_ZIP_JUDGE_MODEL;
 	});
 
-	test("retrieval caps maxTokens at 4000 to leave headroom for reasoning models and complete JSON", async () => {
-		const s = fakeSession(withSibling(), { leaf: "om", hidden: COMPACTED });
-		const { options, reg } = registry([ANSWER], { maxTokens: 16_384 });
-		const mem = new Memory(() => {});
-		mem.sessionStart({ ...s.ctx, modelRegistry: reg });
-		await mem.beforeAgentStart({ ...s.ctx, modelRegistry: reg }, { messageType: "user", prompt: PROMPT });
-		expect(options[0]).toMatchObject({ maxTokens: 4000 });
-		mem.shutdown();
-		rmSync(s.dir, { recursive: true, force: true });
-	});
-
 	test("zip off gates calls, cancels in-flight retrieval, drops ready notes, and leaves indexing active", async () => {
 		const s = fakeSession(withSibling(), { leaf: "om", hidden: COMPACTED });
 		const { reg } = registry([]), { pi, handlers } = fakePi();
 		const ctx = { ...s.ctx, modelRegistry: reg, getSystemPrompt: () => "", ui: { notify: () => {} }, mode: "tui" };
-		const previousWait = process.env.PI_ZIP_RETRIEVAL_WAIT_MS;
-		process.env.PI_ZIP_RETRIEVAL_WAIT_MS = "1";
-		let mem!: Memory, calls = 0, signal!: AbortSignal, finish!: (res: Any) => void, logged!: () => void;
-		const completed = new Promise<void>((resolve) => { logged = resolve; });
-		const logs: Any[] = [];
+		let mem!: Memory, calls = 0, answers = 0, signal!: AbortSignal, hang = true, finish!: (res: Any) => void;
 		const originalStart = Memory.prototype.sessionStart;
 		const start = spyOn(Memory.prototype, "sessionStart").mockImplementation(function (this: Memory, c: Any) { mem = this; originalStart.call(this, c); });
-		const ledger = spyOn(Zip.prototype, "ledger").mockImplementation((r) => { logs.push(r); if (r.type === "memory_retrieval" && r.deferred) logged(); });
-		const reply = { role: "assistant", stopReason: "stop", content: [{ type: "text", text: ANSWER }] };
-		(reg as Any).complete = (_m: Any, _c: Any, options: Any) => {
-			calls++; signal = options.signal;
-			return calls === 1 ? new Promise((resolve) => { finish = resolve; }) : Promise.resolve(reply);
+		const logs: Any[] = [];
+		const ledger = spyOn(Zip.prototype, "ledger").mockImplementation((r) => { logs.push(r); });
+		const reply = (text: string) => ({ role: "assistant", stopReason: "stop", content: [{ type: "text", text }] });
+		(reg as Any).complete = (_m: Any, context: Any, options: Any) => {
+			calls++;
+			if (isPlan(context)) return Promise.resolve(reply(PLAN));
+			answers++; signal = options.signal;
+			return hang ? new Promise((resolve) => { finish = resolve; }) : Promise.resolve(reply(ANSWER));
 		};
 		try {
 			piZip(pi);
@@ -816,139 +905,56 @@ describe("Memory at a new user prompt", () => {
 			await cmd("off"); await prompt();
 			expect(calls).toBe(0);
 			await cmd("on"); await prompt();
-			expect(calls).toBe(1);
-			expect(signal.aborted).toBe(false);
+			expect([calls, answers, signal.aborted]).toEqual([2, 1, false]);
+			const pending = mem.settled();
 			await cmd("off");
 			expect(signal.aborted).toBe(true);
 			await cmd("on"); // enabling again must not resurrect the cancelled result
-			finish(reply); await completed;
+			finish(reply(ANSWER)); await pending;
 			expect(mem.current(ctx)).toBeNull();
 			expect(logs.find((r) => r.type === "memory_retrieval").skip).toBe("cancelled");
-			await prompt();
-			expect(calls).toBe(2);
-			expect(mem.current(ctx)).not.toBeNull();
+			hang = false;
+			await prompt(); await mem.settled();
+			expect(answers).toBe(2);
+			expect(mem.current(ctx)).toMatchObject({ found: true });
 			await cmd("off");
 			expect(mem.current(ctx)).toBeNull();
 			s.state.entries.push(user("new", "om", "index while disabled")); s.state.leaf = "new";
 			await handlers.get("agent_end")!({}, ctx);
 			expect(mem.statusLine(ctx)).toContain(`indexed_entries=${s.state.entries.length}`);
-			await prompt(); expect(calls).toBe(2);
+			await prompt(); expect(answers).toBe(2);
 
-			// Extension conflict ("paused" state): zip.active() is false even when zip.off is false, so before_agent_start must not call retrieval,
-			// and an in-flight retrieval started before the conflict appeared must be aborted immediately when conflict is detected.
+			// Extension conflict ("paused"): no retrieval call, and one in flight from before is aborted when the conflict is detected.
 			await cmd("on");
-			let conflictFinish!: (res: Any) => void;
-			(reg as Any).complete = (_m: Any, _c: Any, options: Any) => {
-				calls++; signal = options.signal;
-				return new Promise((resolve) => { conflictFinish = resolve; });
-			};
-			await prompt(); // starts call #3, which stays in flight after the 1ms foreground wait
-			expect(calls).toBe(3);
-			expect(signal.aborted).toBe(false);
+			hang = true;
+			await prompt();
+			expect([answers, signal.aborted]).toEqual([3, false]);
 			(pi as Any).getAllTools = () => [{ name: "context_prune", sourceInfo: { path: "/ext/context-prune/index.ts" } }];
-			await prompt(); // detects conflict -> aborts in-flight call #3 and skips starting a new call
+			const before = calls;
+			await prompt();
 			expect(signal.aborted).toBe(true);
-			expect(calls).toBe(3);
-			conflictFinish(reply);
+			expect(calls).toBe(before);
+			finish(reply(ANSWER));
 		} finally {
 			await handlers.get("session_shutdown")?.({}, ctx);
 			start.mockRestore(); ledger.mockRestore(); rmSync(s.dir, { recursive: true, force: true });
-			if (previousWait === undefined) delete process.env.PI_ZIP_RETRIEVAL_WAIT_MS;
-			else process.env.PI_ZIP_RETRIEVAL_WAIT_MS = previousWait;
 		}
 	});
 
-	test("slow retrieval releases the foreground, but only the current live run can receive its result", async () => {
-		const prev = process.env.PI_ZIP_RETRIEVAL_WAIT_MS;
-		process.env.PI_ZIP_RETRIEVAL_WAIT_MS = "5";
-		try {
-			for (const action of ["keep", "end", "tree", "compact", "session", "shutdown", "new-prompt"]) {
-				const s = fakeSession(withSibling(), { leaf: "om", hidden: COMPACTED });
-				const { reg } = registry([]);
-				let finish!: (r: Any) => void;
-				let signal: AbortSignal | undefined;
-				(reg as Any).complete = (_m: Any, _c: Any, options: Any) => {
-					signal = options.signal;
-					return new Promise((resolve) => { finish = resolve; }); // deliberately ignores abort
-				};
-				const ctx = { ...s.ctx, modelRegistry: reg };
-				const logs: Any[] = [];
-				let logged!: () => void;
-				const completed = new Promise<void>((resolve) => { logged = resolve; });
-				const mem = new Memory((r) => { logs.push(r); if (r.type === "memory_retrieval" && r.deferred) logged(); });
-				try {
-					mem.sessionStart(ctx);
-					await mem.beforeAgentStart(ctx, { messageType: "user", prompt: PROMPT });
-					expect(logs.filter((r) => r.type === "memory_deferred")).toHaveLength(1);
-					expect(mem.current(ctx)).toBeNull();
-					expect(signal!.aborted).toBe(false); // 5 ms wait is not the provider timeout
-					if (action === "end") mem.agentEnd(ctx);
-					if (action === "tree") mem.catchUp(ctx, "session_tree");
-					if (action === "compact") mem.catchUp(ctx, "session_compact");
-					if (action === "session") mem.sessionStart(ctx);
-					if (action === "shutdown") mem.shutdown();
-					if (action === "new-prompt") await mem.beforeAgentStart(ctx, { messageType: "user", prompt: "zzzqqq wwwyyy" });
-					finish({ role: "assistant", stopReason: "stop", content: [{ type: "text", text: ANSWER }] });
-					await completed;
-					if (action === "keep") expect(mem.current(ctx)).toMatchObject({ deferred: true });
-					else {
-						expect(signal!.aborted).toBe(true);
-						expect(mem.current(ctx)).toBeNull();
-						expect(logs.find((r) => r.type === "memory_retrieval" && r.deferred).skip).toBe("cancelled");
-					}
-				} finally { mem.shutdown(); }
-			}
-		} finally {
-			if (prev === undefined) delete process.env.PI_ZIP_RETRIEVAL_WAIT_MS;
-			else process.env.PI_ZIP_RETRIEVAL_WAIT_MS = prev;
-		}
-	});
-
-	test("nothing is injected while the model still sees every output: no model call at all", async () => {
-		// no fold and no compaction on the branch: the model still sees everything it indexed
-		const clean = await run([ANSWER], { messageType: "user", prompt: PROMPT }, {}, fixtureEntries().slice(0, 3));
+	test("nothing is searched while the branch has no compaction and no fold: no model call at all", async () => {
+		const clean = await run([PLAN, ANSWER], { messageType: "user", prompt: PROMPT }, {}, fixtureEntries().slice(0, 3));
 		expect([clean.sent.length, clean.note]).toEqual([0, null]);
 		expect(clean.retrieval.skip).toBe("nothing hidden yet");
-		// a compaction also hides what the model used to see: the gate opens on it alone, without any folded output
-		const compacted = await run([ANSWER]);
-		expect(compacted.sent.length).toBe(1);
-		expect(compacted.retrieval.skip).not.toBe("nothing hidden yet");
+		const compacted = await run([PLAN, ANSWER]);
+		expect(compacted.sent.length).toBe(2);
 	});
 
 	test("retrieval runs on the judge's model setting; a name that is not available runs nothing", async () => {
 		process.env.PI_ZIP_JUDGE_MODEL = "p/cheap";
-		const chosen = await run([ANSWER]);
-		expect(chosen.sent.length).toBe(1);
+		expect((await run([PLAN, ANSWER])).sent.length).toBe(2);
 		process.env.PI_ZIP_JUDGE_MODEL = "other/model";
-		const missing = await run([ANSWER]);
-		expect(missing.sent.length).toBe(0);
+		expect((await run([PLAN, ANSWER])).sent.length).toBe(0);
 		delete process.env.PI_ZIP_JUDGE_MODEL;
-	});
-
-	test("one call per prompt: the prompt's own words are the query, and a prompt that finds nothing costs none", async () => {
-		const found = await run([ANSWER]);
-		expect(found.sent.length).toBe(1); // no routing call in front of it
-		expect(found.retrieval.terms).toContain("sockets");
-		const empty = await run([ANSWER], { messageType: "user", prompt: "zzzqqq wwwyyy" });
-		expect([empty.sent.length, empty.note]).toEqual([0, null]);
-		expect(empty.retrieval.skip).toBe("no candidates");
-	});
-
-
-	test("history: search then one call; the note cites the hidden conclusion's real handle", async () => {
-		const { sent, note, retrieval } = await run([ANSWER]);
-		const input = sent[0].messages[0].content[0].text;
-		expect(input).toContain(`E1 conclusion [handle ${handleFor("a3")}] — answer to: "fix the retry timeout in src/retry.ts"`);
-		expect(input).toContain(PROMPT);
-		expect(input).not.toContain("sibling branch");
-		expect(note!.text).toMatch(new RegExp(`Evidence: ${handleFor("a3")} \\([0-9.]+ (min|h|d) ago\\) \\[earlier conclusion\\]`));
-		expect(note!.text).not.toContain(handleFor("a6"));
-		expect(retrieval).toMatchObject({ findings: 1, folded: 0, stage: "prepared", deferred: false });
-		expect(retrieval.latency.answer).toBeGreaterThanOrEqual(0);
-		expect(retrieval.calls.map((c: Any) => c.step)).toEqual(["answer"]);
-		expect(retrieval.evidence.find((x: Any) => x.cited)).toMatchObject({ kind: "assistant", hidden: "compacted", cited: true });
-		expect(retrieval.drops).toEqual({ unknownHandle: 0, empty: 0, cap: 0, notFolded: 0, notNeeded: 0 });
-		expect(retrieval.decisions).toEqual([{ ref: "E1", need: "Y", reason: "The request asks how the sockets were fixed." }]);
 	});
 });
 
@@ -965,7 +971,7 @@ describe("injection into the run's requests", () => {
 		return { zip, ctx, entries, prompt, seen: () => seen, setNote: (next: typeof note) => { note = next; } };
 	}
 
-	test("a late note first appears at the next model boundary without changing the already-sent request", async () => {
+	test("a late note is appended at the next model boundary, after everything the run already sent", async () => {
 		const { zip, ctx, entries, prompt, setNote, seen } = zipWith(null);
 		zip.sessionStart(ctx);
 		await startZip(zip, ctx, { prompt });
@@ -978,8 +984,8 @@ describe("injection into the run's requests", () => {
 			{ role: "toolResult", toolCallId: "c1", content: [{ type: "text", text: "ok" }] }];
 		const out2 = await zip.context({ messages: later }, ctx);
 		expect(sent).toEqual(first);
-		expect(out2.messages[3].content[0].text).toBe(note.text);
-		expect(out2.messages.slice(-2)).toEqual(later.slice(-2)); // tool call and result stay together
+		expect(out2.messages.slice(0, 5)).toEqual(later); // what the run already sent keeps its place: one cacheable prefix
+		expect(out2.messages[5].content[0].text).toBe(note.text); // appended after the tool call and its result
 		const out3 = await zip.context({ messages: later }, ctx);
 		expect(out3.messages).toEqual(out2.messages);
 		expect(seen()).toEqual({ injected: 1, reinjected: 1 });

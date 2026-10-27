@@ -2,26 +2,31 @@
 // Always on, and free until the session has something hidden: every persisted entry is projected (no model call), but retrieval
 // runs only when a fold or a compaction left earlier output that the model view no longer shows in full. Nothing is injected before
 // that. Nothing here consults the judge, and nothing here changes folding or compaction. Every failure is logged and skipped.
+// Per prompt: planner call (awaited) -> local search -> answer call in the background, delivered by a later request or zip_recall.
 import { randomUUID } from "node:crypto";
 import { Ledger, type LedgerCounts } from "./ledger/projector.ts";
 import { readSource, visibleText } from "./ledger/source.ts";
 import { sqliteAvailable } from "./ledger/db.ts";
-import { ageOf, type CallInfo, memoryTraceEnabled, RetrievalConversation } from "./retrieval/assistant.ts";
+import { ageOf, type CallInfo, memoryTraceEnabled, requestText, RetrievalConversation } from "./retrieval/assistant.ts";
 import { type DropStats, PACKET_LIMITS, renderPacket } from "./retrieval/packet.ts";
-import { DEFAULT_LIMITS, hiddenOutputs, queryOf, retrieve, scopeOf } from "./retrieval/search.ts";
+import { visibleTail } from "./retrieval/planner.ts";
+import { DEFAULT_LIMITS, type Evidence, hiddenOutputs, queryOf, retrieve, type Scope, scopeOf } from "./retrieval/search.ts";
 import type { Any } from "./util.ts";
 
 export type LedgerState = "idle" | "indexing" | "ready" | "error";
 
-/** The run's packet: bound to the session and the prompt it was made for. */
-export interface Note { sessionId: string; requestId: string; prompt: string; text: string; deferred: boolean; cited: string[] }
-interface RetrievalJob { requestId: string; controller: AbortController; deferred: boolean }
+/**
+ * The run's note: bound to the session and the prompt it was made for. `pending` is shown while the answer call runs; `text` is the
+ * findings (or NOTHING_NOTE) once it has finished, null before. `delivered`: zip_recall already returned the findings.
+ */
+export interface Note { sessionId: string; requestId: string; prompt: string; pending: string; text: string | null; found: boolean; cited: string[]; delivered: boolean }
+interface RetrievalJob { requestId: string; controller: AbortController; answer: Promise<void> | null }
 
-/** Foreground wait only. The provider has a separate hard timeout. */
-export const retrievalWaitMs = () => {
-	const n = Number(process.env.PI_ZIP_RETRIEVAL_WAIT_MS);
-	return Number.isFinite(n) && n >= 0 && process.env.PI_ZIP_RETRIEVAL_WAIT_MS?.trim() ? n : 5000;
-};
+export const pendingNote = (n: number) =>
+	`[pi-zip: a historical retrieval is reading ${n} earlier records of this session that are hidden from your view, for this request. ` +
+	"Its findings will appear in a later message when ready. If you need earlier session history before you finish, call zip_recall with no " +
+	"arguments to wait for the findings; otherwise continue without them.]";
+export const NOTHING_NOTE = "[pi-zip: the historical retrieval for this request found nothing relevant in earlier session records.]";
 
 const errText = (e: unknown) => (e instanceof Error ? e.message : String(e));
 /** PI_ZIP_RETRIEVAL_TIMEOUT_MS, also echoed in the memory_config record. */
@@ -51,6 +56,7 @@ export class Memory {
 	private configLogged = false;
 	private note: Note | null = null;
 	private noteShown = false;
+	private pendingShown = false;
 	private job: RetrievalJob | null = null;
 	/** The ledger has caught up with the session's persisted entries. */
 	private ledgerDone = true;
@@ -126,7 +132,7 @@ export class Memory {
 				this.log({
 					type: "memory_config", why,
 					modelRef: process.env.PI_ZIP_JUDGE_MODEL ?? "(cheapest 32K model of the current provider)",
-					timeoutMs: retrievalTimeoutMs(), waitMs: retrievalWaitMs(), trace: memoryTraceEnabled(),
+					timeoutMs: retrievalTimeoutMs(), trace: memoryTraceEnabled(),
 					limits: DEFAULT_LIMITS, packet: PACKET_LIMITS, backfillBatch: BACKFILL_ENTRIES,
 				});
 			}
@@ -187,32 +193,26 @@ export class Memory {
 	}
 
 	/**
-	 * before_agent_start of a prompt-started run: nothing is injected until the branch has output the model no longer sees in full
-	 * (a fold, or a compaction). Search hidden sources, then judge need and summarize in one model call. Never throws.
+	 * before_agent_start of a prompt-started run: nothing is searched until the branch has output the model no longer sees in full
+	 * (a fold, or a compaction). The main model waits for the planner call and the local search only (a bare continuation, or a search
+	 * that finds nothing, ends here). The answer call then runs in the background: the run's requests carry a pending note at once and
+	 * the findings when they are ready; zip_recall with no arguments waits for them. Never throws.
 	 */
 	async beforeAgentStart(ctx: Any, e: Any) {
 		this.cancelRetrieval();
 		if (e?.messageType !== "user" || typeof e.prompt !== "string" || !e.prompt.trim()) return;
-		const job: RetrievalJob = { requestId: randomUUID(), controller: new AbortController(), deferred: false };
+		const job: RetrievalJob = { requestId: randomUUID(), controller: new AbortController(), answer: null };
 		this.job = job;
-		const started = Date.now();
-		// Own the eventual rejection even when the foreground stops waiting.
-		const work = this.prepare(ctx, e, job).catch((err) => {
-			try { this.log({ type: "error", where: "memory/background", requestId: job.requestId, error: errText(err) }); } catch {}
-		});
-		let timer: ReturnType<typeof setTimeout> | undefined;
-		const waitMs = retrievalWaitMs();
 		try {
-			await Promise.race([work, new Promise<void>((resolve) => {
-				timer = setTimeout(() => {
-					if (this.job === job && !job.controller.signal.aborted) {
-						job.deferred = true;
-						try { this.log({ type: "memory_deferred", requestId: job.requestId, waitMs, ms: Date.now() - started }); } catch {}
-					}
-					resolve();
-				}, Math.max(0, waitMs - (Date.now() - started)));
-			})]);
-		} finally { if (timer !== undefined) clearTimeout(timer); }
+			await this.prepare(ctx, e, job);
+		} catch (err) {
+			try { this.log({ type: "error", where: "memory/prepare", requestId: job.requestId, error: errText(err) }); } catch {}
+		}
+	}
+
+	/** The background answer of the current run, settled (tests and diagnostics). */
+	settled(): Promise<void> {
+		return this.job?.answer ?? Promise.resolve();
 	}
 
 	private async prepare(ctx: Any, e: Any, job: RetrievalJob) {
@@ -225,7 +225,8 @@ export class Memory {
 		// finding, and how long each step took). Nothing here changes behaviour.
 		const rec: Record<string, unknown> = { type: "memory_retrieval", requestId, stage: "start" };
 		const latency: Record<string, number> = {};
-		let drops: DropStats | null = null;
+		const drops: DropStats = { unknownHandle: 0, empty: 0, cap: 0, notFolded: 0, notNeeded: 0 };
+		let background = false;
 		try {
 			// nothing can be indexed without a persisted session (an in-memory one, or a new one before Pi's first flush): no call
 			const src0 = readSource(ctx);
@@ -237,13 +238,20 @@ export class Memory {
 			this.stats.prompts++;
 			rec.promptChars = e.prompt.length;
 			const query = queryOf(e.prompt);
-			Object.assign(rec, { terms: query.tokens, handles: query.handles.length ? query.handles : undefined });
-			if (!query.tokens.length) return void (rec.skip = "no search terms");
+			let t = Date.now();
+			const plan = await conv.plan(requestText(e.prompt), visibleTail(ctx, e.prompt));
+			latency.plan = Date.now() - t;
+			if (signal.aborted || this.job !== job) return void (rec.skip = "cancelled");
+			if (plan?.continue) return void (rec.skip = "continuation");
+			if (plan) query.sets = plan.queries;
+			else rec.plan = "failed: searching the request's own words";
+			Object.assign(rec, { queries: query.sets, terms: query.sets ? undefined : query.tokens, handles: query.handles.length ? query.handles : undefined });
+			if (!query.tokens.length && !query.sets?.length && !query.handles.length) return void (rec.skip = "no search terms");
 			this.runBackfill?.(); // a prompt sent before the deferred backfill ran: backfill now, then search
 			const led = this.ensure(ctx, "before_agent_start");
 			const src = readSource(ctx);
 			if (!led || !src || !led.current(src)) return void (rec.skip = led ? "ledger behind its session" : `ledger ${this.state}`);
-			let t = Date.now();
+			t = Date.now();
 			const r = retrieve(led.db, query, scope, DEFAULT_LIMITS);
 			latency.search = Date.now() - t;
 			Object.assign(rec, { hits: r.hits, inBranch: r.inBranch, candidates: r.evidence.length, expand: DEFAULT_LIMITS.expand });
@@ -255,46 +263,65 @@ export class Memory {
 			rec.evidence = evidenceLog;
 			if (!r.evidence.length) return void (rec.skip = "no candidates");
 			const revision = `${src.entries.length}:${src.entries[src.entries.length - 1]?.id ?? ""}`;
+			this.note = { sessionId: src.sessionId, requestId, prompt: e.prompt, pending: pendingNote(r.evidence.length), text: null, found: false, cited: [], delivered: false };
 			this.stats.calls++;
-			t = Date.now();
-			drops = { unknownHandle: 0, empty: 0, cap: 0, notFolded: 0, notNeeded: 0 };
-			const packet = await conv.answer(e.prompt, recentContext(ctx), r.evidence, requestId, revision, drops);
+			background = true;
+			latency.foreground = Date.now() - t0;
+			// The main model starts now. Own the eventual rejection; the record is logged when the answer settles.
+			job.answer = this.answer(ctx, e, job, signal, conv, r.evidence, scope, src.sessionId, revision, evidenceLog, drops, rec, latency, t0)
+				.catch((err) => { try { this.log({ type: "error", where: "memory/background", requestId, error: errText(err) }); } catch {} });
+		} catch (err) {
+			rec.error = errText(err);
+		} finally {
+			if (!background) this.logRetrieval(rec, conv, latency, null, t0);
+		}
+	}
+
+	private async answer(ctx: Any, e: Any, job: RetrievalJob, signal: AbortSignal, conv: RetrievalConversation, evidence: Evidence[], scope: Scope,
+		sessionId: string, revision: string, evidenceLog: Array<Record<string, unknown>>, drops: DropStats, rec: Record<string, unknown>, latency: Record<string, number>, t0: number) {
+		try {
+			const t = Date.now();
+			const packet = await conv.answer(e.prompt, recentContext(ctx), evidence, job.requestId, revision, drops);
 			latency.answer = Date.now() - t;
 			// A provider may ignore abort. Never publish its late response into another run or branch.
-			if (signal.aborted || this.job !== job || String(ctx?.sessionManager?.getSessionId?.() ?? "") !== src.sessionId) return void (rec.skip = "cancelled");
-			if (!packet) return void (rec.skip = "answer failed");
+			if (signal.aborted || this.job !== job || this.note?.requestId !== job.requestId || String(ctx?.sessionManager?.getSessionId?.() ?? "") !== sessionId) return void (rec.skip = "cancelled");
+			const note = this.note!;
+			if (!packet) { note.text = NOTHING_NOTE; return void (rec.skip = "answer failed"); }
 			const now = scopeOf(ctx);
-			if ([...scope.hidden.keys()].some((id) => !now.hidden.has(id))) return void (rec.skip = "source visibility changed");
-			const ages = new Map(r.evidence.filter((x) => x.at).map((x) => [x.handle, `${ageOf(x.at, Date.now())} ago`]));
+			if ([...scope.hidden.keys()].some((id) => !now.hidden.has(id))) { note.text = NOTHING_NOTE; return void (rec.skip = "source visibility changed"); }
+			const ages = new Map(evidence.filter((x) => x.at).map((x) => [x.handle, `${ageOf(x.at, Date.now())} ago`]));
 			const text = renderPacket(packet, ages);
-			if (!text) return void (rec.skip = "nothing relevant");
+			if (!text) { note.text = NOTHING_NOTE; return void (rec.skip = "nothing relevant"); }
 			const cited = new Set([...packet.findings.flatMap((x) => x.sourceHandles), ...packet.foldedCandidates.map((x) => x.handle)]);
-			this.note = { sessionId: src.sessionId, requestId, prompt: e.prompt, text, deferred: job.deferred, cited: [...cited] };
+			Object.assign(note, { text, found: true, cited: [...cited] });
 			if (memoryTraceEnabled()) rec.note = text; // the exact text the main model will read, for judging quality later
-			for (const x of evidenceLog) x.cited = cited.has(x.handle);
+			for (const x of evidenceLog) x.cited = cited.has(String(x.handle));
 			Object.assign(rec, { findings: packet.findings.length, folded: packet.foldedCandidates.length, chars: text.length, revision });
 		} catch (err) {
 			rec.error = errText(err);
 		} finally {
-			rec.stage = rec.error ? "error" : rec.skip ? String(rec.skip) : "prepared";
-			rec.deferred = job.deferred;
-			rec.decisions = conv.decisions;
-			rec.latency = latency;
-			rec.ms = Date.now() - t0;
-			rec.input = conv.stats;
-			rec.drops = drops ?? undefined;
-			rec.calls = conv.calls.map((c: CallInfo) => ({
-				step: c.step, model: c.model, level: c.level, ms: c.ms, costUsd: c.costUsd,
-				inTokens: c.inTokens, outTokens: c.outTokens, cacheReadTokens: c.cacheReadTokens,
-				stopReason: c.stopReason, replyChars: c.replyChars, thinkingChars: c.thinkingChars,
-				...(c.error ? { error: c.error } : {}), ...(c.reply !== undefined ? { reply: c.reply } : {}),
-			}));
-			for (const c of conv.calls) this.stats.costUsd += c.costUsd;
-			this.log(rec);
+			this.logRetrieval(rec, conv, latency, drops, t0);
 		}
 	}
 
-	/** The packet of the current run, when it still belongs to the open session; consumed by run.ts on every request of the run. */
+	private logRetrieval(rec: Record<string, unknown>, conv: RetrievalConversation, latency: Record<string, number>, drops: DropStats | null, t0: number) {
+		rec.stage = rec.error ? "error" : rec.skip ? String(rec.skip) : "prepared";
+		rec.decisions = conv.decisions;
+		rec.latency = latency;
+		rec.ms = Date.now() - t0;
+		rec.input = conv.stats;
+		rec.drops = drops ?? undefined;
+		rec.calls = conv.calls.map((c: CallInfo) => ({
+			step: c.step, model: c.model, level: c.level, ms: c.ms, costUsd: c.costUsd,
+			inTokens: c.inTokens, outTokens: c.outTokens, cacheReadTokens: c.cacheReadTokens,
+			stopReason: c.stopReason, replyChars: c.replyChars, thinkingChars: c.thinkingChars,
+			...(c.error ? { error: c.error } : {}), ...(c.reply !== undefined ? { reply: c.reply } : {}),
+		}));
+		for (const c of conv.calls) this.stats.costUsd += c.costUsd;
+		this.log(rec);
+	}
+
+	/** The note of the current run, when it still belongs to the open session; read by run.ts on every request of the run. */
 	current(ctx: Any): Note | null {
 		const n = this.note;
 		if (!n || this.job?.controller.signal.aborted) return null;
@@ -305,12 +332,35 @@ export class Memory {
 		}
 		return n;
 	}
-	/** run.ts put the packet into a request (logged once per run, for the first request it went into). */
-	injected(chars: number, at: number) {
-		if (this.noteShown) return;
-		this.noteShown = true;
-		this.stats.injected++;
-		this.log({ type: "memory_inject", requestId: this.note?.requestId, chars, at, deferred: this.note?.deferred ?? false });
+
+	/**
+	 * zip_recall with no arguments: wait for the run's background answer (or `signal`) and return its findings, which then are not
+	 * injected again. Null when this run has no retrieval.
+	 */
+	async awaitNote(ctx: Any, signal?: AbortSignal): Promise<string | null> {
+		const job = this.job;
+		if (!job || !this.current(ctx)) return null;
+		const t0 = Date.now();
+		if (job.answer) {
+			await Promise.race([job.answer, new Promise<void>((resolve) => {
+				if (signal?.aborted) return resolve();
+				signal?.addEventListener("abort", () => resolve(), { once: true });
+			})]);
+		}
+		const n = this.current(ctx);
+		const text = n?.text ?? null;
+		this.log({ type: "memory_wait", requestId: job.requestId, ms: Date.now() - t0, ready: text !== null, found: !!n?.found });
+		if (!n || text === null) return "[pi-zip: the historical retrieval for this request did not finish; continue without it]";
+		n.delivered = true;
+		return text;
+	}
+
+	/** run.ts put a note into a request: the pending note, or the findings (each logged once per run, for the first request). */
+	injected(chars: number, at: number, kind: "pending" | "final" = "final") {
+		if (kind === "pending" ? this.pendingShown : this.noteShown) return;
+		if (kind === "pending") this.pendingShown = true;
+		else { this.noteShown = true; this.stats.injected++; }
+		this.log({ type: "memory_inject", requestId: this.note?.requestId, kind, chars, at });
 	}
 
 	/** One later request of the same run carried the note again (the run's cacheable prefix held). Counted, not logged one by one. */
@@ -336,12 +386,14 @@ export class Memory {
 	 */
 	private logUsage(ctx: Any) {
 		const note = this.note;
-		if (note && !this.noteShown) {
-			// ready, but no model request came after it (a slow answer to a run that made no tool call): the note was never read
-			this.log({ type: "memory_dropped", requestId: note.requestId, deferred: note.deferred, reason: "run ended before the next model request" });
+		if (!note) return;
+		if (!this.noteShown && !note.delivered) {
+			// the findings never reached the model: the answer was still running, or no model request came after it
+			const reason = note.text === null ? "run ended before the answer call finished" : "run ended before the next model request";
+			this.log({ type: "memory_dropped", requestId: note.requestId, pendingShown: this.pendingShown, found: note.found, reason });
 			return;
 		}
-		if (!note) return;
+		if (!note.found) return;
 		const branch: Any[] = ctx?.sessionManager?.getBranch?.() ?? [];
 		let start = branch.length;
 		while (start > 0 && branch[start - 1]?.message?.role !== "user") start--;
@@ -362,7 +414,7 @@ export class Memory {
 			}
 		}
 		this.log({
-			type: "memory_usage", requestId: note.requestId, deferred: note.deferred, cited: note.cited,
+			type: "memory_usage", requestId: note.requestId, delivered: note.delivered ? "zip_recall" : "request", cited: note.cited,
 			recalled: [...recalled], mentioned: [...mentioned], recallCalls, assistantMessages,
 			// naming a handle is not using it (the model may name it to say the note is wrong); only a recall counts
 			used: recalled.size > 0,
@@ -375,6 +427,7 @@ export class Memory {
 		this.job = null;
 		this.note = null;
 		this.noteShown = false;
+		this.pendingShown = false;
 	}
 
 	private release() {
