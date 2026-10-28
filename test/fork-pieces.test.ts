@@ -218,3 +218,16 @@ test("bounded key lines preserve both ends of a minified output", () => {
     expect(keys[0].text).toContain(":TAIL-MARKER");
     expect(keyTexts(text)[0]).toBe(keys[0].text);
 });
+
+test("scoped search headers name the record kind; the default scope keeps the tool-output wording", () => {
+	const items = [
+		{ handle: "aaaaaaaaaa", tool: null, label: "R1", text: "deploy the fix\nthen verify" },
+		{ handle: "bbbbbbbbbb", tool: null, label: "R2", text: "verify again" },
+	];
+	const head = (o: Any) => searchOutputs(items as Any, "verify", o).text.split("\n")[0];
+	expect(head({})).toBe("[grep over all 2 earlier tool outputs (no handle given): 2 matching line(s) in 2 output(s), newest output first]");
+	expect(head({ noun: "request", plural: "user requests" })).toBe("[grep over all 2 user requests (no handle given): 2 matching line(s) in 2 request(s), newest request first]");
+	// newest first: R2's section precedes R1's
+	const text = searchOutputs(items as Any, "verify", { noun: "request", plural: "user requests" }).text;
+	expect(text.indexOf("bbbbbbbbbb")).toBeLessThan(text.indexOf("aaaaaaaaaa"));
+});

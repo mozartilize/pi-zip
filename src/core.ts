@@ -1,4 +1,5 @@
 import { recordFoldDecision } from "./fold-policy.ts";
+import { plan, selectPlan } from "./plan-fork.ts";
 import { newestMessageTime } from "./fold-format.ts";
 // The decision core: view, clock, law, plan and decide as pure functions of the session branch, what pi-zip has learned (Λ) and
 // the time. Nothing here reads a file, Pi or the clock, and nothing here has an effect: run.ts (the shell) gathers the inputs at Pi's
@@ -7,7 +8,7 @@ import { detectCold, modelKey, resolveTtl, type ColdInfo } from "./cache.ts";
 import { validateEdits } from "./guard.ts";
 
 import { GAP_EDGES, lawPrices, pWarm, type Entry } from "./learn.ts";
-import { buildBlocks, calibrate, compactionRoom, plan, selectPlan, sizeOf, untouchedEst, UNIT, type Block, type Cut, type FoldTarget, type Law, type PlanOpts, type PlanResult, type RunPlan, type Scale, type SysInfo } from "./plan.ts";
+import { buildBlocks, calibrate, compactionRoom, sizeOf, untouchedEst, UNIT, type Block, type Cut, type FoldTarget, type Law, type PlanOpts, type PlanResult, type RunPlan, type Scale, type SysInfo } from "./plan.ts";
 import type { FileRecall } from "./recallfile.ts";
 import { PRODUCT, type Any } from "./util.ts";
 

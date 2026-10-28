@@ -1,5 +1,7 @@
 import { describe, expect, test } from "bun:test";
-import { buildBlocks, callOf, NARRATIVE_CALL_MAX, NARRATIVE_MAX, plan, toolCallIndex, UNIT } from "../src/plan.ts";
+import { buildBlocks, NARRATIVE_CALL_MAX, NARRATIVE_MAX, toolCallIndex, UNIT } from "../src/plan.ts";
+import { callOf } from "../src/fold-policy.ts";
+import { plan } from "../src/plan-fork.ts";
 import { lawPrices } from "../src/learn.ts";
 import { tok4 } from "../src/util.ts";
 import { handleFor, makePlaceholderFor } from "../src/fold-format.ts";

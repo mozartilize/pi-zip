@@ -1,7 +1,9 @@
 // Model-switch fitting is fork policy. The runtime supplies planning, background work and commit hooks.
 import { modelKey } from "./cache.ts";
 import { headOf, checkEdits, type Artifact } from "./core.ts";
-import { compactionRoom, foldPlaceholder, type Cut, type PlanOpts, type PlanResult, type Scale, type plan } from "./plan.ts";
+import { compactionRoom, type Cut, type PlanOpts, type PlanResult, type Scale } from "./plan.ts";
+import { foldPlaceholder } from "./fold-policy.ts";
+import type { plan } from "./plan-fork.ts";
 import { type Any, PRODUCT, tokensOf } from "./util.ts";
 const errText = (err: unknown) => err instanceof Error ? err.message : String(err);
 export interface SwitchPlan { o: PlanOpts; cal: Scale; p: PlanResult }

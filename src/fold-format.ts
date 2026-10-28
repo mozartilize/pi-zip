@@ -1,9 +1,10 @@
 // Fork-only command aliases, bounded hints and fold timestamps. Upstream formatting stays in placeholder.ts.
-import { blockTime, cdDirOf, clipMid, cmdLabel as upstreamCmdLabel, jsonKeyFields, makePlaceholder as upstreamPlaceholder, PH_MARK, pickKeyLines as upstreamKeyLines, sharedCdDirs, shortArgs as upstreamShortArgs, type KeyLine, type PlaceholderMeta as UpstreamMeta } from "./placeholder.ts";
+import { blockTime, cdDirOf, clipMid, cmdLabel as upstreamCmdLabel, jsonKeyFields, outcomeHint, PH_MARK, RECALL_TOOL, whenLabel, pickKeyLines as upstreamKeyLines, sharedCdDirs, shortArgs as upstreamShortArgs, type KeyLine, type PlaceholderMeta as UpstreamMeta } from "./placeholder.ts";
 import { handleFor } from "./handle.ts";
-import { type Block, type Calls, callOf } from "./plan.ts";
-import { type FileRecall } from "./recallfile.ts";
-import { type Any, fmtWhen, textOf } from "./util.ts";
+import type { Block } from "./plan.ts";
+import { type Calls, callOf } from "./fold-policy.ts";
+import { type FileRecall, fileRecallHow } from "./recallfile.ts";
+import { type Any, clip, fmtWhen, textOf } from "./util.ts";
 export { blockTime, clipMid, distinctLines, jsonKeyFields, outcomeHint, PH_MARK, RECALL_TOOL, whenLabel } from "./placeholder.ts";
 export { handleFor, handleTokens } from "./handle.ts";
 export const MIN_FOLD_CHARS = 1000;
@@ -26,9 +27,27 @@ export function shortArgs(args: Any, n = 90, aliases?: Map<string, string>): str
 }
 
 export interface PlaceholderMeta extends UpstreamMeta { foldedAt?: number }
+
+/** Placeholder text, or null when the output is too short to be worth folding. Owned here (not a rewrite of upstream's text) so an
+ *  upstream wording change cannot silently drop the fold time. Stored with the fold, so old folds keep their bytes. */
 export function makePlaceholder(text: string, tool: string, args: string, handle: string, keep = 8, meta: PlaceholderMeta = {}): string | null {
-	const rendered = upstreamPlaceholder(text, tool, args, handle, keep, meta);
-	return rendered && meta.foldedAt ? rendered.replace(PH_MARK, `${PH_MARK} at ${fmtWhen(meta.foldedAt)}`) : rendered;
+	if (text.length <= MIN_FOLD_CHARS) return null;
+	const lines = text.split("\n").length;
+	const fields = jsonKeyFields(text, keep);
+	const keys = fields?.length ? [] : pickKeyLines(text, keep);
+	const body = keys.map((k) => `${k.no}: ${clip(k.text, 160)}`).join("\n");
+	const outcome = outcomeHint(text, tool, meta.isError);
+	const when = whenLabel(meta.at, meta.turn);
+	return (
+		`${PH_MARK}${meta.foldedAt ? ` at ${fmtWhen(meta.foldedAt)}` : ""} · ${tool}${args ? " " + args : ""}${when ? ` · ${when}` : ""}${outcome ? ` · ${outcome}` : ""} · ${text.length} chars, ${lines} lines · handle ${handle}]\n` +
+		(fields?.length ? `key fields kept (JSON; path: value, long strings show their end; up to ${keep}):\n${fields.join("\n")}\n` : "") +
+		(keys.length ? `key lines kept (original line numbers; up to ${keep}):\n${body}\n` : "") +
+		(meta.file
+			? `Original kept byte for byte, even after summaries or compaction, in ${meta.file.dir}/${handle}.txt: ${fileRecallHow(meta.file)}; prefer that to re-running or re-reading the source (output may differ). Do not guess its content.`
+			: !meta.noRecall
+			? `Original kept byte for byte, recallable even after summaries or compaction: ${RECALL_TOOL}("${handle}") (optional grep/range) is instant, free, no side effects; prefer it to re-running or re-reading (output may differ). Do not guess its content.`
+			: `Original not shown (${RECALL_TOOL} is not enabled in this session): re-read the file or re-run the read-only command if you need it. Do not guess its content.`)
+	);
 }
 
 export function keyTexts(text: string, keep = 8): string[] {

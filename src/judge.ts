@@ -2,7 +2,9 @@
 // A verdict only ranks folds the deterministic planner already allows. It never lowers a protected output's age.
 import { createHash, randomUUID } from "node:crypto";
 import { isAbsolute, normalize, resolve } from "node:path";
-import { callOf, foldCandidates, foldPlaceholder, settings, type Block, type Calls, type PlanOpts, type Verdict } from "./plan.ts";
+import type { Block, PlanOpts } from "./plan.ts";
+import { callOf, foldCandidates, foldPlaceholder, type Calls } from "./fold-policy.ts";
+import type { Verdict } from "./plan-fork.ts";
 import { handleFor, handleTokens, outcomeHint, pickKeyLines, shortArgs, RECALL_TOOL } from "./fold-format.ts";
 import { modelRef, reasoningFor, supportedThinking } from "./model-pick.ts";
 import { envInt, textOf, tok4, type Any } from "./util.ts";
@@ -735,7 +737,7 @@ export class Judge {
 	readonly hinted = new Set<string>();
 	readonly stats = { calls: 0, costUsd: 0, unknown: 0, errors: 0 };
 	/** Minimum age before a live output is scored. Not a permission to fold earlier than the planner allows. */
-	readonly judgeAge = Math.max(1, settings().judgeAge);
+	readonly judgeAge = Math.max(1, envInt("JUDGE_AGE", 10)); // minimum age before the judge scores a live output; not a permission to fold earlier
 	scope = "\0";
 	private catalogue = new Map<string, CatalogueItem>();
 	private run = false;

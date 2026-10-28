@@ -8,7 +8,8 @@ The fork now starts at upstream 0.4.15 (`ec10b2a7413ede90d9a906c35721b383227ac3d
 
 ## Ownership
 
-These source files match the upstream base byte-for-byte:
+These source files match the upstream base byte-for-byte (`summary.ts` and the planner in `plan.ts` are kept as upstream's reference
+implementations and are not what the fork runs):
 
 - `src/summary.ts`
 - `src/placeholder.ts`
@@ -22,6 +23,7 @@ The fork's implementations live in separate modules:
 | --- | --- |
 | Summary dispatch, shared epoch machinery and migration | `src/summary-engine.ts` |
 | Summary formats | `src/summary-v2.ts`, `src/summary-v3.ts` |
+| Planner (`plan`, `selectPlan`, `planContext`) with pressure gates, judge reordering, merge reserve, rescue | `src/plan-fork.ts` |
 | Summary pressure gates | `src/summary-pressure.ts` |
 | Source-order call matching, fold selection and diagnostics | `src/fold-policy.ts` |
 | Aliases, bounded hints and fold timestamps | `src/fold-format.ts` |
@@ -34,9 +36,27 @@ The fork's implementations live in separate modules:
 
 The fork emits **v2 and v3 only**. V3 is the default, and `PI_ZIP_SUMMARY_V2=1` selects v2. Old upstream/fork-v1 summaries remain readable for migration. The shared engine retains the legacy budgeting helpers used to size v2 calls; it has no fork-v1 emitter. Upstream `summary.ts` is retained as the reference implementation, not used to produce fork summaries.
 
-`run.ts`, `plan.ts`, `core.ts` and `index.ts` still contain integration hooks. Their remaining differences concern lifecycle ordering, planning, optional diagnostics and guard checks. `guard.ts`, `recallfile.ts` and `ui.ts` retain small changes for rescue permissions, request-ledger files and display. Do not remove these differences without checking the corresponding fork modules.
+`plan.ts` differs from upstream in two lines only: `toolCallIndex` comes from `fold-policy.ts`, and a judge need note does not
+start a run. Fork fields on its types (`Cut`, `PlanOpts`, `PlanResult`) are added by module augmentation in `plan-fork.ts`.
 
-The upstream summary/formatting/time-zone unit tests are preserved. Fork regressions live in separate files, including `summary-v2.test.ts`, `summary-v3.test.ts`, `summary-dispatch.test.ts`, `fork-pieces.test.ts` and `tz-fork.test.ts`. Runtime/planner integration tests still have adjustments where this fork intentionally behaves differently.
+`run.ts` keeps upstream's methods. Fork behavior lives in one block at the end of the `Zip` class (`// ---- fork:`), reached through
+one-line `fork*` hook calls in upstream methods (about 35 sites). On a conflict, keep upstream's line and re-add the hook call.
+`core.ts`, `index.ts`, `guard.ts`, `recallfile.ts` and `ui.ts` keep small integration changes.
+
+Fork-owned renderers: `fold-format.makePlaceholder` (fold timestamp) and `recall-extended.searchOutputs` (scoped headers) are full
+implementations, not rewrites of upstream output, so an upstream wording change cannot silently break them.
+
+### Tests
+
+- Upstream test files stay upstream except for small fixture changes the fork's behavior requires: `pi-integration.test.ts`
+  (v3 replies, pressure gate off, placeholder stamp, digest, installed-Pi hook signature), `core.test.ts`, `invariants.test.ts`,
+  `helpers.ts`, `pi-integration-mutants.ts`.
+- Upstream planner tests (`plan`, `law`, `calibration`, `coldwarm`, `planlaw`, `recallfile`) run unchanged against upstream's
+  planner; `fork-<name>.test.ts` runs the same suites, plus fork cases, against `plan-fork.ts`.
+- `fork-pi-integration.test.ts` holds the fork's real-Pi cases. It carries a copy of the rig from `pi-integration.test.ts`
+  (importing that file would run its tests twice); when upstream changes the rig, port the change to the copy.
+- Other fork suites: `summary-v2`, `summary-v3`, `summary-dispatch`, `fork-pieces`, `fork-restart`, `tz-fork`, `judge`,
+  `lookup`, `retrieval`, `ledger`, and the summary regression files.
 
 Fork documentation lives in `docs/fork.md`, `docs/fork-design.md` and `docs/fork-changelog.md`. Upstream changelog, design and reference documents remain untouched; README has one fork notice.
 

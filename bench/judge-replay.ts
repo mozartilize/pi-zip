@@ -2,7 +2,7 @@
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { parseFacts, parseEvidence, parseVerdict, type EvidenceSpan } from "../src/judge.ts";
-import type { Verdict } from "../src/plan.ts";
+import { type Verdict } from "../src/plan-fork.ts";
 
 export interface JudgeCapture {
 	// Keep the exact model, system prompt, task and candidate subset: different inputs are not repeat trials.

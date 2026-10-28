@@ -1,7 +1,8 @@
 // The pure decision core (src/core.ts): view, clock, law, plan and decide as functions of (branch, Λ, now).
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { checkEdits, clock, inRunClock, decideRun, decideEdits, want, decideTurnEnd, artifactsOf, grow, headOf, lawOf, planOpts, readyOf, unusedOf, runPlanOf, scaleOf, valvePlanOf, type Env, type Learned } from "../src/core.ts";
-import { planContext, UNIT, type PlanResult } from "../src/plan.ts";
+import { UNIT, type PlanResult } from "../src/plan.ts";
+import { planContext } from "../src/plan-fork.ts";
 import { buildCut } from "../src/summary.ts";
 import { replayGrowth } from "../src/state.ts";
 import { A, AX, R, U, type Any } from "./helpers.ts";

@@ -360,7 +360,7 @@ const mutants = [
 		name: "warmer-overwrites-main-snapshot",
 		pattern: "real warmer overlap",
 		check: "main snapshot survives two real warmer refreshes",
-		edit: (source: string) => rep(rep(source, 'this.requestStart(ctx);\n\t\tconst hinted', 'const hinted'), 'providerRequest(e: Any, ctx?: Any): Any {', 'providerRequest(e: Any, ctx?: Any): Any { this.requestStart(ctx);'),
+		edit: (source: string) => rep(rep(source, 'this.requestStart(ctx);\n\t\tconst noted', 'const noted'), 'providerRequest(e: Any, ctx?: Any): Any {', 'providerRequest(e: Any, ctx?: Any): Any { this.requestStart(ctx);'),
 	},
 ];
 const only = process.env.PZ_MUTANTS?.split(","); // run some by name

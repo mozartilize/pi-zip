@@ -1,7 +1,9 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { BoundaryIndex, Judge, judgeInput, candidateCausalTrace, supersededOutputs, parseFacts, parseEvidence, parseVerdict, judgeModelRef, judgeReasoning, hintText, requestOpen, locatorOf, citesWork, latestUserText, JUDGE_SYSTEM, NEED_CUSTOM, CATALOGUE_TOKENS, type EvidenceSpan } from "../src/judge.ts";
-import { buildBlocks, countUserTurns, foldCandidates, foldPlaceholder, plan, planContext, toolCallIndex, UNIT, type PlanOpts } from "../src/plan.ts";
+import { buildBlocks, countUserTurns, toolCallIndex, UNIT, type PlanOpts } from "../src/plan.ts";
+import { foldCandidates, foldPlaceholder } from "../src/fold-policy.ts";
+import { plan, planContext } from "../src/plan-fork.ts";
 import { checkEdits, decideEdits } from "../src/core.ts";
 import { handleFor, PH_MARK } from "../src/placeholder.ts";
 import { resolveHandlesInBranch } from "../src/recall-extended.ts";

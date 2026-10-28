@@ -4,7 +4,8 @@ import { reasonsByDefault } from "./reasoning-policy.ts";
 import { randomUUID } from "node:crypto";
 import { classifySummaryRead } from "./read-policy.ts";
 import { blockTime, cdAliases, clipMid, distinctLines, handleFor, keyTexts, outcomeHint, RECALL_TOOL, shortArgs, whenLabel } from "./fold-format.ts";
-import { type Block, type Cut, type PlanResult, callOf, NARRATIVE_CALL_MAX, NARRATIVE_MAX, settings } from "./plan.ts";
+import { type Block, type Cut, type PlanResult, NARRATIVE_CALL_MAX, NARRATIVE_MAX, settings } from "./plan.ts";
+import { callOf } from "./fold-policy.ts";
 
 import { type FileRecall, fileRecallHow } from "./recallfile.ts";
 import { type EvidenceProposal, type CommitmentProposal, type IntentProposal, intentQuotesOf, parseSummaryV2, prepareEpochV2, referencesSource, regroupEpochsV2, renderEpochSummaryV2 } from "./summary-v2.ts";

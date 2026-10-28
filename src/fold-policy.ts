@@ -1,11 +1,16 @@
 // Fork fold selection and source-order call matching. The upstream planner owns the price law.
-import { type Block, type Calls, type Call, type PlanOpts, type PlanResult, type plan, settings, UNIT, countUserTurns, openStarter, buildBlocks } from "./plan.ts";
+import { type Block, type PlanOpts, type PlanResult, settings, UNIT, countUserTurns, openStarter, buildBlocks } from "./plan.ts";
+import type { plan } from "./plan-fork.ts";
 import { classifyRecoverability } from "./read-policy.ts";
 import { handleFor, makePlaceholderFor, RECALL_TOOL } from "./fold-format.ts";
 import { commandNamesRecall, parseRecallPath } from "./recallfile.ts";
 import { MIN_EXPECT } from "./learn.ts";
 import { type Any, textOf, tok4, tokensOf } from "./util.ts";
 const PROTECT_USER_TURNS = 2;
+export type Call = { name: string; args: Any };
+/** Tool calls by id, plus each tool result's own call (`byResult`, keyed by the result message): ids may be reused, so a result belongs
+ *  to the newest call issued before it, never to a later call with the same id. Read a result's call with callOf. */
+export type Calls = Map<string, Call> & { byResult?: WeakMap<object, Call | null> };
 
 export function toolCallIndex(blocks: Block[]): Calls {
 	const m: Calls = new Map();

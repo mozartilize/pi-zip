@@ -1,13 +1,9 @@
 // The summary decision is the same whatever the cache is believed to be (research round5/cold-warm.md, round 6 one planner): every
 // summary passes its own law with the call priced, and the call is priced as the narrative call summary.ts makes.
-import { beforeEach, afterEach, describe, expect, test } from "bun:test";
+import { describe, expect, test } from "bun:test";
 import { planContext, type PlanOpts } from "../src/plan.ts";
 import { lawPrices } from "../src/learn.ts";
 import { A, AX, U, type Any } from "./helpers.ts";
-
-let savedAt: string | undefined;
-beforeEach(() => { savedAt = process.env.PI_ZIP_SUMMARY_AT; process.env.PI_ZIP_SUMMARY_AT = "0"; });
-afterEach(() => { if (savedAt === undefined) delete process.env.PI_ZIP_SUMMARY_AT; else process.env.PI_ZIP_SUMMARY_AT = savedAt; });
 
 const ANTH = lawPrices("explicit", false);
 const SUM = "S".repeat(40_000); // the previous summary, carried forward by the next one (~10K tokens)

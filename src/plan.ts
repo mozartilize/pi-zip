@@ -1,14 +1,11 @@
-import { recordSummaryPressure, summaryPrepareThreshold, type SummaryGate } from "./summary-pressure.ts";
-import { toolCallIndex, callOf, foldCandidates, foldPlaceholder } from "./fold-policy.ts";
 // Pure planning: session projection -> which outputs to fold, whether to summarise, where to cut (F5-F10).
-import { classifyRecoverability, type Recover } from "./read-policy.ts";
-import { handleFor, pickKeyLines, shortArgs } from "./fold-format.ts";
+import { classifyRecoverability, type Recover } from "./classify.ts";
+import { handleFor, makePlaceholderFor, pickKeyLines, RECALL_TOOL, shortArgs } from "./placeholder.ts";
 import { createHash } from "node:crypto";
 import { type Any, COMMIT_CUSTOM, PRODUCT, clamp, envInt, piTokensOf, textOf, tok4, tokensOf } from "./util.ts";
-import { PH_MARK } from "./fold-format.ts";
-import { lawPrices, type Prices } from "./learn.ts";
-import { type FileRecall } from "./recallfile.ts";
-import { ACTIVE_INPUT_TOKENS, estimateMergeWork, type MergeWork } from "./summary-engine.ts";
+import { PH_MARK } from "./placeholder.ts";
+import { lawPrices, MIN_EXPECT, type Prices } from "./learn.ts";
+import { commandNamesRecall, parseRecallPath, type FileRecall } from "./recallfile.ts";
 
 /** Default age, in assistant requests, from which ANY foldable output (every recoverability class) inside the protected user turns may
  *  still be folded. A sub-agent session is one user turn with hundreds of tool rounds, so without this its candidate set is empty for
@@ -19,8 +16,9 @@ export const INTURN_AGE = 60;
 
 const PROTECT_USER_TURNS = 2; // the latest user turn and the one before it are never summarised; their outputs fold only after a pause (previous turn, re-readable) or when old enough (INTURN_AGE)
 
-/** Summary production is priced as the narrative call over the new slice and bounded previous active state, plus a conservative
- *  reserve for tier merges. The previous summary's lists and durable epochs are not sent to the narrative call. */
+/** A summary call is priced as the call summary.ts makes (its narrative): uncached input of the prefix the narrative reads plus the
+ *  previous summary's narrative it merges (an upper bound: summary.ts PREV_NARRATIVE_CHARS; the previous summary's lists are not sent,
+ *  code carries them forward), plus output of at most the narrative budget. */
 /** The narrative's token budget (chars/4), summary.ts buildCut: clamp(planned - skeleton, 300, NARRATIVE_MAX). */
 export const NARRATIVE_MAX = 4000;
 /** The narrative call's output cap (summary.ts narrative): room above the budget, which is what the prompt asks for and the law
@@ -49,8 +47,6 @@ export function compactionRoom(model: Any, reserve = DEFAULT_RESERVE_TOKENS): nu
 	const w = Number(model?.contextWindow);
 	return w > 0 ? Math.max(MIN_TARGET, w - reserve - COMPACT_MARGIN) : null;
 }
-
-export { DEFAULT_SUMMARY_WINDOW, SUMMARY_PRESSURE_CAP, summaryThreshold, summaryPrepareThreshold } from "./summary-pressure.ts";
 
 export const PI_KEEP_RECENT = 20_000; // Pi's compaction keepRecentTokens default
 
@@ -438,10 +434,9 @@ export const CAP_CONTENT_MIN = 0.5;
 export const coldTarget = (cap: number, O: number, room: number | null): number => Math.min(Math.max(cap, O + CAP_CONTENT_MIN * cap), room ?? Infinity);
 
 export const settings = () => ({
-	coldCap: envInt("COLD_CAP", 40_000), // folding/cut target, not summary permission; never below O + half of it (coldTarget)
+	coldCap: envInt("COLD_CAP", 40_000), // cold: fold, then summarise, down to this many real tokens of the whole context, but never below O + half of it (coldTarget)
 	foldMin: envInt("FOLD_MIN", 500), // outputs below this many tokens are never folded
 	keepLines: envInt("KEEP_LINES", 8),
-	judgeAge: Math.max(1, envInt("JUDGE_AGE", 10)), // minimum age before the judge scores a live output; not a permission to fold earlier
 	inturnAge: envInt("INTURN_AGE", INTURN_AGE), // outputs (any class) of the protected turns at least this many assistant requests old may fold; 0 = never
 });
 
@@ -460,10 +455,7 @@ export interface Block {
 	ours: boolean; // ... and it is one of our placeholders
 	age: number; // toolResult: assistant requests that came after the one that issued the call (0 = answered by the newest request); other kinds 0
 }
-export type Call = { name: string; args: Any };
-/** Tool calls by id, plus each tool result's own call (`byResult`, keyed by the result message): ids may be reused, so a result belongs
- *  to the newest call issued before it, never to a later call with the same id. Read a result's call with callOf. */
-export type Calls = Map<string, Call> & { byResult?: WeakMap<object, Call | null> };
+export type Calls = Map<string, { name: string; args: Any }>;
 
 /** User turns so far: the real prompts. Steering and follow-up messages typed during a run belong to that run's turn. */
 export const countUserTurns = (blocks: Block[]): number => blocks.reduce((a, b) => Math.max(a, b.userTurn), 0);
@@ -516,7 +508,7 @@ export function buildBlocks(contextEntries: Any[], steerIds?: Set<string>): Bloc
 			if (!(src.id && steerIds?.has(src.id)) && !starter) userTurn++;
 			starter = false;
 			afterAnswer = false;
-		} else if (msgs.some((m) => m?.role === "custom" && m.customType !== "pi-zip/need")) {
+		} else if (msgs.some((m) => m?.role === "custom" && m.customType !== "pi-zip/need")) { // fork: a judge need note starts no run
 			if (afterAnswer) { userTurn++; starter = true; afterAnswer = false; }
 		} else if (kind === "assistant" || kind === "toolResult") starter = false;
 		// a run ends at its final answer, and also at a request that failed or was aborted (Esc): a custom message after either starts
@@ -541,7 +533,9 @@ export function buildBlocks(contextEntries: Any[], steerIds?: Set<string>): Bloc
  *  from the previous turn's final answer on (formal TR, round 4: 50K of answer kept in front of a driven run). */
 export const isCutBlock = (b: Block): boolean => !!b.entryId && (b.kind === "user" || b.kind === "assistant" || (b.kind === "other" && b.msg?.role === "custom"));
 
-export { toolCallIndex, callOf, foldCandidates, foldPlaceholder } from "./fold-policy.ts";
+// Fork: source-order call matching (a reused tool call id belongs to the newest call before its result).
+import { toolCallIndex } from "./fold-policy.ts";
+export { toolCallIndex };
 
 // ---------------------------------------------------------------------------------------------------------------
 // plan types
@@ -569,15 +563,10 @@ export interface Cut {
 	summaryTokens: number;
 	llmOk: boolean;
 	llmError: string | null;
-	costUsd: number; // all summariser calls, including tier merges (0 when unknown)
-	predictedMergeCostUsd?: number;
-	actualMergeCostUsd?: number;
+	costUsd: number; // what the narrative model call cost (0 when unknown)
 	usage?: Any;
 	ms: number; // total production time (the narrative model call included)
 	prepared?: boolean; // written in the background (a pi-zip/summary entry): its cost was counted when it was produced
-	reason?: string; // e.g. "request-budget-overflow" when protected user requests exceed the available summary budget/room
-	overflow?: { requiredTokens: number; availableTokens: number };
-	summaryDiagnostics?: Record<string, unknown>;
 }
 
 /** What a run sends from its first request on and persists verbatim at turn_end (F8). */
@@ -601,10 +590,7 @@ export interface RunPlan {
 	ready?: "away" | "background"; // its summary was written in the background: before this warm return ("away"), or while the run went on
 }
 
-export type Verdict = "cold" | "warm" | "hot" | "need";
-
 export interface PlanOpts {
-	verdicts?: ReadonlyMap<string, Verdict>;
 	keep?: number; // real tokens in Pi's kept tail, measured on the unedited view
 	rent?: number; // removable tokens rented since the last applied edit or cold decision
 	justEdited?: boolean; // the immediately preceding request carried a rewrite
@@ -614,13 +600,6 @@ export interface PlanOpts {
 	law?: Law; // prices, g and P(warm): the only input that depends on P; default: the explicit class ratios at P = 0
 	pause?: boolean; // a return after a pause (the absence outlived the requested cache lifetime) or a model switch: the previous user turn's re-readable outputs may fold
 	trace?: (LawTerms & { where: "summary" | "plan" | "guard"; cut?: boolean; ready?: boolean; key?: string })[]; // every law evaluation is pushed here (ledger)
-	/** Ledger only: candidate eligibility and the final application decision, populated by core.decideEdits. */
-	foldDecision?: {
-		reason: "selected" | "back-to-back" | "guard-rejected" | "no-plan";
-		outputs: Array<{ h: string; age: number; verdict: Verdict | "unscored"; group: number | null; planned: boolean; selected: boolean }>;
-	};
-	/** Output diagnostic, overwritten on each plan; sizes are calibrated whole-context tokens. */
-	summaryGate?: SummaryGate;
 	reserve?: number; // Pi's compaction reserveTokens (default 16384)
 	steerIds?: Set<string>; // user entries that are mid-run steering or follow-up messages, not new user turns
 	scale?: Scale; // real = O + c x content estimate (calibrate); default UNIT = the estimates are taken as real
@@ -634,31 +613,20 @@ export interface PlanOpts {
 	inturnAge?: number; // default settings().inturnAge (PI_ZIP_INTURN_AGE, 60); 0 = outputs of the protected turns never fold on age
 	rereadOnly?: boolean; // zip_recall is not available to the model: fold only outputs that can be re-read (classify "rereadable")
 	fileRecall?: FileRecall; // zip_recall is hidden but read, grep or bash is active: fold as in full mode, placeholders name the recall file
-	/** Newest message time (ms) in the view this plan was made from, stamped into new placeholders: every request before it saw the
-	 *  output in full. Taken from the session, not the clock, so the same view always renders the same placeholder bytes. */
-	foldedAt?: number;
 	cutAt?: string; // cut at this entry or not at all (a summary for that cut is produced or being produced: core.ts adopt)
 	foldsOnly?: boolean; // no cut: the plan of the folds alone (its summary is not ready: core.ts unready)
 	ready?: readonly string[];
-	/** Model-switch rescue: the context must fit a smaller window, and the alternative is Pi's own summary or an overflow, so the law's
-	 *  price never refuses the cut. `cutLatest`: a cut may enter the protected turns, up to and keeping the current user message.
-	 *  `force`: these outputs fold whatever their turn or age (chosen by the caller, biggest first, only as many as the window needs). */
-	rescue?: { cutLatest?: boolean; force?: ReadonlySet<string> };
 	readySizes?: Readonly<Record<string, number>>; // cuts whose summary is produced and ready: its call is spent, so the law prices it at 0 (theory 1.4)
 }
 
 export interface PlanResult {
-	judged?: { folds: FoldTarget[]; ctxAfterFolds: number }; // alternate folds, applied only AFTER the unchanged law accepts this plan
 	blocks: Block[];
 	calls: Calls;
 	folds: FoldTarget[];
 	cutIdx: number | null;
 	firstKeptEntryId: string | null;
 	prefixTokens: number; // content estimate units (x c = real), like summaryTokensPlanned
-	summaryTokensPlanned: number; // soft target: what the plan priced; the summary may use more, up to summaryRoomTokens
-	/** Hard bound (estimate units): the largest summary whose compacted view still stays below the model's compaction room. Absent: no known window. */
-	summaryRoomTokens?: number;
-	mergeWork?: MergeWork; // reserved tier-merge input/output tokens for production, not a ready summary's sunk cost
+	summaryTokensPlanned: number;
 	sumTrigger: "cold" | "valve" | null;
 	scale: Scale;
 	ctxTokens: number; // real: O + c x content
@@ -686,10 +654,10 @@ export const contentKeyOf = (content: Any): string => {
 /** The planner: one plan, whatever the cache is believed to be. Below the working view W (the cold target) it plans nothing. Above
  *  it, eligible outputs fold biggest first, class by class, until the view is at W: those of user turns older than the previous one;
  *  after a pause (PlanOpts.pause), the previous turn's re-readable outputs; those of the protected turns at least INTURN_AGE requests
- *  old. Only at min(80% of Pi's compaction room, 400K) after folds, one summary: the first cut from the one reaching W whose summary pays with its call, and with
+ *  old. If the folds cannot reach W, one summary: the first cut from the one reaching W whose summary pays with its call, and with
  *  which the whole plan pays (folds inside the prefix are void). Then the whole plan must pay. P(warm) enters only the law (o.law), so
  *  a lower P never plans less. The target never exceeds Pi's compaction room. null: nothing to plan, or the law refuses. */
-export function plan(entries: Any[], o: PlanOpts): { f: PlanResult; c: PlanResult | null; a: PlanResult | null; stuck?: boolean } | null {
+export function plan(entries: Any[], o: PlanOpts): { f: PlanResult; c: PlanResult | null; a: PlanResult | null } | null {
 	const s = settings();
 	// limits are in real tokens; the plan works in content estimate units (real = O + c x estimate), so they are converted once, here.
 	// The cold cap is on the whole context, but leaves at least half of itself for the conversation above O (coldTarget): a cap the
@@ -708,16 +676,15 @@ export function plan(entries: Any[], o: PlanOpts): { f: PlanResult; c: PlanResul
 		o.trace?.push({ where, ...t, ...(r !== null ? { keep: o.keep } : {}), ...(Tsuf !== undefined ? { Tsuf } : {}), ...(cut !== undefined ? { cut } : {}), ...(isReady ? { ready: true } : {}), ...(key !== undefined ? { key } : {}) });
 		return t.ok;
 	};
-	let judging = false, target = coldCap, minIdx = 0;
-	delete o.summaryGate;
+	const foldMin = o.foldMin ?? s.foldMin;
+	const keepLines = o.keepLines ?? s.keepLines;
+	const inturnAge = o.inturnAge ?? s.inturnAge;
 	const blocks = buildBlocks(entries, o.steerIds);
 	if (!blocks.length) return null;
 	const userTurns = countUserTurns(blocks) + (o.promptPending && !openStarter(blocks) ? 1 : 0); // the upcoming prompt is a new user turn (unless it joins an open starter)
 	const calls = toolCallIndex(blocks);
 	const recalled = o.recalled ?? new Set<string>();
 	const ctxEst = blocks.reduce((a, b) => a + b.tokens, 0); // content
-	const recordPressure = (after: number) => recordSummaryPressure(o, real(ctxEst), real(after), real(coldCap), room);
-	recordPressure(ctxEst);
 	let tail = 0;
 	for (let i = blocks.length - 1; i >= 0 && tail < PI_KEEP_RECENT; i--) tail += c * blocks[i].tokens;
 	o.keep = tail;
@@ -737,127 +704,92 @@ export function plan(entries: Any[], o: PlanOpts): { f: PlanResult; c: PlanResul
 		}
 	}
 	const classify = (b: Block): Recover => {
-		const call = callOf(calls, b.msg);
-		return classifyRecoverability(call?.name ?? b.msg.toolName ?? "", call?.args, textOf((b.raw ?? b.msg).content), o.cwd, (b.raw ?? b.msg).content);
+		const call = calls.get(b.msg.toolCallId);
+		return classifyRecoverability(call?.name ?? b.msg.toolName ?? "", call?.args, textOf((b.raw ?? b.msg).content), o.cwd);
 	};
 	const addFold = (b: Block, trig: string): boolean => {
 		if (tokOverride.has(b.idx) || recalled.has(handleFor(b.entryId!))) return false; // F4: never refold what the model recalled
-		const replacement = foldPlaceholder(b, calls, o);
-		if (!replacement) return false;
-		const { ph, phTok } = replacement;
+		const ph = makePlaceholderFor(b, calls, keepLines, !!o.rereadOnly, o.fileRecall);
+		if (ph === null) return false;
+		const phTok = tokensOf({ ...b.msg, content: [{ type: "text", text: ph }] }); // the folded message: its id and framing stay
+		if (!(phTok < 0.9 * b.tokens)) return false;
 		tokOverride.set(b.idx, phTok);
-		const call = callOf(calls, b.msg);
+		const call = calls.get(b.msg.toolCallId);
 		folds.push({ entryId: b.entryId!, toolCallId: b.msg.toolCallId, visIdx: visOfBlock[b.idx] ?? -1, contentKey: contentKeyOf(b.msg.content), tool: call?.name ?? b.msg.toolName ?? "tool", args: call ? shortArgs(call.args) : "", entryTokens: b.tokens, phTokens: phTok, ph, trig, recover: classify(b) });
 		return true;
 	};
-	const candidates = foldCandidates(blocks, calls, o);
+	// a zip_recall result IS content the model just asked for: folding it would undo the recall (and loop); never
+	// ... and so is a built-in read, grep, find, ls or bash call on a recall file (file recall, when an allowlist hides zip_recall)
+	const isRecall = (b: Block) => {
+		const call = calls.get(b.msg.toolCallId), name = call?.name ?? b.msg.toolName;
+		if (name === RECALL_TOOL) return true;
+		if (name === "bash") return commandNamesRecall(call?.args?.command);
+		return (name === "read" || name === "grep" || name === "find" || name === "ls") && !!parseRecallPath(call?.args?.path);
+	};
+	// Observability: on an automatic (prefix) cache no fold starts inside the first MIN_EXPECT real tokens, so the next response's cacheRead
+	// is an uncensored survival sample (learn.ts sample). Without it every idle return folded into the first 1-7K tokens and its sample was
+	// censored, so the learned curve never saw a return (live GLM bench). Explicit caches are exempt: the provider looks back only ~20
+	// blocks from the last breakpoint, a far head is not read either way. A cut replaces the prefix from the first message: exempt too.
+	const head = law.pr.cls === "automatic" ? (MIN_EXPECT - O) / c : 0; // MIN_EXPECT counts from the first token, O included
+	const start: number[] = [];
+	blocks.reduce((acc, b) => ((start[b.idx] = acc), acc + b.tokens), 0);
+	const foldable = (b: Block) => b.kind === "toolResult" && !b.edited && !!b.entryId && tok4(textOf((b.raw ?? b.msg).content)) > foldMin && !isRecall(b) && start[b.idx] >= head && (!o.rereadOnly || classify(b) === "rereadable");
 	const protectedTurn = (b: Block) => b.userTurn >= userTurns - PROTECT_USER_TURNS + 1;
 	const savings = () => folds.reduce((a, t) => a + t.entryTokens - t.phTokens, 0);
 	// the eligible outputs, class by class, each biggest first, until the view is at the working size: inside one rewrite a fold beyond
 	// it would hide work for no saving the law asked for
 	let est = ctxEst - savings();
-	const verdict = (b: Block) => o.verdicts?.get(handleFor(b.entryId!));
-	const rank = (b: Block) => ({ cold: 0, warm: 1, hot: 2, need: 3 }[verdict(b) ?? "warm"]);
 	const take = (list: Block[], tag: string) => {
-		for (const b of list.filter((b) => b.idx >= minIdx).sort((x, y) => (judging ? rank(x) - rank(y) : 0) || y.tokens - x.tokens)) {
-			if (est <= target) return;
+		for (const b of list.sort((x, y) => y.tokens - x.tokens)) {
+			if (est <= coldCap) return;
 			if (addFold(b, tag)) est -= b.tokens - (tokOverride.get(b.idx) ?? 0);
 		}
 	};
-	const choose = () => {
 	// outputs of the user turns before the previous one
-	take(candidates[0], trig);
+	take(blocks.filter((b) => foldable(b) && !protectedTurn(b)), trig);
 	// the protected window = the new prompt + the previous user turn; after a pause (or a model switch) the user comes back to a cache
 	// that is gone, and that turn's big re-readable reads are what makes the return expensive: they come back exactly
-	take(candidates[1], `${trig}(relax)`);
+	if (o.pause) take(blocks.filter((b) => foldable(b) && protectedTurn(b) && b.userTurn < userTurns && classify(b) === "rereadable"), `${trig}(relax)`);
 	// in-turn: outputs of the protected turns that are many requests old, whatever their recoverability class (every fold stays
 	// recallable). Age = assistant requests since the call was issued (the newest outputs, age < inturnAge, always stay).
-	take(candidates[2], `${trig}(inturn)`);
-	};
-	choose();
-	// Rent, production, cuts and the permission to rewrite always use the original plan. Reorder only its accepted folds.
-	const capReal = coldTarget(o.coldCap ?? s.coldCap, O, room);
-	const finish = (q: { f: PlanResult; c: PlanResult | null; a: PlanResult | null }, cutsLeft = false) => {
-		if (o.verdicts?.size) for (const p of [q.f, q.a]) {
-			if (!p || !p.folds.length) continue;
-			const before = p.folds.reduce((n, t) => n + t.entryTokens - t.phTokens, 0);
-			folds.splice(0, folds.length, ...(o.carriedFolds ?? []));
-			tokOverride.clear();
-			for (const t of folds) tokOverride.set(blocks.findIndex((b) => b.entryId === t.entryId), t.phTokens);
-			judging = true;
-			minIdx = p.cutIdx ?? 0;
-			target = coldCap; // stay at the working-size cap; chasing the last fold's overshoot takes later hot folds
-			est = ctxEst - savings();
-			choose();
-			// The original overshoot helped pay for this rewrite. Never spend that saving on a ranking preference.
-			if (savings() >= before) p.judged = { folds: [...folds], ctxAfterFolds: p.ctxAfterFolds - c * (savings() - before) };
-		}
-		const carried = new Set((o.carriedFolds ?? []).map((t) => t.entryId));
-		const foldLeft = q.f.folds.some((t) => !carried.has(t.entryId));
-		// Over the cap with nothing left to fold or cut. A price, rent, or back-to-back deferral of a fold or cut that still exists is not this case.
-		return !q.c && !q.a && !foldLeft && !cutsLeft && q.f.ctxAfterFolds > capReal ? { ...q, stuck: true as const } : q;
-	};
+	if (inturnAge > 0) take(blocks.filter((b) => foldable(b) && protectedTurn(b) && b.age >= inturnAge), `${trig}(inturn)`);
 	const ctxAfterFolds = ctxEst - savings();
 	// what no summary can remove (besides O): the protected turns (after their folds) and the previous summary, which the next one
 	// carries forward; the cap is never chased below it (a context that is mostly this floor would be re-summarised for nothing)
 	const prevSum = blocks[0]?.kind === "summary" ? blocks[0].tokens : 0;
-	// The skeleton can leave as little as 300 narrative tokens. Reserve merges at that smallest possible epoch budget.
-	recordPressure(ctxAfterFolds);
-	const canApplySummary = o.summaryGate!.eligible;
-	const canPrepareSummary = o.summaryGate!.prepareEligible;
-	const mergeWork: MergeWork = prevSum && !o.foldsOnly && canPrepareSummary && ctxAfterFolds > coldCap
-		? estimateMergeWork(String(blocks[0].msg.summary ?? ""), 300, c, o.model)
-		: { inputTokens: 0, outputTokens: 0, merges: 0 };
-	const mergeCall = law.pr.w * mergeWork.inputTokens + law.pr.out * mergeWork.outputTokens;
-	const activeInput = prevSum ? c * (ACTIVE_INPUT_TOKENS + 128) : 0;
 	const atRoom = room !== null && real(ctxAfterFolds) >= room;
 	const atRoomUnedited = room !== null && real(ctxEst) >= room;
-	const sumTrigger: "cold" | "valve" | null = !o.foldsOnly && canPrepareSummary && ctxAfterFolds > coldCap ? trig : null;
+	const sumTrigger: "cold" | "valve" | null = !o.foldsOnly && ctxAfterFolds > coldCap ? trig : null;
 	const minCut = blocks[0].kind === "summary" ? 2 : 1; // never re-summarise a prefix that is only the previous summary
 	const pre: number[] = [];
 	const S = (x: number) => Math.max(clamp(SUMMARY_RATIO * c * x, SUMMARY_FLOOR, SUMMARY_CAP), c * prevSum) / c; // the next summary carries the previous one forward
 	const result = (pick: number | null, summary = pick === null ? 0 : S(pre[pick])): PlanResult => ({
 		blocks, calls, folds: pick === null ? [...folds] : folds.filter((t) => blocks.findIndex((b) => b.entryId === t.entryId) >= pick || o.carriedFolds?.some((u) => u.entryId === t.entryId)),
 		cutIdx: pick, firstKeptEntryId: pick === null ? null : blocks[pick].entryId, prefixTokens: pick === null ? 0 : pre[pick],
-		summaryTokensPlanned: summary, ...(pick !== null ? { mergeWork } : {}), sumTrigger, scale: o.scale ?? UNIT,
-		...(pick !== null && room !== null ? { summaryRoomTokens: Math.max(0, Math.floor((room - real(ctxAfterFolds)) / c + pre[pick])) } : {}),
+		summaryTokensPlanned: summary, sumTrigger, scale: o.scale ?? UNIT,
 		ctxTokens: real(ctxEst), ctxAfterFolds: real(ctxAfterFolds), userTurns, ...(o.fileRecall ? { fileRecall: o.fileRecall } : {}),
 		...(atRoom ? { atRoom } : {}), ...(atRoomUnedited ? { atRoomUnedited } : {}),
 	});
 	const f = result(null);
-	if (!sumTrigger) return finish({ f, c: null, a: null });
+	if (!sumTrigger) return { f, c: null, a: null };
 	let acc = 0;
 	for (const b of blocks) { pre[b.idx] = acc; acc += tokOverride.get(b.idx) ?? b.tokens; }
-	const limit = o.rescue?.cutLatest ? blocks.findIndex((b) => b.userTurn >= userTurns) : blocks.findIndex(protectedTurn), cuts: number[] = [];
+	const limit = blocks.findIndex(protectedTurn), cuts: number[] = [];
 	for (let i = minCut; i < blocks.length && (limit < 0 || i <= limit); i++) if (isCutBlock(blocks[i])) cuts.push(i);
-	if (!cuts.length) return finish({ f, c: null, a: null });
+	if (!cuts.length) return { f, c: null, a: null };
 	const cw = cuts.findIndex((k) => ctxAfterFolds - pre[k] + S(pre[k]) <= coldCap);
 	const first = cw < 0 ? cuts.length - 1 : cw;
 	const paying = cuts.slice(first).find((k) => {
 		const X = c * pre[k], Sr = c * S(pre[k]);
-		if (o.rescue) return X > Sr; // any shrinking cut: the window, not the price, decides
 		if (X < 2 * Sr) return false;
-		const call = law.pr.w * (c * Math.max(0, pre[k] - prevSum) + activeInput) + law.pr.out * Math.min(c * S(pre[k]), NARRATIVE_MAX) + mergeCall;
+		const call = law.pr.w * c * Math.max(0, pre[k] - prevSum) + law.pr.out * Math.min(c * S(pre[k]), NARRATIVE_MAX);
 		return gate("summary", X, Sr, null, call, Sr, undefined, undefined, false, blocks[k].entryId ?? undefined)
 			&& gate("plan", real(ctxEst), real(ctxAfterFolds - pre[k] + S(pre[k])), room, call, real(ctxAfterFolds - pre[k] + S(pre[k])), undefined, true);
 	});
 	const bound = paying ?? cuts[first], ready = new Set(o.ready ?? []);
 	const readySize = (k: number) => o.readySizes?.[blocks[k].entryId!] ?? S(pre[k]);
-	const checkpoint = cuts.filter((k) => ready.has(blocks[k].entryId!) && pre[k] >= 2 * readySize(k)).pop();
-	const have = (!o.application || canApplySummary)
-		? cuts.filter((k) => k <= bound && ready.has(blocks[k].entryId!) && pre[k] >= 2 * readySize(k)).pop()
-		: undefined;
-	// A speculative checkpoint does not shorten the live prefix. Re-reading it for a new cut ID alone wastes a full summary call.
-	// Refresh only near the preparation limit, with at least a quarter-threshold of newly covered real tokens (35K by default).
-	const prep = summaryPrepareThreshold(room);
-	const refresh = canApplySummary || checkpoint === undefined || (paying !== undefined
-		&& real(ctxAfterFolds - pre[checkpoint] + readySize(checkpoint)) >= prep
-		&& c * (pre[paying] - pre[checkpoint]) >= prep / 4);
-	if (!canApplySummary && checkpoint !== undefined) o.summaryGate!.checkpoint = {
-		key: blocks[checkpoint].entryId!, after: Math.round(real(ctxAfterFolds - pre[checkpoint] + readySize(checkpoint))),
-		advance: Math.round(paying === undefined ? 0 : c * (pre[paying] - pre[checkpoint])), refresh,
-	};
-	return finish({ f, c: paying === undefined || !refresh ? null : result(paying), a: have === undefined ? null : result(have, readySize(have)) }, true);
+	const have = cuts.filter((k) => k <= bound && ready.has(blocks[k].entryId!) && pre[k] >= 2 * readySize(k)).pop();
+	return { f, c: paying === undefined ? null : result(paying), a: have === undefined ? null : result(have, readySize(have)) };
 }
 
 /** Select from the planner's tuple: production uses the plain law; application uses G_{1/10} and takes only READY summaries. */
@@ -872,10 +804,9 @@ export function selectPlan(q: ReturnType<typeof plan>, o: PlanOpts): PlanResult 
 		return t.ok && (p.cutIdx !== null || p.folds.length > 0);
 	};
 	const a = o.cutAt === undefined ? q.a : q.a?.firstKeptEntryId === o.cutAt ? q.a : null;
-	const judged = (p: PlanResult) => p.judged ? { ...p, ...p.judged, judged: undefined } : p;
-	if (a && !o.deferSummary && test(a, true)) return judged(a);
-	if (!o.application && !o.foldsOnly && o.cutAt === undefined && q.c && o.summaryGate?.eligible) return q.c;
-	return test(q.f) ? judged(q.f) : null;
+	if (a && !o.deferSummary && test(a, true)) return a;
+	if (!o.application && !o.foldsOnly && o.cutAt === undefined && q.c) return q.c;
+	return test(q.f) ? q.f : null;
 }
 
 /** Compatibility projection for planner callers; the decision core also reads the unfiltered tuple for rent and production. */

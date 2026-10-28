@@ -5,7 +5,7 @@ import { handleFor, RECALL_TOOL, shortArgs } from "./placeholder.ts";
 import { commandRecallHandles, parseRecallPath } from "./recallfile.ts";
 import { measure, recallCallLine, recallResultLines, type RecallSectionInfo } from "./ui.ts";
 import { type Any, textOf } from "./util.ts";
-import { parseRange, recallSections, searchOutputs as upstreamSearch, type RecallItem } from "./recall.ts";
+import { parseRange, recallSections, grepMatcher, sliceRecall, type RecallItem } from "./recall.ts";
 export * from "./recall.ts";
 const RECALL_PAGE_CHARS = 20_000, SEARCH_PAGE_CHARS = 8_000, RECALL_MAX_PAGE_CHARS = 50_000;
 const int = (v: unknown): number | null => {
@@ -286,15 +286,49 @@ export function recalledHandlesFromBranch(branch: Any[]): Set<string> {
 	return out;
 }
 
-export function searchOutputs(outputs: Array<RecallItem & { text: string }>, grep: string,
-	opts: { offset?: unknown; limit?: unknown; upTo?: number; noun?: string; plural?: string } = {}) {
-	const result = upstreamSearch(outputs, grep, opts);
-	if (!opts.noun && !opts.plural) return result;
-	const end = result.text.indexOf("\n");
-	const noun = opts.noun ?? "output", plural = opts.plural ?? "earlier tool outputs";
-	const head = result.text.slice(0, end).replace("earlier tool outputs", plural)
-	    .replace("output(s)", `${noun}(s)`).replace("newest output first", `newest ${noun} first`);
-	return { ...result, text: head + result.text.slice(end) };
+const RECALL_MAX_HITS = 400;
+const GREP_BUDGET_MS = 2000;
+const sectionHead = (it: RecallItem & { text: string }) => `[handle ${it.handle}${it.label || it.tool ? " · " + (it.label ?? it.tool) : ""} · ${it.text.length} chars · ${it.text.split("\n").length} lines]`;
+
+/** Grep without a handle over a pool of records (outputs, requests or assistant text), newest first. Owned here because its header
+ *  names the record kind; upstream's searchOutputs names tool outputs only. */
+export function searchOutputs(
+	outputs: Array<RecallItem & { text: string }>,
+	grep: string,
+	opts: { offset?: unknown; limit?: unknown; upTo?: number; noun?: string; plural?: string } = {},
+): { text: string; matched: number; hits: number; chars: number; pool: number; sections: RecallSectionInfo[] } {
+	const { re, literal } = grepMatcher(grep);
+	const all = outputs.filter((o) => o.tool !== RECALL_TOOL);
+	const pool = opts.upTo !== undefined && opts.upTo >= 0 && opts.upTo < all.length ? all.slice(0, opts.upTo) : all;
+	const parts: string[] = [];
+	const sections: RecallSectionInfo[] = [];
+	let hits = 0;
+	let stopped = false;
+	const t0 = Date.now();
+	for (let k = pool.length - 1; k >= 0 && !stopped; k--) {
+		const it = pool[k];
+		const lines = it.text.split("\n");
+		const got: string[] = [];
+		for (let i = 0; i < lines.length; i++) {
+			if (hits >= RECALL_MAX_HITS || Date.now() - t0 > GREP_BUDGET_MS) {
+				stopped = true;
+				break;
+			}
+			if (re.test(lines[i])) {
+				got.push(`${i + 1}: ${lines[i]}`);
+				hits++;
+			}
+		}
+		if (!got.length) continue;
+		parts.push(`${sectionHead(it)}\n${got.join("\n")}`);
+		sections.push({ handle: it.handle, label: it.label ?? it.tool ?? undefined, turn: it.turn, totalLines: lines.length, shownLines: got.length, how: "grep" });
+	}
+	const noun = opts.noun ?? "output";
+	const plural = opts.plural ?? "earlier tool outputs";
+	const head = `[grep${literal ? " (searched as literal text: the pattern is not a safe regular expression)" : ""} over all ${pool.length} ${plural} (no handle given): ${hits} matching line(s) in ${sections.length} ${noun}(s), newest ${noun} first${stopped ? "; stopped early (time or hit cap), narrow the pattern or pass a handle" : ""}]\n`;
+	if (!hits) return { text: head + "Nothing matched. Try a shorter or different pattern, or pass the handle shown in a folded block or a summary.", matched: 0, hits, chars: 0, pool: pool.length, sections };
+	const page = sliceRecall(parts.join("\n\n"), { offset: opts.offset, limit: opts.limit, pageChars: SEARCH_PAGE_CHARS, narrow: "narrow the pattern, or pass one of the handles above with grep" });
+	return { text: head + page.text, matched: sections.length, hits, chars: page.body.length, pool: pool.length, sections };
 }
 
 export interface RecallHooks {

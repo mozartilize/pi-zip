@@ -1,7 +1,3 @@
-import { recoverLength } from "./length-recovery.ts";
-import { fitModelSwitch } from "./model-switch.ts";
-import { RequestNotes, type RequestMemory } from "./request-notes.ts";
-import { DecisionLog } from "./decision-log.ts";
 // The per-session shell behind index.ts: Pi's events, the run plan (F8) and the warm valve (F10) carried out and persisted at
 // turn_end, the producer and its timer for the summary (F12). The decisions themselves are pure functions in core.ts.
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -18,11 +14,17 @@ import { handleFor, PH_MARK, RECALL_TOOL } from "./placeholder.ts";
 import { branchOutputs, formatRequestsLedger, recalledHandlesFromBranch, resolveHandlesInBranch } from "./recall-extended.ts";
 import { cleanupRecall, commandNamesRecall, fileRecallFor, materialize, parseRecallPath, recallRoot, recallRootShown, rewriteCommand, sidDir, type FileRecall } from "./recallfile.ts";
 import { buildCut } from "./summary-engine.ts";
-import { Judge, HINT_CUSTOM, latestProjectedUser } from "./judge.ts";
-import { coldTarget, compactionRoom, plan, settings, toolCallIndex } from "./plan.ts";
 import { type Any, attempt, COMMIT_CUSTOM, envInt, PRODUCT, textOf, tok4, tokensOf } from "./util.ts";
 import { pendingSummary, replayGrowth } from "./state.ts";
 import { fmtLife, type CardData, type ChartBin, type StateWord } from "./ui.ts";
+// fork modules
+import { recoverLength } from "./length-recovery.ts";
+import { fitModelSwitch } from "./model-switch.ts";
+import { RequestNotes, type RequestMemory } from "./request-notes.ts";
+import { DecisionLog } from "./decision-log.ts";
+import { Judge, HINT_CUSTOM, latestProjectedUser } from "./judge.ts";
+import { coldTarget, compactionRoom, settings, toolCallIndex } from "./plan.ts";
+import { plan } from "./plan-fork.ts";
 
 export const PLAN_CUSTOM = "pi-zip/plan";
 export const STATE_CUSTOM = "pi-zip/state";
@@ -114,10 +116,6 @@ export class Zip implements ZipControl {
 	conflict: string | null = null;
 	readonly stats = new Stats();
 	readonly recalled = new Set<string>();
-	private judge = new Judge((rec) => this.ledger(rec));
-	private judgeReq = 0;
-	private judgePrompt = "";
-	private stuckNoted = false;
 	private cold = false;
 	private coldReason = "";
 	private runChecked = true; // the first request of the run has been looked at
@@ -158,7 +156,7 @@ export class Zip implements ZipControl {
 	private rentHead = "";
 	private rent = 0; // R14: accumulated planned savings, persisted at each boundary
 	private justEdited = false; // the newest response answered a request that first carried an edit: the next request gets no warm edit
-	// pi-zip's own ctx.compact() in flight (compaction null = cancel a late ask)
+	// pi-zip's own ctx.compact() in flight: the only compaction session_before_compact answers (compaction null = cancel a late ask)
 	private nativeAsk: { compaction: Any | null; answered: boolean; askedAt: number; askedWall: number; until: number } | null = null;
 	/** What became of the native path for this run, for the notice (the session file alone says why a summary went the draft way). */
 	private nativeNote: { native: string; ms?: number; askMs?: number } | null = null;
@@ -171,13 +169,6 @@ export class Zip implements ZipControl {
 	private foreignRun = false;
 	// the native summary already went in; its joint decision supplies the first request's folds and notice sizes
 	private nativeRun: NativeRun | null = null;
-	// model switch: the folds-only plan a cancelled threshold compaction hands this run, the compaction Pi is committing, the rescue folds
-	// allowed in protected turns until committed, and the newest request's model (its larger window reads a prefix the new one cannot)
-	private switchRun: { o: PlanOpts; cal: Scale; p: PlanResult } | null = null;
-	private switchPending: (NativeRun & { key: string; waitMs: number }) | null = null;
-	private overflowFailedKeys = new Set<string>();
-	private rescueIds = new Set<string>();
-	private lastReqModel: Any = null;
 	// the idle door (armDoor): its timer, the evaluation in flight, the inputs seen, and the decision the next run carries (any run)
 	private doorTimer: ReturnType<typeof setTimeout> | null = null;
 	private doorGen = 0;
@@ -312,12 +303,9 @@ export class Zip implements ZipControl {
 		this.stateLine(ctx, "on", "older context gets zipped when the savings pay for the rewrite · /zip");
 	}
 
-	private decisionLog = new DecisionLog();
-	get ledgerSid() { return this.decisionLog.sid; }
-	set ledgerSid(sid: string) { this.decisionLog.sid = sid; }
-	ledgerOn() { return this.decisionLog.enabled(); }
-	ledger(rec: Record<string, unknown>) { this.decisionLog.write(rec); }
-	private rotateLedger() { this.decisionLog.rotate(); }
+	ledger(rec: Record<string, unknown>) {
+		this.decisionLog.write(rec);
+	}
 
 	/** keep = a fold/summary notice: written to the session as a custom entry, so it stays in the transcript (also after a restart)
 	 *  next to Pi's own "[compaction]" block instead of a status line the next status overwrites. Custom entries never reach the model. */
@@ -433,11 +421,9 @@ export class Zip implements ZipControl {
 	/** Ledger form of the law's evaluations: Phi, K, eta, T next to g, w/r, P(warm) and where the inputs came from. */
 	private lawLedger(where: string, o: PlanOpts) {
 		const l = o.law!, pr = l.pr, rd = (x: number) => (Number.isFinite(x) ? Math.round(x * 1000) / 1000 : x > 0 ? "inf" : null);
-			const sg = o.summaryGate ? { before: Math.round(o.summaryGate.before), afterFolds: Math.round(o.summaryGate.afterFolds), target: Math.round(o.summaryGate.target), threshold: o.summaryGate.threshold === null ? null : Math.round(o.summaryGate.threshold), prepareThreshold: o.summaryGate.prepareThreshold === null ? null : Math.round(o.summaryGate.prepareThreshold), room: o.summaryGate.room === null ? null : Math.round(o.summaryGate.room), eligible: o.summaryGate.eligible, prepareEligible: o.summaryGate.prepareEligible, reason: o.summaryGate.reason, ...(o.summaryGate.checkpoint ? { checkpoint: o.summaryGate.checkpoint } : {}) } : undefined;
 		this.ledger({
 			type: "law", where, g: Math.round(l.g), pWarm: rd(l.pWarm), survSrc: where === "run" ? this.survSrc : "in-run", cls: pr.cls, wr: rd(pr.w / pr.r), prSrc: pr.src,
-			...(sg ? { summaryGate: sg } : {}),
-			...(o.foldDecision ? { foldDecision: o.foldDecision } : {}),
+			...this.forkLawFields(o),
 			steps: (o.trace ?? []).map((t) => ({ at: t.where, ok: t.ok, B: Math.round(t.B), A: Math.round(t.A), T: Math.round(t.T), ...(t.Tsuf !== undefined ? { Tsuf: Math.round(t.Tsuf) } : {}), phi: rd(t.phi), K: rd(t.K), eta: rd(t.eta) })),
 		});
 	}
@@ -482,12 +468,7 @@ export class Zip implements ZipControl {
 
 	// ---- events ----------------------------------------------------------------------------------------------
 	sessionStart(ctx: Any) {
-		this.judge.stop("session-changed");
-		this.judge = new Judge((rec) => this.ledger(rec));
-		this.ledgerSid = this.sessionId(ctx); // this session's ledger file, before the first record names it
-		this.rotateLedger();
-		this.judgeReq = 0;
-		this.judgePrompt = "";
+		this.forkSessionStart(ctx);
 		this.liveCtx = ctx;
 		this.start = null; // a decision carried for a run of the session before is never handed to a run of this one
 		this.startKind = null;
@@ -554,15 +535,6 @@ export class Zip implements ZipControl {
 		const out = materialize(recallRoot(), sid, found.map((it) => ({ handle: it.handle, text: it.text })));
 		this.ledger({ type: "recall_file", handles: found.map((it) => it.handle), missing: handles.length - found.length, chars: found.reduce((a, it) => a + it.text.length, 0) });
 		return out;
-	}
-	/** Write `requests.txt` (raw-branch-v2 request ledger) for file-based recall when `zip_recall` is hidden. */
-	private materializeRequests(ctx: Any): string | null {
-		const sid = this.recallSid(ctx);
-		if (!sid) return null;
-		const text = formatRequestsLedger(this.branch(ctx));
-		const out = materialize(recallRoot(), sid, [{ handle: "requests", text }]);
-		this.ledger({ type: "recall_file", requests: true, chars: text.length });
-		return out.get("requests") ?? null;
 	}
 	/** Every output this session's model no longer sees in full (folded, or summarised away): what a grep, ls or find over the directory needs. */
 	private materializeAll(ctx: Any): string | null {
@@ -684,8 +656,7 @@ export class Zip implements ZipControl {
 	/** before_agent_start: the prompt's run (its input carried the decision), or on Pi 1.2.0 a run an extension's message starts
 	 *  (messageType "custom"), which begins here, once, as a driven run. */
 	async beforeAgentStart(ctx: Any, e?: Any): Promise<void> {
-		this.detectConflict(ctx);
-		this.judgePrompt = typeof e?.prompt === "string" ? e.prompt : "";
+		this.forkBeforeAgentStart(ctx, e);
 		this.runStarts++;
 		if (e?.messageType === "custom") {
 			this.start = null;
@@ -727,11 +698,10 @@ export class Zip implements ZipControl {
 	private promptStart = false;
 
 	agentEnd() {
-		this.judge.stop("run-ended", true);
+		this.forkAgentEnd();
 		this.startKind = null;
 		this.promptStart = false;
 		this.inRun = false;
-		this.notes.resetMemory();
 		this.writeUnwritten();
 		const s = this.version, d = { v: s.v, pi: s.pi, since: s.since }; // at the end of a run, unless the newest entry on this branch says the same
 		if (!(s.last?.v === d.v && s.last?.pi === d.pi)) attempt(() => this.pi.appendEntry(VERSION_CUSTOM, (s.last = d)), undefined);
@@ -760,10 +730,7 @@ export class Zip implements ZipControl {
 	private async beginRun(ctx: Any, viaPrompt: boolean, carried: Start | null = null): Promise<void> {
 		this.liveCtx = ctx;
 		this.inRun = true;
-		this.stuckNoted = false;
-		this.judge.startRun();
-		this.notes.resetLookup(); // a cue is request-local: a new run with the same text gets it again
-		if (!this.judgePrompt) this.judgePrompt = textOf([...this.branch(ctx)].reverse().find((e) => e.message?.role === "user")?.message?.content);
+		this.forkBeginRun(ctx);
 		this.cancelTimer(); // the user is back: nothing is started behind their back any more
 		this.cancelDoor();
 		this.ranHere = true;
@@ -825,7 +792,10 @@ export class Zip implements ZipControl {
 		else if (!carried && ready) this.nativeNote = { native: "no idle input before this prompt's run" };
 	}
 
-	/** Own native requests, plus Pi's threshold check after a model switch. Manual and unrelated auto-compactions stay untouched. */
+	/** session_before_compact: answers ONLY the compaction pi-zip itself asked for a moment ago (nativeAsk): its own summary and its own
+	 *  tokensBefore. Pi's threshold and overflow compactions, /compact and other extensions' compactions get undefined and run untouched.
+	 *  Once pi-zip has given up on its compaction (compaction null), a late ask of it is cancelled, never one with a live signal: that is
+	 *  another compaction (pi-zip's own was aborted). */
 	sessionBeforeCompact(e?: Any, ctx?: Any): Any {
 		const a = this.nativeAsk;
 		if (typeof e?.customInstructions === "string" && e.customInstructions.startsWith(NATIVE_MARKER)) {
@@ -852,89 +822,6 @@ export class Zip implements ZipControl {
 		a.askedAt = performance.now();
 		a.askedWall = Date.now();
 		return a.compaction ? { compaction: a.compaction } : { cancel: true };
-	}
-
-	private switchedModel(ctx: Any): boolean {
-		// Pi may check compaction before the first agent_start after reopening a session restores prevKey.
-		const previous = this.lastModelKey || this.prevKey || lastPrompt(this.branch(ctx)).key;
-		return !!previous && !!ctx?.model && previous !== modelKey(ctx.model);
-	}
-
-	private stopSwitch(ctx: Any, reason: string) {
-		this.ledger({ type: "model_switch_blocked", model: modelKey(ctx.model), reason });
-		this.notify(ctx, `${PRODUCT}: the context does not fit ${ctx.model?.id ?? "the selected model"} (${reason}); the run stopped with the history intact. Select a larger-window model, or shorten the latest request.`);
-		// Awaiting abort from an active hook deadlocks: Pi waits for this handler before it can settle.
-		void Promise.resolve(ctx.abort?.()).catch((err) => this.ledger({ type: "error", where: "switch_abort", error: errText(err) }));
-		return { cancel: true };
-	}
-
-	/** The next request of this run plans again: its run plan was made for the previous model's window. */
-	private replan() {
-		this.runPlan = null;
-		this.runEdits = false;
-		this.runChecked = false;
-	}
-
-	/** The newest request's model when its window is larger: it can still read a prefix the new model cannot. */
-	private summaryModel(ctx: Any): Any {
-		const old = this.lastReqModel;
-		return old && modelKey(old) !== modelKey(ctx.model) && Number(old.contextWindow) > Number(ctx.model?.contextWindow) ? old : ctx.model;
-	}
-
-
-	/**
-	 * Pi checks its compaction threshold before context hooks, so a switch to a smaller window is fitted here, least loss first:
-	 * 1. folds alone fit: cancel Pi's compaction; this run's next request carries the folds;
-	 * 2. a READY prefix summary fits with the kept turns after their folds: Pi compacts with it;
-	 * 3. a summary being written: wait for it, then 2;
-	 * 4. write the cut this window needs now, its narrative read by the previous model when that window is larger;
-	 * 5. the two protected turns alone are too big: cut up to the current user message, then fold its biggest outputs as needed.
-	 * The run stops only when even the current request cannot fit. Folds ride the run plan (nativeRun); Pi's entry is the summary.
-	 */
-	private async switchCompact(e: Any, ctx: Any): Promise<Any> {
-		return fitModelSwitch(e, ctx, {
-			reserve: this.reserve(ctx), branch: () => this.branch(ctx), ready: () => readyOf(this.branch(ctx), this.mine),
-			planFor: (entries, rescue) => {
-				const avail = this.ready(this.branch(ctx)).filter(a => !a.running);
-				const { o, cal } = this.opts(ctx, false, entries, 0, true, undefined, false, avail.map(a => a.key));
-				o.readySizes = Object.fromEntries(avail.filter(a => a.summaryTokens !== undefined).map(a => [a.key, a.summaryTokens!]));
-				if (rescue) o.rescue = rescue;
-				return { o, cal, q: plan(entries, o) };
-			},
-			useFolds: p => { this.switchRun = p; this.replan(); },
-			background: (head, signal) => {
-				const bg = this.bg;
-				return bg && !bg.aborted && bg.head === head
-					? this.working(ctx, `${PRODUCT}: finishing a summary for ${ctx.model?.id ?? modelKey(ctx.model)}`, waitFor(bg.promise, signal)) : null;
-			},
-			roomWait: (p, c) => this.roomWait(p, c), summaryModel: () => this.summaryModel(ctx),
-			overflowed: (head, key) => this.overflowFailedKeys.has(`${head}:${key}`), active: () => this.active(),
-			stop: reason => this.stopSwitch(ctx, reason), ledger: rec => this.ledger(rec),
-			install: (pending, forced) => { this.cancelTimer(); this.rescueIds = new Set(forced ?? []); this.switchPending = pending; },
-		});
-	}
-
-	/** Book only the switch compaction Pi actually committed (another extension can replace or cancel it); its folds ride the run plan. */
-	sessionCompact(e: Any, _ctx: Any) {
-		const entry = e.compactionEntry, s = this.switchPending;
-		this.switchPending = null;
-		if (!s || entry?.details?.by !== PRODUCT || entry.details.door !== "model-switch" || entry.firstKeptEntryId !== s.key || entry.summary !== s.cut.text) {
-			if (s) this.rescueIds.clear();
-			return;
-		}
-		const { cut } = s, c = s.p.scale.c, saved = Math.round(c * (cut.prefixTokens - cut.summaryTokens));
-		this.stats.summaries++;
-		this.stats.summarizedTokens += saved;
-		this.stats.activeSaved += saved;
-		this.stats.writeSavedTokens += saved;
-		this.rent = 0;
-		this.nextEdit = 0;
-		this.discardBg("replaced");
-		this.replan();
-		this.nativeRun = { cut, before: s.before, after: s.after, o: s.o, cal: s.cal, p: s.p, waitMs: s.waitMs };
-		this.ledger({ type: "summary", via: "native", door: "model-switch", trigger: "cold", count: cut.count, tokensBefore: entry.tokensBefore,
-			prefixTokens: Math.round(c * cut.prefixTokens), summaryTokens: Math.round(c * cut.summaryTokens), waitedMs: Math.round(s.waitMs),
-			ms: cut.ms, llmOk: cut.llmOk, llmError: cut.llmError, costUsd: cut.costUsd, ...this.usageOf(cut) });
 	}
 
 	/** The native path ends for the rest of the process (logged once): later summaries wait for turn_end. */
@@ -1199,12 +1086,7 @@ export class Zip implements ZipControl {
 	/** The summaries a plan of this branch may take: the ready ones, and the call in flight when it reads this branch's projection. */
 	private avail(branch: Any[]): Avail[] {
 		const out: Avail[] = readyOf(branch, this.mine).map((a) => ({ key: a.key, running: false, summaryTokens: a.cut!.summaryTokens }));
-		for (const k of this.overflowFailedKeys) {
-			if (k.startsWith(`${headOf(branch)}:`)) {
-				const fk = k.slice(headOf(branch).length + 1);
-				if (!out.some((a) => a.key === fk)) out.push({ key: fk, running: true });
-			}
-		}
+		this.forkAvail(branch, out);
 		const b = this.bg;
 		if (b && !b.aborted && b.head === headOf(branch) && !out.some((a) => a.key === b.key)) out.push({ key: b.key, running: true });
 		return out;
@@ -1266,16 +1148,7 @@ export class Zip implements ZipControl {
 		this.rent = rentNext; // only a request that passed cancellation earns rent or ends the stretch
 		const plan = this.runPlan && !this.runPlan.persisted ? this.runPlan : null;
 		const out = plan ? applyPlanToMessages(e.messages, plan) : null;
-		// A switch can land after Pi's pre-request compaction check. Context hooks cannot persist a summary: fail closed here.
-		if (this.switchedModel(ctx)) {
-			const room = compactionRoom(ctx.model, this.reserve(ctx));
-			const sc = this.scaleOf(ctx);
-			const tokens = sizeOf(sc, (out?.messages ?? e.messages).filter((m: Any) => m.role !== "system").reduce((n: number, m: Any) => n + wireTokensOf(m), 0));
-			if (room !== null && tokens >= room) {
-				this.stopSwitch(ctx, "the request still exceeds the new model's safe room");
-				return undefined;
-			}
-		}
+		if (this.forkSwitchOverflow(ctx, out?.messages ?? e.messages)) return undefined;
 		if ((first && this.pWarm < 0.5) || out || plan?.native) this.rent = 0; // R14: an applied rewrite or a cold request ends the rent stretch
 		if (plan && (out || plan.native)) { // a native summary is already in the request Pi built: it still goes out with this request
 			if (!plan.sent) this.nextEdit = plan.untouched ?? 0;
@@ -1289,26 +1162,10 @@ export class Zip implements ZipControl {
 			}
 		}
 		this.requestStart(ctx);
-		const hinted = this.withHint(out?.messages ?? e.messages, ctx);
-		const remembered = this.withMemory(hinted ?? out?.messages ?? e.messages, ctx);
-		if (remembered) return { messages: remembered };
-		if (hinted) return { messages: hinted };
+		const noted = this.forkNotes(out?.messages ?? e.messages, ctx);
+		if (noted) return { messages: noted };
 		return out ? { messages: out.messages } : undefined;
 	}
-
-	memory: RequestMemory | null = null;
-	private notes = new RequestNotes(rec => this.ledger(rec));
-	retrievalNote = (ctx: Any, signal?: AbortSignal): Promise<string | null> =>
-		this.memory?.awaitNote && this.inRun ? this.memory.awaitNote(ctx, signal) : Promise.resolve(null);
-
-	private noteHost() {
-		return { inRun: this.inRun, recallMode: this.recallMode, steerIds: this.steerIds, foldedCalls: this.foldedCalls,
-			recalled: this.recalled, judgeReq: this.judgeReq, judge: this.judge,
-			branch: (ctx: Any) => this.branch(ctx), scaleOf: (ctx: Any, entries?: Any[]) => this.scaleOf(ctx, entries),
-			reserve: (ctx: Any) => this.reserve(ctx), appendHint: (handles: string[]) => this.pi.appendEntry(HINT_CUSTOM, { handles }) };
-	}
-	private withMemory(messages: Any[], ctx: Any) { return this.notes.withMemory(messages, ctx, this.memory, this.noteHost()); }
-	private withHint(messages: Any[], ctx: Any) { return this.notes.withHint(messages, ctx, this.noteHost()); }
 
 	/** While the user waits for a summary, Pi's working line says what for. */
 	private async working<T>(ctx: Any, text: string, p: Promise<T>): Promise<T> {
@@ -1380,29 +1237,9 @@ export class Zip implements ZipControl {
 	async settle(e: Any, ctx: Any): Promise<Any> {
 		this.judge.stop("settle", true);
 		this.inRun = false;
-		const entries = e.context.contextEntries;
-		const recovered = await recoverLength(e, ctx, {
-			steerIds: this.steerIds, branch: () => this.branch(ctx), active: () => this.active(),
-			candidate: (entries, branch) => candidateOf(entries, (cutAt, foldsOnly, ready) => this.opts(ctx, true, entries, 1, false, cutAt, foldsOnly, ready), this.avail(branch), "length").r.p,
-			prepare: (p, branch) => {
-				if (this.bg && (this.bg.head !== headOf(branch) || this.bg.key !== p.firstKeptEntryId)) this.discardBg("replaced");
-				const cut = readyOf(branch, this.mine).find(a => a.key === p.firstKeptEntryId)?.cut;
-				if (!cut && (!this.bg || this.bg.aborted)) this.startBg(p, ctx, true);
-				const bg = this.bg;
-				return { cut, promise: !cut && bg && !bg.aborted && bg.key === p.firstKeptEntryId ? bg.promise : null };
-			},
-			wait: async promise => {
-				this.inRun = true;
-				try { return await this.working(ctx, `${PRODUCT}: recovering from the context limit`, promise); }
-				finally { this.inRun = false; }
-			},
-			commit: (e, ctx, plan, o) => this.commit(e, ctx, plan, o),
-		});
-		if (recovered) {
-			this.rent = 0; this.cancelTimer(); this.cancelDoor();
-			return { entries: [...recovered.entries, ...this.drafts()], continue: true };
-		}
-		this.want("settle", ctx, undefined, entries);
+		const recovered = await this.forkRecoverLength(e, ctx);
+		if (recovered) return recovered;
+		this.want("settle", ctx, undefined, e.context.contextEntries);
 		const recs = this.drafts();
 		this.armDoor(ctx, false); // a summary ready now was priced by this run's last turn_end at this P(warm): the next change decides
 		return recs.length ? { entries: [...e.entries, ...recs] } : undefined;
@@ -1501,14 +1338,7 @@ export class Zip implements ZipControl {
 		bg.promise = buildCut(p, ctx, controller.signal)
 			.then((c) => {
 				if (bg.aborted || !c) return null;
-				if (c.reason === "request-budget-overflow") {
-					this.overflowFailedKeys.add(`${head}:${key}`);
-					const usd = c.costUsd || estUsd;
-					this.stats.summaryUsd += usd;
-					this.record({ head, key, usd, ...(c.costUsd ? {} : { estimated: true }), lost: "request-budget-overflow", error: "request-budget-overflow" });
-					this.ledger({ type: "summary_overflow", where: room ? "room" : "background", key, reason: c.reason, ...(c.overflow ?? {}) });
-					return null;
-				}
+				if (c.reason === "request-budget-overflow") return this.forkBgOverflow(c, head, key, estUsd, room);
 				this.completed(c, model, head, key, estUsd, p.scale.c * c.prefixTokens);
 				this.ledger({ type: "away_summary", key, ms: c.ms, llmOk: c.llmOk, ...(c.llmOk ? {} : { llmError: c.llmError }), costUsd: c.costUsd, ...this.usageOf(c) });
 				if (!this.inRun) this.armDoor(this.liveCtx ?? ctx, true); // finished while Pi is idle: the door asks now (a run's settle asks otherwise)
@@ -1534,14 +1364,8 @@ export class Zip implements ZipControl {
 		if (!this.active()) return undefined;
 		try {
 			const fresh = this.collectSteer(e); // marked before anything is validated: a steering message is part of its turn
-			const blocks = buildBlocks(e.context?.contextEntries ?? [], this.steerIds);
-			for (const h of recalledHandlesFromBranch(this.branch(ctx))) this.recalled.add(h);
-			try {
-				this.judgeBoundary(e, ctx, blocks); // invalidate old advice before this boundary's planner reads it
-			} catch (err) {
-				this.ledger({ type: "error", where: "judge", error: errText(err) }); // never drop this turn's edits for an optional hint
-			}
-			const out = await this.onTurnEnd(e, ctx, blocks);
+			this.forkTurnEnd(e, ctx);
+			const out = await this.onTurnEnd(e, ctx);
 			const previousRent = rentOf(this.branch(ctx));
 			const recs = [...this.drafts(), ...(this.rent !== previousRent ? [{ type: "custom", customType: "pi-zip/rent", data: { rent: this.rent } }] : [])]; // summaries recorded during the run, after the turn's edits (a compaction goes first)
 			if (!fresh.length && !recs.length) return out;
@@ -1551,14 +1375,6 @@ export class Zip implements ZipControl {
 			this.ledger({ type: "error", where: "turn_end", error: errText(err) });
 			return undefined;
 		}
-	}
-
-	private judgeBoundary(e: Any, ctx: Any, blocks = buildBlocks(e.context.contextEntries, this.steerIds)) {
-		if (!this.judge.enabled || !this.inRun || !this.active() || e.message?.stopReason !== "toolUse") return;
-		const entries = e.context.contextEntries;
-		const { o, cal: sc } = this.opts(ctx, false, entries, 1, false);
-		this.judge.maybeRun(ctx, blocks, toolCallIndex(blocks), this.judgePrompt, this.judgeReq,
-			sizeOf(sc, blocks.reduce((n, b) => n + b.tokens, 0)), coldTarget(settings().coldCap, sc.O, compactionRoom(ctx.model, this.reserve(ctx))), o);
 	}
 
 	/** Steering and follow-up user messages (typed during a run) are not new user turns; Pi does not mark them, so we persist the ids. */
@@ -1575,20 +1391,23 @@ export class Zip implements ZipControl {
 		return ids;
 	}
 
-	private async onTurnEnd(e: Any, ctx: Any, prebuilt?: Block[]) {
+	private async onTurnEnd(e: Any, ctx: Any) {
 		const msg: Any = e.message;
 		const failed = msg?.stopReason === "error" || msg?.stopReason === "aborted";
 		const t0 = performance.now();
-		const blocks = prebuilt ?? buildBlocks(e.context.contextEntries, this.steerIds), branch = this.branch(ctx);
-		if (!prebuilt) for (const h of recalledHandlesFromBranch(branch)) this.recalled.add(h);
+		const blocks = buildBlocks(e.context.contextEntries, this.steerIds);
 		if (!blocks.length) return undefined;
 		const userTurns = countUserTurns(blocks);
 		const u = msg?.usage;
 		const usageTotal = u ? (u.input ?? 0) + (u.cacheRead ?? 0) + (u.cacheWrite ?? 0) : 0;
 		const o = { t0, blocks, userTurns, usageTotal };
 		// P(warm) in-run: the learned curve at the time since the newest response (a long tool call is an absence like any other)
-		const m = ctx?.model ?? this.model;
+		const m = ctx?.model ?? this.model, branch = this.branch(ctx);
 		const touch = Math.max(this.lastReqMs, msg?.stopReason === "error" ? 0 : Number(msg?.timestamp) || 0); // the response that ended this turn is the newest touch
+		// a recall made in this run by a built-in tool on a recall file (file recall) is in the branch only: zip_recall's own hook
+		// marks its handles at once, a read, grep or bash of a recall file would otherwise be folded again at this turn_end, by its
+		// decision or its room wait (RC)
+		for (const h of recalledHandlesFromBranch(branch)) this.recalled.add(h);
 		const clk = inRunClock(branch, { model: m, ent: this.entKey === modelKey(m) ? this.ent : undefined, tier: this.tier(m) }, Date.now(), { reqMs: touch, modelKey: this.lastModelKey });
 		const pIn = clk.pWarm;
 		// the notice's "why now" says what this decision assumed (P(warm) at this turn_end), not the run's start
@@ -1602,11 +1421,7 @@ export class Zip implements ZipControl {
 		const d = decideTurnEnd({ failed, justEdited: this.justEdited, pWarm: pIn, ready: this.ready(branch), entries: ents, runPlan, opts: (cutAt, foldsOnly, ready) => this.opts(ctx, false, ents, pIn, false, cutAt, foldsOnly, ready) });
 		if (runPlan) runPlan.folds = d.runPlan!.folds;
 		if (d.kind === "none") return runPlan ? this.commit(e, ctx, runPlan, o) : undefined;
-		const carriedWork = !!(runPlan && (runPlan.folds.length || runPlan.cut || runPlan.native));
-		if (d.stuck && !d.room && !d.produce && !carriedWork && !(d.p && (d.p.folds.length || d.p.cutIdx != null)) && !this.quiet && !this.stuckNoted) {
-			this.stuckNoted = true;
-			this.notify(ctx, `${PRODUCT}: context is still over the working size, and no further fold or summary is available`);
-		}
+		this.forkStuckNotice(ctx, d, runPlan);
 		if (d.kind === "b2b") this.ledger({ type: "b2b_skip", where: "turn_end" });
 		else {
 			for (const n of d.notes) this.ledger(n);
@@ -1677,11 +1492,7 @@ export class Zip implements ZipControl {
 			this.ledger({ type: "cold_noop", turnIndex: e.turnIndex, ctx: Math.round(ctxTokens), ...(stale ? { staleTargets: stale } : {}) });
 			return undefined;
 		}
-		// At a repaired length stop there is no upcoming prompt: Pi's own recovery cut may keep only the current runnable turn.
-		// Keep the ordinary fold protections and all structural/pairing checks; relax only the two-turn quality margin for that cut.
-		const bad = o.allowLatestCut && cut
-			? checkEdits(o.blocks, o.userTurns, live, null, this.rescueIds) ?? checkEdits(o.blocks, o.userTurns + 2, [], cut)
-			: checkEdits(o.blocks, o.userTurns, live, cut, this.rescueIds);
+		const bad = this.forkCheckEdits(o, live, cut);
 		if (bad) {
 			this.ledger({ type: "guard_drop", turnIndex: e.turnIndex, reason: bad, folds: live.length, source: plan.source });
 			plan.persisted = false; // keep the request-local view: never switch the fold set mid-run
@@ -1737,9 +1548,7 @@ export class Zip implements ZipControl {
 
 	/** Pi's model_select (/model, cycling, restore): a switch in the middle of a run is not seen by any run start. */
 	modelSelect(model: Any) {
-		this.judge.stop("model-changed");
-		this.judge.verdicts.clear();
-		if (this.inRun) this.judge.startRun();
+		this.forkModelSelect();
 		if (model) this.model = model;
 	}
 
@@ -1936,8 +1745,8 @@ export class Zip implements ZipControl {
 	statsLine = (ctx?: Any) => `${PRODUCT} ${this.sessionTotals(ctx)} (tokens on the provider's scale, calibrated from this session's usage)`;
 	setOff(off: boolean): string {
 		this.off = off;
-		if (!off && this.inRun) this.judge.startRun();
-		if (off) { this.memory?.cancelRetrieval(); this.judge.stop("disabled"); this.runPlan = null; this.runEdits = false; this.cancelTimer(); this.cancelDoor(); this.discardBg("off"); }
+		this.forkSetOff(off);
+		if (off) { this.runPlan = null; this.runEdits = false; this.cancelTimer(); this.cancelDoor(); this.discardBg("off"); }
 		this.persistState();
 		return off ? `${PRODUCT}: off. Nothing is folded or summarised, retrieval is stopped and requests are left untouched; earlier folds stay recallable (/zip on to resume)` : `${PRODUCT}: on`;
 	}
@@ -1945,5 +1754,257 @@ export class Zip implements ZipControl {
 		this.quiet = !this.quiet;
 		this.persistState();
 		return `${PRODUCT}: per-turn notices ${this.quiet ? "off" : "on"} (folding continues)`;
+	}
+
+	// ---- fork: judge, memory/lookup notes, model switch, length recovery, summary overflow, decision log -------------------
+	// Upstream methods call into this block through one-line fork* hooks, so an upstream sync touches as few of its lines as possible.
+	private judge = new Judge((rec) => this.ledger(rec));
+	private judgeReq = 0;
+	private judgePrompt = "";
+	private stuckNoted = false;
+	// model switch: the folds-only plan a cancelled threshold compaction hands this run, the compaction Pi is committing, the rescue folds
+	// allowed in protected turns until committed, and the newest request's model (its larger window reads a prefix the new one cannot)
+	private switchRun: { o: PlanOpts; cal: Scale; p: PlanResult } | null = null;
+	private switchPending: (NativeRun & { key: string; waitMs: number }) | null = null;
+	private overflowFailedKeys = new Set<string>();
+	private rescueIds = new Set<string>();
+	private lastReqModel: Any = null;
+	private decisionLog = new DecisionLog();
+	get ledgerSid() { return this.decisionLog.sid; }
+	set ledgerSid(sid: string) { this.decisionLog.sid = sid; }
+	ledgerOn() { return this.decisionLog.enabled(); }
+	private rotateLedger() { this.decisionLog.rotate(); }
+	/** Fork ledger fields of a law record: the summary pressure gate and the fold decision. */
+	private forkLawFields(o: PlanOpts): Record<string, unknown> {
+		const sg = o.summaryGate ? { before: Math.round(o.summaryGate.before), afterFolds: Math.round(o.summaryGate.afterFolds), target: Math.round(o.summaryGate.target), threshold: o.summaryGate.threshold === null ? null : Math.round(o.summaryGate.threshold), prepareThreshold: o.summaryGate.prepareThreshold === null ? null : Math.round(o.summaryGate.prepareThreshold), room: o.summaryGate.room === null ? null : Math.round(o.summaryGate.room), eligible: o.summaryGate.eligible, prepareEligible: o.summaryGate.prepareEligible, reason: o.summaryGate.reason, ...(o.summaryGate.checkpoint ? { checkpoint: o.summaryGate.checkpoint } : {}) } : undefined;
+		return { ...(sg ? { summaryGate: sg } : {}), ...(o.foldDecision ? { foldDecision: o.foldDecision } : {}) };
+	}
+	private forkSessionStart(ctx: Any) {
+		this.judge.stop("session-changed");
+		this.judge = new Judge((rec) => this.ledger(rec));
+		this.ledgerSid = this.sessionId(ctx); // this session's ledger file, before the first record names it
+		this.rotateLedger();
+		this.judgeReq = 0;
+		this.judgePrompt = "";
+	}
+	/** Write `requests.txt` (raw-branch-v2 request ledger) for file-based recall when `zip_recall` is hidden. */
+	private materializeRequests(ctx: Any): string | null {
+		const sid = this.recallSid(ctx);
+		if (!sid) return null;
+		const text = formatRequestsLedger(this.branch(ctx));
+		const out = materialize(recallRoot(), sid, [{ handle: "requests", text }]);
+		this.ledger({ type: "recall_file", requests: true, chars: text.length });
+		return out.get("requests") ?? null;
+	}
+	private forkBeforeAgentStart(ctx: Any, e?: Any) {
+		this.detectConflict(ctx);
+		this.judgePrompt = typeof e?.prompt === "string" ? e.prompt : "";
+	}
+	private forkAgentEnd() {
+		this.judge.stop("run-ended", true);
+		this.notes.resetMemory();
+	}
+	private forkBeginRun(ctx: Any) {
+		this.stuckNoted = false;
+		this.judge.startRun();
+		this.notes.resetLookup(); // a cue is request-local: a new run with the same text gets it again
+		if (!this.judgePrompt) this.judgePrompt = textOf([...this.branch(ctx)].reverse().find((e) => e.message?.role === "user")?.message?.content);
+	}
+	private switchedModel(ctx: Any): boolean {
+		// Pi may check compaction before the first agent_start after reopening a session restores prevKey.
+		const previous = this.lastModelKey || this.prevKey || lastPrompt(this.branch(ctx)).key;
+		return !!previous && !!ctx?.model && previous !== modelKey(ctx.model);
+	}
+
+	private stopSwitch(ctx: Any, reason: string) {
+		this.ledger({ type: "model_switch_blocked", model: modelKey(ctx.model), reason });
+		this.notify(ctx, `${PRODUCT}: the context does not fit ${ctx.model?.id ?? "the selected model"} (${reason}); the run stopped with the history intact. Select a larger-window model, or shorten the latest request.`);
+		// Awaiting abort from an active hook deadlocks: Pi waits for this handler before it can settle.
+		void Promise.resolve(ctx.abort?.()).catch((err) => this.ledger({ type: "error", where: "switch_abort", error: errText(err) }));
+		return { cancel: true };
+	}
+
+	/** The next request of this run plans again: its run plan was made for the previous model's window. */
+	private replan() {
+		this.runPlan = null;
+		this.runEdits = false;
+		this.runChecked = false;
+	}
+
+	/** The newest request's model when its window is larger: it can still read a prefix the new model cannot. */
+	private summaryModel(ctx: Any): Any {
+		const old = this.lastReqModel;
+		return old && modelKey(old) !== modelKey(ctx.model) && Number(old.contextWindow) > Number(ctx.model?.contextWindow) ? old : ctx.model;
+	}
+
+
+	/**
+	 * Pi checks its compaction threshold before context hooks, so a switch to a smaller window is fitted here, least loss first:
+	 * 1. folds alone fit: cancel Pi's compaction; this run's next request carries the folds;
+	 * 2. a READY prefix summary fits with the kept turns after their folds: Pi compacts with it;
+	 * 3. a summary being written: wait for it, then 2;
+	 * 4. write the cut this window needs now, its narrative read by the previous model when that window is larger;
+	 * 5. the two protected turns alone are too big: cut up to the current user message, then fold its biggest outputs as needed.
+	 * The run stops only when even the current request cannot fit. Folds ride the run plan (nativeRun); Pi's entry is the summary.
+	 */
+	private async switchCompact(e: Any, ctx: Any): Promise<Any> {
+		return fitModelSwitch(e, ctx, {
+			reserve: this.reserve(ctx), branch: () => this.branch(ctx), ready: () => readyOf(this.branch(ctx), this.mine),
+			planFor: (entries, rescue) => {
+				const avail = this.ready(this.branch(ctx)).filter(a => !a.running);
+				const { o, cal } = this.opts(ctx, false, entries, 0, true, undefined, false, avail.map(a => a.key));
+				o.readySizes = Object.fromEntries(avail.filter(a => a.summaryTokens !== undefined).map(a => [a.key, a.summaryTokens!]));
+				if (rescue) o.rescue = rescue;
+				return { o, cal, q: plan(entries, o) };
+			},
+			useFolds: p => { this.switchRun = p; this.replan(); },
+			background: (head, signal) => {
+				const bg = this.bg;
+				return bg && !bg.aborted && bg.head === head
+					? this.working(ctx, `${PRODUCT}: finishing a summary for ${ctx.model?.id ?? modelKey(ctx.model)}`, waitFor(bg.promise, signal)) : null;
+			},
+			roomWait: (p, c) => this.roomWait(p, c), summaryModel: () => this.summaryModel(ctx),
+			overflowed: (head, key) => this.overflowFailedKeys.has(`${head}:${key}`), active: () => this.active(),
+			stop: reason => this.stopSwitch(ctx, reason), ledger: rec => this.ledger(rec),
+			install: (pending, forced) => { this.cancelTimer(); this.rescueIds = new Set(forced ?? []); this.switchPending = pending; },
+		});
+	}
+
+	/** Book only the switch compaction Pi actually committed (another extension can replace or cancel it); its folds ride the run plan. */
+	sessionCompact(e: Any, _ctx: Any) {
+		const entry = e.compactionEntry, s = this.switchPending;
+		this.switchPending = null;
+		if (!s || entry?.details?.by !== PRODUCT || entry.details.door !== "model-switch" || entry.firstKeptEntryId !== s.key || entry.summary !== s.cut.text) {
+			if (s) this.rescueIds.clear();
+			return;
+		}
+		const { cut } = s, c = s.p.scale.c, saved = Math.round(c * (cut.prefixTokens - cut.summaryTokens));
+		this.stats.summaries++;
+		this.stats.summarizedTokens += saved;
+		this.stats.activeSaved += saved;
+		this.stats.writeSavedTokens += saved;
+		this.rent = 0;
+		this.nextEdit = 0;
+		this.discardBg("replaced");
+		this.replan();
+		this.nativeRun = { cut, before: s.before, after: s.after, o: s.o, cal: s.cal, p: s.p, waitMs: s.waitMs };
+		this.ledger({ type: "summary", via: "native", door: "model-switch", trigger: "cold", count: cut.count, tokensBefore: entry.tokensBefore,
+			prefixTokens: Math.round(c * cut.prefixTokens), summaryTokens: Math.round(c * cut.summaryTokens), waitedMs: Math.round(s.waitMs),
+			ms: cut.ms, llmOk: cut.llmOk, llmError: cut.llmError, costUsd: cut.costUsd, ...this.usageOf(cut) });
+	}
+	/** A cut whose summary overflowed its request budget counts as running: no plan waits for it or starts it again. */
+	private forkAvail(branch: Any[], out: Avail[]) {
+		const head = headOf(branch);
+		for (const k of this.overflowFailedKeys) {
+			if (!k.startsWith(`${head}:`)) continue;
+			const fk = k.slice(head.length + 1);
+			if (!out.some((a) => a.key === fk)) out.push({ key: fk, running: true });
+		}
+	}
+	/** A switch can land after Pi's pre-request compaction check. Context hooks cannot persist a summary: fail closed. */
+	private forkSwitchOverflow(ctx: Any, messages: Any[]): boolean {
+		if (!this.switchedModel(ctx)) return false;
+		const room = compactionRoom(ctx.model, this.reserve(ctx));
+		const tokens = sizeOf(this.scaleOf(ctx), messages.filter((m: Any) => m.role !== "system").reduce((n: number, m: Any) => n + wireTokensOf(m), 0));
+		if (room === null || tokens < room) return false;
+		this.stopSwitch(ctx, "the request still exceeds the new model's safe room");
+		return true;
+	}
+	memory: RequestMemory | null = null;
+	private notes = new RequestNotes(rec => this.ledger(rec));
+	retrievalNote = (ctx: Any, signal?: AbortSignal): Promise<string | null> =>
+		this.memory?.awaitNote && this.inRun ? this.memory.awaitNote(ctx, signal) : Promise.resolve(null);
+
+	private noteHost() {
+		return { inRun: this.inRun, recallMode: this.recallMode, steerIds: this.steerIds, foldedCalls: this.foldedCalls,
+			recalled: this.recalled, judgeReq: this.judgeReq, judge: this.judge,
+			branch: (ctx: Any) => this.branch(ctx), scaleOf: (ctx: Any, entries?: Any[]) => this.scaleOf(ctx, entries),
+			reserve: (ctx: Any) => this.reserve(ctx), appendHint: (handles: string[]) => this.pi.appendEntry(HINT_CUSTOM, { handles }) };
+	}
+	private withMemory(messages: Any[], ctx: Any) { return this.notes.withMemory(messages, ctx, this.memory, this.noteHost()); }
+	private withHint(messages: Any[], ctx: Any) { return this.notes.withHint(messages, ctx, this.noteHost()); }
+
+	/** Request-local lookup/judge hint, then the retrieval note after the prompt; null: nothing to add. */
+	private forkNotes(messages: Any[], ctx: Any): Any[] | null {
+		const hinted = this.withHint(messages, ctx);
+		return this.withMemory(hinted ?? messages, ctx) ?? hinted;
+	}
+	/** A repaired length stop has one chance to take its summary at this boundary (length-recovery.ts). */
+	private async forkRecoverLength(e: Any, ctx: Any): Promise<Any> {
+		const recovered = await recoverLength(e, ctx, {
+			steerIds: this.steerIds, branch: () => this.branch(ctx), active: () => this.active(),
+			candidate: (entries, branch) => candidateOf(entries, (cutAt, foldsOnly, ready) => this.opts(ctx, true, entries, 1, false, cutAt, foldsOnly, ready), this.avail(branch), "length").r.p,
+			prepare: (p, branch) => {
+				if (this.bg && (this.bg.head !== headOf(branch) || this.bg.key !== p.firstKeptEntryId)) this.discardBg("replaced");
+				const cut = readyOf(branch, this.mine).find(a => a.key === p.firstKeptEntryId)?.cut;
+				if (!cut && (!this.bg || this.bg.aborted)) this.startBg(p, ctx, true);
+				const bg = this.bg;
+				return { cut, promise: !cut && bg && !bg.aborted && bg.key === p.firstKeptEntryId ? bg.promise : null };
+			},
+			wait: async promise => {
+				this.inRun = true;
+				try { return await this.working(ctx, `${PRODUCT}: recovering from the context limit`, promise); }
+				finally { this.inRun = false; }
+			},
+			commit: (e, ctx, plan, o) => this.commit(e, ctx, plan, o),
+		});
+		if (!recovered) return null;
+		this.rent = 0;
+		this.cancelTimer();
+		this.cancelDoor();
+		return { entries: [...recovered.entries, ...this.drafts()], continue: true };
+	}
+	/** A summary over its request budget is never adopted: its key is not produced again for this head. */
+	private forkBgOverflow(c: Cut, head: string, key: string, estUsd: number, room: unknown): null {
+		this.overflowFailedKeys.add(`${head}:${key}`);
+		const usd = c.costUsd || estUsd;
+		this.stats.summaryUsd += usd;
+		this.record({ head, key, usd, ...(c.costUsd ? {} : { estimated: true }), lost: "request-budget-overflow", error: "request-budget-overflow" });
+		this.ledger({ type: "summary_overflow", where: room ? "room" : "background", key, reason: c.reason, ...(c.overflow ?? {}) });
+		return null;
+	}
+	/** Invalidate old judge advice before this boundary's planner reads it; never drop this turn's edits for an optional hint. */
+	private forkTurnEnd(e: Any, ctx: Any) {
+		if (!this.judge.enabled || !this.inRun || !this.active() || e.message?.stopReason !== "toolUse") return;
+		try {
+			for (const h of recalledHandlesFromBranch(this.branch(ctx))) this.recalled.add(h);
+			this.judgeBoundary(e, ctx, buildBlocks(e.context?.contextEntries ?? [], this.steerIds));
+		} catch (err) {
+			this.ledger({ type: "error", where: "judge", error: errText(err) });
+		}
+	}
+	private judgeBoundary(e: Any, ctx: Any, blocks: Block[]) {
+		if (!this.judge.enabled || !this.inRun || !this.active() || e.message?.stopReason !== "toolUse") return;
+		const entries = e.context.contextEntries;
+		const { o, cal: sc } = this.opts(ctx, false, entries, 1, false);
+		this.judge.maybeRun(ctx, blocks, toolCallIndex(blocks), this.judgePrompt, this.judgeReq,
+			sizeOf(sc, blocks.reduce((n, b) => n + b.tokens, 0)), coldTarget(settings().coldCap, sc.O, compactionRoom(ctx.model, this.reserve(ctx))), o);
+	}
+	/** Once per run: over the working size with nothing left to fold or summarise. */
+	private forkStuckNotice(ctx: Any, d: Any, runPlan: RunPlan | null) {
+	const carriedWork = !!(runPlan && (runPlan.folds.length || runPlan.cut || runPlan.native));
+	if (d.stuck && !d.room && !d.produce && !carriedWork && !(d.p && (d.p.folds.length || d.p.cutIdx != null)) && !this.quiet && !this.stuckNoted) {
+		this.stuckNoted = true;
+		this.notify(ctx, `${PRODUCT}: context is still over the working size, and no further fold or summary is available`);
+	}
+	}
+	/** At a repaired length stop there is no upcoming prompt: the recovery cut may keep only the current runnable turn. Fold protections
+	 *  and all structural/pairing checks stay; only the two-turn margin is relaxed for that cut. Rescue folds may enter protected turns. */
+	private forkCheckEdits(o: { blocks: Block[]; userTurns: number; allowLatestCut?: boolean }, live: FoldTarget[], cut: Cut | null) {
+		return o.allowLatestCut && cut
+			? checkEdits(o.blocks, o.userTurns, live, null, this.rescueIds) ?? checkEdits(o.blocks, o.userTurns + 2, [], cut)
+			: checkEdits(o.blocks, o.userTurns, live, cut, this.rescueIds);
+	}
+	private forkModelSelect() {
+		this.judge.stop("model-changed");
+		this.judge.verdicts.clear();
+		if (this.inRun) this.judge.startRun();
+	}
+	private forkSetOff(off: boolean) {
+		if (!off && this.inRun) this.judge.startRun();
+		if (off) {
+			this.memory?.cancelRetrieval();
+			this.judge.stop("disabled");
+		}
 	}
 }

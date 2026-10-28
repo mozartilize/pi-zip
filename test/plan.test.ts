@@ -1,6 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { applyPlanToMessages, buildBlocks, compactionRoom, contentKeyOf, plan, planContext, selectPlan, settings, SUMMARY_PRESSURE_CAP, summaryPrepareThreshold, summaryThreshold, type Cut, type FoldTarget, type PlanOpts, type RunPlan } from "../src/plan.ts";
-import { candidateOf, decideEdits, decideTurnEnd } from "../src/core.ts";
+import { applyPlanToMessages, buildBlocks, compactionRoom, contentKeyOf, planContext, settings, type Cut, type FoldTarget, type PlanOpts, type RunPlan } from "../src/plan.ts";
 import { lawPrices } from "../src/learn.ts";
 import { A, AX, flat, longTurn, R, U, type Any } from "./helpers.ts";
 import { validateEdits } from "../src/guard.ts";
@@ -79,29 +78,17 @@ describe("after a pause (previous user turn)", () => {
 
 describe("summary gate", () => {
 	const sumCtx = [U("u1", "one"), A("a1", ["c1"]), R("r1", "c1", 44_000), AX("a2", 120_000), U("u2", "two"), A("a3", ["c3"]), R("r3", "c3", 44_000), AX("a4", 120_000), U("u3", "three"), A("a5")];
-	const sumOpts = (over: Partial<PlanOpts> = {}): PlanOpts => opts({ coldCap: 6000, model: { contextWindow: 50_000 }, ...over });
 	test("a big prefix plans the same cut in the settle and run-start views; folds before the cut are void", () => {
-		const s = planContext(sumCtx, sumOpts())!;
-		const r = planContext([...sumCtx, U("u4", "back")], sumOpts({ promptPending: false }))!;
+		const s = planContext(sumCtx, opts({ coldCap: 6000 }))!;
+		const r = planContext([...sumCtx, U("u4", "back")], opts({ coldCap: 6000, promptPending: false }))!;
 		expect(s.cutIdx).not.toBeNull();
 		expect(s.firstKeptEntryId).toBe("u3");
 		expect(r.firstKeptEntryId).toBe("u3");
 		expect(s.prefixTokens).toBe(r.prefixTokens);
 		expect(s.folds).toHaveLength(0);
 	});
-	test("a cut records the hard summary room: the largest summary whose compacted view still fits the model's room (above the soft target)", () => {
-		const o = sumOpts();
-		const s = planContext(sumCtx, o)!;
-		const room = compactionRoom(o.model, o.reserve)!;
-		expect(s.summaryRoomTokens).toBeDefined();
-		expect(s.summaryRoomTokens!).toBeGreaterThan(s.summaryTokensPlanned);
-		const after = (S: number) => s.ctxAfterFolds - s.scale.c * (s.prefixTokens - S);
-		expect(after(s.summaryRoomTokens!)).toBeLessThanOrEqual(room);
-		expect(after(s.summaryRoomTokens! + 1)).toBeGreaterThan(room);
-		expect(planContext(sumCtx, sumOpts({ model: {} }))?.summaryRoomTokens).toBeUndefined(); // no known window: no hard bound
-	});
 	test("successive warm summaries pay below the previous starting size without a regrowth budget", () => {
-		const o = sumOpts({ promptPending: false, law: at(1, 500) });
+		const o = opts({ coldCap: 6000, promptPending: false, law: at(1, 500) });
 		const first = planContext([...sumCtx, U("u4", "back")], o)!;
 		const summary = "S".repeat(4 * first.summaryTokensPlanned);
 		const comp = { sourceEntry: { type: "compaction", id: "cmp", details: { by: "pi-zip" } }, messages: [{ role: "compactionSummary", summary }] };
@@ -118,11 +105,11 @@ describe("summary gate", () => {
 		const comp = { sourceEntry: { id: "cmp", type: "compaction", summary: SUM, firstKeptEntryId: "k1" }, messages: [{ role: "compactionSummary", summary: SUM, content: SUM }] };
 		const view = [comp, U("k1", "one"), A("a1", ["c1"]), R("r1", "c1", 14_000), AX("a2", 8_000), U("u2", "two"), A("a3"), U("u3", "three"), A("a4")];
 		// prefix ~18K: a 1.8K planned summary would remove 16K; planned at >= 12K it removes ~6K, which does not pay for its call
-		expect(planContext(view, sumOpts({ promptPending: false }))?.cutIdx ?? null).toBeNull();
+		expect(planContext(view, opts({ coldCap: 6000, promptPending: false }))?.cutIdx ?? null).toBeNull();
 	});
 	test("no summary when it does not pay for its call (small context)", () => {
 		const small = [U("u1", "one"), A("a1", ["c1"]), R("r1", "c1", 3000), A("a2"), U("u2", "two"), A("a3"), U("u3", "three"), A("a4")];
-		expect(planContext(small, sumOpts({ coldCap: 100, promptPending: false }))?.cutIdx ?? null).toBeNull();
+		expect(planContext(small, opts({ coldCap: 100, promptPending: false }))?.cutIdx ?? null).toBeNull();
 	});
 });
 
@@ -221,203 +208,16 @@ describe("cold cap default", () => {
 		expect(settings().coldCap).toBe(25_000);
 	});
 
-	test("a ~45K prose context exceeds the fold target but does not authorize a summary", () => {
+	test("a ~45K context is over the default cap (it would have been under the old 60K)", () => {
 		delete process.env.PI_ZIP_COLD_CAP;
-		delete process.env.PI_ZIP_SUMMARY_AT;
 		const prose = [U("u1", "one"), AX("x1", 90_000), U("u2", "two"), AX("x2", 90_000), U("u3", "three"), A("a3"), U("u4", "now")]; // ~45K tokens of prose
-		expect(planContext(prose, { cwd: ".", promptPending: false, model: { contextWindow: 200_000 } })).toBeNull();
+		const p = planContext(prose, { cwd: ".", promptPending: false })!;
+		expect(p.ctxTokens).toBeGreaterThan(40_000);
+		expect(p.ctxTokens).toBeLessThan(60_000);
+		expect(p.sumTrigger).toBe("cold");
 		expect(planContext(prose, { cwd: ".", promptPending: false, coldCap: 60_000 })).toBeNull(); // below the working view: no plan at all
 	});
 });
-
-describe("summary pressure gate and tuning diagnostics", () => {
-	const saved = { cap: process.env.PI_ZIP_COLD_CAP, at: process.env.PI_ZIP_SUMMARY_AT };
-	afterEach(() => {
-		if (saved.cap === undefined) delete process.env.PI_ZIP_COLD_CAP; else process.env.PI_ZIP_COLD_CAP = saved.cap;
-		if (saved.at === undefined) delete process.env.PI_ZIP_SUMMARY_AT; else process.env.PI_ZIP_SUMMARY_AT = saved.at;
-	});
-
-	test("application threshold caps at 400K while preparation keeps its 200K-window cap, with PI_ZIP_SUMMARY_AT override", () => {
-		delete process.env.PI_ZIP_SUMMARY_AT;
-		const room = compactionRoom({ contextWindow: 100_000 }, 16_384)!;
-		expect(room).toBe(75_424);
-		expect(summaryThreshold(room)).toBeCloseTo(60_339.2, 6);
-		expect(summaryPrepareThreshold(room)).toBeCloseTo(60_339.2, 6);
-		// Application scales with room up to 400K; preparation still caps at 200K's 140,339.2.
-		expect(SUMMARY_PRESSURE_CAP).toBeCloseTo(140_339.2, 6);
-		expect(summaryThreshold(compactionRoom({ contextWindow: 200_000 }, 16_384))).toBeCloseTo(140_339.2, 6);
-		expect(summaryThreshold(compactionRoom({ contextWindow: 272_000 }, 16_384))).toBeCloseTo(197_939.2, 6);
-		expect(summaryThreshold(compactionRoom({ contextWindow: 500_000 }, 16_384))).toBeCloseTo(380_339.2, 6);
-		expect(summaryThreshold(compactionRoom({ contextWindow: 1_000_000 }, 16_384))).toBe(400_000);
-		expect(summaryThreshold(499_999)).toBeCloseTo(399_999.2, 6);
-		expect(summaryThreshold(500_000)).toBe(400_000);
-		expect(summaryThreshold(500_001)).toBe(400_000);
-		expect(summaryPrepareThreshold(compactionRoom({ contextWindow: 200_000 }, 16_384))).toBeCloseTo(140_339.2, 6);
-		expect(summaryPrepareThreshold(compactionRoom({ contextWindow: 272_000 }, 16_384))).toBeCloseTo(140_339.2, 6);
-		expect(summaryPrepareThreshold(compactionRoom({ contextWindow: 1_000_000 }, 16_384))).toBeCloseTo(140_339.2, 6);
-		expect(summaryThreshold(null)).toBe(Infinity);
-		expect(summaryPrepareThreshold(null)).toBe(Infinity);
-		process.env.PI_ZIP_SUMMARY_AT = "50000";
-		expect(summaryThreshold(room)).toBe(50_000);
-		expect(summaryPrepareThreshold(room)).toBe(50_000);
-		process.env.PI_ZIP_SUMMARY_AT = "600000";
-		expect(summaryThreshold(975_424)).toBe(600_000); // explicit override is not capped
-		expect(summaryPrepareThreshold(975_424)).toBe(600_000);
-		expect(summaryThreshold(null)).toBe(600_000);
-	});
-
-	test("1M -> 200K/272K mid-run model switch: 1M prepares background summary at 140.3K without applying it; switching to 200K/272K compacts only the prepared prefix and keeps unsummarised later turns", () => {
-		delete process.env.PI_ZIP_COLD_CAP;
-		delete process.env.PI_ZIP_SUMMARY_AT;
-		// While on 1M at ~150K tokens (u1..u4): above prepareThreshold (140.3K) but well below 1M's applyThreshold (780.3K).
-		const at150K = [
-			U("u1", "old1"), AX("x1", 300_000),
-			U("u2", "old2"), AX("x2", 300_000),
-			U("u3", "prev"), A("a3"), U("u4", "now"),
-		];
-		const on1M: PlanOpts = { cwd: ".", promptPending: false, coldCap: 40_000, model: { contextWindow: 1_000_000 }, law: at(0, 2_500) };
-		const q1M = plan(at150K, { ...on1M, application: true })!;
-		// 1. On 1M, background preparation produces c="u3", but application (a / selectPlan) is withheld so 1M keeps full context.
-		expect(q1M.c?.firstKeptEntryId).toBe("u3");
-		expect(q1M.a).toBeNull();
-		expect(selectPlan(q1M, { ...on1M, application: true })).toBeNull();
-		expect(planContext(at150K, on1M)).toBeNull();
-		expect(on1M.summaryGate).toMatchObject({ eligible: false, prepareEligible: true, reason: "prepare-only", prepareThreshold: SUMMARY_PRESSURE_CAP });
-
-		// 2. Session grows further on 1M with new unsummarised turns u4..u6 (~80K more tokens => ~230K total), while only u3's summary is READY.
-		// Even with u3 READY in memory, staying on 1M at 230K still does NOT apply the summary (< 400K).
-		const grown = [
-			...at150K,
-			AX("x4", 160_000),
-			U("u5", "later"), AX("x5", 160_000),
-			U("u6", "latest"),
-		];
-		const still1M: PlanOpts = { cwd: ".", promptPending: false, coldCap: 40_000, model: { contextWindow: 1_000_000 }, ready: ["u3"], readySizes: { u3: 4_000 }, application: true, law: at(0, 2_500) };
-		expect(planContext(grown, still1M)).toBeNull();
-		expect(still1M.summaryGate).toMatchObject({ eligible: false, prepareEligible: true, reason: "prepare-only" });
-
-		// 3. User switches model mid-run to 272K (threshold 197.9K) or 200K (threshold 140.3K).
-		// Now grown (~230K) >= applyThreshold(272K/200K): planner immediately applies the already-ready summary at u3 (0ms wait),
-		// compacting only u1..x2 and keeping the unsummarised suffix u3..u6 intact while requesting background preparation for u5.
-		for (const contextWindow of [272_000, 200_000]) {
-			const switched: PlanOpts = { cwd: ".", promptPending: false, coldCap: 40_000, model: { contextWindow }, ready: ["u3"], readySizes: { u3: 4_000 }, application: true, law: at(0, 2_500) };
-			const qSwitched = plan(grown, switched)!;
-			expect(qSwitched.c?.firstKeptEntryId).toBe("u5"); // deeper cut wanted for background production
-			expect(qSwitched.a?.firstKeptEntryId).toBe("u3"); // ready prefix cut taken now
-			const applied = selectPlan(qSwitched, switched)!;
-			expect(applied.firstKeptEntryId).toBe("u3"); // compacts only what already has a summary; keeps u3..u6 untouched!
-			expect(switched.summaryGate).toMatchObject({ eligible: true, prepareEligible: true, reason: "pressure" });
-		}
-	});
-
-	test("1M applies a READY prefix above 400K, but only prepares below it", () => {
-		delete process.env.PI_ZIP_SUMMARY_AT;
-		for (const [chars, eligible] of [[790_000, false], [810_000, true]] as const) {
-			const entries = [U("u1", "old"), AX("x1", chars), U("u2", "old"), AX("x2", chars), U("u3", "prev"), A("a3"), U("u4", "now")];
-			const o: PlanOpts = { cwd: ".", promptPending: false, coldCap: 40_000, model: { contextWindow: 1_000_000 }, ready: ["u3"], readySizes: { u3: 4_000 }, application: true, law: at(0, 2_500) };
-			const q = plan(entries, o)!;
-			expect(q.f.ctxAfterFolds > 400_000).toBe(eligible);
-			expect(o.summaryGate).toMatchObject({ threshold: 400_000, prepareThreshold: SUMMARY_PRESSURE_CAP, prepareEligible: true, eligible, reason: eligible ? "pressure" : "prepare-only" });
-			expect(q.a?.firstKeptEntryId ?? null).toBe(eligible ? "u3" : null);
-			expect(selectPlan(q, o)?.firstKeptEntryId ?? null).toBe(eligible ? "u3" : null);
-		}
-	});
-
-	test("speculative checkpoints refresh for uncovered pressure and material progress, not a new cut ID", () => {
-		delete process.env.PI_ZIP_SUMMARY_AT;
-		const entries = [U("u1", "old"), AX("x1", 300_000), U("u2", "old"), AX("x2", 300_000), U("u3", "prev"), A("a3"), U("u4", "now")];
-		const opts = (cutAt?: string, foldsOnly?: boolean, ready?: readonly string[]) => ({ o: { cwd: ".", coldCap: 40_000, model: { contextWindow: 1_000_000 }, promptPending: false, law: at(0, 2500), cutAt, foldsOnly, ready } });
-		const ready = [{ key: "u3", running: false, summaryTokens: 4_000 }];
-		const decide = () => decideEdits({ at: "turn_end", justEdited: false, pWarm: 0, entries, ready, opts });
-		// The new legal cut at u4 adds only two tokens to the existing ~150K prefix. Even an oversized suffix cannot justify it.
-		entries.push(AX("x4", 600_000), U("u5", "later"));
-		const suppressed = decide();
-		expect(suppressed.produce).toBeNull();
-		expect(suppressed.o.summaryGate?.checkpoint).toMatchObject({ key: "u3", refresh: false });
-		expect(suppressed.o.summaryGate!.checkpoint!.advance).toBeLessThan(10);
-		// Once u4 is eligible, substantial new coverage exists and the remaining suffix is under pressure.
-		entries.push(AX("x5", 4_000), U("u6", "latest"));
-		expect(decide().produce?.firstKeptEntryId).toBe("u5");
-		expect(candidateOf(entries, opts, ready, "timer").r.p?.firstKeptEntryId).toBe("u5");
-		// Once that checkpoint is ready, no duplicate/full-prefix refresh is needed for the small remainder.
-		ready.push({ key: "u5", running: false, summaryTokens: 4_000 });
-		expect(decide().produce).toBeNull();
-		// Material progress alone is insufficient while the existing checkpoint still covers the small-window return.
-		const covered = [U("c1", "old"), AX("cx1", 600_000), U("c2", "covered"), AX("cx2", 200_000), U("c3", "prev"), A("ca3"), U("c4", "now")];
-		const q = plan(covered, { ...opts().o, application: true, ready: ["c2"], readySizes: { c2: 4_000 } })!;
-		expect(q.c).toBeNull(); // 54K after the checkpoint is below 140K, despite another 50K of eligible coverage
-	});
-
-	test("post-fold calibrated context decides summary eligibility: folding below 0.8 * room blocks summary even when pre-fold was above it and cache is cold", () => {
-		delete process.env.PI_ZIP_COLD_CAP;
-		delete process.env.PI_ZIP_SUMMARY_AT;
-		// O=10,000, c=1.5; room(100K)=75,424 => threshold=60,339.2.
-		// Before folds: 10,000 + 1.5 * ~55,000 = ~92,500 > threshold.
-		// Fold removes ~20,000 est; post-fold: 10,000 + 1.5 * ~35,000 = ~62,500 if prose is 35K, or ~55,000 < threshold if prose is 30K.
-		const entries = [
-			U("u1", "old"), A("a1", ["c1"]), R("r1", "c1", 80_000), AX("x1", 60_000),
-			U("u2", "mid"), AX("x2", 60_000),
-			U("u3", "prev"), A("a3"), U("u4", "now"),
-		];
-		const scale = { O: 10_000, c: 1.5, real: 90_000, est: 53_333, source: "usage" as const, oSource: "first" as const };
-		const base: PlanOpts = { cwd: ".", promptPending: false, coldCap: 30_000, scale, model: { contextWindow: 100_000 }, law: at(0, 2_500) };
-
-		const blocked = { ...base };
-		const pBlocked = planContext(entries, blocked)!;
-		expect(pBlocked.folds.map((f) => f.entryId)).toEqual(["r1"]);
-		expect(pBlocked.cutIdx).toBeNull();
-		expect(blocked.summaryGate).toMatchObject({ eligible: false, reason: "below-pressure", room: 75_424 });
-		expect(blocked.summaryGate!.before).toBeGreaterThan(blocked.summaryGate!.threshold!);
-		expect(blocked.summaryGate!.afterFolds).toBeLessThan(blocked.summaryGate!.threshold!);
-
-		// Same post-fold size against a slightly tighter window crosses 0.8 * room and authorizes the summary cut.
-		const allowed = { ...base, model: { contextWindow: 90_000 } }; // room 65,424 => threshold 52,339.2 < afterFolds (~55.5K)
-		const pAllowed = planContext(entries, allowed)!;
-		expect(pAllowed.folds).toHaveLength(0); // r1 is before the cut
-		expect(pAllowed.cutIdx).not.toBeNull();
-		expect(pAllowed.firstKeptEntryId).toBe("u3");
-		expect(allowed.summaryGate).toMatchObject({ eligible: true, reason: "pressure", room: 65_424 });
-		expect(allowed.summaryGate!.afterFolds).toBeGreaterThanOrEqual(allowed.summaryGate!.threshold!);
-	});
-
-	test("exact threshold boundary and ready-artifact gating: ready summaries are withheld below pressure and applied at/above pressure", () => {
-		delete process.env.PI_ZIP_SUMMARY_AT;
-		const prose = [U("u1", "one"), AX("x1", 120_000), U("u2", "two"), AX("x2", 120_000), U("u3", "three"), A("a3"), U("u4", "now")];
-		const est = buildBlocks(prose).reduce((n, b) => n + b.tokens, 0);
-		// Choose summaryThreshold(room) = 0.8 * room around est: room = est / 0.8 => window = room + 16,384 + 8,192.
-		const exactWindow = Math.floor(est / 0.8) + 16_384 + 8_192;
-		const makeOpts = (contextWindow?: number): PlanOpts => ({
-			cwd: ".", promptPending: false, coldCap: 20_000, model: contextWindow ? { contextWindow } : undefined,
-			ready: ["u3"], readySizes: { u3: 3_000 }, application: true, law: at(0, 2_500),
-		});
-
-		const unknown = makeOpts(undefined);
-		expect(planContext(prose, unknown)).toBeNull();
-		expect(unknown.summaryGate).toMatchObject({ eligible: false, reason: "unknown-window", threshold: null, room: null });
-
-		const below = makeOpts(exactWindow + 20); // threshold > est
-		expect(plan(prose, below)?.a).toBeNull();
-		expect(below.summaryGate).toMatchObject({ eligible: false, reason: "below-pressure" });
-
-		const atOrAbove = makeOpts(exactWindow); // threshold <= est
-		const selected = planContext(prose, atOrAbove)!;
-		expect(selected.firstKeptEntryId).toBe("u3");
-		expect(atOrAbove.summaryGate).toMatchObject({ eligible: true, reason: "pressure" });
-	});
-
-	test("room safety still compacts when post-fold context reaches Pi's compaction room", () => {
-		delete process.env.PI_ZIP_SUMMARY_AT;
-		const entries = [U("u1", "one"), AX("x1", 140_000), U("u2", "two"), AX("x2", 140_000), U("u3", "three"), A("a3"), U("u4", "now")];
-		const model = { contextWindow: 90_000 }; // room 65,424; entries are ~70K
-		const d = decideTurnEnd({
-			failed: false, justEdited: false, pWarm: 1, ready: [], entries,
-			opts: (cutAt, foldsOnly, ready) => ({ o: { cwd: ".", promptPending: false, coldCap: 20_000, model, law: at(1, 500), ...(cutAt ? { cutAt } : {}), ...(foldsOnly ? { foldsOnly } : {}), ...(ready ? { ready } : {}) } }),
-		});
-		expect(d.room?.cutIdx).not.toBeNull();
-		expect(d.room?.firstKeptEntryId).toBe("u3");
-	});
-});
-
 
 // =============================================================================================================
 describe("the law at P = 1 (a warm cache)", () => {
@@ -615,7 +415,7 @@ describe("driven runs (an extension's triggerTurn message): turn boundaries", ()
 	test("the protected tail with a nextTurn message after each prompt is still the current prompt and the previous one", () => {
 		const e: Any[] = [];
 		for (let i = 1; i <= 4; i++) e.push(U(`u${i}`, `p${i}`), C(`k${i}`), A(`a${i}`, [`c${i}`]), R(`r${i}`, `c${i}`, 20_000), AX(`e${i}`, 30_000));
-		const p = planContext(e, { cwd: process.cwd(), coldCap: 3000, promptPending: false, law: at(0, 100), model: { contextWindow: 50_000 } })!;
+		const p = planContext(e, { cwd: process.cwd(), coldCap: 3000, promptPending: false, law: at(0, 100) })!;
 		// the latest two user turns are prompts 3 and 4: nothing of turn 3 may be cut (old code: turns 6..8 were 3's and 4's, so the
 		// window covered only prompt 4 and its nextTurn message, and prompt 3's turn was summarised)
 		expect(p.cutIdx).not.toBeNull();
@@ -630,7 +430,7 @@ describe("driven runs (an extension's triggerTurn message): turn boundaries", ()
 	// final answer (29K of prose kept at a cold return)
 	test("a summary before a driven run keeps from the custom message that started it, not from the previous final answer", () => {
 		const e = [U("u1", "the one real prompt"), A("a1", ["c1"]), R("r1", "c1", 30_000), AX("a2", 60_000), C("k2"), AX("a3", 400)];
-		const p = planContext(e, { cwd: process.cwd(), coldCap: 3000, promptPending: true, law: at(0, 100), model: { contextWindow: 40_000 } })!;
+		const p = planContext(e, { cwd: process.cwd(), coldCap: 3000, promptPending: true, law: at(0, 100) })!;
 		expect(p.cutIdx).not.toBeNull();
 		expect(p.firstKeptEntryId).toBe("k2"); // old code: "a2" (the 60K answer stayed)
 		expect(validateEdits(p.blocks, { folds: new Map(p.folds.map((f) => [blockIdx(p.blocks, f.entryId), f.ph])), recover: new Map(p.folds.map((f) => [blockIdx(p.blocks, f.entryId), f.recover])), cut: p.cutIdx }, p.userTurns)).toBeNull();
@@ -648,7 +448,7 @@ describe("driven runs (an extension's triggerTurn message): turn boundaries", ()
 		const driven: Any[] = [];
 		for (let i = 1; i <= 6; i++) driven.push(C(`k${i}`), A(`d${i}`, [`x${i}`]), R(`rx${i}`, `x${i}`, 30_000), AX(`e${i}`, 60_000));
 		const e = [...old, ...driven];
-		const p = planContext(e, { cwd: process.cwd(), coldCap: 3000, promptPending: true, model: { contextWindow: 100_000 } })!;
+		const p = planContext(e, { cwd: process.cwd(), coldCap: 3000, promptPending: true })!;
 		// the pending prompt is turn 8, the last run turn 7: only they are protected. Old code: every run belonged to turn 1 and the cut
 		// could not pass the real prompt's turn (the protected tail reached back to it: 273K kept of 518K).
 		expect(p.cutIdx).not.toBeNull();
