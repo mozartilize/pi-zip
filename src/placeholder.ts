@@ -1,14 +1,18 @@
 // Placeholders (F2): tool + args + size + key lines + handle. Handles are deterministic in the session entry id.
-import { handleFor } from "./handle.ts";
-import { type Block, type Calls, callOf } from "./plan.ts";
+import { createHash } from "node:crypto";
+import type { Block, Calls } from "./plan.ts";
 import { type FileRecall, fileRecallHow } from "./recallfile.ts";
 import { type Any, attempt, clip, fmtWhen, textOf } from "./util.ts";
 
 export const PH_MARK = "[folded by pi-zip";
 export const RECALL_TOOL = "zip_recall";
-export const MIN_FOLD_CHARS = 1000; // shorter outputs are never worth a placeholder
+const MIN_FOLD_CHARS = 1000; // shorter outputs are never worth a placeholder
 
-export { handleFor, handleTokens } from "./handle.ts";
+/** Deterministic recall handle for a session entry id: 10-char base36 of sha256("pi-zip:"+id)[0..12). */
+export function handleFor(entryId: string): string {
+	const hex = createHash("sha256").update(`pi-zip:${entryId}`).digest("hex").slice(0, 12);
+	return BigInt("0x" + hex).toString(36).padStart(Math.ceil(48 / Math.log2(36)), "0").slice(-10);
+}
 
 export interface KeyLine {
 	no: number;
@@ -27,17 +31,15 @@ const hexLike = (line: string): boolean => {
 	return false;
 };
 
-export const KEY_LINE_MAX_CHARS = 500;
-
 /** Deterministic key lines: first line, error/warning lines, id-like lines (tickets, hashes, key=value, labelled numbers), last line; sorted by line number. */
-export function pickKeyLines(text: string, keep = 8, maxLineChars = KEY_LINE_MAX_CHARS): KeyLine[] {
+export function pickKeyLines(text: string, keep = 8): KeyLine[] {
 	const lines = text.split("\n");
 	if (keep <= 0 || !lines.length) return [];
 	const picked = new Map<number, KeyLine>();
 	const add = (no: number, why: KeyLine["why"]) => {
 		if (picked.size >= keep || picked.has(no)) return;
 		const t = lines[no - 1] ?? "";
-		if (t.trim()) picked.set(no, { no, text: maxLineChars > 0 && t.length > maxLineChars ? clipMid(t, maxLineChars) : t, why });
+		if (t.trim()) picked.set(no, { no, text: t, why });
 	};
 	const room = () => picked.size < keep - (picked.has(lines.length) ? 0 : 1); // always leave room for the last line
 	add(1, "first");
@@ -147,23 +149,13 @@ export function sharedCdDirs(cmds: string[]): Set<string> {
 	}
 	return new Set([...n].filter(([, k]) => k >= 2).map(([d]) => d).sort());
 }
-/** Alias number i: a..z, then aa, ab, ... */
-const aliasName = (i: number): string => (i < 26 ? "" : aliasName(Math.floor(i / 26) - 1)) + String.fromCharCode(97 + (i % 26));
-/** Short aliases for `cd <dir>` prefixes (dir -> alias): a row writes `[a] cmd` for `cd <dir> && cmd`, and the heading names each dir
- *  once. Every dir works this way, so rows in several dirs stay told apart. An alias of `earlier` (an earlier summary's heading) keeps
- *  its letter; a dir that at least two of these commands share gets the first letter no earlier alias holds, in order of first use. */
-export function cdAliases(cmds: string[], earlier: Map<string, string> = new Map()): Map<string, string> {
-	const out = new Map(earlier);
-	const shared = sharedCdDirs(cmds), taken = new Set(earlier.values());
-	let next = 0;
-	for (const c of cmds) {
-		const d = cdDirOf(c);
-		if (!d || out.has(d) || !shared.has(d)) continue;
-		while (taken.has(aliasName(next))) next++;
-		taken.add(aliasName(next));
-		out.set(d, aliasName(next));
-	}
-	return out;
+/** The `cd <dir>` prefix rows may leave out: only when exactly one dir is shared by these commands and no other dir was left out
+ *  earlier (`earlier` = the dirs an earlier summary's heading names). With two dirs in play, `cd` is what tells rows apart: kept. */
+export function strippableCdDirs(cmds: string[], earlier: string[] = []): Set<string> {
+	const s = sharedCdDirs(cmds);
+	if (s.size !== 1) return new Set();
+	const [d] = s;
+	return earlier.every((e) => e === d) ? s : new Set();
 }
 
 const HEREDOC_RE = /<<-?\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\1/;
@@ -184,18 +176,16 @@ function heredocLabel(cmd: string): string | null {
 	return `${lines[0].trim()} … ${gist.trim()}${after ? ` ${m[2]} ${after}` : ""}`;
 }
 
-/** A command as a label: an aliased `cd` prefix, a heredoc shown by its gist, clipped in the middle. */
-export function cmdLabel(cmd: string, n = ARG_CHARS, aliases?: Map<string, string>): string {
+/** A command as a label: a `cd` prefix shared with other rows (`shared`) dropped, a heredoc shown by its gist, clipped in the middle. */
+export function cmdLabel(cmd: string, n = ARG_CHARS, shared?: Set<string>): string {
 	const d = cdDirOf(cmd);
-	const a = d ? aliases?.get(d) : undefined;
-	if (!a) return clipMid(heredocLabel(cmd) ?? cmd, n);
-	const c = cmd.replace(CD_RE, ""), head = `[${a}] `;
-	return head + clipMid(heredocLabel(c) ?? c, Math.max(1, n - head.length));
+	const c = d && shared?.has(d) ? cmd.replace(CD_RE, "") : cmd;
+	return clipMid(heredocLabel(c) ?? c, n);
 }
 
-export function shortArgs(args: Any, n = ARG_CHARS, aliases?: Map<string, string>): string {
+export function shortArgs(args: Any, n = ARG_CHARS, shared?: Set<string>): string {
 	if (!args || typeof args !== "object") return "";
-	if (typeof args.command === "string") return cmdLabel(args.command, n, aliases);
+	if (typeof args.command === "string") return cmdLabel(args.command, n, shared);
 	const path = typeof args.path === "string" ? args.path : typeof args.file_path === "string" ? args.file_path : null;
 	if (path !== null && typeof args.pattern !== "string") {
 		// which slice of the file, written the way Pi's own read row writes it: "src/a.ts:1-2000", "src/a.ts:50-"
@@ -223,8 +213,32 @@ export function distinctLines(texts: string[], preferred: string[][] = [], taken
 	return linesOf.map((ls) => ls.find((l) => count.get(l) === 1 && !used.has(l)) ?? null);
 }
 
-import { outcomeHint } from "./outcome.ts";
-export { outcomeHint };
+const COUNT_RE = /\b(\d+)\s+(passed|passing|pass|failed|failing|fail|skipped|errors?)\b/gi;
+const COUNT_ORDER = ["passed", "failed", "skipped", "errors"];
+
+/**
+ * Deterministic one-line outcome of a command, from the output alone: exit status (bash) and test counts when the tail of the
+ * output has "N passed / N failed" style summaries. `isError` (the tool result flag) lets a bash result without an exit-code
+ * line read as "exit 0" or "error"; leave it undefined when unknown. Empty string = nothing distinctive to say.
+ */
+export function outcomeHint(text: string, tool: string, isError?: boolean): string {
+	if (tool !== "bash") return "";
+	const tail = text.slice(-2000);
+	const parts: string[] = [];
+	const ex = [...tail.matchAll(/Command exited with code (\d+)/g)].pop();
+	if (ex) parts.push(`exit ${ex[1]}`);
+	else if (/Command timed out/.test(tail)) parts.push("timed out");
+	else if (/Command aborted/.test(tail)) parts.push("aborted");
+	else if (isError === true) parts.push("error");
+	else if (isError === false) parts.push("exit 0");
+	const last = new Map<string, string>();
+	for (const m of tail.matchAll(COUNT_RE)) {
+		const w = m[2].toLowerCase();
+		last.set(w.startsWith("pass") ? "passed" : w.startsWith("fail") ? "failed" : w === "skipped" ? "skipped" : "errors", m[1]);
+	}
+	if (last.has("passed") || last.has("failed")) parts.push(COUNT_ORDER.filter((k) => last.has(k)).map((k) => `${last.get(k)} ${k}`).join(", "));
+	return parts.join(", ");
+}
 
 /** When a block's message was written (ms), if it says: tool results carry Pi's timestamp. */
 export function blockTime(b: Block): number | undefined {
@@ -240,7 +254,6 @@ export interface PlaceholderMeta {
 	isError?: boolean;
 	noRecall?: boolean; // zip_recall is not declared to the model (`--tools` allowlist): point at re-reading instead
 	file?: FileRecall; // ... but read, grep or bash is: point at the recall file (written on demand from the session)
-	foldedAt?: number; // when the fold was planned (ms; PlanOpts.foldedAt): the output was shown in full to every request before it
 }
 
 /** Placeholder text, or null when the output is too short to be worth folding. The text is stored with the fold (context_edit),
@@ -253,7 +266,7 @@ export function makePlaceholder(text: string, tool: string, args: string, handle
 	const body = keys.map((k) => `${k.no}: ${clip(k.text, 160)}`).join("\n");
 	const outcome = outcomeHint(text, tool, meta.isError);
 	return (
-		`${PH_MARK}${meta.foldedAt ? ` at ${fmtWhen(meta.foldedAt)}` : ""} · ${tool}${args ? " " + args : ""}${whenLabel(meta.at, meta.turn) ? ` · ${whenLabel(meta.at, meta.turn)}` : ""}${outcome ? ` · ${outcome}` : ""} · ${text.length} chars, ${lines} lines · handle ${handle}]\n` +
+		`${PH_MARK} · ${tool}${args ? " " + args : ""}${whenLabel(meta.at, meta.turn) ? ` · ${whenLabel(meta.at, meta.turn)}` : ""}${outcome ? ` · ${outcome}` : ""} · ${text.length} chars, ${lines} lines · handle ${handle}]\n` +
 		(fields?.length ? `key fields kept (JSON; path: value, long strings show their end; up to ${keep}):\n${fields.join("\n")}\n` : "") +
 		(keys.length ? `key lines kept (original line numbers; up to ${keep}):\n${body}\n` : "") +
 		(meta.file
@@ -274,30 +287,11 @@ export function keyTexts(text: string, keep = 8): string[] {
 	return best ? [best.text, ...keys.filter((k) => k !== best).map((k) => k.text)] : [];
 }
 
-// A summary hint describes what a call found. The key-line heuristics above are tuned for placeholders, where a source line is a fine
-// landmark; in a one-line hint they pick "isError?: boolean;" because it contains "error". Measured on a real session summary: most
-// hints of code reads were such identifier hits, separators ("===") or arbitrary source lines.
-const ERROR_WORD_RE = /(?<![A-Za-z0-9_$])(?:errors?|fail(?:ed|ure|s)?|exception|warnings?)(?![A-Za-z0-9_$])/i;
-const SEPARATOR_RE = /^[\s=\-*_#~.|+:]*$/;
-const LOCATION_RE = /^[\w./@-]+\.[A-Za-z0-9]+:\d+:/; // "src/a.ts:12:" (grep -n, compilers): where something is, a finding
-const CODE_RE = /^(?:const|let|var|function|export|import|return|if|else|for|while|switch|case|class|interface|type|enum|private|public|protected|static|async|await|def|fn|pub|use|test|describe|it|expect)\b|^(?:\/\/|\/\*|\*\/?(?:\s|$))|[;{}(,[]\s*$|=>|;\s*\/\/|^[\w$]+\??\s*:\s*[^;]*;$/;
-const looksLikeCode = (line: string) => !LOCATION_RE.test(line.trim()) && CODE_RE.test(line.replace(/^\s*\d+(?::|\s)\s?/, "").trim());
-
-/** The one line a summary shows for a successful output: JSON key fields first, else an error-worded line (whole words, not
- *  identifiers), an id-like line, or the first key line, skipping separators and source-code lines. None when only those remain:
- *  the call head already says what was read, and the handle recalls it. */
-export function summaryHint(text: string, keep = 4): string | undefined {
-	const f = jsonKeyFields(text, keep, true);
-	if (f?.length) return f[0];
-	const keys = pickKeyLines(text, keep).filter((k) => !SEPARATOR_RE.test(k.text) && !looksLikeCode(k.text));
-	return (keys.find((k) => ERROR_WORD_RE.test(k.text)) ?? keys.find((k) => k.why === "id") ?? keys[0])?.text;
-}
-
 /** Placeholder for a toolResult block (null for image results, entries without an id, or short outputs). */
-export function makePlaceholderFor(b: Block, calls: Calls, keep = 8, noRecall = false, file?: FileRecall, foldedAt?: number): string | null {
+export function makePlaceholderFor(b: Block, calls: Calls, keep = 8, noRecall = false, file?: FileRecall): string | null {
 	const content = b.msg.content;
 	if (Array.isArray(content) && content.some((c: Any) => c?.type !== "text")) return null;
 	if (!b.entryId) return null;
-	const call = callOf(calls, b.msg);
-	return makePlaceholder(textOf(content), call?.name ?? b.msg.toolName ?? "tool", call ? shortArgs(call.args) : "", handleFor(b.entryId), keep, { at: blockTime(b), turn: b.userTurn, isError: !!b.msg.isError, noRecall, file, foldedAt });
+	const call = calls.get(b.msg.toolCallId);
+	return makePlaceholder(textOf(content), call?.name ?? b.msg.toolName ?? "tool", call ? shortArgs(call.args) : "", handleFor(b.entryId), keep, { at: blockTime(b), turn: b.userTurn, isError: !!b.msg.isError, noRecall, file });
 }

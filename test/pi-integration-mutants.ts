@@ -42,7 +42,7 @@ const mutants = [
 	// 0.4.0/0.4.1 (P1): the narrative call capped at its budget, and a failed narrative dropped instead of its fallback summary
 	{
 		name: "narrative-call-capped-at-budget",
-		file: "summary.ts",
+		file: "summary-engine.ts",
 		pattern: "a narrative longer than its budget",
 		check: "expect(received).toBe(expected)",
 		edit: (source: string) => rep(source, "{ maxTokens: cap, signal,", "{ maxTokens: NARRATIVE_MAX, signal,"),
@@ -65,7 +65,7 @@ const mutants = [
 		file: "recallfile.ts",
 		pattern: "a long branch: turn_end",
 		check: "turn_end on a branch of 80 long commands stays under 400 ms",
-		edit: (source: string) => rep(source, '(typeof cmd === "string" && cmd.includes(CMD_LIT) ? [...cmd.matchAll(CMD_RE)]', '(typeof cmd === "string" ? [...cmd.matchAll(CMD_RE)]'),
+		edit: (source: string) => rep(source, 'typeof cmd === "string" && cmd.includes(CMD_LIT)\n\t\t? [...cmd.matchAll(CMD_RE)]', 'typeof cmd === "string"\n\t\t? [...cmd.matchAll(CMD_RE)]'),
 	},
 	{
 		name: "settle-rereads-branch-per-plan",
@@ -90,7 +90,7 @@ const mutants = [
 	},
 	{
 		name: "narrative-effort-refusal-not-retried",
-		file: "summary.ts",
+		file: "summary-engine.ts",
 		pattern: "refuses effort none",
 		check: "a narrative refused for its reasoning effort is retried with low effort",
 		edit: (source: string) => rep(source, "if (!low && model.reasoning && EFFORT_REFUSED_RE.test(lastErr) && !signal.aborted) {", "if (false) {"),
@@ -360,7 +360,7 @@ const mutants = [
 		name: "warmer-overwrites-main-snapshot",
 		pattern: "real warmer overlap",
 		check: "main snapshot survives two real warmer refreshes",
-		edit: (source: string) => rep(rep(source, 'this.requestStart(ctx);\n\t\treturn out ?', 'return out ?'), 'providerRequest(e: Any, ctx?: Any): Any {', 'providerRequest(e: Any, ctx?: Any): Any { this.requestStart(ctx);'),
+		edit: (source: string) => rep(rep(source, 'this.requestStart(ctx);\n\t\tconst hinted', 'const hinted'), 'providerRequest(e: Any, ctx?: Any): Any {', 'providerRequest(e: Any, ctx?: Any): Any { this.requestStart(ctx);'),
 	},
 ];
 const only = process.env.PZ_MUTANTS?.split(","); // run some by name

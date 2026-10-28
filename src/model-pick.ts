@@ -1,6 +1,7 @@
+import { reasonsByDefault } from "./reasoning-policy.ts";
 // Which model a background call runs on, shared by the judge and the retrieval assistant: the same `provider/id[:level]`
 // configuration (PI_ZIP_JUDGE_MODEL), the same thinking-level clamping, no separate setting per feature.
-import { reasonsByDefault, type Any } from "./util.ts";
+import { type Any } from "./util.ts";
 
 export const LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 

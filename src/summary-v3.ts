@@ -16,12 +16,12 @@
 //   supplies verbatim intent. A quote from a request the model judged go-ahead only is refused (assent alone is no intent; what was
 //   approved belongs in an open-work item). A quote may name the digest item it is about (`about iN`), which gives its scope.
 // Section order puts the stable system picture first and the open work and current intent last, where a reader looks for what to do.
-import { blockTime, cdAliases, handleFor, RECALL_TOOL } from "./placeholder.ts";
+import { blockTime, cdAliases, handleFor, RECALL_TOOL } from "./fold-format.ts";
 import type { Block, Cut, PlanResult } from "./plan.ts";
-import { branchRequests, type BranchRequest } from "./recall.ts";
+import { branchRequests, type BranchRequest } from "./recall-extended.ts";
 import { type FileRecall, fileRecallHow } from "./recallfile.ts";
 import { skillReference } from "./skill-reference.ts";
-import { addUsage, bashCommands, complete, excerpt, parseSummary, PREV_NARRATIVE_CHARS, previousNarrative, REASONING_QUALIFICATION, reasoningInput, serialize } from "./summary.ts";
+import { addUsage, bashCommands, complete, excerpt, parseSummary, PREV_NARRATIVE_CHARS, previousNarrative, REASONING_QUALIFICATION, reasoningInput, serialize } from "./summary-engine.ts";
 import {
 	collectExecutions, type EvidenceProposal, evidenceQuotes, formatExecutionRecord, formatRequestExcerpt, type IntentProposal, intentQuotesOf,
 	MIN_EXCERPT_CHARS, parseSummaryV2, recordHandles, resolveIntents, SUMMARY_V2_DISCLAIMER, type V2Intent, type V2Request,

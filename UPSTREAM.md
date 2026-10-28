@@ -1,0 +1,67 @@
+# Keeping this fork close to upstream
+
+## History
+
+The fork now starts at upstream 0.4.15 (`ec10b2a7413ede90d9a906c35721b383227ac3da`), followed by the fork's 42 commits and the isolation refactor. The old mixed upstream/fork merge is not part of this history. Upstream's rewritten history has different commit identities, so the fork commits were replayed onto its current history.
+
+`backup/master-before-upstream-rebase` preserves the original local master. Nothing was pushed to origin.
+
+## Ownership
+
+These source files match the upstream base byte-for-byte:
+
+- `src/summary.ts`
+- `src/placeholder.ts`
+- `src/classify.ts`
+- `src/recall.ts`
+- `src/util.ts`
+
+The fork's implementations live in separate modules:
+
+| Area | Fork modules |
+| --- | --- |
+| Summary dispatch, shared epoch machinery and migration | `src/summary-engine.ts` |
+| Summary formats | `src/summary-v2.ts`, `src/summary-v3.ts` |
+| Summary pressure gates | `src/summary-pressure.ts` |
+| Source-order call matching, fold selection and diagnostics | `src/fold-policy.ts` |
+| Aliases, bounded hints and fold timestamps | `src/fold-format.ts` |
+| Exact read verification and routine-read omission | `src/read-policy.ts` |
+| Raw-request recall, visible assistant recall and scoped search | `src/recall-extended.ts` |
+| Request-local lookup/retrieval insertion state | `src/request-notes.ts` |
+| Model-switch fitting and repaired length-stop recovery | `src/model-switch.ts`, `src/length-recovery.ts` |
+| Logging and memory registration | `src/decision-log.ts`, `src/memory-extension.ts` |
+| Reasoning-effort policy | `src/reasoning-policy.ts` |
+
+The fork emits **v2 and v3 only**. V3 is the default, and `PI_ZIP_SUMMARY_V2=1` selects v2. Old upstream/fork-v1 summaries remain readable for migration. The shared engine retains the legacy budgeting helpers used to size v2 calls; it has no fork-v1 emitter. Upstream `summary.ts` is retained as the reference implementation, not used to produce fork summaries.
+
+`run.ts`, `plan.ts`, `core.ts` and `index.ts` still contain integration hooks. Their remaining differences concern lifecycle ordering, planning, optional diagnostics and guard checks. `guard.ts`, `recallfile.ts` and `ui.ts` retain small changes for rescue permissions, request-ledger files and display. Do not remove these differences without checking the corresponding fork modules.
+
+The upstream summary/formatting/time-zone unit tests are preserved. Fork regressions live in separate files, including `summary-v2.test.ts`, `summary-v3.test.ts`, `summary-dispatch.test.ts`, `fork-pieces.test.ts` and `tz-fork.test.ts`. Runtime/planner integration tests still have adjustments where this fork intentionally behaves differently.
+
+Fork documentation lives in `docs/fork.md`, `docs/fork-design.md` and `docs/fork-changelog.md`. Upstream changelog, design and reference documents remain untouched; README has one fork notice.
+
+## Sync procedure
+
+Start with a clean working tree, or save your changes first. Prefer a merge for future syncs: it compares the net fork changes, instead of replaying historical commits that modified files later restored by the refactor.
+
+```sh
+git fetch upstream
+git merge upstream/master
+# Resolve the remaining integration hooks, then verify:
+env -u PI_ZIP_SUMMARY_V2 bun test
+bun run build-check
+bunx --package typescript tsc --noEmit --lib es2023,dom
+```
+
+The explicit library override supports the existing `findLastIndex` calls without changing upstream's tsconfig. TypeScript runs from bunx; it is not added to this package.
+
+After a sync, review changes to upstream exports used by the fork. Internal upstream summary changes do not automatically alter v2/v3: port any wanted logic into the fork engine, rather than editing upstream `summary.ts`. The integration files can still conflict; this layout reduces conflicts, not eliminates them.
+
+To check the unmodified source boundary after merging:
+
+```sh
+git diff --exit-code upstream/master -- \
+  src/summary.ts src/placeholder.ts src/classify.ts src/recall.ts src/util.ts
+```
+
+Publishing the rewritten history requires a deliberate `git push --force-with-lease origin master`. It has not been run.

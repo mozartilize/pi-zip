@@ -4,7 +4,7 @@ import { BoundaryIndex, Judge, judgeInput, candidateCausalTrace, supersededOutpu
 import { buildBlocks, countUserTurns, foldCandidates, foldPlaceholder, plan, planContext, toolCallIndex, UNIT, type PlanOpts } from "../src/plan.ts";
 import { checkEdits, decideEdits } from "../src/core.ts";
 import { handleFor, PH_MARK } from "../src/placeholder.ts";
-import { resolveHandlesInBranch } from "../src/recall.ts";
+import { resolveHandlesInBranch } from "../src/recall-extended.ts";
 import { cardText } from "../src/ui.ts";
 import { Zip } from "../src/run.ts";
 import { lawPrices } from "../src/learn.ts";

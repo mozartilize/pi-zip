@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { buildBlocks, toolCallIndex } from "../src/plan.ts";
 import { handleFor } from "../src/placeholder.ts";
-import { buildCut } from "../src/summary.ts";
+import { buildCut } from "../src/summary-engine.ts";
 import { buildEpochSummaryV2, collectExecutions, evidenceQuotes, parseSummaryV2 } from "../src/summary-v2.ts";
 
 const message = (id: string, role: string, content: any, extra: any = {}) => {

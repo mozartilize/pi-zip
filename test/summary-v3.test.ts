@@ -2,8 +2,8 @@
 import { expect, test } from "bun:test";
 import { buildBlocks, toolCallIndex } from "../src/plan.ts";
 import { handleFor } from "../src/placeholder.ts";
-import { recallRequestsInBranch } from "../src/recall.ts";
-import { buildCut, estimateMergeWork, parseSummary } from "../src/summary.ts";
+import { recallRequestsInBranch } from "../src/recall-extended.ts";
+import { buildCut, estimateMergeWork, parseSummary } from "../src/summary-engine.ts";
 import { buildEpochSummaryV2 } from "../src/summary-v2.ts";
 import {
 	applyDigestOps, buildSummaryV3, type Digest, type DigestKey, type DigestOp, itemsOf, parseSummaryV3, parseV3Reply, prepareV3, previousDigest,

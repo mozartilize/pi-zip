@@ -3,10 +3,10 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { Any } from "./util.ts";
 import { type NoticeData, registerZipCommand, renderNotice } from "./notice.ts";
 import { RECALL_TOOL } from "./placeholder.ts";
-import { registerRecallTool } from "./recall.ts";
+import { registerRecallTool } from "./recall-extended.ts";
 import { parseRecallPath } from "./recallfile.ts";
 import { NOTICE_CUSTOM, Zip } from "./run.ts";
-import { Memory } from "./memory.ts";
+import { registerMemory } from "./memory-extension.ts";
 import { markFirstLine, measure, recallCallLine, renderCard, renderState, setMeasure } from "./ui.ts";
 
 export default function piZip(pi: ExtensionAPI) {
@@ -15,23 +15,7 @@ export default function piZip(pi: ExtensionAPI) {
 	import("@earendil-works/pi-coding-agent").then((m: Any) => { zip.version.pi = String(m?.VERSION ?? ""); }, () => {}); // Pi's version, for the version entry
 	registerRecallTool(pi, zip); // stays registered even when off: earlier folds must stay recallable, and a tool-list change would bust the cache
 	registerZipCommand(pi, zip);
-	// Session memory: a deterministic ledger of the opened session (no model call) and retrieval at new prompts once a fold or a
-	// compaction has hidden earlier output. Failures never block the run.
-	const memory = new Memory((rec) => zip.ledger(rec));
-	{
-		zip.memory = memory;
-		pi.registerCommand("zip-memory", {
-			description: "pi-zip: session memory status (ledger of this session, retrieval counters)",
-			handler: async (_args: string, cctx: Any) => {
-				const text = memory.statusLine(cctx);
-				if (cctx?.ui?.notify && (cctx.mode === "tui" || cctx.mode === "rpc")) {
-					try { cctx.ui.notify(text); return; } catch {}
-				}
-				process.stderr.write(text + "\n");
-			},
-		});
-		pi.on("session_tree", (_e, ctx) => memory.catchUp(ctx, "session_tree"));
-	}
+	const memory = registerMemory(pi, zip);
 	try {
 		// Everything pi-zip shows lives in the transcript as custom entries (never part of the model's context): fold/summary
 		// notices, state lines and the /zip card. Widths are measured with Pi's own pi-tui once it has loaded.

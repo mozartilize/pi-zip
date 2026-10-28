@@ -1,11 +1,13 @@
+import { recordFoldDecision } from "./fold-policy.ts";
+import { newestMessageTime } from "./fold-format.ts";
 // The decision core: view, clock, law, plan and decide as pure functions of the session branch, what pi-zip has learned (Λ) and
 // the time. Nothing here reads a file, Pi or the clock, and nothing here has an effect: run.ts (the shell) gathers the inputs at Pi's
 // events, keeps what only the process holds (the summary call in the background, the timers) and carries out what these return.
 import { detectCold, modelKey, resolveTtl, type ColdInfo } from "./cache.ts";
 import { validateEdits } from "./guard.ts";
-import { handleFor } from "./handle.ts";
+
 import { GAP_EDGES, lawPrices, pWarm, type Entry } from "./learn.ts";
-import { buildBlocks, calibrate, compactionRoom, foldCandidates, plan, selectPlan, settings, sizeOf, toolCallIndex, untouchedEst, UNIT, type Block, type Cut, type FoldTarget, type Law, type PlanOpts, type PlanResult, type RunPlan, type Scale, type SysInfo } from "./plan.ts";
+import { buildBlocks, calibrate, compactionRoom, plan, selectPlan, sizeOf, untouchedEst, UNIT, type Block, type Cut, type FoldTarget, type Law, type PlanOpts, type PlanResult, type RunPlan, type Scale, type SysInfo } from "./plan.ts";
 import type { FileRecall } from "./recallfile.ts";
 import { PRODUCT, type Any } from "./util.ts";
 
@@ -158,16 +160,6 @@ export function planOpts(entries: Any[], branch: Any[], env: Env, lam: Learned, 
 	return { cal, o: { ...(foldedAt ? { foldedAt } : {}), pause, scale: cal, cwd: env.cwd, recalled: env.recalled, model: env.model, promptPending: pending, rereadOnly: env.rereadOnly, ...(env.fileRecall ? { fileRecall: env.fileRecall } : {}), reserve: env.reserve, steerIds: env.steerIds, law: lawOf(branch, lam, pWarm), trace: [], ...(cutAt !== undefined ? { cutAt } : {}), ...(foldsOnly ? { foldsOnly } : {}), ...(ready?.length ? { ready } : {}) } };
 }
 
-/** The newest message timestamp (ms) in a projection: the session's own clock, so a re-plan of the same view stamps the same time. */
-function newestMessageTime(entries: Any[]): number | undefined {
-	let t = 0;
-	for (const pe of entries) for (const m of pe?.messages ?? []) {
-		const x = Number(m?.timestamp);
-		if (Number.isFinite(x) && x > t) t = x;
-	}
-	return t > 0 ? t : undefined;
-}
-
 /** The branch owns rent; every compaction is a rewrite, including one supplied by Pi or another extension. */
 export function rentOf(branch: Any[]): number {
 	const latest = [...branch].reverse().find((e) => e?.customType === "pi-zip/rent" || e?.type === "compaction");
@@ -203,23 +195,7 @@ export function decideEdits(x: { at: "native" | "run" | "turn_end"; justEdited: 
 	const saved = q ? q.f.ctxTokens - (q.a ?? q.f).ctxAfterFolds + (q.a ? q.a.scale.c * (q.a.prefixTokens - q.a.summaryTokensPlanned) : 0) : 0;
 	const b2b = x.justEdited && x.pWarm >= 0.5;
 	const p = b2b ? null : selectPlan(q, o);
-	if (o.trace) {
-		const blocks = q?.f.blocks ?? buildBlocks(x.entries), calls = q?.f.calls ?? toolCallIndex(blocks);
-		const groups = new Map<string, number>();
-		foldCandidates(blocks, calls, o).forEach((xs, i) => xs.forEach((b) => groups.set(b.entryId!, i)));
-		// The guard may try a ready-summary plan and then the folds-only fallback. Record proposals from both paths.
-		const proposed = [q?.a, q?.f, p].flatMap((x) => x ? [...x.folds, ...(x.judged?.folds ?? [])] : []);
-		const planned = new Set(proposed.map((f) => f.entryId));
-		const selected = new Set(p?.folds.map((f) => f.entryId) ?? []);
-		o.foldDecision = {
-			reason: b2b ? "back-to-back" : p ? "selected" : o.trace.some((t) => t.where === "guard" && !t.ok && t.A < t.B) ? "guard-rejected" : "no-plan",
-			outputs: blocks.filter((b) => b.kind === "toolResult" && b.entryId && !b.edited && b.tokens > (o.foldMin ?? settings().foldMin)).map((b) => {
-				const h = handleFor(b.entryId!);
-				return { h, age: b.age, verdict: o.verdicts?.get(h) ?? "unscored", group: groups.get(b.entryId!) ?? null,
-					planned: planned.has(b.entryId!), selected: selected.has(b.entryId!) };
-			}),
-		};
-	}
+	recordFoldDecision(o, q, p, b2b, x.entries);
 	const rentNext = p || x.pWarm < 0.5 ? 0 : (o.rent ?? 0) + Math.max(0, saved - carriedSavings);
 	const notes: Note[] = q?.a && x.at === "run" ? [{ type: "defer", key: q.a.firstKeptEntryId }] : [];
 	if (p?.cutIdx != null && q?.c && p.firstKeptEntryId !== q.c.firstKeptEntryId) notes.push({ type: "pin", where: x.at, from: q.c.firstKeptEntryId, to: p.firstKeptEntryId, ok: true });

@@ -1,6 +1,6 @@
 // Lookup cue for a new user request: earlier tool outputs the request names exactly. No model call and no context-pressure gate.
 import { hintText, locatorOf, pathsIn, WRITERS } from "./judge.ts";
-import { handleFor, handleTokens, MIN_FOLD_CHARS, RECALL_TOOL, shortArgs } from "./placeholder.ts";
+import { handleFor, handleTokens, MIN_FOLD_CHARS, RECALL_TOOL, shortArgs } from "./fold-format.ts";
 import { textOf, type Any } from "./util.ts";
 
 export interface LookupRef { handle: string; label: string; via: "handle" | "locator" }

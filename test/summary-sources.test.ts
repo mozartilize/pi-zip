@@ -1,9 +1,9 @@
 import { expect, test } from "bun:test";
 import { buildBlocks, toolCallIndex } from "../src/plan.ts";
 import { handleFor } from "../src/placeholder.ts";
-import { recallRequestsInBranch } from "../src/recall.ts";
+import { recallRequestsInBranch } from "../src/recall-extended.ts";
 import { skillReference } from "../src/skill-reference.ts";
-import { buildCut, parseNarrativeReply } from "../src/summary.ts";
+import { buildCut, parseNarrativeReply } from "../src/summary-engine.ts";
 import { buildEpochSummaryV2, collectAssistantCommitments, parseSummaryV2, prepareEpochV2, renderV2 } from "../src/summary-v2.ts";
 
 const entry = (id: string, role: string, content: any) => {

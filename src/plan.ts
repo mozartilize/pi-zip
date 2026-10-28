@@ -1,12 +1,14 @@
+import { recordSummaryPressure, summaryPrepareThreshold, type SummaryGate } from "./summary-pressure.ts";
+import { toolCallIndex, callOf, foldCandidates, foldPlaceholder } from "./fold-policy.ts";
 // Pure planning: session projection -> which outputs to fold, whether to summarise, where to cut (F5-F10).
-import { classifyRecoverability, type Recover } from "./classify.ts";
-import { handleFor, makePlaceholderFor, pickKeyLines, RECALL_TOOL, shortArgs } from "./placeholder.ts";
+import { classifyRecoverability, type Recover } from "./read-policy.ts";
+import { handleFor, pickKeyLines, shortArgs } from "./fold-format.ts";
 import { createHash } from "node:crypto";
 import { type Any, COMMIT_CUSTOM, PRODUCT, clamp, envInt, piTokensOf, textOf, tok4, tokensOf } from "./util.ts";
-import { PH_MARK } from "./placeholder.ts";
-import { lawPrices, MIN_EXPECT, type Prices } from "./learn.ts";
-import { commandNamesRecall, parseRecallPath, type FileRecall } from "./recallfile.ts";
-import { ACTIVE_INPUT_TOKENS, estimateMergeWork, type MergeWork } from "./summary.ts";
+import { PH_MARK } from "./fold-format.ts";
+import { lawPrices, type Prices } from "./learn.ts";
+import { type FileRecall } from "./recallfile.ts";
+import { ACTIVE_INPUT_TOKENS, estimateMergeWork, type MergeWork } from "./summary-engine.ts";
 
 /** Default age, in assistant requests, from which ANY foldable output (every recoverability class) inside the protected user turns may
  *  still be folded. A sub-agent session is one user turn with hundreds of tool rounds, so without this its candidate set is empty for
@@ -32,7 +34,6 @@ const SUMMARY_RATIO = 0.1;
 
 export const DEFAULT_RESERVE_TOKENS = 16_384; // Pi's compaction reserve default
 export const COMPACT_MARGIN = 8_192; // estimates are chars/4: stay clear of the trigger
-export const DEFAULT_SUMMARY_WINDOW = 200_000; // prepare checkpoints for a possible switch to a smaller window
 const MIN_TARGET = 4_096;
 
 /** Pi's compaction reserve for this model: compaction.modelOverrides["provider/id"], else compaction.reserveTokens, else 16384. */
@@ -49,24 +50,7 @@ export function compactionRoom(model: Any, reserve = DEFAULT_RESERVE_TOKENS): nu
 	return w > 0 ? Math.max(MIN_TARGET, w - reserve - COMPACT_MARGIN) : null;
 }
 
-export const SUMMARY_PRESSURE_CAP = 0.8 * compactionRoom({ contextWindow: DEFAULT_SUMMARY_WINDOW })!; // 140,339.2
-
-/** Summary application threshold: 80% of the active model's safe compaction room, capped at 400K tokens.
- * Unknown windows cannot establish pressure unless PI_ZIP_SUMMARY_AT overrides the real-token threshold. */
-export const summaryThreshold = (room: number | null): number => {
-	const over = envInt("SUMMARY_AT", -1);
-	if (over >= 0) return over;
-	return room === null ? Infinity : Math.min(0.8 * room, 400_000);
-};
-
-/** Background summary preparation threshold: min(0.8 * room, 200K-window pressure cap).
- * On large windows (e.g. 1M), background summaries are prepared from 140.3K without applying them until the active window's own
- * min(0.8 * room, 400K) is reached. A switch can reuse a prepared prefix only if the summary plus untouched suffix fits the new window. */
-export const summaryPrepareThreshold = (room: number | null): number => {
-	const over = envInt("SUMMARY_AT", -1);
-	if (over >= 0) return over;
-	return room === null ? Infinity : Math.min(0.8 * room, SUMMARY_PRESSURE_CAP);
-};
+export { DEFAULT_SUMMARY_WINDOW, SUMMARY_PRESSURE_CAP, summaryThreshold, summaryPrepareThreshold } from "./summary-pressure.ts";
 
 export const PI_KEEP_RECENT = 20_000; // Pi's compaction keepRecentTokens default
 
@@ -557,36 +541,7 @@ export function buildBlocks(contextEntries: Any[], steerIds?: Set<string>): Bloc
  *  from the previous turn's final answer on (formal TR, round 4: 50K of answer kept in front of a driven run). */
 export const isCutBlock = (b: Block): boolean => !!b.entryId && (b.kind === "user" || b.kind === "assistant" || (b.kind === "other" && b.msg?.role === "custom"));
 
-export function toolCallIndex(blocks: Block[]): Calls {
-	const m: Calls = new Map();
-	const byResult = new WeakMap<object, Call | null>();
-	const issued = new Map<string, Call | null>(); // id -> the newest call that issued it so far; null: one message issued it twice
-	for (const b of blocks) {
-		if (b.kind === "assistant") {
-			const content: Any[] = Array.isArray(b.msg.content) ? b.msg.content : [];
-			const seen = new Map<string, number>();
-			for (const c of content) if (c?.type === "toolCall") seen.set(c.id, (seen.get(c.id) ?? 0) + 1);
-			for (const c of content) {
-				if (c?.type !== "toolCall") continue;
-				const call = { name: c.name, args: c.arguments };
-				m.set(c.id, call);
-				issued.set(c.id, (seen.get(c.id) ?? 0) > 1 ? null : call);
-			}
-		} else if (b.kind === "toolResult" && b.msg && typeof b.msg === "object") {
-			byResult.set(b.msg, issued.get(b.msg.toolCallId) ?? null);
-			if (b.raw && typeof b.raw === "object") byResult.set(b.raw, issued.get(b.msg.toolCallId) ?? null);
-		}
-	}
-	m.byResult = byResult;
-	return m;
-}
-
-/** The call that produced this tool result message: its own source-order call when `calls` indexed it (undefined when ambiguous or
- *  issued only after it), else the call with its id (an index built without results). */
-export function callOf(calls: Calls, msg: Any): Call | undefined {
-	if (msg && typeof msg === "object" && calls.byResult?.has(msg)) return calls.byResult.get(msg) ?? undefined;
-	return calls.get(msg?.toolCallId);
-}
+export { toolCallIndex, callOf, foldCandidates, foldPlaceholder } from "./fold-policy.ts";
 
 // ---------------------------------------------------------------------------------------------------------------
 // plan types
@@ -665,7 +620,7 @@ export interface PlanOpts {
 		outputs: Array<{ h: string; age: number; verdict: Verdict | "unscored"; group: number | null; planned: boolean; selected: boolean }>;
 	};
 	/** Output diagnostic, overwritten on each plan; sizes are calibrated whole-context tokens. */
-	summaryGate?: { before: number; afterFolds: number; target: number; threshold: number | null; prepareThreshold: number | null; room: number | null; eligible: boolean; prepareEligible: boolean; checkpoint?: { key: string; after: number; advance: number; refresh: boolean }; reason: "folds-only" | "unknown-window" | "below-target" | "below-pressure" | "prepare-only" | "pressure" };
+	summaryGate?: SummaryGate;
 	reserve?: number; // Pi's compaction reserveTokens (default 16384)
 	steerIds?: Set<string>; // user entries that are mid-run steering or follow-up messages, not new user turns
 	scale?: Scale; // real = O + c x content estimate (calibrate); default UNIT = the estimates are taken as real
@@ -712,44 +667,6 @@ export interface PlanResult {
 	fileRecall?: FileRecall; // the summary of this plan names recall files instead of zip_recall (PlanOpts.fileRecall)
 	atRoom?: boolean; // the context after the plan's folds is at Pi's compaction room: Pi would compact (lossy) if nothing is done now
 	atRoomUnedited?: boolean; // the context as it is (no fold, no cut applied) is at Pi's compaction room: a request sent unchanged would trigger it
-}
-
-/** Candidate groups in planner order. Shared with the background judge; economics still belongs to plan(). */
-export function foldCandidates(blocks: Block[], calls: Calls, o: PlanOpts): [Block[], Block[], Block[]] {
-	const s = settings(), scale = o.scale ?? UNIT;
-	const turns = countUserTurns(blocks) + (o.promptPending && !openStarter(blocks) ? 1 : 0);
-	const age = o.inturnAge ?? s.inturnAge;
-	// Preserve the automatic-cache observation prefix in both selection paths.
-	const head = o.law?.pr.cls === "automatic" ? (MIN_EXPECT - scale.O) / scale.c : 0;
-	const groups: [Block[], Block[], Block[]] = [[], [], []];
-	let start = 0;
-	for (const b of blocks) {
-		const pos = start; start += b.tokens;
-		if (b.kind !== "toolResult" || b.edited || !b.entryId || pos < head || (o.recalled?.size ? o.recalled.has(handleFor(b.entryId)) : false)) continue;
-		const text = textOf((b.raw ?? b.msg).content);
-		if (tok4(text) <= (o.foldMin ?? s.foldMin)) continue;
-		const call = callOf(calls, b.msg), name = call?.name ?? b.msg.toolName;
-		if (name === RECALL_TOOL || (name === "bash" && commandNamesRecall(call?.args?.command))
-			|| (["read", "grep", "find", "ls"].includes(name) && !!parseRecallPath(call?.args?.path))) continue;
-		const rereadable = () => classifyRecoverability(name ?? "", call?.args, text, o.cwd, (b.raw ?? b.msg).content) === "rereadable";
-		if (o.rereadOnly && !rereadable()) continue;
-		if (b.userTurn < turns - PROTECT_USER_TURNS + 1) groups[0].push(b);
-		else if (o.rescue?.force?.has(b.entryId)) groups[2].push(b);
-		else {
-			if (o.pause && b.userTurn < turns && rereadable()) groups[1].push(b);
-			if (age > 0 && b.age >= age) groups[2].push(b);
-		}
-	}
-	return groups;
-}
-
-/** A useful, recallable replacement; ranking cannot bypass the planner's saving check. */
-export function foldPlaceholder(b: Block, calls: Calls, o: PlanOpts): { ph: string; phTok: number } | null {
-	if (!b.entryId || (o.recalled?.size ? o.recalled.has(handleFor(b.entryId)) : false)) return null;
-	const ph = makePlaceholderFor(b, calls, o.keepLines ?? settings().keepLines, !!o.rereadOnly, o.fileRecall, o.foldedAt);
-	if (ph === null) return null;
-	const phTok = tokensOf({ ...b.msg, content: [{ type: "text", text: ph }] });
-	return phTok < 0.9 * b.tokens ? { ph, phTok } : null;
 }
 
 /** Estimated content before the earliest edited block: what stays cached through the edit with O (real: O + c x it). A cut edits from the start. */
@@ -799,13 +716,7 @@ export function plan(entries: Any[], o: PlanOpts): { f: PlanResult; c: PlanResul
 	const calls = toolCallIndex(blocks);
 	const recalled = o.recalled ?? new Set<string>();
 	const ctxEst = blocks.reduce((a, b) => a + b.tokens, 0); // content
-	const recordPressure = (after: number) => {
-		const threshold = summaryThreshold(room), prep = summaryPrepareThreshold(room), afterReal = real(after);
-		const prepareEligible = !o.foldsOnly && Number.isFinite(prep) && after > coldCap && afterReal >= prep;
-		const eligible = !o.foldsOnly && Number.isFinite(threshold) && after > coldCap && afterReal >= threshold;
-		const reason = o.foldsOnly ? "folds-only" : !Number.isFinite(threshold) ? "unknown-window" : after <= coldCap ? "below-target" : eligible ? "pressure" : prepareEligible ? "prepare-only" : "below-pressure";
-		o.summaryGate = { before: real(ctxEst), afterFolds: afterReal, target: real(coldCap), threshold: Number.isFinite(threshold) ? threshold : null, prepareThreshold: Number.isFinite(prep) ? prep : null, room, eligible, prepareEligible, reason };
-	};
+	const recordPressure = (after: number) => recordSummaryPressure(o, real(ctxEst), real(after), real(coldCap), room);
 	recordPressure(ctxEst);
 	let tail = 0;
 	for (let i = blocks.length - 1; i >= 0 && tail < PI_KEEP_RECENT; i--) tail += c * blocks[i].tokens;

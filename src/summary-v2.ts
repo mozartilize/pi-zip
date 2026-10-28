@@ -3,13 +3,13 @@
 // come first. Identities (request numbers, executions, results) are rebuilt from the raw session branch; the summary text carries what
 // the branch cannot give back: the prose, the grouping and what was left out. The next summary parses this text and carries every old
 // epoch as written; only its prose is ever merged by a model call, its requests and evidence are joined by code.
-import { classifySummaryRead } from "./classify.ts";
-import { blockTime, cdAliases, handleFor, outcomeHint, RECALL_TOOL, shortArgs, summaryHint, whenLabel } from "./placeholder.ts";
+import { classifySummaryRead } from "./read-policy.ts";
+import { blockTime, cdAliases, handleFor, outcomeHint, RECALL_TOOL, shortArgs, summaryHint, whenLabel } from "./fold-format.ts";
 import type { Block } from "./plan.ts";
-import { assistantVisibleText, branchRequests, type BranchRequest } from "./recall.ts";
+import { assistantVisibleText, branchRequests, type BranchRequest } from "./recall-extended.ts";
 import { skillReference } from "./skill-reference.ts";
 import { type FileRecall, fileRecallHow } from "./recallfile.ts";
-import { BUDGET, bashCommands, type EpochBlock, legacyNarrative, mkEpoch, parseSummary, prose, SHORT_MARK } from "./summary.ts";
+import { BUDGET, bashCommands, type EpochBlock, legacyNarrative, mkEpoch, parseSummary, SHORT_MARK } from "./summary-engine.ts";
 import { type Any, clip, textOf, tok4 } from "./util.ts";
 
 export const SUMMARY_V2_MARK = "[pi-zip summary · format v2 · request numbering: raw-branch-v2]";
@@ -779,7 +779,7 @@ export function prepareEpochV2(o: PrepareV2Options): PreparedV2 {
 	const raw = branch.length ? branchRequests(branch) : [];
 	const rawById = new Map(raw.map((r) => [r.entryId, r]));
 	const rawByHandle = new Map(raw.map((r) => [r.handle, r]));
-	const sliceFirst = o.prefix.find((b) => b.entryId)?.entryId;
+	const sliceFirst = o.prefix.find((b) => b.entryId)?.entryId ?? undefined;
 	const prevV2 = parseSummaryV2(o.previous ?? null);
 	let carried: V2Epoch[] = [];
 	let prevIntents: V2Intent[] = [];

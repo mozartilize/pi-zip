@@ -21,16 +21,12 @@ for (let i = 0; i < 65; i++) {
 }
 entries.push(U("keep", "Continue."), A("keepA"));
 const blocks = buildBlocks(entries), calls = toolCallIndex(blocks);
-// TZ_FIXTURE_FORMAT: "v1" pins format v1; unset renders the default (format v3, or v2 under PI_ZIP_SUMMARY_V2=1).
-const format = process.env.TZ_FIXTURE_FORMAT;
-const p: Any = { blocks, calls, cutIdx: blocks.findIndex((b) => b.entryId === "keep"), prefixTokens: 50_000, summaryTokensPlanned: 7000, sumTrigger: "cold", ...(format ? { summaryFormat: format } : {}) };
+const p: Any = { blocks, calls, cutIdx: blocks.findIndex((b) => b.entryId === "keep"), prefixTokens: 50_000, summaryTokensPlanned: 7000, sumTrigger: "cold" };
 const prompts: string[] = [];
 const ctx = (fail = false): Any => ({ model: { id: "m" }, modelRegistry: { complete: async (_m: Any, c: Any) => {
 	prompts.push(c.messages[0].content[0].text);
 	return fail ? { stopReason: "error", errorMessage: "offline", content: [] }
-		: { stopReason: "stop", content: [{ type: "text", text: c.messages[0].content[0].text.includes("Update the STATE DIGEST")
-			? `---DECISIONS---\nADD i1: Persisted fact: 42.\n---EVIDENCE---\n${JSON.stringify({ sourceHandle: handleFor("r0"), quote: "2 passed" })}\n${JSON.stringify({ sourceHandle: handleFor("r1"), quote: "2 passed" })}`
-			: "## Key facts to remember\nPersisted fact: 42." }] };
+		: { stopReason: "stop", content: [{ type: "text", text: "## Key facts to remember\nPersisted fact: 42." }] };
 } } });
 const placeholders = blocks.filter((b) => b.kind === "toolResult").map((b) => makePlaceholderFor(b, calls));
 const first = (await buildCut(p, ctx())).text;

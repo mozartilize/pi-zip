@@ -3,7 +3,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { isAbsolute, normalize, resolve } from "node:path";
 import { callOf, foldCandidates, foldPlaceholder, settings, type Block, type Calls, type PlanOpts, type Verdict } from "./plan.ts";
-import { handleFor, handleTokens, outcomeHint, pickKeyLines, shortArgs, RECALL_TOOL } from "./placeholder.ts";
+import { handleFor, handleTokens, outcomeHint, pickKeyLines, shortArgs, RECALL_TOOL } from "./fold-format.ts";
 import { modelRef, reasoningFor, supportedThinking } from "./model-pick.ts";
 import { envInt, textOf, tok4, type Any } from "./util.ts";
 export { modelRef as judgeModelRef, reasoningFor as judgeReasoning, supportedThinking } from "./model-pick.ts";
