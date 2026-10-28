@@ -421,6 +421,41 @@ describe("retrieve", () => {
 		}
 	});
 
+	test("candidate caps grow with topics, not facets, languages or the graph stream; fixed overrides and named handles are preserved", () => {
+		const entries: Any[] = [user("u", null, "start")];
+		let parent = "u";
+		for (let i = 0; i < 40; i++) {
+			const id = `budget${i}`;
+			entries.push(asst(id, parent, [{ type: "text", text: `capbudget source ${i}` }]));
+			parent = id;
+		}
+		entries.push(asst("read", parent, [call("c", "read", { path: "config/topic.yml" })]),
+			result("graph", "read", "c", "read", "graph-only evidence"),
+			E("cm", "graph", { type: "compaction", summary: "s", firstKeptEntryId: "cm", tokensBefore: 1 }));
+		const { s, l } = indexed(entries);
+		s.sm.buildSessionProjection = () => buildSessionProjection(s.state.entries, s.state.leaf);
+		const scope = scopeOf(s.ctx);
+		const query = (topics: number) => ({ ...q("capbudget"), sets: Array.from({ length: topics }, (_, i) =>
+			["what", "why", "how", "when"].map((facet, j) => ({
+				aspect: j % 2 ? ` topic${i} ` : `topic${i}`, facet, lang: j % 2 ? "vi" : "en", keywords: ["capbudget"],
+			}))).flat() });
+		// Each topic has four facets, while every stream finds the same entries: neither query count nor duplicates inflate T.
+		for (const [topics, expected] of [[0, 8], [1, 8], [2, 12], [3, 14], [4, 16], [17, 32]]) {
+			const evidence = retrieve(l.db, query(topics), scope).evidence;
+			expect(evidence).toHaveLength(expected);
+			expect(new Set(evidence.map((e) => e.entryId)).size).toBe(expected);
+		}
+		const unlabeled = { ...query(1), sets: query(1).sets.map(({ aspect, ...set }) => set) };
+		expect(retrieve(l.db, unlabeled, scope).evidence).toHaveLength(8);
+		const graph = retrieve(l.db, { ...query(1), paths: ["config/topic.yml"] }, scope).evidence;
+		expect(graph).toHaveLength(8);
+		expect(graph.some((e) => e.entryId === "graph")).toBe(true); // graph participated, but did not create another topic
+		expect(retrieve(l.db, query(4), scope, { ...DEFAULT_LIMITS, candidates: 3 }).evidence).toHaveLength(3);
+		const named = retrieve(l.db, { ...query(1), handles: [handleFor("u")] }, scope).evidence;
+		expect(named).toHaveLength(9);
+		expect(named[0]).toMatchObject({ entryId: "u", exact: true });
+	});
+
 	test("planner keyword sets merge round-robin (an entry one facet finds is not buried), and a matched call brings its result", () => {
 		const entries: Any[] = [user("u1", null, "start")];
 		let parent = "u1";

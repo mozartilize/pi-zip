@@ -59,9 +59,9 @@ export interface Evidence {
 	at: number;
 }
 
-/** `ftsRows`: FTS rows read per prompt, after the active-branch hidden scope filter. */
-export interface SearchLimits { candidates: number; expand: number; excerptChars: number; ftsRows: number }
-export const DEFAULT_LIMITS: SearchLimits = { candidates: 32, expand: 6, excerptChars: 1500, ftsRows: 400 };
+/** `candidates`: fixed override; omitted uses the topic-based cap. `ftsRows`: rows after the active-branch hidden scope filter. */
+export interface SearchLimits { candidates?: number; expand: number; excerptChars: number; ftsRows: number }
+export const DEFAULT_LIMITS: SearchLimits = { expand: 6, excerptChars: 1500, ftsRows: 400 };
 
 /** Diacritics removed, for comparison only: "tiếp tục" -> "tiep tuc", "đ" -> "d". */
 export const fold = (s: string) => s.normalize("NFD").replace(/\p{M}+/gu, "").replace(/đ/g, "d").replace(/Đ/g, "D");
@@ -338,6 +338,7 @@ export function retrieve(db: Db, q: Query, scope: Scope, limits: SearchLimits = 
 	// One scope for every query below: SQL filters to the hidden active-branch entries before ranking and LIMIT.
 	setSearchScope(db, eligible);
 	const runs = searchesOf(q);
+	const topics = Math.max(1, new Set(runs.map((r) => r.aspect)).size);
 	const perRun = Math.max(40, Math.floor(limits.ftsRows / Math.max(1, runs.length)));
 	// At most PER_ENTRY_ROWS chunks per entry: a few long outputs matching on every chunk cannot fill all rows.
 	const lists: Array<{ aspect: string; facet: string; tokens: string[]; hits: Hit[] }> = runs.map((r) => ({ aspect: r.aspect, facet: r.facet, tokens: r.tokens, hits: eligible.length ? ftsSearchScoped(db, r.match, perRun, SEARCH_KINDS, PER_ENTRY_ROWS) : [] }));
@@ -374,7 +375,8 @@ export function retrieve(db: Db, q: Query, scope: Scope, limits: SearchLimits = 
 		if (picked.has(hit.entry_id!)) continue;
 		picked.set(hit.entry_id!, { hit, exact: true, tokens: allTokens, passages: [passage(hit, true, allTokens, limits.excerptChars)!] });
 	}
-	const cap = limits.candidates + named.length;
+	// Grow sublinearly with topics, not facets or the extra graph stream, to bound evidence cost without fixing every request at 32.
+	const cap = (limits.candidates ?? Math.min(32, Math.ceil(8 * Math.sqrt(topics)))) + named.length;
 	// Round-robin, two levels: within one aspect (its what/why/how/when queries compete for that aspect's slots), then across
 	// aspects (each sub-question of the request gets its own slots). A flat merge let one aspect whose queries match many records
 	// (benchmark logs, long tool outputs) take the candidates of an aspect about a design decision that fewer records mention.
