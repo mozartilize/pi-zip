@@ -5,13 +5,14 @@ import { type NoticeData, registerZipCommand, renderNotice } from "./notice.ts";
 import { RECALL_TOOL } from "./placeholder.ts";
 import { registerRecallTool } from "./recall-extended.ts";
 import { parseRecallPath } from "./recallfile.ts";
-import { NOTICE_CUSTOM, Zip } from "./run.ts";
+import { NOTICE_CUSTOM } from "./run.ts";
+import { ZipFork } from "./run-fork.ts";
 import { registerMemory } from "./memory-extension.ts";
 import { markFirstLine, measure, recallCallLine, renderCard, renderState, setMeasure } from "./ui.ts";
 
 export default function piZip(pi: ExtensionAPI) {
 	if (process.env.PI_ZIP_OFF === "1") return; // test only: behave exactly as if not installed (registers nothing)
-	const zip = new Zip(pi);
+	const zip = new ZipFork(pi);
 	import("@earendil-works/pi-coding-agent").then((m: Any) => { zip.version.pi = String(m?.VERSION ?? ""); }, () => {}); // Pi's version, for the version entry
 	registerRecallTool(pi, zip); // stays registered even when off: earlier folds must stay recallable, and a tool-list change would bust the cache
 	registerZipCommand(pi, zip);

@@ -78,7 +78,7 @@ describe("a reasoning model whose provider refuses effort none (gateway gpt-6.1-
 		: { stopReason: "error", errorMessage: REFUSED, usage: { cost: { total: 0 } } });
 	test("asked again with low effort without using up the retry, then low at once for that model", async () => {
 		const efforts: (string | undefined)[] = [];
-		const ctx = { model: { provider: "gateway", id: "unit-refuses-none", reasoning: true }, modelRegistry: { complete: refusing(efforts) } } as Any;
+		const ctx = { model: { provider: "gateway", id: "unit-refuses-none-v2", reasoning: true }, modelRegistry: { complete: refusing(efforts) } } as Any;
 		expect((await narrative(buildBlocks([U("u", "work"), A("a")]), ctx, 1000)).ok).toBe(true);
 		expect(efforts).toEqual([undefined, "low"]);
 		expect((await narrative(buildBlocks([U("u", "work"), A("a")]), ctx, 1000)).ok).toBe(true);

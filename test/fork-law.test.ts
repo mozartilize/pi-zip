@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { lawPrices, loadStats, MIN_EXPECT, pWarm, record, sample, type Prices } from "../src/learn.ts";
 import { buildBlocks, compactionRoom, editAllowed, lawTerms, settings, sizeOf, UNIT, untouchedEst, type Law } from "../src/plan.ts";
 import { planContext } from "../src/plan-fork.ts";
-import { Zip } from "../src/run.ts";
+import { ZipFork as Zip } from "../src/run-fork.ts";
 import { A, AX, fakeCtx, fakePi, flat, longTurn, project, R, startZip, U, type Any } from "./helpers.ts";
 
 const ANTH: Prices = { r: 0.3, w: 3.75, input: 3, out: 15, cls: "explicit", src: "class" };

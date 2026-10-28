@@ -42,7 +42,7 @@ const mutants = [
 	// 0.4.0/0.4.1 (P1): the narrative call capped at its budget, and a failed narrative dropped instead of its fallback summary
 	{
 		name: "narrative-call-capped-at-budget",
-		file: "summary-engine.ts",
+		file: "summary.ts",
 		pattern: "a narrative longer than its budget",
 		check: "expect(received).toBe(expected)",
 		edit: (source: string) => rep(source, "{ maxTokens: cap, signal,", "{ maxTokens: NARRATIVE_MAX, signal,"),
@@ -90,7 +90,7 @@ const mutants = [
 	},
 	{
 		name: "narrative-effort-refusal-not-retried",
-		file: "summary-engine.ts",
+		file: "summary.ts",
 		pattern: "refuses effort none",
 		check: "a narrative refused for its reasoning effort is retried with low effort",
 		edit: (source: string) => rep(source, "if (!low && model.reasoning && EFFORT_REFUSED_RE.test(lastErr) && !signal.aborted) {", "if (false) {"),

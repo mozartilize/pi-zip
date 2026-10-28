@@ -8,7 +8,8 @@ import { buildBlocks, applyPlanToMessages, reserveTokensFor, type Block, type Ru
 import { planContext } from "../src/plan-fork.ts";
 import { handleFor } from "../src/placeholder.ts";
 import { skeleton } from "../src/summary.ts";
-import { NATIVE_MARKER, Zip } from "../src/run.ts";
+import { NATIVE_MARKER } from "../src/run.ts";
+import { ZipFork as Zip } from "../src/run-fork.ts";
 import { A, AX, fakeCtx, fakePi, flat, longTurn, narrativeReply, project, R, startPrompt, U, withK, type Any } from "./helpers.ts";
 
 const ENV = ["PI_ZIP_TTL_SECS", "PI_ZIP_COLD_CAP", "PI_ZIP_OFF", "PI_ZIP_LEDGER", "PI_ZIP_INTURN_AGE", "PI_ZIP_SUMMARY_AT"];
@@ -33,10 +34,14 @@ async function rig(entries: Any[], lastTs: number, over: Any = {}, piExtra: Any 
 }
 /** The Zip instance behind a rig (index.ts keeps it private): only to put it in a state a test needs (justEdited after a warm edit). */
 const zipOf = async (r: Any): Promise<Any> => {
+	const ownStart = Object.getOwnPropertyDescriptor(Zip.prototype, "sessionStart");
 	const orig = Zip.prototype.sessionStart;
 	let z: Any = null;
 	Zip.prototype.sessionStart = function (this: Any, ...a: Any[]) { z = this; return (orig as Any).apply(this, a); };
-	try { await r.fire("session_start", {}); } finally { Zip.prototype.sessionStart = orig; }
+	try { await r.fire("session_start", {}); } finally {
+		if (ownStart) Object.defineProperty(Zip.prototype, "sessionStart", ownStart);
+		else delete (Zip.prototype as Any).sessionStart;
+	}
 	return z;
 };
 

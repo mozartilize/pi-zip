@@ -69,7 +69,7 @@ for (let r = 0; r < 3; r++) {
 	await fire("message_end", { message: { ...lastA.message, timestamp: Date.now() } }, );
 	await fire("turn_end", { message: { ...lastA.message, timestamp: Date.now() }, messageEntryId: lastA.id, context: { contextEntries: proj.entries }, entries: [], turnIndex: r });
 }
-const { Zip } = await import("../src/run.ts");
+const { ZipFork: Zip } = await import("../src/run-fork.ts");
 const Z: Any = Zip.prototype, origOpts = Z.opts, origBranch = Z.branch;
 let nOpts = 0, msOpts = 0, nBranch = 0, msBranch = 0;
 Z.opts = function (...a: Any[]) { const s = performance.now(); try { return origOpts.apply(this, a); } finally { nOpts++; msOpts += performance.now() - s; } };

@@ -4,6 +4,8 @@ Upstream releases remain in [CHANGELOG.md](../CHANGELOG.md).
 
 ## Unreleased
 
+- Share upstream summary parsing, formatting, serialization and provider/retry logic with v2/v3. Move runtime extensions to `ZipFork extends Zip`; inherited lifecycle methods and the producer now stay in the base class.
+
 - Rebased the fork onto upstream 0.4.15, isolated fork policy in dedicated modules, restored the upstream summary implementation and removed the fork-v1 emitter. Only v2/v3 are emitted; existing summaries remain readable.
 
 - Format v3 is the new default summary format (`PI_ZIP_SUMMARY_V2=1` selects format v2): a state digest instead of a

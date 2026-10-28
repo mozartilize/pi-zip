@@ -319,7 +319,7 @@ describe("file recall through the extension", () => {
 	});
 
 	test("the card says on in file mode and how unzips work; reread-only only without read, grep and bash", async () => {
-		const { Zip } = await import("../src/run.ts");
+		const { ZipFork: Zip } = await import("../src/run-fork.ts");
 		const entries = [U("u1", "one")];
 		const z = new Zip(fakePi().pi);
 		const { ctx } = fakeCtx(entries, { sessionManager: { getBranch: () => [], buildSessionProjection: () => ({ entries }), getSessionId: () => SID, getSessionFile: () => SESSION_FILE } });

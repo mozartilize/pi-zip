@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { lookupRefs, lookupText } from "../src/lookup.ts";
 import { handleFor, handleTokens, PH_MARK } from "../src/fold-format.ts";
-import { Zip } from "../src/run.ts";
+import { ZipFork as Zip } from "../src/run-fork.ts";
 import { A, U, fakeCtx, fakePi, flat, project, startZip, type Any } from "./helpers.ts";
 
 const saved = { ...process.env };

@@ -8,7 +8,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { G0 } from "../src/plan.ts";
 import { replayGrowth } from "../src/state.ts";
-import { Zip } from "../src/run.ts";
+import { ZipFork as Zip } from "../src/run-fork.ts";
 import { COMMIT_CUSTOM, PRODUCT } from "../src/util.ts";
 import { fakeCtx, fakePi, type Any } from "./helpers.ts";
 

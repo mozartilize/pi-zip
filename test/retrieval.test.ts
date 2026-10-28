@@ -10,7 +10,7 @@ import { Memory, recentContext } from "../src/memory.ts";
 import { renderPacket, statusFor, validate } from "../src/retrieval/packet.ts";
 import { ANSWER_INSTRUCTIONS, answerInput, buildAnswerInput, EVIDENCE_CHARS, parseReply, recordedAt, requestText, RetrievalConversation, type NeedDecision } from "../src/retrieval/assistant.ts";
 import { conclusionsOf, DEFAULT_LIMITS, type Evidence, GRAPH_REFERENCE_LIMIT, queryOf, retrieve, scopeOf } from "../src/retrieval/search.ts";
-import { Zip } from "../src/run.ts";
+import { ZipFork as Zip } from "../src/run-fork.ts";
 import { A, fakeCtx, fakePi, flat, startZip, U } from "./helpers.ts";
 import { asst, call, E, fakeSession, fixtureEntries, result, user, type Any } from "./memory-fixture.ts";
 

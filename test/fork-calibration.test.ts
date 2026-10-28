@@ -270,7 +270,7 @@ describe("calibrate: per model, Pi's compaction, dropped responses", () => {
 	});
 
 	test("/zip folded total: each fold on the scale of the model that made it, not today's c for all", async () => {
-		const { Zip } = await import("../src/run.ts");
+		const { ZipFork: Zip } = await import("../src/run-fork.ts");
 		const e = [SYS("s0", "x".repeat(8_000)), U("u1", "one"), A("a1", ["c1"]), R("ra", "c1", 40_000), A("a2"), U("u2", "two"), A("a3", ["c2"]), R("rb", "c2", 40_000), A("a4")];
 		provider(e, 15_000, 1, ["a1", "a2"]);
 		as(e, ["a1", "a2"], "zai", "glm-like");

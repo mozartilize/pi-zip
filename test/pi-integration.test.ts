@@ -101,7 +101,7 @@ async function rig(setup: (sm: SessionManager) => void = populate, opts: RigOpts
 	// the real loader, from the real entry file: exactly how `pi -e` loads the extension
 	const bus = createEventBus();
 	const source = process.env.PI_ZIP_TEST_SRC ?? fileURLToPath(new URL("../src", import.meta.url));
-	const { Zip } = await import(join(source, "run.ts"));
+	const { ZipFork: Zip } = await import(join(source, "run-fork.ts"));
 	const loaded = await discoverAndLoadExtensions([join(source, "index.ts")], CWD, "/tmp/pi-zip-integration-agent", bus);
 	expect(loaded.errors).toEqual([]);
 	const runtime = loaded.runtime;
@@ -306,10 +306,14 @@ async function rig(setup: (sm: SessionManager) => void = populate, opts: RigOpts
 		sm.appendCustomMessageEntry(message.customType, message.content, message.display);
 		await runner.emit({ type: "message_end", message } as Any);
 	};
+	const ownStart = Object.getOwnPropertyDescriptor(Zip.prototype, "sessionStart");
 	const start = (Zip.prototype as Any).sessionStart;
 	(Zip.prototype as Any).sessionStart = function (this: Any, ...args: Any[]) { zip = this; return start.apply(this, args); };
 	try { await runner.emit({ type: "session_start", reason: "startup" } as Any); }
-	finally { (Zip.prototype as Any).sessionStart = start; }
+	finally {
+		if (ownStart) Object.defineProperty(Zip.prototype, "sessionStart", ownStart);
+		else delete (Zip.prototype as Any).sessionStart;
+	}
 	let noticeScale = UNIT;
 	const noticeFor = zip.noticeFor.bind(zip), notify = zip.notify.bind(zip), ledger = zip.ledger.bind(zip);
 	zip.noticeFor = (...args: Any[]) => { noticeScale = args[1].scale; return noticeFor(...args); };

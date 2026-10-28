@@ -8,7 +8,7 @@ import { checkEdits, decideEdits } from "../src/core.ts";
 import { handleFor, PH_MARK } from "../src/placeholder.ts";
 import { resolveHandlesInBranch } from "../src/recall-extended.ts";
 import { cardText } from "../src/ui.ts";
-import { Zip } from "../src/run.ts";
+import { ZipFork as Zip } from "../src/run-fork.ts";
 import { lawPrices } from "../src/learn.ts";
 import { A, R, U, fakeCtx, fakePi, longTurn, project, startZip, type Any } from "./helpers.ts";
 import { tok4 } from "../src/util.ts";

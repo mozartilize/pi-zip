@@ -1,10 +1,10 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import type { Zip } from "./run.ts";
+import type { ZipFork } from "./run-fork.ts";
 import type { Any } from "./util.ts";
 import { Memory } from "./memory.ts";
 
 /** Session memory registration; lifecycle calls stay next to the runtime's corresponding event hooks. */
-export function registerMemory(pi: ExtensionAPI, zip: Zip): Memory {
+export function registerMemory(pi: ExtensionAPI, zip: ZipFork): Memory {
 	const memory = new Memory((rec) => zip.ledger(rec));
 	{
 		zip.memory = memory;

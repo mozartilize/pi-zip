@@ -4,7 +4,7 @@ This fork tracks upstream pi-zip. Upstream documentation describes the base beha
 
 ## Summary formats
 
-Only v2 and v3 are emitted. V3 is the default; `PI_ZIP_SUMMARY_V2=1` selects v2. Existing upstream, fork-v1, v2, v3 and native Pi summaries remain readable for migration. `src/summary.ts` is the unmodified upstream implementation, not the fork's runtime entry point; the runtime uses `src/summary-engine.ts`.
+Only v2 and v3 are emitted. V3 is the default; `PI_ZIP_SUMMARY_V2=1` selects v2. Existing upstream, fork-v1, v2, v3 and native Pi summaries remain readable for migration. `src/summary-engine.ts` dispatches v2/v3 and extends the parser, while importing shared parsing, budgeting, serialization and provider-call logic from `src/summary.ts`. The runtime is `ZipFork` in `src/run-fork.ts`, which inherits the lifecycle and producer from upstream's `Zip` in `src/run.ts`.
 
 ### Format v2: verbatim requests and the request floor
 

@@ -9,7 +9,7 @@ import { type Any, clamp, clip, envInt, fmtWhen, textOf, tok4 } from "./util.ts"
 export const SUMMARY_MARK = "[summary of earlier conversation by pi-zip]";
 const POLICY_BLOCK_RE = /violate|terms of service|usage polic|content polic|acceptable use/i;
 const CAP_ERR = "narrative hit the token cap";
-const NARRATIVE_SYSTEM =
+export const NARRATIVE_SYSTEM =
 	"You are a context summarization assistant. Read the conversation and write ONLY the requested summary sections. " +
 	"Do NOT continue the conversation, do NOT answer questions in it, do NOT call tools.";
 
@@ -35,8 +35,8 @@ const tableLine = (r: HandleRow) => `- ${r.handle} · ${r.tool}${r.args ? " " + 
  * Compact table appended to every summary so handles survive it: this prefix's rows merged with the rows of the previous summary's
  * table(s) (hints and outcomes kept), newest TABLE_ROWS rows, each handle once, and a count of the older rows left out.
  */
-export function handleTable(rows: HandleRow[], previous: string | null = null, file?: FileRecall): string | null {
-	const prev = parseSummary(previous);
+export function handleTable(rows: HandleRow[], previous: string | null = null, file?: FileRecall, parse = parseSummary): string | null {
+	const prev = parse(previous);
 	const merged = mergeItems(prev.table.items, rows.map(tableLine), prev.table.omitted, TABLE_ROWS, Infinity, (l) => TABLE_ROW.exec(l)?.[1]);
 	if (!merged.kept.length) return null;
 	const lines = merged.omitted ? [`[… ${merged.omitted} older folded outputs omitted from this table …]`, ...merged.kept] : merged.kept;
@@ -51,14 +51,14 @@ const H = "[0-9a-z]{10}"; // a handle, see handleFor
 const W = "turn \\d+|\\d\\d-\\d\\d \\d\\d:\\d\\d(?: UTC)?";
 const CMD_ROW = new RegExp(`^\`(.*)\` -> [^(]*\\((${W}), (${H})\\)$`);
 const OTHER_ROW = new RegExp(`^(\\S+) (.*) \\((${W}), (${H})\\)$`);
-const FILE_ROW = /^- (.*) \(([^()]*)\)$/;
+export const FILE_ROW = /^- (.*) \(([^()]*)\)$/;
 const FILE_OP = new RegExp(`^(\\S+): (${H})$`);
-const TABLE_ROW = new RegExp(`^- (${H}) · (\\S+)((?: [^·]*?)?)(?: · (${W}))?(?: · (.*))?$`);
+export const TABLE_ROW = new RegExp(`^- (${H}) · (\\S+)((?: [^·]*?)?)(?: · (${W}))?(?: · (.*))?$`);
 const INDEX_HEAD = "## Handle index";
 /** Budget of the "Handle index" section, in tokens. */
 export const INDEX_TOKENS = envInt("SUM_INDEX_TOKENS", 2500);
 
-interface IndexRow {
+export interface IndexRow {
 	handle: string;
 	tool: string;
 	args: string;
@@ -67,7 +67,7 @@ interface IndexRow {
 	when?: string; // the time label as an earlier summary wrote it (UTC, or an older local time / turn number)
 	hint?: string; // only for rows that would otherwise read the same: the first line of the output that tells it apart
 }
-const INDEX_HINT = 50;
+export const INDEX_HINT = 50;
 
 const indexLine = (r: IndexRow) => `- ${r.handle} · ${r.tool}${r.args ? " " + r.args : ""}${when(r)}${r.hint ? ` · ${clip(r.hint, INDEX_HINT)}` : ""}`;
 
@@ -76,7 +76,7 @@ const indexLine = (r: IndexRow) => `- ${r.handle} · ${r.tool}${r.args ? " " + r
  * other-calls lists, the folded-outputs table and an earlier handle index. Works on the whole text, nested carried-forward blocks
  * included, so the clip applied to the carried-forward text cannot lose them.
  */
-export function handleRowsOf(text: string | null): IndexRow[] {
+export function handleRowsOf(text: string | null, extraRow?: (line: string, section: string) => IndexRow | undefined): IndexRow[] {
 	const rows: IndexRow[] = [];
 	let sec = "";
 	for (const line of (text ?? "").split("\n")) {
@@ -98,6 +98,9 @@ export function handleRowsOf(text: string | null): IndexRow[] {
 		} else if (sec.startsWith("## Folded outputs") || sec.startsWith(INDEX_HEAD)) {
 			// an index row keeps the line that tells it apart; a table row's tail (outcome, key line) stays in the table
 			if ((m = TABLE_ROW.exec(line))) rows.push({ handle: m[1], tool: m[2], args: m[3].trim(), ...(m[4] ? { when: m[4] } : {}), ...(m[5] && sec.startsWith(INDEX_HEAD) ? { hint: m[5] } : {}) });
+		} else {
+			const row = extraRow?.(line, sec);
+			if (row) rows.push(row);
 		}
 	}
 	return rows;
@@ -107,10 +110,10 @@ export function handleRowsOf(text: string | null): IndexRow[] {
  * Handles of the tool results the summary would otherwise lose: this prefix's results and the earlier summary's rows, newest first,
  * minus handles already written elsewhere in the summary, under a token budget. Says how many rows did not fit.
  */
-function handleIndex(now: IndexRow[], previous: string | null, listed: string, budgetTokens: number, file?: FileRecall): string | null {
+export function handleIndex(now: IndexRow[], previous: string | null, listed: string, budgetTokens: number, file?: FileRecall, readRows = handleRowsOf): string | null {
 	const seen = new Set<string>(listed.match(new RegExp(`\\b${H}\\b`, "g")) ?? []);
 	const rows: IndexRow[] = [];
-	for (const r of [...now].reverse().concat(handleRowsOf(previous).reverse())) {
+	for (const r of [...now].reverse().concat(readRows(previous).reverse())) {
 		if (seen.has(r.handle)) continue;
 		seen.add(r.handle);
 		rows.push({ ...r, args: clipMid(r.args, 60) });
@@ -135,12 +138,12 @@ function handleIndex(now: IndexRow[], previous: string | null, listed: string, b
 // count of what was left out. (The earlier design clipped the whole carried text to its first 12,000 characters, which kept the
 // oldest nested content and cut the newest requests and handles.)
 // ---------------------------------------------------------------------------------------------------------------
-interface Items {
+export interface Items {
 	items: string[]; // oldest first
 	omitted: number; // older items already left out by earlier merges
 	nums?: number[]; // user requests: the number each item was written with (1 = the session's first request), when the format says
 }
-interface FileRow {
+export interface FileRow {
 	path: string;
 	ops: Map<string, string | null>; // tool -> handle of its latest result
 }
@@ -170,14 +173,14 @@ const SECTIONS: Array<[RegExp, string]> = [
 	[/^## Earlier summary/, "free"], // the carried-forward block of the older format
 ];
 /** Heading written for the user section. Its request bodies indent every continuation line by USER_INDENT, so a numbered list or a `## ` heading inside a request cannot be taken for an item or section start. Older summaries have no such marker and are parsed heuristically. */
-const USERS_HEAD = "## User requests (verbatim, oldest first, continuation lines indented)";
+export const USERS_HEAD = "## User requests (verbatim, oldest first, continuation lines indented)";
 /** Heading once older requests in the middle are shortened (USERS budget): those lines start with SHORT_MARK. */
-const USERS_HEAD_SHORT = "## User requests (oldest first, continuation lines indented; the first and the newest verbatim, lines starting with ≈ shortened to their start)";
-const SHORT_MARK = "≈ ";
-const USER_INDENT = "   ";
+export const USERS_HEAD_SHORT = "## User requests (oldest first, continuation lines indented; the first and the newest verbatim, lines starting with ≈ shortened to their start)";
+export const SHORT_MARK = "≈ ";
+export const USER_INDENT = "   ";
 const OMIT_ROW = /^\[… (\d+) [^\]]*?(?:omitted|not listed)[^\]]*…\]$/;
 const COVERS_ROW = /^Covers \d+ earlier messages\./;
-const NONE_ROW = "(none)";
+export const NONE_ROW = "(none)";
 /** Heading of a previous narrative carried forward unchanged because the call for a new one failed (buildCut). */
 const narrCarriedHead = (at: string | undefined, why: string) => `## Narrative (carried forward from the summary of ${at ?? "an earlier time"}; possibly stale: a new one could not be written: ${why})`;
 /** The commands heading names the shared `cd <dir>` prefixes its rows leave out. */
@@ -186,7 +189,7 @@ const CMD_DIRS_RE = /^## Commands run \(.*; a leading "cd <dir> &&" is left out 
 const NARR_CARRIED_RE = /^## Narrative \(carried forward from the summary of ([^;]+);/;
 
 /** Parse any summary text: pi-zip's current and older formats (carried-forward blocks nested inside carried-forward blocks included), or free text. */
-export function parseSummary(text: string | null): ParsedSummary {
+export function parseSummary(text: string | null, onNarrative?: (text: string) => void): ParsedSummary {
 	const out: ParsedSummary = { cmdDirs: [], structured: false, users: { items: [], omitted: 0 }, files: { rows: [], omitted: 0 }, cmds: { items: [], omitted: 0 }, others: { items: [], omitted: 0 }, errors: { items: [], omitted: 0 }, table: { items: [], omitted: 0 }, narrative: [] };
 	if (!text) return out;
 	// occurrences in text order; in the older nested format the nested (older) copy of a section comes first, so order = oldest first
@@ -246,7 +249,10 @@ export function parseSummary(text: string | null): ParsedSummary {
 		else if (key === "table") take(out.table, (l) => TABLE_ROW.test(l));
 		else if (key === "narr" || key === "free") {
 			const t = lines.join("\n").trim();
-			if (t && !t.startsWith("(unavailable")) out.narrative.push(t);
+			if (t && !t.startsWith("(unavailable")) {
+				out.narrative.push(t);
+				if (key === "narr") onNarrative?.(t);
+			}
 		}
 	}
 	out.files.rows = [...files.values()];
@@ -317,7 +323,7 @@ function parseUsers(lines: string[]): Items {
  * `null` = no dedup, for repeated user requests), then the newest items that fit `maxItems` and `maxChars` are kept (always at least the newest one). `omitted` counts every older
  * item left out so far, this merge's drops included.
  */
-function mergeItems(older: string[], newer: string[], omitted: number, maxItems: number, maxChars: number, key: ((s: string) => string | undefined) | null = (s) => s): { kept: string[]; omitted: number } {
+export function mergeItems(older: string[], newer: string[], omitted: number, maxItems: number, maxChars: number, key: ((s: string) => string | undefined) | null = (s) => s): { kept: string[]; omitted: number } {
 	let all = [...older, ...newer];
 	if (key) {
 		const seen = new Set<string>();
@@ -331,7 +337,7 @@ function mergeItems(older: string[], newer: string[], omitted: number, maxItems:
 }
 
 /** Every bash command of these blocks, in order. */
-const bashCommands = (blocks: Block[]): string[] =>
+export const bashCommands = (blocks: Block[]): string[] =>
 	blocks.flatMap((b) => (b.kind === "assistant" ? (b.msg.content ?? []).filter((c: Any) => c?.type === "toolCall" && c.name === "bash").map((c: Any) => String(c.arguments?.command ?? "")) : []));
 
 /** Per-section budgets (characters unless noted); the total stays near the old design's 12,000-char carry plus the new prefix's own lists. */
@@ -355,7 +361,7 @@ export const SHORT_CHARS = 100;
  * they fit usersFirst) and the newest (users) verbatim; the ones between shortened to one line (usersShort, newest first); the rest
  * counted. A request already shortened stays as it is.
  */
-function mergeUsers(prev: Items, now: string[]): { lines: string[]; omitted: number } {
+export function mergeUsers(prev: Items, now: string[], shorten = (text: string) => SHORT_MARK + clip(text, SHORT_CHARS)): { lines: string[]; omitted: number } {
 	const pn = prev.nums ?? prev.items.map((_, i) => prev.omitted + i + 1);
 	const last = Math.max(prev.omitted + prev.items.length, pn.at(-1) ?? 0);
 	const all = [...prev.items.map((t, i) => ({ t, n: pn[i] })), ...now.map((t, i) => ({ t, n: last + i + 1 }))];
@@ -375,7 +381,7 @@ function mergeUsers(prev: Items, now: string[]): { lines: string[]; omitted: num
 	}
 	used = 0;
 	for (; k >= 0 && !keep.has(k); k--) {
-		const l = all[k].t.startsWith(SHORT_MARK) ? all[k].t : SHORT_MARK + clip(all[k].t, SHORT_CHARS);
+		const l = all[k].t.startsWith(SHORT_MARK) ? all[k].t : shorten(all[k].t);
 		if (used + l.length + 8 > BUDGET.usersShort) break;
 		used += l.length + 8;
 		keep.set(k, l);
@@ -405,7 +411,7 @@ const MERGE_WORDS = 1000;
 const PREV_CHARS_PER_WORD = 12;
 export const PREV_NARRATIVE_CHARS = MERGE_WORDS * PREV_CHARS_PER_WORD;
 
-function excerpt(text: string, max: number, head = 0): string {
+export function excerpt(text: string, max: number, head = 0): string {
 	if (text.length <= max) return text;
 	const cutAtLine = (t: string) => {
 		const nl = t.indexOf("\n"); // start on a line boundary, else on a word boundary: never mid-word
@@ -430,8 +436,8 @@ export interface PrevNarrative {
  * excerpt included, so the first merge also settles what that excerpt said), or the whole text of a free-text summary. null: none.
  * `at` = the previous summary's timestamp (ms), used when the text does not say when its narrative was written.
  */
-export function previousNarrative(text: string | null, at?: number, maxChars = PREV_NARRATIVE_CHARS): PrevNarrative | null {
-	const p = parseSummary(text);
+export function previousNarrative(text: string | null, at?: number, maxChars = PREV_NARRATIVE_CHARS, parsed?: ParsedSummary): PrevNarrative | null {
+	const p = parsed ?? parseSummary(text);
 	const t = p.narrative.join("\n\n").trim();
 	if (!t) return null;
 	const when = p.narrativeAt ?? (at && at > 0 ? fmtWhen(at) : undefined);
@@ -439,7 +445,7 @@ export function previousNarrative(text: string | null, at?: number, maxChars = P
 	return { text: excerpt(t, max, Math.floor(max / 4)), foreign: !p.structured, ...(when ? { at: when } : {}) };
 }
 
-const list = (title: string, m: { kept: string[]; omitted: number }, marker: string): string[] => [title, m.kept.length ? [...(m.omitted ? [`[… ${m.omitted} ${marker} …]`] : []), ...m.kept].join("\n") : NONE_ROW];
+export const list = (title: string, m: { kept: string[]; omitted: number }, marker: string): string[] => [title, m.kept.length ? [...(m.omitted ? [`[… ${m.omitted} ${marker} …]`] : []), ...m.kept].join("\n") : NONE_ROW];
 
 /**
  * The deterministic part of a summary: user words verbatim, files, commands, other calls, errors and a handle index, each section
@@ -538,7 +544,7 @@ export function skeleton(prefix: Block[], previous: string | null, tableText = "
 }
 
 /** Pi's own serializer (lazy import: only needed when a summary is actually written); a plain-text fallback if it is unavailable. */
-async function serialize(msgs: Any[]): Promise<string> {
+export async function serialize(msgs: Any[]): Promise<string> {
 	try {
 		const pi: Any = await import("@earendil-works/pi-coding-agent");
 		return pi.serializeConversation(pi.convertToLlm(msgs));
@@ -562,6 +568,67 @@ export interface Narrative {
 export const EFFORT_REFUSED_RE = /(?:'none'|"none"|reasoning|effort)[^\n]{0,80}not supported|unsupported[^\n]{0,60}(?:reasoning|effort)/i;
 const lowEffort = new Set<string>(); // provider/model keys that need an explicit effort: the next narrative asks for "low" at once
 
+/** Whether this process has learned that a provider requires explicit reasoning effort. */
+export const needsLowEffort = (model: Any): boolean => lowEffort.has(`${model?.provider ?? ""}/${model?.id ?? ""}`);
+
+/** Shared uncached provider call: bounded output, charged retries, cancellation and effort-refusal recovery. */
+export async function complete(ctx: Any, prompt: string, ownSignal?: AbortSignal, outputCap = NARRATIVE_CALL_MAX): Promise<Narrative> {
+	const t0 = Date.now();
+	const model = ctx.model;
+	if (!model) return { text: null, ok: false, ms: 0, costUsd: 0, error: "no current model" };
+	const cap = Math.min(outputCap, Number(model.maxTokens) > 0 ? Number(model.maxTokens) : outputCap);
+	let lastErr = "", costUsd = 0;
+	let usage: Any;
+	try {
+		const signals: AbortSignal[] = [AbortSignal.timeout(240_000)];
+		// a background summary has its own signal (nothing is running, so the run's signal would be stale); a summary the user waits for follows the run's (Esc)
+		const outer = ownSignal ?? ctx.signal;
+		if (outer) signals.push(outer);
+		const signal = AbortSignal.any(signals);
+		const key = `${model.provider ?? ""}/${model.id ?? ""}`;
+		for (let attempt = 0; attempt < 2; attempt++) {
+			const low = lowEffort.has(key);
+			try {
+				signal.throwIfAborted();
+				const res: Any = await ctx.modelRegistry.complete(
+					model,
+					{ systemPrompt: NARRATIVE_SYSTEM, messages: [{ role: "user", content: [{ type: "text", text: prompt }], timestamp: Date.now() }] },
+					{ maxTokens: cap, signal, cacheRetention: "none", sessionId: randomUUID(), ...(low ? { reasoningEffort: "low" } : {}) },
+				);
+				costUsd += Number(res.usage?.cost?.total) || 0;
+				if (res.usage) usage = addUsage(usage, res.usage);
+				if (res.stopReason === "aborted" || signal.aborted) return { text: null, ok: false, ms: Date.now() - t0, costUsd, usage, error: "narrative aborted" };
+				if (res.stopReason === "error") throw new Error(res.errorMessage || "provider error");
+				if (res.stopReason === "length") throw new Error(CAP_ERR);
+				if ((res.content ?? []).some((c: Any) => c.type === "toolCall")) throw new Error("summariser attempted a tool call");
+				const text = textOf(res.content).trim();
+				if (!text) throw new Error("empty narrative");
+				return { text, ok: true, ms: Date.now() - t0, costUsd, usage };
+			} catch (err) {
+				lastErr = err instanceof Error ? err.message : String(err);
+				if (!low && model.reasoning && EFFORT_REFUSED_RE.test(lastErr) && !signal.aborted) {
+					lowEffort.add(key); // the request itself was refused: ask again with the lowest common effort, without using up the retry
+					attempt--;
+					continue;
+				}
+				if (POLICY_BLOCK_RE.test(lastErr) || lastErr === CAP_ERR || signal.aborted) break; // an identical retry fails the same way
+			}
+		}
+	} catch (err) {
+		lastErr = err instanceof Error ? err.message : String(err);
+	}
+	return { text: null, ok: false, ms: Date.now() - t0, costUsd, usage, error: lastErr };
+}
+
+export function addUsage(a: Any, b: Any): Any {
+	if (!b) return a;
+	const out: Any = a ? { ...a, cost: { ...(a.cost ?? {}) } } : { cost: {} };
+	const { cost, ...tokens } = b;
+	for (const [k, v] of Object.entries(tokens)) out[k] = (Number(out[k]) || 0) + (Number(v) || 0);
+	for (const [k, v] of Object.entries(cost ?? {})) out.cost[k] = (Number(out.cost[k]) || 0) + (Number(v) || 0);
+	return out;
+}
+
 /**
  * Narrative sections written by the current model in a separate, uncached call. Never throws. `previous` = the previous summary's
  * narrative: the call merges it with what the prefix adds into ONE narrative (newer values replace older ones, finished todos go,
@@ -571,15 +638,12 @@ export async function narrative(prefix: Block[], ctx: Any, budgetTokens: number,
 	const t0 = Date.now();
 	const model = ctx.model;
 	if (!model) return { text: null, ok: false, ms: 0, costUsd: 0, error: "no current model" };
-	const cap = Math.min(NARRATIVE_CALL_MAX, Number(model.maxTokens) > 0 ? Number(model.maxTokens) : NARRATIVE_CALL_MAX);
 	const msgs = prefix
 		.filter((b) => b.kind !== "summary")
 		.map((b) => {
 			const m = b.raw && !(b.edited && !b.ours) ? b.raw : b.msg; // the summariser reads the unfolded originals
 			return m.role === "assistant" ? { ...m, content: (m.content ?? []).filter((c: Any) => c?.type !== "thinking") } : m;
 		});
-	let lastErr = "", costUsd = 0;
-	let usage: Any;
 	try {
 		const conv = await serialize(msgs);
 		const words = narrativeWords(budgetTokens, !!previous);
@@ -604,49 +668,11 @@ export async function narrative(prefix: Block[], ctx: Any, budgetTokens: number,
 			`Be concrete and keep exact paths, names and numbers. Stay under about ${words} words` +
 			(previous ? ` (a hard limit: the previous narrative and the conversation together say more, so compress: keep what the work still depends on, drop how it got there and whatever is finished)` : "") +
 			`. Do not call tools.`;
-		const signals: AbortSignal[] = [AbortSignal.timeout(240_000)];
-		// a background summary has its own signal (nothing is running, so the run's signal would be stale); a summary the user waits for follows the run's (Esc)
-		const outer = ownSignal ?? ctx.signal;
-		if (outer) signals.push(outer);
-		const signal = AbortSignal.any(signals);
-		const key = `${model.provider ?? ""}/${model.id ?? ""}`;
-		for (let attempt = 0; attempt < 2; attempt++) {
-			const low = lowEffort.has(key);
-			try {
-				signal.throwIfAborted();
-				const res: Any = await ctx.modelRegistry.complete(
-					model,
-					{ systemPrompt: NARRATIVE_SYSTEM, messages: [{ role: "user", content: [{ type: "text", text: prompt }], timestamp: Date.now() }] },
-					{ maxTokens: cap, signal, cacheRetention: "none", sessionId: randomUUID(), ...(low ? { reasoningEffort: "low" } : {}) },
-				);
-				costUsd += Number(res.usage?.cost?.total) || 0;
-				if (res.usage) {
-					const { cost, ...tokens } = res.usage;
-					usage ??= { cost: {} };
-					for (const [k, v] of Object.entries(tokens)) usage[k] = (Number(usage[k]) || 0) + (Number(v) || 0);
-					for (const [k, v] of Object.entries(cost ?? {})) usage.cost[k] = (Number(usage.cost[k]) || 0) + (Number(v) || 0);
-				}
-				if (res.stopReason === "aborted" || signal.aborted) return { text: null, ok: false, ms: Date.now() - t0, costUsd, usage, error: "narrative aborted" };
-				if (res.stopReason === "error") throw new Error(res.errorMessage || "provider error");
-				if (res.stopReason === "length") throw new Error(CAP_ERR);
-				if ((res.content ?? []).some((c: Any) => c.type === "toolCall")) throw new Error("summariser attempted a tool call");
-				const text = textOf(res.content).trim();
-				if (!text) throw new Error("empty narrative");
-				return { text, ok: true, ms: Date.now() - t0, costUsd, usage };
-			} catch (err) {
-				lastErr = err instanceof Error ? err.message : String(err);
-				if (!low && model.reasoning && EFFORT_REFUSED_RE.test(lastErr) && !signal.aborted) {
-					lowEffort.add(key); // the request itself was refused: ask again with the lowest common effort, without using up the retry
-					attempt--;
-					continue;
-				}
-				if (POLICY_BLOCK_RE.test(lastErr) || lastErr === CAP_ERR || signal.aborted) break; // an identical retry fails the same way
-			}
-		}
+		const result = await complete(ctx, prompt, ownSignal);
+		return { ...result, ms: Date.now() - t0 };
 	} catch (err) {
-		lastErr = err instanceof Error ? err.message : String(err);
+		return { text: null, ok: false, ms: Date.now() - t0, costUsd: 0, error: err instanceof Error ? err.message : String(err) };
 	}
-	return { text: null, ok: false, ms: Date.now() - t0, costUsd, usage, error: lastErr };
 }
 
 /** The cold summary (skeleton + narrative + handle table) for a planned cut. */
