@@ -125,3 +125,7 @@ export async function startPrompt(fire: (name: string, e: Any) => Any, e: Any = 
 /** startPrompt on a Zip instance driven directly. */
 export const startZip = (zip: Any, ctx: Any, e: Any = {}) =>
 	startPrompt((n, ev) => (n === "input" ? zip.input(ev, ctx) : n === "before_agent_start" ? zip.beforeAgentStart(ctx, ev) : zip.agentStart(ctx)), e);
+
+/** A stub summariser's reply in the format its prompt asks for: digest operations for format v3, free narrative text for v1/v2. */
+export const narrativeReply = (request: Any, text = "narrative") =>
+	JSON.stringify(request).includes("Update the STATE DIGEST") ? `---DECISIONS---\nADD i1: ${text}` : `## Decisions\n${text}`;

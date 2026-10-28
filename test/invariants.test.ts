@@ -8,7 +8,7 @@ import { buildBlocks, planContext, applyPlanToMessages, reserveTokensFor, type B
 import { handleFor } from "../src/placeholder.ts";
 import { skeleton } from "../src/summary.ts";
 import { NATIVE_MARKER, Zip } from "../src/run.ts";
-import { A, AX, fakeCtx, fakePi, flat, longTurn, project, R, startPrompt, U, withK, type Any } from "./helpers.ts";
+import { A, AX, fakeCtx, fakePi, flat, longTurn, narrativeReply, project, R, startPrompt, U, withK, type Any } from "./helpers.ts";
 
 const ENV = ["PI_ZIP_TTL_SECS", "PI_ZIP_COLD_CAP", "PI_ZIP_OFF", "PI_ZIP_LEDGER", "PI_ZIP_INTURN_AGE", "PI_ZIP_SUMMARY_AT"];
 let saved: Record<string, string | undefined> = {};
@@ -132,7 +132,7 @@ describe("I1 byte stability: every request of a run sends the same prefix, and i
 		process.env.PI_ZIP_COLD_CAP = "6000";
 		const big = [U("u1", "one"), A("a1", ["c1"]), R("r1", "c1", 44_000), AX("a2", 120_000), U("u2", "two"), A("a3", ["c3"]), R("r3", "c3", 44_000), AX("a4", 120_000), U("u3", "three"), A("a5"), U("u4", "back")];
 		const r = await rig(big, COLD_TS());
-		r.ctx.modelRegistry = { complete: async () => ((r.ctx as Any).__done = true, { stopReason: "stop", content: [{ type: "text", text: "## Decisions\nnarrative" }], usage: { cost: { total: 0.01 } } }) };
+		r.ctx.modelRegistry = { complete: async (_m: Any, c: Any) => ((r.ctx as Any).__done = true, { stopReason: "stop", content: [{ type: "text", text: narrativeReply(c) }], usage: { cost: { total: 0.01 } } }) };
 		await produced(r, big);
 		await r.prompt({});
 		const req1 = await r.fire("context_with_system", { messages: flat(big) });
@@ -140,7 +140,7 @@ describe("I1 byte stability: every request of a run sends the same prefix, and i
 		const all = [...big, A("a6")];
 		const te = await r.fire("turn_end", turnEnd(all, "a6"));
 		const comp = te.entries.find((e: Any) => e.type === "compaction");
-		expect(comp.summary).toContain("[summary of earlier conversation by pi-zip]");
+		expect(comp.summary).toContain("[pi-zip summary · format v3");
 		expect(comp.firstKeptEntryId).toBe("u3");
 		const projected = flat(project(all, te.entries));
 		expect(projected[0].role).toBe("compactionSummary");
@@ -154,7 +154,7 @@ describe("I1 byte stability: every request of a run sends the same prefix, and i
 		const big = [U("u1", "one"), A("a1", ["c1"]), R("r1", "c1", 44_000), AX("a2", 120_000), U("u2", "two"), A("a3", ["c3"]), R("r3", "c3", 44_000), AX("a4", 120_000), U("u3", "three"), A("a5", ["c5"]), R("r5", "c5", 30_000), A("a5e"), U("u4", "back")];
 		const r = await rig(big, COLD_TS());
 		const zip = await zipOf(r);
-		r.ctx.modelRegistry = { complete: async () => ((r.ctx as Any).__done = true, { stopReason: "stop", content: [{ type: "text", text: "## Decisions\nnarrative" }], usage: { cost: { total: 0.01 } } }) };
+		r.ctx.modelRegistry = { complete: async (_m: Any, c: Any) => ((r.ctx as Any).__done = true, { stopReason: "stop", content: [{ type: "text", text: narrativeReply(c) }], usage: { cost: { total: 0.01 } } }) };
 		await produced(r, big);
 		zip.lastReqMs = COLD_TS(); // a second cold return after the preparatory request
 		await r.prompt({});
@@ -182,7 +182,7 @@ describe("one producer prepares the return with one timer", () => {
 		state.calls++;
 		state.signals?.push(o?.signal);
 		if (state.delay) await sleep(state.delay);
-		return { stopReason: "stop", content: [{ type: "text", text: "## Decisions\nnarrative" }], usage: { input: 11, output: 22, cacheRead: 0, cacheWrite: 0, cost: { total: 0.02 } } };
+		return { stopReason: "stop", content: [{ type: "text", text: narrativeReply(_c) }], usage: { input: 11, output: 22, cacheRead: 0, cacheWrite: 0, cost: { total: 0.02 } } };
 	};
 	const settle = (r: Any, entries = done) => r.fire("agent_before_settle", { context: { contextEntries: entries }, entries: [] });
 	const comeBack = async (r: Any, settled: Any, ts: number) => {
@@ -432,7 +432,7 @@ describe("one producer prepares the return with one timer", () => {
 		expect(st.calls).toBe(1); // written once, while away
 		expect(n.compactCalls).toBe(1);
 		expect(n.answer.compaction).toMatchObject({ firstKeptEntryId: "u3", details: { by: "pi-zip", via: "native", trigger: "cold" } });
-		expect(n.answer.compaction.summary).toContain("[summary of earlier conversation by pi-zip]");
+		expect(n.answer.compaction.summary).toContain("[pi-zip summary · format v3");
 		expect(n.answer.compaction.usage).toMatchObject({ input: 11, output: 22 }); // Pi books the summary call's cost on its block
 		expect(n.req).toBeUndefined(); // nothing left to do locally: the request Pi built already starts with the summary
 		await sleep(5);
@@ -574,7 +574,7 @@ describe("never wait: rule A starts early; a summary is used once ready; the one
 		state.calls++;
 		state.signals?.push(o?.signal);
 		if (state.delay) await sleep(state.delay);
-		return { stopReason: "stop", content: [{ type: "text", text: "## Decisions\nnarrative" }], usage: { input: 11, output: 22, cacheRead: 0, cacheWrite: 0, cost: { total: 0.02 } } };
+		return { stopReason: "stop", content: [{ type: "text", text: narrativeReply(_c) }], usage: { input: 11, output: 22, cacheRead: 0, cacheWrite: 0, cost: { total: 0.02 } } };
 	};
 	let ledger = "";
 	beforeEach(() => {

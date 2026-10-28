@@ -24,7 +24,7 @@ import {
 	waterFillChars,
 	estimateMergeWork,
 	BUDGET,
-	buildCut,
+	buildCut as buildCutDefault,
 	boundEpochs,
 	clipActive,
 	consolidateEpochs,
@@ -50,6 +50,9 @@ import {
 	TABLE_ROWS,
 } from "../src/summary.ts";
 import { A, AX, R, U, type Any } from "./helpers.ts";
+
+// These tests cover formats v1 and v2; format v3 (the default) has its own tests. An explicit plan format still wins.
+const buildCut = (p: Any, ctx: Any, signal?: AbortSignal) => buildCutDefault({ summaryFormat: "v1", ...p }, ctx, signal);
 
 const tcall = (id: string, name: string, args: Any) => {
 	const m = { role: "assistant", content: [{ type: "text", text: "x" }, { type: "toolCall", id: `c-${id}`, name, arguments: args }] };

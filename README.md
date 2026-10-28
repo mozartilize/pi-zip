@@ -214,7 +214,7 @@ The request guard also repairs a tool result that lost its tool call before the 
 
 **Does it cost extra?** Planning is local. A summary is one extra model call with no tools; its price is weighed before the call is made, and every call, used or not, is counted in `/zip`.
 
-**Can the model lose information?** Folded outputs keep their key lines and a handle, and the placeholder tells the model not to guess. Summaries quote your first and newest requests word for word and never paraphrase the model's reasoning. A model that ignores the handle and guesses anyway is a failure pi-zip cannot catch, which is why recent turns are protected.
+**Can the model lose information?** Folded outputs keep their key lines and a handle, and the placeholder tells the model not to guess. Summaries quote your newest requests word for word, keep older ones recallable by number and never paraphrase the model's reasoning. A model that ignores the handle and guesses anyway is a failure pi-zip cannot catch, which is why recent turns are protected.
 
 **Does it work with `/tree`, fork, resume and model switches?** Yes. Folds are ordinary `context_edit` entries that Pi projects per branch; the originals stay in the session file, and a restart rebuilds pi-zip's state from it.
 

@@ -33,9 +33,10 @@ const zones: [string, string][] = [["Asia/Shanghai", "tr_TR.UTF-8"], ["America/N
 const noLocalTime = (rendered: unknown) => expect(JSON.stringify(rendered)).not.toMatch(/\d\d-\d\d \d\d:\d\d(?! UTC)/);
 
 test.each(runtimes)("%s model text is byte-identical across process time zones and locales, including summary failure and carry-forward", (runtime, executable) => {
-	const utc = render(executable, "UTC", "en_US.UTF-8");
+	const v1 = { TZ_FIXTURE_FORMAT: "v1" };
+	const utc = render(executable, "UTC", "en_US.UTF-8", v1);
 	for (const [tz, locale] of zones) {
-		const other = render(executable, tz, locale);
+		const other = render(executable, tz, locale, v1);
 		expect(other.zoneOffset).not.toBe(utc.zoneOffset); // the processes really use different local clocks
 		// Bun currently fixes its default Intl locale to en-US; Node exercises the locale changes.
 		if (runtime === "Node" && nodeFullIcu) expect(other.locale).not.toBe(utc.locale);
@@ -63,5 +64,23 @@ test("format v2 model text is byte-identical across process time zones", () => {
 	}
 	expect(utc.rendered.first).toContain("### Epoch 1 · source interval u1..r64 · request 1 · 12-31 23:58 UTC");
 	expect(utc.rendered.first).toContain("## Current state — assistant interpretation (as of 12-31 23:58 UTC)");
+	noLocalTime(utc.rendered);
+});
+
+// Format v3 (the default) writes "as of" and "carried forward from" digest labels and evidence times; they must be TZ-stable too.
+test("format v3 model text is byte-identical across process time zones", () => {
+	const utc = render(process.execPath, "UTC", "en_US.UTF-8");
+	for (const [tz, locale] of zones) {
+		const other = render(process.execPath, tz, locale);
+		expect(other.zoneOffset).not.toBe(utc.zoneOffset);
+		expect(JSON.stringify(other.rendered)).toBe(JSON.stringify(utc.rendered));
+	}
+	// the newest time in the slice dates the digest: 2026-12-31 23:58 is later than the two 2026-03-08 times and 2024-02-29;
+	// the selected outputs (r0, r1) carry their own times
+	expect(utc.rendered.first).toContain("Digest: as of 12-31 23:58 UTC");
+	expect(utc.rendered.first).toContain("- [i1] Persisted fact: 42.");
+	expect(utc.rendered.first).toContain(" · 12-31 23:58 UTC · ");
+	expect(utc.rendered.first).toContain(" · 02-29 00:05 UTC · ");
+	expect(utc.rendered.failed).toContain("Digest: carried forward from 12-31 23:58 UTC; possibly stale: offline");
 	noLocalTime(utc.rendered);
 });

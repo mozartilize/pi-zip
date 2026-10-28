@@ -12,7 +12,7 @@ import { collapseSystemMessages, getCurrentSystemMessage, normalizeContext, reso
 import { buildBlocks, calibrate, collapseSystem, editAllowed, planContext, UNIT, wireTokensOf } from "../src/plan.ts";
 import { decideRun, decideTurnEnd, planOpts, rentOf, unusedOf } from "../src/core.ts";
 import { lawPrices, loadStats, record } from "../src/learn.ts";
-import type { Any } from "./helpers.ts";
+import { type Any, narrativeReply } from "./helpers.ts";
 // Pi's own draft application (AgentSession._applyBoundaryDrafts uses no instance state): the order of the drafts and the
 // tokensBefore Pi writes for a compaction draft are Pi's, not a re-implementation
 import { AgentSession } from "../node_modules/@earendil-works/pi-coding-agent/dist/core/agent-session.js";
@@ -125,7 +125,7 @@ async function rig(setup: (sm: SessionManager) => void = populate, opts: RigOpts
 			narrativeCalls.push(c);
 			narrativeModels.push(_m);
 			if (opts.latencyMs) await new Promise((res) => setTimeout(res, opts.latencyMs));
-			return { stopReason: "stop", content: [{ type: "text", text: "## Decisions\nnarrative" }], usage: { cost: { total: 0 } } };
+			return { stopReason: "stop", content: [{ type: "text", text: narrativeReply(c) }], usage: { cost: { total: 0 } } };
 		},
 	};
 	const runner = new ExtensionRunner(extensions, runtime, CWD, sm, registry);
@@ -1493,7 +1493,8 @@ for (const order of ORDERS) describe(`real Pi: a summary prepared while the user
 			expect(r.compactions[0].details.via).toBe("native");
 			const compaction = r.sm.getBranch().find((e: Any) => e.type === "compaction") as Any;
 			expect(compaction.firstKeptEntryId).toBe(p.firstKeptEntryId);
-			expect(compaction.summary.includes("## Narrative (model-written)")).toBe(!fails);
+			expect(compaction.summary.includes("- [i1] narrative")).toBe(!fails);
+			expect(compaction.summary.includes("possibly stale")).toBe(fails);
 			expect(caps).toHaveLength(1);
 			// /zip says so: how many narrative calls failed, and why the newest did
 			expect(r.zip.card(ctx).failed).toBe(fails ? 1 : undefined);
@@ -1588,7 +1589,7 @@ for (const order of ORDERS) describe(`real Pi: a summary prepared while the user
 		}, { model, start: false });
 		const ctx = r.runner.createContext(), provider = ctx.modelRegistry.complete;
 		let calls = 0, restarted: Awaited<ReturnType<typeof rig>> | undefined;
-		ctx.modelRegistry.complete = async () => ({ stopReason: "stop", content: [{ type: "text", text: "detail ".repeat(5000) }], usage: { cost: { total: ++calls / 10 } } });
+		ctx.modelRegistry.complete = async (_m: Any, c: Any) => ({ stopReason: "stop", content: [{ type: "text", text: narrativeReply(c, "detail ".repeat(5000)) }], usage: { cost: { total: ++calls / 10 } } });
 		try {
 			await r.runner.emit({ type: "agent_start" } as Any);
 			const response = { ...asst([{ type: "text", text: "done" }]), timestamp: Date.now(), usage: undefined };
@@ -3122,7 +3123,7 @@ describe("no UI (pi -p, json): the requests and the session of three scenarios h
 	// Append-only narrative epochs change summary text and its token counts, not the no-UI scheduling contract. Explicit UTC
 	// labels do too (pre-UTC: 5a371f039325809b7d5d843b53dce731), and so does the fold time in new placeholders ("[folded by pi-zip at
 	// MM-DD HH:MM UTC"; without it: 663118104757653de4ec3ef5172a04bd, checked by disabling the stamp).
-	const NOUI_DIGEST = "a6d5db9f40c2d14fb854912abea45424"; // R5_PRINT_DIGEST=1 prints it (pre-epochs: f6d9629b3c18c8a4101cfd5d92bc94b1)
+	const NOUI_DIGEST = "35b4253db8fbc44a54ba9cf1f49e31e8"; // R5_PRINT_DIGEST=1 prints it (format v1: a6d5db9f40c2d14fb854912abea45424; pre-epochs: f6d9629b3c18c8a4101cfd5d92bc94b1)
 	const sleep = (ms: number) => new Promise((res) => setTimeout(res, ms));
 	const shifted = (agoMs: number, prose: number) => {
 		const sm = SessionManager.inMemory(CWD);

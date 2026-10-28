@@ -7,6 +7,7 @@ import { type Block, type Cut, type PlanResult, callOf, NARRATIVE_CALL_MAX, NARR
 import { assistantVisibleText, branchRequests } from "./recall.ts";
 import { type FileRecall, fileRecallHow } from "./recallfile.ts";
 import { type EvidenceProposal, type CommitmentProposal, type IntentProposal, intentQuotesOf, parseSummaryV2, prepareEpochV2, referencesSource, regroupEpochsV2, renderEpochSummaryV2 } from "./summary-v2.ts";
+import { buildCutV3, parseSummaryV3, sectionText } from "./summary-v3.ts";
 import { type Any, attempt, clamp, clip, envInt, fmtWhen, reasonsByDefault, textOf, tok4 } from "./util.ts";
 
 export const SUMMARY_MARK = "[summary of earlier conversation by pi-zip]";
@@ -216,6 +217,22 @@ const NARR_CARRIED_RE = /^## Narrative \(carried forward from the summary of ([^
 export function parseSummary(text: string | null): ParsedSummary {
 	const out: ParsedSummary = { cmdDirs: [], cmdAliases: new Map(), structured: false, users: { items: [], omitted: 0 }, files: { rows: [], omitted: 0 }, cmds: { items: [], omitted: 0 }, others: { items: [], omitted: 0 }, errors: { items: [], omitted: 0 }, table: { items: [], omitted: 0 }, narrative: [] };
 	if (!text) return out;
+	const v3 = parseSummaryV3(text);
+	if (v3) {
+		// the format-v3 view an older-format reader needs: the resident requests (numbered; ranges counted as omitted), the aliases, the
+		// digest as one epoch and the open work as the state
+		out.structured = true;
+		const reqs = v3.rows.flatMap((r) => ("request" in r ? [r.request] : []));
+		const omitted = v3.rows.reduce((n, r) => n + ("range" in r ? r.range.last - r.range.first + 1 : 0), 0);
+		out.users = { items: reqs.map((r) => r.text), omitted, nums: reqs.map((r) => r.number || r.legacyNumber || 0) };
+		for (const [d, a] of v3.aliases) out.cmdAliases.set(d, a);
+		const d = v3.digest;
+		const body = ([["Architecture", d.architecture], ["Settled decisions", d.decisions], ["Discarded approaches", d.discarded], ["Test health", d.tests]] as const)
+			.filter(([, t]) => t.length).map(([h, t]) => `**${h}**\n${sectionText(t)}`).join("\n\n");
+		out.epochs = { activeState: sectionText(d.open), ...(v3.digestAt ? { activeAt: v3.digestAt } : {}), ...(v3.digestStale ? { activeStale: v3.digestStale } : {}), epochs: body ? [mkEpoch(1, 1, "state digest", v3.digestAt ?? "time unknown", 1, body)] : [] };
+		if (d.open.length || body) out.narrative.push(formatNarrative(out.epochs));
+		return out;
+	}
 	const v2 = parseSummaryV2(text);
 	if (v2) {
 		// the format-v2 view an older-format reader needs: every request (numbered), the aliases and the epochs' prose
@@ -499,7 +516,7 @@ export const epochCap = (budgetTokens: number) => clamp(budgetTokens - Math.ceil
  *  older summary's narrative and its earlier excerpt) is kept as its head and its tail, so nothing it carries can grow. */
 export const PREV_NARRATIVE_CHARS = 12_000;
 
-function excerpt(text: string, max: number, head = 0): string {
+export function excerpt(text: string, max: number, head = 0): string {
 	if (text.length <= max) return text;
 	const cutAtLine = (t: string) => {
 		const nl = t.indexOf("\n"); // start on a line boundary, else on a word boundary: never mid-word
@@ -767,6 +784,12 @@ export interface MergeWork { inputTokens: number; outputTokens: number; merges: 
 
 /** Conservative reserve before writing the newest epoch: simulate tier selection with maximum-sized replies, not hoped-for shrinkage. */
 export function estimateMergeWork(previous: string | null, budgetTokens: number, scale = 1, model?: Any): MergeWork {
+	// A v3 digest is never merged. The narrative call re-reads it: the part beyond the active-state reserve is priced here as input.
+	const v3 = parseSummaryV3(previous);
+	if (v3) {
+		const d = v3.digest;
+		return { inputTokens: Math.ceil(scale * tok4([d.architecture, d.decisions, d.discarded, d.tests].map(sectionText).concat(v3.intents.map((i) => i.quote)).join("\n"))) + 64, outputTokens: 0, merges: 0 };
+	}
 	const prev = parseSummary(previous);
 	const struct = prev.epochs ?? legacyNarrative(previous, 0, lastRequestNo(prev.users));
 	const work: MergeWork = { inputTokens: 0, outputTokens: 0, merges: 0 };
@@ -831,7 +854,7 @@ export function boundEpochs(epochs: EpochBlock[], hard: number): EpochBlock[] {
 }
 
 /** Token usage of two calls added up (cost included). */
-function addUsage(a: Any, b: Any): Any {
+export function addUsage(a: Any, b: Any): Any {
 	if (!b) return a;
 	const out: Any = a ? { ...a, cost: { ...(a.cost ?? {}) } } : { cost: {} };
 	const { cost, ...tokens } = b;
@@ -1022,7 +1045,7 @@ export function skeleton(
 }
 
 /** Pi's own serializer (lazy import: only needed when a summary is actually written); a plain-text fallback if it is unavailable. */
-async function serialize(msgs: Any[]): Promise<string> {
+export async function serialize(msgs: Any[]): Promise<string> {
 	try {
 		const pi: Any = await import("@earendil-works/pi-coding-agent");
 		return pi.serializeConversation(pi.convertToLlm(msgs));
@@ -1050,7 +1073,7 @@ const lowEffort = new Set<string>(); // provider/model keys that need an explici
  * One summariser call (the narrative, or a tier merge of two epochs) to the current model, separate and uncached. Never throws; one
  * retry, none for a refusal by policy, a reply cut at the cap or an abort.
  */
-async function complete(ctx: Any, prompt: string, ownSignal?: AbortSignal, outputCap = NARRATIVE_CALL_MAX): Promise<Narrative> {
+export async function complete(ctx: Any, prompt: string, ownSignal?: AbortSignal, outputCap = NARRATIVE_CALL_MAX): Promise<Narrative> {
 	const t0 = Date.now();
 	const model = ctx.model;
 	if (!model) return { text: null, ok: false, ms: 0, costUsd: 0, error: "no current model" };
@@ -1234,6 +1257,9 @@ export async function narrative(prefix: Block[], ctx: Any, budgetTokens: number,
 
 /** The cold summary (skeleton + narrative + handle table) for a planned cut. */
 export async function buildCut(p: PlanResult, ctx: Any, signal?: AbortSignal): Promise<Cut> {
+	// Format v3 is the default. An explicit plan format ("v1" | "v2") wins; PI_ZIP_SUMMARY_V2=1 keeps format v2.
+	const format = (p as Any).summaryFormat ?? (process.env.PI_ZIP_SUMMARY_V2 === "1" ? "v2" : "v3");
+	if (format === "v3") return buildCutV3(p, ctx, signal);
 	const { foldMin, keepLines } = settings();
 	const t0 = performance.now();
 	const prefix = p.blocks.slice(0, p.cutIdx!);
@@ -1291,7 +1317,7 @@ export async function buildCut(p: PlanResult, ctx: Any, signal?: AbortSignal): P
 	const nowWhen = lastAt > 0 ? fmtWhen(lastAt) : undefined;
 	const mergeWork = p.mergeWork ?? estimateMergeWork(prev, nb, p.scale?.c ?? 1, ctx.model);
 	const predictedMergeCostUsd = (mergeWork.inputTokens * (Number(ctx.model?.cost?.input) || 0) + mergeWork.outputTokens * (Number(ctx.model?.cost?.output) || 0)) / 1e6;
-	const v2Mode = process.env.PI_ZIP_SUMMARY_V2 === "1" || (p as Any).summaryFormat === "v2";
+	const v2Mode = format === "v2";
 	const prevV2 = v2Mode ? parseSummaryV2(prev) : null;
 	const nar = await narrative(prefix, ctx, nb, signal, prevStruct.activeState, v2Mode ? { previous: prevV2?.intents.map((x) => x.quote) ?? [] } : undefined);
 	let costUsd = nar.costUsd, actualMergeCostUsd = 0;

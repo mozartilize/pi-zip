@@ -138,7 +138,7 @@ export function collectAssistantCommitments(blocks: Block[], proposals: readonly
 export interface EvidenceProposal { sourceHandle: string; quote: string }
 
 /** Select only quotes found in tool results. This verifies provenance, not the model's relevance judgement. */
-export function evidenceQuotes(blocks: Block[], proposals: readonly EvidenceProposal[] = []): Map<string, string> {
+export function evidenceQuotes(blocks: Block[], proposals: readonly EvidenceProposal[] = [], max = 8): Map<string, string> {
 	const sources = new Map(blocks.filter((b) => b.kind === "toolResult" && b.entryId && b.msg?.toolName !== RECALL_TOOL)
 		.map((b) => [handleFor(b.entryId!), textOf((b.raw ?? b.msg)?.content)]));
 	const out = new Map<string, string>();
@@ -148,7 +148,7 @@ export function evidenceQuotes(blocks: Block[], proposals: readonly EvidenceProp
 		const quote = raw && validateUserIntentQuote(raw, p.quote);
 		if (!quote || out.has(p.sourceHandle)) continue;
 		out.set(p.sourceHandle, quote);
-		if (out.size === 8) break;
+		if (out.size === max) break;
 	}
 	return out;
 }
@@ -1068,7 +1068,7 @@ const isErrorRecord = (rec: string) => /\n {2}Error|^- [^\n]* · (?:exit [1-9]\d
 const selectedRecord = (rec: string) => /\n {2}Selected evidence(?: \([0-9a-z]{10}\))?: /.test(rec);
 const mutationAcknowledgement = (rec: string) => !isErrorRecord(rec) && rec.split("\n")[0].split(" · ").some((part) => /^(?:edit|write)(?: |$)/.test(part)) && / · success(?: ·|$)/.test(rec.split("\n")[0]);
 /** Handles a record names on its first line: "handle X", "handles X, Y", or an older summary's row ("- legacy · X · …", "…, X)"). */
-const recordHandles = (rec: string) => {
+export const recordHandles = (rec: string) => {
 	const l = rec.split("\n")[0];
 	const out = (/handles? ([0-9a-z]{10}(?:, [0-9a-z]{10})*)/.exec(l)?.[1] ?? "").split(", ").filter(Boolean);
 	if (l.startsWith("- legacy · ")) for (const m of l.matchAll(/(?:^- legacy · |, )([0-9a-z]{10})(?=[ )·]|$)/g)) out.push(m[1]);
