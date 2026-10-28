@@ -487,8 +487,8 @@ const clip = (s: string, n: number) => {
 
 /**
  * What produced a tool result: "bash: npm test -- retry". The call is the nearest ancestor assistant message that issued the
- * result's toolCallId (call ids can be reused, so the nearest one is the right one). The arguments are shown only when that assistant
- * message is hidden too: a visible call must not be copied into the note. Otherwise the plain kind ("tool result bash").
+ * result's toolCallId (call ids can be reused, so the nearest one is the right one). A searchable call supplies bounded provenance even
+ * when retained in view; dropping its origin can make unrelated components' outputs indistinguishable. Calls outside search scope stay plain.
  */
 function titleOf(scope: Scope, entryId: string, h: Hit): string {
 	const plain = `${h.kind.replace(/_/g, " ")}${h.tool ? ` ${h.tool}` : ""}`;
@@ -500,7 +500,7 @@ function titleOf(scope: Scope, entryId: string, h: Hit): string {
 		if (cur.message?.role !== "assistant") continue;
 		const b = (Array.isArray(cur.message.content) ? cur.message.content : []).find((x: Any) => x?.type === "toolCall" && x.id === callId);
 		if (!b) continue;
-		if (!scope.hidden.has(cur.id) || scope.visible.has(cur.id)) return plain;
+		if (!scope.hidden.has(cur.id)) return plain;
 		const a = b.arguments ?? {};
 		const arg = typeof a.command === "string" ? a.command : typeof a.path === "string" ? a.path : JSON.stringify(a);
 		return `${b.name}: ${clip(arg.replace(/\s+/g, " ").trim(), 160)}`;

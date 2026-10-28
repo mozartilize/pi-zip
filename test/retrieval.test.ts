@@ -356,15 +356,45 @@ describe("retrieve", () => {
 		expect(retrieve(l.db, q("sockets fixed"), scopeOf(s.ctx)).evidence).toEqual([]);
 	});
 
-	test("a tool result named by handle is titled by its own call (nearest issuer of a reused id), only when that call is hidden too", () => {
+	test("a tool result keeps its nearest searchable call's provenance even when that call is retained in view", () => {
 		const both = indexed(fixtureEntries(), { leaf: "om", hidden: ["a1", "r1", "a2", "r3"] });
 		const ev1 = retrieve(both.l.db, q(`${handleFor("r3")} and ${handleFor("r1")}`), scopeOf(both.s.ctx)).evidence;
 		expect(ev1.find((e) => e.entryId === "r3")!.title).toBe("bash: npm test -- retry"); // a2's c1, not a1's "cd /w && npm test"
 		expect(ev1.find((e) => e.entryId === "r1")!.title).toBe("read: src/retry.ts");
-		const callShown = indexed(fixtureEntries(), { leaf: "om", folded: ["r3"] }); // a2 still visible
-		const r3 = retrieve(callShown.l.db, q(handleFor("r3")), scopeOf(callShown.s.ctx)).evidence.find((e) => e.entryId === "r3")!;
-		expect(r3.title).toBe("tool result bash");
-		expect(answerInput("x", "", [r3])).not.toContain("npm test -- retry");
+		const callShown = indexed(fixtureEntries(), { leaf: "om", folded: ["r3"] }); // a2 still visible, but searchable before the compaction
+		const retained = scopeOf(callShown.s.ctx);
+		expect(retained.visible.has("a2")).toBe(true); expect(retained.hidden.has("a2")).toBe(true);
+		const r3 = retrieve(callShown.l.db, q(handleFor("r3")), retained).evidence.find((e) => e.entryId === "r3")!;
+		expect(r3.title).toBe("bash: npm test -- retry");
+		expect(answerInput("x", "", [r3])).toContain("npm test -- retry");
+		// A folded result after the compaction does not authorize quoting its still-visible, non-searchable call.
+		const recent = indexed([user("old", null, "earlier"),
+			E("cm", "old", { type: "compaction", summary: "s", firstKeptEntryId: "cm", tokensBefore: 1 }),
+			user("u", "cm", "current"), asst("a", "u", [call("c", "read", { path: "current-only.ts" })]),
+			result("r", "a", "c", "read", "result"),
+		], { folded: ["r"] });
+		const scope = scopeOf(recent.s.ctx);
+		expect(scope.visible.has("a")).toBe(true); expect(scope.hidden.has("a")).toBe(false);
+		const [e] = retrieve(recent.l.db, q(handleFor("r")), scope).evidence;
+		expect(e.title).toBe("tool result read");
+		expect(answerInput("x", "", [e])).not.toContain("current-only.ts");
+	});
+
+	test("retained origin metadata identifies the source without copying an unbounded command", () => {
+		const origin = "D=/w/packages/other-plugin; cat \"$D/index.ts\"; ";
+		const entries = [user("u", null, "inspect schema"),
+			asst("a", "u", [call("c", "bash", { command: origin + "padding ".repeat(100) + "full-command-tail" })]),
+			result("r", "a", "c", "bash", "export const schema = {}"),
+			E("cm", "r", { type: "compaction", summary: "s", firstKeptEntryId: "a", tokensBefore: 1 }),
+		];
+		const { s, l } = indexed(entries);
+		s.sm.buildSessionProjection = () => buildSessionProjection(s.state.entries, s.state.leaf);
+		const scope = scopeOf(s.ctx);
+		expect(scope.visible.has("a")).toBe(true);
+		const [e] = retrieve(l.db, q(handleFor("r")), scope).evidence;
+		expect(e.title).toStartWith("bash: " + origin);
+		expect(e.title.length).toBeLessThanOrEqual("bash: ".length + 160);
+		expect(answerInput("inspect schema", "", [e])).not.toContain("full-command-tail");
 	});
 
 	test("a long prompt is searched by its first 32 and last 96 distinct words, in prompt order, none twice", () => {
