@@ -12,6 +12,9 @@ export { modelRef as judgeModelRef, reasoningFor as judgeReasoning, supportedThi
 
 export const NEED_CUSTOM = "pi-zip/need";
 export const HINT_CUSTOM = "pi-zip/hinted";
+/** One judge call's addition to Judge.stats, kept in the session so /zip totals survive a restart (summed over the branch). */
+export const JUDGE_CUSTOM = "pi-zip/judge";
+export type JudgeStats = { calls: number; costUsd: number; unknown: number; errors: number };
 /** Includes both catalogue rows and their changing state; leaves room for the task, evidence and reply on 32K models. */
 export const CATALOGUE_TOKENS = 12_000;
 
@@ -735,7 +738,9 @@ export class Judge {
 	readonly enabled = process.env.PI_ZIP_JUDGE === "1";
 	readonly verdicts = new Map<string, Stored>();
 	readonly hinted = new Set<string>();
-	readonly stats = { calls: 0, costUsd: 0, unknown: 0, errors: 0 };
+	readonly stats: JudgeStats = { calls: 0, costUsd: 0, unknown: 0, errors: 0 };
+	/** Receives each call's stats delta once the call settles; the host writes it to the session. */
+	persistStats: ((delta: JudgeStats) => void) | null = null;
 	/** Minimum age before a live output is scored. Not a permission to fold earlier than the planner allows. */
 	readonly judgeAge = Math.max(1, envInt("JUDGE_AGE", 10)); // minimum age before the judge scores a live output; not a permission to fold earlier
 	scope = "\0";
@@ -779,6 +784,9 @@ export class Judge {
 	}
 	get running() { return this.pending; }
 	restoreHinted(handles: Iterable<string>) { for (const h of handles) if (typeof h === "string") this.hinted.add(h); }
+	restoreStats(delta: Any) {
+		for (const k of ["calls", "costUsd", "unknown", "errors"] as const) { const n = Number(delta?.[k]); if (Number.isFinite(n)) this.stats[k] += n; }
+	}
 	labels(reqCount: number, scope: string): ReadonlyMap<string, Verdict> | undefined {
 		if (!this.enabled || this.disabled || scope !== this.scope) return undefined;
 		const out = new Map([...this.verdicts].filter(([, x]) => x.fixed || reqCount - x.atReq <= 20).map(([h, x]) => [h, x.v]));
@@ -928,6 +936,7 @@ export class Judge {
 		let model: Any, usage: Any, error: string | undefined, costUsd = 0, maxTokens: number | undefined, stopReason: string | undefined, level: string | undefined;
 		let reply: string | undefined, diag: VerdictDiag | undefined;
 		const counts = { cold: 0, hot: 0, need: 0, unknown: 0 };
+		const before = { ...this.stats };
 		// One row per catalogue handle: its answer triple ("-" when the reply had no valid line for it), the verdict, and whether it
 		// was applied (a fixed verdict is kept). Lets a later reader tie a fold back to the facts the judge gave for that output.
 		let perHandle: Array<{ h: string; f: string; v: Verdict; folded: boolean; tool?: string; fixed?: true; applied: boolean }> | undefined;
@@ -1020,6 +1029,8 @@ export class Judge {
 			if (!applied && generation === this.generation) { this.failures++; this.stats.errors++; }
 		} finally {
 			if (this.partial?.controller === controller) this.partial = null;
+			const delta: JudgeStats = { calls: this.stats.calls - before.calls, costUsd: this.stats.costUsd - before.costUsd, unknown: this.stats.unknown - before.unknown, errors: this.stats.errors - before.errors };
+			if (delta.calls || delta.costUsd || delta.unknown || delta.errors) try { this.persistStats?.(delta); } catch { /* the session may be gone (shutdown) */ }
 			// An interrupted call retains only complete, validated rows from a still-current snapshot.
 			this.ledger({ type: "judge", model: model ? `${model.provider}/${model.id}` : undefined, level, ms: Date.now() - started, maxTokens, stopReason,
 				outputTokens: usage?.output, reasoningTokens: usage?.reasoning, costUsd, usage, counts, ...why,

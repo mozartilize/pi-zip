@@ -1118,6 +1118,34 @@ describe("Zip integration", () => {
 		zip.shutdown();
 	});
 
+	test("judge totals are written to the session and restored on restart (/zip)", async () => {
+		const entries = longTurn(100, { chars: 12_000 });
+		const { pi, appended } = fakePi();
+		const branch = entries.map((e) => e.sourceEntry);
+		const { ctx } = fakeCtx(entries, { model, branch, modelRegistry: { getAvailable: () => [model], complete: async () => textReply("not a verdict") } });
+		const zip = new Zip(pi); zip.sessionStart(ctx); await startZip(zip, ctx);
+		const message = { role: "assistant", stopReason: "toolUse" };
+		zip.messageEnd(message, ctx);
+		await zip.turnEnd({ message, entries: [], context: { contextEntries: entries } }, ctx);
+		await (zip as Any).judge.running;
+		const live = { ...(zip as Any).judge.stats };
+		expect(live.calls).toBe(1);
+		const written = appended.filter((e: Any) => e.customType === "pi-zip/judge");
+		expect(written).toHaveLength(1);
+		expect(written[0].data).toEqual(live);
+		zip.shutdown();
+		// Restart: same session file, a fresh process. Two calls in the branch are summed.
+		const { pi: pi2 } = fakePi();
+		const { ctx: ctx2 } = fakeCtx(entries, { model, branch: [...branch, ...written, ...written] });
+		const again = new Zip(pi2); again.sessionStart(ctx2);
+		expect((again as Any).judge.stats).toEqual({ calls: 2 * live.calls, costUsd: 2 * live.costUsd, unknown: 2 * live.unknown, errors: 2 * live.errors });
+		expect(again.status(ctx2)).toContain(`judge ${2 * live.calls} calls`);
+		// Another session starts from its own totals.
+		const { ctx: ctx3 } = fakeCtx(entries, { model, branch });
+		again.sessionStart(ctx3);
+		expect((again as Any).judge.stats.calls).toBe(0);
+	});
+
 	test("a judge failure never drops the turn's fold drafts", async () => {
 		const entries = longTurn(100, { chars: 12_000 });
 		const { pi } = fakePi({ sendMessage: () => { throw new Error("steer refused"); } });

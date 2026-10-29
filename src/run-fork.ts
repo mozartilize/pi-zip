@@ -9,7 +9,7 @@ import { formatRequestsLedger, branchOutputs, recalledHandlesFromBranch, resolve
 import { materialize, recallRoot } from "./recallfile.ts";
 import { buildCut } from "./summary-engine.ts";
 import { plan } from "./plan-fork.ts";
-import { Judge, HINT_CUSTOM, latestProjectedUser } from "./judge.ts";
+import { Judge, HINT_CUSTOM, JUDGE_CUSTOM, latestProjectedUser } from "./judge.ts";
 import { DecisionLog } from "./decision-log.ts";
 import { RequestNotes, type RequestMemory } from "./request-notes.ts";
 import { fitModelSwitch } from "./model-switch.ts";
@@ -40,7 +40,9 @@ export class ZipFork extends Zip {
 	}
 	protected override onSessionStart(ctx: Any) {
 		this.judge.stop("session-changed");
-		this.judge = new Judge((rec) => this.ledger(rec));
+		const judge = this.judge = new Judge((rec) => this.ledger(rec));
+		// A call of a replaced judge (an earlier session) settling late must not write into this one.
+		judge.persistStats = (delta) => { if (this.judge === judge) this.pi.appendEntry(JUDGE_CUSTOM, delta); };
 		this.ledgerSid = this.sessionId(ctx); // this session's ledger file, before the first record names it
 		this.rotateLedger();
 		this.judgeReq = 0;
@@ -271,7 +273,11 @@ export class ZipFork extends Zip {
 	}
 	protected override onConflict() { this.memory?.cancelRetrieval(); }
 	protected override restoreExtensionState(branch: Any[]) {
-		for (const en of branch) if (en?.type === "custom" && en.customType === HINT_CUSTOM && Array.isArray(en.data?.handles)) this.judge.restoreHinted(en.data.handles);
+		for (const en of branch) {
+			if (en?.type !== "custom") continue;
+			if (en.customType === HINT_CUSTOM && Array.isArray(en.data?.handles)) this.judge.restoreHinted(en.data.handles);
+			else if (en.customType === JUDGE_CUSTOM) this.judge.restoreStats(en.data);
+		}
 	}
 	protected override onShutdown() { this.judge.stop("shutdown"); }
 	protected override thresholdCompaction(e: Any, ctx: Any): Any {
