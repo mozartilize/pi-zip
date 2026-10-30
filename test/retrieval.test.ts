@@ -6,7 +6,8 @@ import { buildSessionProjection } from "../node_modules/@earendil-works/pi-codin
 import { handleFor } from "../src/handle.ts";
 import { Ledger } from "../src/ledger/projector.ts";
 import { readSource } from "../src/ledger/source.ts";
-import { Memory, recentContext } from "../src/memory.ts";
+import { Memory, NOTHING_NOTE, recentContext } from "../src/memory.ts";
+import { noteTerms, reusedTerms } from "../src/retrieval/usage.ts";
 import { renderPacket, statusFor, validate } from "../src/retrieval/packet.ts";
 import { ANSWER_INSTRUCTIONS, answerInput, buildAnswerInput, EVIDENCE_CHARS, parseReply, recordedAt, requestText, RetrievalConversation, type NeedDecision } from "../src/retrieval/assistant.ts";
 import { conclusionsOf, DEFAULT_LIMITS, type Evidence, GRAPH_REFERENCE_LIMIT, queryOf, retrieve, scopeOf } from "../src/retrieval/search.ts";
@@ -720,6 +721,8 @@ describe("packet validation", () => {
 
 });
 
+const flush = async () => { for (let i = 0; i < 5; i++) await new Promise((r) => setTimeout(r, 0)); };
+
 /** A model registry that answers each call from `replies` in order and records every context it was sent. */
 function registry(replies: Array<string | Error>, modelOver: Partial<Any> = {}) {
 	const sent: Any[] = [], options: Any[] = [];
@@ -742,7 +745,9 @@ function registry(replies: Array<string | Error>, modelOver: Partial<Any> = {}) 
 
 // The shared model setting must not leak in from the machine running the tests.
 const AMBIENT_MODEL = process.env.PI_ZIP_JUDGE_MODEL;
-beforeEach(() => { delete process.env.PI_ZIP_JUDGE_MODEL; });
+// Fixture sessions are tiny: their searches return few rows, so the weak-search gate is off unless a test sets it.
+beforeEach(() => { delete process.env.PI_ZIP_JUDGE_MODEL; process.env.PI_ZIP_RETRIEVAL_MIN_HITS = "0"; });
+afterAll(() => { delete process.env.PI_ZIP_RETRIEVAL_MIN_HITS; });
 afterAll(() => { if (AMBIENT_MODEL !== undefined) process.env.PI_ZIP_JUDGE_MODEL = AMBIENT_MODEL; });
 
 describe("Memory at a new user prompt", () => {
@@ -788,19 +793,21 @@ describe("Memory at a new user prompt", () => {
 		expect(note!.text).toMatch(new RegExp(`Evidence: ${handleFor("a3")} \\([0-9.]+ (min|h|d) ago\\) \\[earlier conclusion\\]`));
 		expect(note!.text).not.toContain(handleFor("a6"));
 		expect(retrieval).toMatchObject({ findings: 1, folded: 0, stage: "prepared" });
+		// the own-words search that ran while the planner was in flight is recorded, to compare with the planner's search
+		expect(retrieval.early).toMatchObject({ candidates: expect.any(Number), handles: expect.arrayContaining([handleFor("a3")]) });
 	});
 
 	test("a continuation ends after the plan; an invalid plan falls back to the request's words; nothing found costs no answer call", async () => {
 		const cont = await run(['{"continue":true,"queries":[]}']);
-		expect([cont.sent.length, cont.note, cont.retrieval.skip]).toEqual([1, null, "continuation"]);
+		expect([cont.sent.length, cont.note?.found, cont.note?.text, cont.retrieval.skip]).toEqual([1, false, NOTHING_NOTE, "continuation"]);
 		const fallback = await run(["not json", ANSWER]);
 		expect(fallback.sent.length).toBe(2);
 		expect(fallback.retrieval.terms).toContain("sockets");
 		const none = await run([JSON.stringify({ continue: false, queries: [{ keywords: ["zzzqqq"] }] })]);
-		expect([none.sent.length, none.note, none.retrieval.skip]).toEqual([1, null, "no candidates"]);
+		expect([none.sent.length, none.note?.found, none.retrieval.skip]).toEqual([1, false, "no candidates"]);
 	});
 
-	test("the main model waits for the plan and the search only; the answer runs on, and only the current live run receives it", async () => {
+	test("the main model waits for the own-words search only; the plan and answer run on, and only the current live run receives it", async () => {
 		for (const action of ["keep", "end", "tree", "compact", "session", "shutdown", "new-prompt"]) {
 			const s = fakeSession(withSibling(), { leaf: "om", hidden: COMPACTED });
 			const { reg } = registry([]);
@@ -819,6 +826,7 @@ describe("Memory at a new user prompt", () => {
 				await mem.beforeAgentStart(ctx, { messageType: "user", prompt: PROMPT });
 				const settled = mem.settled();
 				expect(mem.current(ctx)).toMatchObject({ text: null, pending: expect.stringContaining("zip_recall") });
+				await flush(); // the plan is answered at once: the answer call is in flight now
 				if (action === "end") mem.agentEnd(ctx);
 				if (action === "tree") mem.catchUp(ctx, "session_tree");
 				if (action === "compact") mem.catchUp(ctx, "session_compact");
@@ -828,12 +836,29 @@ describe("Memory at a new user prompt", () => {
 				finish({ role: "assistant", stopReason: "stop", content: [{ type: "text", text: ANSWER }] });
 				await settled;
 				if (action === "keep") expect(mem.current(ctx)).toMatchObject({ found: true });
-				else {
+				else if (action === "end") {
+					// a run that ended keeps its retrieval running for the next prompt, never for a request of its own
+					expect(signal!.aborted).toBe(false);
+					expect(mem.current(ctx)).toBeNull();
+				} else {
 					expect(signal!.aborted).toBe(true);
 					expect(mem.current(ctx)?.prompt ?? null).not.toBe(PROMPT); // a new prompt may have its own note, never this one
 				}
 			} finally { mem.shutdown(); }
 		}
+	});
+
+	test("the main model does not wait for the planner: the own-words search sets the pending note at once", async () => {
+		const s = fakeSession(withSibling(), { leaf: "om", hidden: COMPACTED });
+		const { reg } = registry([]);
+		(reg as Any).complete = () => new Promise(() => {}); // the planner never answers
+		const ctx = { ...s.ctx, modelRegistry: reg };
+		const logs: Any[] = [];
+		const mem = new Memory((r) => logs.push(r));
+		mem.sessionStart(ctx);
+		await mem.beforeAgentStart(ctx, { messageType: "user", prompt: PROMPT });
+		expect(mem.current(ctx)).toMatchObject({ text: null, pending: expect.stringContaining("zip_recall") });
+		mem.shutdown();
 	});
 
 	test("zip_recall with no arguments waits for the findings, which then are not injected again", async () => {
@@ -849,6 +874,7 @@ describe("Memory at a new user prompt", () => {
 		mem.sessionStart(ctx);
 		await mem.beforeAgentStart(ctx, { messageType: "user", prompt: PROMPT });
 		const waiting = mem.awaitNote(ctx);
+		await flush();
 		finish({ role: "assistant", stopReason: "stop", content: [{ type: "text", text: ANSWER }] });
 		const text = await waiting;
 		expect(text).toContain(handleFor("a3"));
@@ -857,20 +883,112 @@ describe("Memory at a new user prompt", () => {
 		mem.shutdown();
 	});
 
-	test("findings that never reached the model are logged as dropped, with no usage record", async () => {
+	test("findings a run ended before showing go to a related next prompt; an unrelated one drops them", async () => {
+		const CONT = '{"continue":true,"queries":[]}', OTHER = JSON.stringify({ continue: false, queries: [{ keywords: ["zzzqqq"] }] });
+		for (const [next, delivered] of [[CONT, true], [PLAN, true], [OTHER, false]] as const) {
+			const s = fakeSession(withSibling(), { leaf: "om", hidden: COMPACTED });
+			const { reg } = registry([PLAN, ANSWER, next, ...(next === PLAN ? ['{"needed":[],"findings":[],"folded":[]}'] : [])]);
+			const ctx = { ...s.ctx, modelRegistry: reg };
+			const logs: Any[] = [];
+			const mem = new Memory((r) => logs.push(r));
+			mem.sessionStart(ctx);
+			await mem.beforeAgentStart(ctx, { messageType: "user", prompt: PROMPT });
+			await mem.settled();
+			mem.agentEnd(ctx); // no injected() call
+			const id = logs.find((r) => r.type === "memory_retrieval").requestId;
+			expect(logs.filter((r) => r.type === "memory_carried")).toEqual([expect.objectContaining({ requestId: id, ready: true })]);
+			expect(logs.some((r) => r.type === "memory_usage" || r.type === "memory_dropped")).toBe(false);
+			await mem.beforeAgentStart(ctx, { messageType: "user", prompt: next === OTHER ? "zzzqqq wwwyyy" : "go on" });
+			await mem.settled();
+			const note = mem.current(ctx)!;
+			if (delivered) {
+				expect(note).toMatchObject({ found: true, cited: expect.arrayContaining([handleFor("a3")]) });
+				expect(note.text).toContain("prepared for the previous request");
+				expect(logs.filter((r) => r.type === "memory_retrieval").at(-1).carried).toBe(id);
+			} else {
+				expect(note.found).toBe(false);
+				expect(logs.filter((r) => r.type === "memory_dropped")).toEqual([expect.objectContaining({ requestId: id, reason: "next request unrelated" })]);
+			}
+			mem.shutdown();
+		}
+	});
+
+	test("a run that ends while its answer call runs hands the findings to the next prompt", async () => {
 		const s = fakeSession(withSibling(), { leaf: "om", hidden: COMPACTED });
-		const { reg } = registry([PLAN, ANSWER]);
+		const { reg } = registry([]);
+		let finish!: (r: Any) => void, n = 0;
+		(reg as Any).complete = (_m: Any, context: Any) => {
+			n++;
+			if (isPlan(context)) return Promise.resolve({ role: "assistant", stopReason: "stop", content: [{ type: "text", text: n === 1 ? PLAN : '{"continue":true,"queries":[]}' }] });
+			return new Promise((resolve) => { finish = resolve; });
+		};
 		const ctx = { ...s.ctx, modelRegistry: reg };
 		const logs: Any[] = [];
 		const mem = new Memory((r) => logs.push(r));
 		mem.sessionStart(ctx);
 		await mem.beforeAgentStart(ctx, { messageType: "user", prompt: PROMPT });
-		await mem.settled();
-		mem.agentEnd(ctx); // no injected() call
-		const id = logs.find((r) => r.type === "memory_retrieval").requestId;
-		expect(logs.filter((r) => r.type === "memory_dropped")).toEqual([expect.objectContaining({ requestId: id })]);
-		expect(logs.some((r) => r.type === "memory_usage")).toBe(false);
+		await flush();
+		mem.agentEnd(ctx);
+		expect(logs.find((r) => r.type === "memory_carried")).toMatchObject({ ready: false });
+		await mem.beforeAgentStart(ctx, { messageType: "user", prompt: "continue" });
+		finish({ role: "assistant", stopReason: "stop", content: [{ type: "text", text: ANSWER }] });
+		await mem.settled(); await mem.settled();
+		expect(mem.current(ctx)).toMatchObject({ found: true, prompt: "continue" });
+		expect(mem.current(ctx)!.text).toContain(handleFor("a3"));
 		mem.shutdown();
+	});
+
+	test("a ready answer survives run end while it waits for the preceding run's answer", async () => {
+		const s = fakeSession(withSibling(), { leaf: "om", hidden: COMPACTED });
+		const { reg } = registry([]);
+		const reply = (text: string) => ({ role: "assistant", stopReason: "stop", content: [{ type: "text", text }] });
+		let plans = 0, answers = 0, finishOld!: (r: Any) => void;
+		(reg as Any).complete = (_m: Any, context: Any) => {
+			if (isPlan(context)) return Promise.resolve(reply(++plans === 3 ? '{"continue":true,"queries":[]}' : PLAN));
+			if (++answers === 1) return new Promise((resolve) => { finishOld = resolve; });
+			return Promise.resolve(reply(JSON.stringify({ needed: [{ evidence: "E1", reason: "asked" }], findings: [{ summary: "Second-run marker: close the sockets.", evidence: ["E1"], status: "historical" }], folded: [] })));
+		};
+		const ctx = { ...s.ctx, modelRegistry: reg };
+		const logs: Any[] = [], mem = new Memory((r) => logs.push(r));
+		mem.sessionStart(ctx);
+		try {
+			await mem.beforeAgentStart(ctx, { messageType: "user", prompt: PROMPT });
+			await flush(); mem.agentEnd(ctx);
+			await mem.beforeAgentStart(ctx, { messageType: "user", prompt: PROMPT });
+			await flush(); // second answer is ready, but publish waits for the first
+			expect(answers).toBe(2);
+			mem.agentEnd(ctx);
+			finishOld(reply(ANSWER));
+			await mem.settled();
+			await mem.beforeAgentStart(ctx, { messageType: "user", prompt: "continue" });
+			await mem.settled();
+			expect(mem.current(ctx)?.found).toBe(true);
+			expect(mem.current(ctx)?.text).toContain("Second-run marker");
+		} finally { mem.shutdown(); }
+	});
+
+	test("the weak-search gate passes at its threshold, not only above it", async () => {
+		const baseline = await run([PLAN, ANSWER]);
+		const hits = baseline.retrieval.hits;
+		expect(hits).toBeGreaterThan(0);
+		for (const [minHits, skipped] of [[hits - 1, false], [hits, false], [hits + 1, true]] as const) {
+			process.env.PI_ZIP_RETRIEVAL_MIN_HITS = String(minHits);
+			const result = await run([PLAN, ANSWER]);
+			expect(result.retrieval.gate).toMatchObject({ minHits, hits, skipped });
+			expect(result.sent.length).toBe(skipped ? 1 : 2);
+		}
+	});
+
+	test("a search with few rows skips the answer call unless the prompt names a handle", async () => {
+		process.env.PI_ZIP_RETRIEVAL_MIN_HITS = "1000";
+		const weak = await run([PLAN, ANSWER]);
+		expect([weak.sent.length, weak.retrieval.skip, weak.note?.found]).toEqual([1, "weak search", false]);
+		expect(weak.retrieval.gate).toEqual({ minHits: 1000, hits: weak.retrieval.hits, named: 0, maxMatched: expect.any(Number), skipped: true });
+		expect(weak.retrieval.evidence.length).toBeGreaterThan(0); // the candidates it would have read stay in the record
+		const named = await run([PLAN, ANSWER], { messageType: "user", prompt: `what did ${handleFor("a3")} conclude?` });
+		expect(named.retrieval.skip).not.toBe("weak search");
+		expect(named.sent.length).toBe(2);
+		expect(named.retrieval.gate).toMatchObject({ minHits: 1000, named: 1, skipped: false });
 	});
 
 	test("the trace keeps the note text, and agent_end records whether the run used the cited handles", async () => {
@@ -902,6 +1020,86 @@ describe("Memory at a new user prompt", () => {
 			expect(usage.mentioned).toEqual(name ? [h] : []); // named only: recorded, but not "used"
 			mem.shutdown();
 		}
+	});
+
+	test("usage: a finding's distinctive term repeated before anything else in the run showed it counts as used", () => {
+		const note = "[pi-zip: relevant historical findings from earlier in this session]\n1. The pool in `src/pool.ts` set MAX_SOCKETS to 64 after v2.3.1; sockets were closed.\n   Evidence: 0abcdefghi (5 min ago) [seen in output]\nThese are historical observations, not current workspace state.";
+		const terms = noteTerms(note, ["0abcdefghi"]);
+		expect(terms).toEqual(expect.arrayContaining(["src/pool.ts", "MAX_SOCKETS", "v2.3.1"]));
+		expect(terms).not.toContain("0abcdefghi"); // a handle is not a finding term
+		expect(terms).not.toContain("sockets"); // plain words match by chance
+		const said = (text: string) => ({ role: "assistant", content: [{ type: "text", text }] });
+		const tool = (text: string) => ({ role: "toolResult", content: [{ type: "text", text }] });
+		const call = (args: Any) => ({ role: "assistant", content: [{ type: "toolCall", name: "read", arguments: args }] });
+		expect(reusedTerms(terms, "", [call({ path: "src/pool.ts" })])).toEqual(["src/pool.ts"]);
+		expect(reusedTerms(terms, "look at src/pool.ts", [said("src/pool.ts")])).toEqual([]); // the prompt or the view had it
+		expect(reusedTerms(terms, "", [tool("MAX_SOCKETS = 64"), said("MAX_SOCKETS is 64")])).toEqual([]); // the run read it first
+		expect(reusedTerms(terms, "", [said("MAX_SOCKETS is 64"), tool("MAX_SOCKETS = 64")])).toEqual(["MAX_SOCKETS"]);
+	});
+
+	test("agent_end records terms reuse next to recalls; a term already in view or said before a steer is judged right", async () => {
+		const answer = JSON.stringify({ needed: [{ evidence: "E1", reason: "asked" }], findings: [{ summary: "The fix closed sockets in `src/pool.ts` via releaseAll_v2.", evidence: ["E1"], status: "historical" }], folded: [] });
+		const msg = (id: string, parentId: string, message: Any) => ({ type: "message", id, parentId, timestamp: "2026-01-01T00:00:00Z", message });
+		const said = (text: string) => ({ role: "assistant", content: [{ type: "text", text }] });
+		// [what the run's entries are, expected reused]
+		const cases: Array<[string, (leaf: string) => Any[], string[]]> = [
+			["plain reuse", (leaf) => [msg("p1", leaf, { role: "user", content: [{ type: "text", text: PROMPT }] }), msg("p2", "p1", said("The earlier fix used releaseAll_v2."))], ["releaseAll_v2"]],
+			// the model called the path earlier, in view: repeating it is not news from the note (only the call args carry it)
+			["in view as call args", (leaf) => [
+				msg("v1", leaf, { role: "assistant", content: [{ type: "toolCall", id: "t9", name: "read", arguments: { path: "src/pool.ts" } }] }),
+				msg("v2", "v1", { role: "toolResult", toolCallId: "t9", toolName: "read", content: [{ type: "text", text: "ok" }] }),
+				msg("p1", "v2", { role: "user", content: [{ type: "text", text: PROMPT }] }), msg("p2", "p1", said("Look at src/pool.ts."))], []],
+			// a steer splits the run: reuse before it still counts
+			["reuse before a steer", (leaf) => [msg("p1", leaf, { role: "user", content: [{ type: "text", text: PROMPT }] }), msg("p2", "p1", said("It used releaseAll_v2.")),
+				msg("p3", "p2", { role: "user", content: [{ type: "text", text: "also check tests" }] }), msg("p4", "p3", said("ok"))], ["releaseAll_v2"]],
+		];
+		for (const [name, entries, reused] of cases) {
+			const s = fakeSession(withSibling(), { leaf: "om", hidden: COMPACTED });
+			const { reg } = registry([PLAN, answer]);
+			const ctx = { ...s.ctx, modelRegistry: reg };
+			const logs: Any[] = [];
+			const mem = new Memory((r) => logs.push(r));
+			mem.sessionStart(ctx);
+			await mem.beforeAgentStart(ctx, { messageType: "user", prompt: PROMPT });
+			await mem.settled();
+			const note = mem.current(ctx)!;
+			mem.injected(note.text!.length, 1);
+			const added = entries("om");
+			s.state.entries.push(...added);
+			s.state.leaf = added.at(-1).id;
+			mem.agentEnd(ctx);
+			const usage = logs.find((r) => r.type === "memory_usage");
+			expect([name, usage.reused]).toEqual([name, reused]);
+			expect([name, usage.used, usage.usedBy]).toEqual([name, reused.length > 0, reused.length ? ["terms"] : []]);
+			expect(usage.terms).toBeGreaterThanOrEqual(2);
+			mem.shutdown();
+		}
+	});
+
+	test("usage never credits an assistant term or recall that preceded delivery", async () => {
+		const s = fakeSession(withSibling(), { leaf: "om", hidden: COMPACTED });
+		const answer = JSON.stringify({ needed: [{ evidence: "E1", reason: "asked" }], findings: [{ summary: "Use releaseAll_v2.", evidence: ["E1"], status: "historical" }], folded: [] });
+		const { reg } = registry([PLAN, answer]);
+		const ctx = { ...s.ctx, modelRegistry: reg };
+		const logs: Any[] = [], mem = new Memory((r) => logs.push(r));
+		mem.sessionStart(ctx);
+		try {
+			await mem.beforeAgentStart(ctx, { messageType: "user", prompt: PROMPT });
+			await mem.settled();
+			const add = (id: string, message: Any) => {
+				s.state.entries.push({ type: "message", id, parentId: s.state.leaf, message });
+				s.state.leaf = id;
+			};
+			add("late-user", { role: "user", content: [{ type: "text", text: PROMPT }] });
+			add("before-note", { role: "assistant", content: [
+				{ type: "text", text: "Use releaseAll_v2." },
+				{ type: "toolCall", id: "rec", name: "zip_recall", arguments: { handle: handleFor("a3") } },
+			] });
+			mem.injected(mem.current(ctx)!.text!.length, 3);
+			add("after-note", { role: "assistant", content: [{ type: "text", text: "releaseAll_v2 was already known." }] });
+			mem.agentEnd(ctx);
+			expect(logs.find((r) => r.type === "memory_usage")).toMatchObject({ used: false, reused: [], recalled: [] });
+		} finally { mem.shutdown(); }
 	});
 
 	test("rejected items stay in the trace but never enter the note", async () => {
@@ -969,7 +1167,7 @@ describe("Memory at a new user prompt", () => {
 			const prompt = () => handlers.get("before_agent_start")!({ messageType: "user", prompt: PROMPT }, ctx);
 			await cmd("off"); await prompt();
 			expect(calls).toBe(0);
-			await cmd("on"); await prompt();
+			await cmd("on"); await prompt(); await flush();
 			expect([calls, answers, signal.aborted]).toEqual([2, 1, false]);
 			const pending = mem.settled();
 			await cmd("off");
@@ -992,7 +1190,7 @@ describe("Memory at a new user prompt", () => {
 			// Extension conflict ("paused"): no retrieval call, and one in flight from before is aborted when the conflict is detected.
 			await cmd("on");
 			hang = true;
-			await prompt();
+			await prompt(); await flush();
 			expect([answers, signal.aborted]).toEqual([3, false]);
 			(pi as Any).getAllTools = () => [{ name: "context_prune", sourceInfo: { path: "/ext/context-prune/index.ts" } }];
 			const before = calls;

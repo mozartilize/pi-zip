@@ -330,7 +330,7 @@ function pairedResult(db: Db, h: Hit): string | null {
  * finds (a decision found by "why", a command found by "how") above entries every facet matches a little. A matched tool call brings
  * its hidden result right after it. Up to 3 passages of one entry (its matching chunks in that search). The model decides need.
  */
-export function retrieve(db: Db, q: Query, scope: Scope, limits: SearchLimits = DEFAULT_LIMITS): { evidence: Evidence[]; hits: number; inBranch: number } {
+export function retrieve(db: Db, q: Query, scope: Scope, limits: SearchLimits = DEFAULT_LIMITS): { evidence: Evidence[]; hits: number; inBranch: number; named: number } {
 	const usable = (id: string) => scope.branch.has(id) && scope.hidden.has(id);
 	// A handle in the prompt names one entry: resolve it through the ledger, not through the text (a handle appears in no document).
 	const named = handleDocs(db, q.handles).filter((h) => h.entry_id && usable(h.entry_id));
@@ -477,7 +477,7 @@ export function retrieve(db: Db, q: Query, scope: Scope, limits: SearchLimits = 
 			at: Date.parse(e?.timestamp ?? "") || 0,
 		};
 	});
-	return { evidence, hits: named.length + hitCount, inBranch: named.length + hitCount };
+	return { evidence, hits: named.length + hitCount, inBranch: named.length + hitCount, named: named.length };
 }
 
 const clip = (s: string, n: number) => {
