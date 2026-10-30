@@ -760,6 +760,8 @@ export class Judge {
 	private controller: AbortController | null = null;
 	private pending: Promise<void> | null = null;
 	private pendingHandles = new Set<string>();
+	/** Handles of the running call whose evidence changed after it was sent: its reply must not label them. The rest of the reply stays usable. */
+	private pendingTainted = new Set<string>();
 	/** Snapshot flush before a safe run-end abort; never used for scope/session invalidation. */
 	private partial: { controller: AbortController; flush: () => void } | null = null;
 	private readonly sessionId = randomUUID();
@@ -838,7 +840,7 @@ export class Judge {
 		}
 		this.scope = scope;
 		const refs = workReferences(blocks, cwd);
-		const invalidate = (h: string) => { this.verdicts.delete(h); if (this.pendingHandles.has(h)) invalidatePending = true; };
+		const invalidate = (h: string) => { this.verdicts.delete(h); if (this.pendingHandles.has(h)) this.pendingTainted.add(h); };
 		const observe = (h: string, slot: IndexedSlot) => {
 			const reference = `${refs.handles.get(h) ?? ""}|${slot.locator ? refs.locators.get(slot.locator) ?? "" : ""}`;
 			const state = `${slot.edited}|${reference}`;
@@ -868,6 +870,9 @@ export class Judge {
 		}
 		this.prevRefs = refs;
 		this.prevRecalled = new Set(opts.recalled ?? []);
+		// A changed request invalidates every row of the running call. Changed evidence taints only the rows it touches; the call is
+		// aborted only when no row is left to use.
+		if (!invalidatePending && this.pendingHandles.size && [...this.pendingHandles].every((h) => this.pendingTainted.has(h))) invalidatePending = true;
 		if (invalidatePending) { this.generation++; this.controller?.abort(scopeChanged ? "scope-changed" : "evidence-changed"); }
 		// Superseded outputs are cold by rule, at every boundary and below every gate: no model call is needed or asked for them.
 		const superseded = this.index.superseded;
@@ -922,16 +927,17 @@ export class Judge {
 		this.lastReq = reqCount;
 		for (const h of input.manifest) this.sentTokens.set(h, input.catalogue.get(h)!.tokens);
 		const controller = new AbortController(), generation = this.generation;
-		this.controller = controller; this.pendingHandles = input.manifest;
+		const tainted = new Set<string>();
+		this.controller = controller; this.pendingHandles = input.manifest; this.pendingTainted = tainted;
 		const meta = new Map([...input.manifest].map((h) => [h, { folded: input.folded.has(h), locator: input.catalogue.get(h)?.locator ?? null }]));
 		const why = { protocol: JUDGE_PROTOCOL, reqCount, superseded: superseded.size, eligible: eligibleCount, foldedHit, scopeChanged, known: input.manifest.size, folded: input.folded.size,
 			reused: [...this.verdicts].filter(([h, v]) => !input.manifest.has(h) && (v.fixed || reqCount - v.atReq <= 20)).length,
 			addedTokens, evidence: input.evidence.length, inputTokens: tok4(input.text + JUDGE_SYSTEM) };
-		this.pending = this.complete(ctx, input.text, input.manifest, input.evidence, meta, scope, reqCount, generation, controller, why)
-			.finally(() => { this.pending = null; this.pendingHandles = new Set(); if (this.controller === controller) this.controller = null; });
+		this.pending = this.complete(ctx, input.text, input.manifest, input.evidence, meta, scope, reqCount, generation, controller, why, tainted)
+			.finally(() => { this.pending = null; this.pendingHandles = new Set(); this.pendingTainted = new Set(); if (this.controller === controller) this.controller = null; });
 	}
 
-	private async complete(ctx: Any, text: string, known: Set<string>, evidence: EvidenceSpan[], meta: Map<string, { folded: boolean; locator: string | null }>, scope: string, reqCount: number, generation: number, controller: AbortController, why: Record<string, unknown> = {}) {
+	private async complete(ctx: Any, text: string, known: Set<string>, evidence: EvidenceSpan[], meta: Map<string, { folded: boolean; locator: string | null }>, scope: string, reqCount: number, generation: number, controller: AbortController, why: Record<string, unknown> = {}, tainted: ReadonlySet<string> = new Set()) {
 		const started = Date.now(), signal = AbortSignal.any([controller.signal, AbortSignal.timeout(this.timeoutMs)]);
 		let model: Any, usage: Any, error: string | undefined, costUsd = 0, maxTokens: number | undefined, stopReason: string | undefined, level: string | undefined;
 		let reply: string | undefined, diag: VerdictDiag | undefined;
@@ -939,7 +945,7 @@ export class Judge {
 		const before = { ...this.stats };
 		// One row per catalogue handle: its answer triple ("-" when the reply had no valid line for it), the verdict, and whether it
 		// was applied (a fixed verdict is kept). Lets a later reader tie a fold back to the facts the judge gave for that output.
-		let perHandle: Array<{ h: string; f: string; v: Verdict; folded: boolean; tool?: string; fixed?: true; applied: boolean }> | undefined;
+		let perHandle: Array<{ h: string; f: string; v: Verdict; folded: boolean; tool?: string; fixed?: true; tainted?: true; applied: boolean }> | undefined;
 		let streamed = "", toolAttempt = false, partial = false, applied = 0, salvaged = false;
 		const apply = (parsed: ParsedVerdict, interrupted: boolean) => {
 			diag = parsed.diag;
@@ -948,14 +954,15 @@ export class Judge {
 			perHandle = [...parsed.verdicts].map(([h, v]) => {
 				const fixed = this.verdicts.get(h)?.fixed === true;
 				// Incomplete or duplicate rows must not become cold, nor erase an existing valid judgment.
-				const use = current && !fixed && (!interrupted || parsed.triples?.has(h) === true);
+				const stale = tainted.has(h); // its evidence changed while the call ran: the old snapshot's label is not used
+				const use = current && !fixed && !stale && (!interrupted || parsed.triples?.has(h) === true);
 				if (use) {
 					this.verdicts.set(h, { v, atReq: reqCount, locator: parsed.locator.get(h) ?? null, nOk: parsed.nOk.get(h) ?? false });
 					applied++;
 					if (v !== "warm") counts[v]++;
 				}
 				return { h, f: parsed.triples?.get(h) ?? "-", v, folded: meta.get(h)?.folded === true,
-					tool: this.catalogue.get(h)?.label?.slice(0, 80), ...(fixed ? { fixed: true as const } : {}), applied: use };
+					tool: this.catalogue.get(h)?.label?.slice(0, 80), ...(fixed ? { fixed: true as const } : {}), ...(stale ? { tainted: true as const } : {}), applied: use };
 			});
 			counts.unknown = parsed.abstained;
 			if (current) this.stats.unknown += parsed.abstained;
@@ -994,7 +1001,9 @@ export class Judge {
 			if (maxTokens < 1024) throw new Error("Judge input exceeds the model context window");
 			this.stats.calls++;
 			const context = { systemPrompt: JUDGE_SYSTEM, messages: [{ role: "user", content: [{ type: "text", text }], timestamp: Date.now() }] };
-			const options = { maxTokens, signal, cacheRetention: "short", sessionId: this.sessionId };
+			// No prompt cache: every request starts with a changing catalogue after a short system prompt, so no prefix repeats and a
+			// cache write is a pure surcharge. Providers that cache automatically still do; ones without the option ignore it.
+			const options = { maxTokens, signal, cacheRetention: "none", sessionId: this.sessionId };
 			const sendLevel = level && level !== "off";
 			if (sendLevel && !ctx.modelRegistry.streamSimple) throw new Error("This Pi cannot set the judge thinking level");
 			let res: Any;
@@ -1034,8 +1043,8 @@ export class Judge {
 			// An interrupted call retains only complete, validated rows from a still-current snapshot.
 			this.ledger({ type: "judge", model: model ? `${model.provider}/${model.id}` : undefined, level, ms: Date.now() - started, maxTokens, stopReason,
 				outputTokens: usage?.output, reasoningTokens: usage?.reasoning, costUsd, usage, counts, ...why,
-				streamChars: streamed.length, partial, applied,
-				resultDisposition: applied ? (partial ? "partial-applied" : "applied") : generation !== this.generation || !this.run || this.scope !== scope ? "stale" : "no-usable-rows",
+				streamChars: streamed.length, partial, applied, ...(tainted.size ? { tainted: tainted.size } : {}),
+				resultDisposition: applied ? (partial ? "partial-applied" : "applied") : generation !== this.generation || !this.run || this.scope !== scope || tainted.size ? "stale" : "no-usable-rows",
 				...(signal.aborted ? { cancelReason: String(signal.reason) } : {}),
 				...(perHandle ? { verdicts: perHandle } : {}),
 				...(diag ? { diag: { ...diag, n: diag.n.slice(0, 10) } } : {}), ...(error ? { error } : {}),

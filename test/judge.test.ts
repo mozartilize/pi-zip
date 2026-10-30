@@ -674,17 +674,37 @@ describe("incremental judge selection", () => {
 		expect(r.judge.verdicts.size).toBe(0);
 		expect(r.judge.scope).toBe("new task");
 	});
-	test("a new explicit dependency during a call rejects that snapshot, not just changed user scopes", async () => {
+	test("a new explicit dependency during a call rejects that output's row, not the rest of the reply", async () => {
 		const d = deferred(), r = rig(() => d.promise);
 		r.run(); await flush();
+		const sent = r.calls[0][1].messages[0].content[0].text as string;
+		expect(sent).toContain(h(1)); expect(sent).toContain(h(2));
+		expect(r.calls[0][2]).toMatchObject({ cacheRetention: "none" }); // no prefix repeats across judge calls: a cache write is only a surcharge
 		const entries = longTurn(24);
 		entries.push(A("dependency", []));
 		entries.at(-1)!.messages[0].content = [{ type: "text", text: `Need ${h(1)} for the next step` }];
 		r.run(25, buildBlocks(entries));
-		expect(r.calls[0][2].signal.aborted).toBe(true);
-		d.resolve(textReply(`${h(1)} C E1`)); await r.judge.running;
-		expect(r.judge.verdicts.size).toBe(0);
+		expect(r.calls[0][2].signal.aborted).toBe(false); // other rows are still usable
+		d.resolve(textReply(`${h(1)} N Y N\n${h(2)} N Y N`)); await r.judge.running;
+		expect(r.judge.verdicts.has(h(1))).toBe(false);
+		expect(r.judge.verdicts.get(h(2))?.v).toBe("cold");
 		expect(r.judge.stats.errors).toBe(0); // invalidation is not a provider failure
+		const record = r.records.find((x) => x.type === "judge");
+		expect(record).toMatchObject({ tainted: 1, resultDisposition: "applied" });
+		expect(record.verdicts.find((v: Any) => v.h === h(1))).toMatchObject({ tainted: true, applied: false });
+		expect(record).not.toHaveProperty("cancelReason");
+	});
+	test("a call is aborted once changed evidence taints every row it asked for", async () => {
+		const d = deferred(), r = rig(() => d.promise);
+		r.run(); await flush();
+		const entries = longTurn(24);
+		entries.push(A("dependency", []));
+		entries.at(-1)!.messages[0].content = [{ type: "text", text: `Need ${Array.from({ length: 30 }, (_, i) => h(i + 1)).join(" ")}` }];
+		r.run(25, buildBlocks(entries));
+		expect(r.calls[0][2].signal.aborted).toBe(true);
+		d.resolve(textReply(`${h(2)} N Y N`)); await r.judge.running;
+		expect(r.judge.verdicts.has(h(2))).toBe(false);
+		expect(r.records.find((x) => x.type === "judge")).toMatchObject({ cancelReason: "evidence-changed", resultDisposition: "stale" });
 	});
 	test("live/folded transitions and pruning invalidate old judgments", async () => {
 		const r = rig(async () => textReply(`${h(1)} C E1`));
