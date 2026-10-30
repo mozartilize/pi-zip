@@ -109,6 +109,8 @@ export class Zip implements ZipControl {
 	conflict: string | null = null;
 	readonly stats = new Stats();
 	readonly recalled = new Set<string>();
+	/** handle -> the judge's label when this process folded it: recall records carry it so a ledger shows which verdicts were wrong. */
+	private readonly foldVerdicts = new Map<string, string | null>();
 	private cold = false;
 	private coldReason = "";
 	protected runChecked = true; // the first request of the run has been looked at
@@ -464,6 +466,7 @@ export class Zip implements ZipControl {
 	// ---- events ----------------------------------------------------------------------------------------------
 	sessionStart(ctx: Any) {
 		this.onSessionStart(ctx);
+		this.foldVerdicts.clear();
 		this.liveCtx = ctx;
 		this.start = null; // a decision carried for a run of the session before is never handed to a run of this one
 		this.startKind = null;
@@ -528,7 +531,7 @@ export class Zip implements ZipControl {
 		const { items } = this.resolveHandles(this.branch(ctx), handles);
 		const found = items.filter((it): it is typeof it & { text: string } => it.text !== null);
 		const out = materialize(recallRoot(), sid, found.map((it) => ({ handle: it.handle, text: it.text })));
-		this.ledger({ type: "recall_file", handles: found.map((it) => it.handle), missing: handles.length - found.length, chars: found.reduce((a, it) => a + it.text.length, 0) });
+		this.ledger({ type: "recall_file", handles: found.map((it) => it.handle), ...this.verdictsAtFold(found.map((it) => it.handle)), missing: handles.length - found.length, chars: found.reduce((a, it) => a + it.text.length, 0) });
 		return out;
 	}
 	/** Every output this session's model no longer sees in full (folded, or summarised away): what a grep, ls or find over the directory needs. */
@@ -1532,7 +1535,10 @@ export class Zip implements ZipControl {
 			s.summaryMs += waitMs;
 			if (!cut.prepared) s.summaryUsd += cut.costUsd; // a prepared one was counted when it was produced
 		}
+		const verdicts = live.some((t) => t.verdict) ? live.map((t) => t.verdict ?? null) : undefined;
+		for (const t of live) this.foldVerdicts.set(handleFor(t.entryId), t.verdict ?? null);
 		if (live.length) this.ledger({
+			...(verdicts ? { verdicts } : {}),
 			type: "fold", trigger: plan.source, turnIndex: e.turnIndex, count: live.length, entries: live.map((t) => t.entryId), tools: live.map((t) => t.tool),
 			recoverability: live.map((t) => t.recover ?? "?"), trigs: live.map((t) => t.trig), handles: live.map((t) => handleFor(t.entryId)),
 			entryTokensBefore: before, entryTokensAfter: after, ctxBefore: Math.round(ctxTokens), ctxAfter: Math.round(ctxAfter), O: Math.round(sc.O), c: Math.round(sc.c * 1000) / 1000, usageTotal: o.usageTotal,
@@ -1648,11 +1654,17 @@ export class Zip implements ZipControl {
 		this.prevKey = pend.key;
 	}
 
+	/** foldVerdicts: per handle, the judge's label when folded here; null = folded without a label; "?" = not folded by this process (an
+	 *  earlier one, or a summary): join with the fold record of the same handle in the session's ledger. Omitted when no handle has a label. */
+	private verdictsAtFold(handles: string[]): { foldVerdicts?: (string | null)[] } {
+		const v = handles.map((h) => (this.foldVerdicts.has(h) ? this.foldVerdicts.get(h)! : "?"));
+		return v.some((x) => x !== null && x !== "?") ? { foldVerdicts: v } : {};
+	}
 	onRecall = (handles: string[], chars: number, entryIds: (string | null)[]) => {
 		for (const h of handles) this.recalled.add(h);
 		this.stats.recalls += handles.length;
 		this.stats.recallChars += chars;
-		this.ledger({ type: "recall", handles, chars, entryIds });
+		this.ledger({ type: "recall", handles, chars, entryIds, ...this.verdictsAtFold(handles) });
 	};
 
 	// ---- /zip --------------------------------------------------------------------------------------------------

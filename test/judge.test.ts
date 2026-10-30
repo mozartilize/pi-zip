@@ -515,7 +515,9 @@ describe("judge folds keep the existing decision", () => {
 			const original = planContext(entries, opts)!;
 			expect(original.folds.map((f) => f.entryId)).toEqual(["r1"]);
 			const judged = planContext(entries, { ...opts, verdicts: new Map([[h(1), "hot"], [h(2), "cold"], [h(3), "cold"]]) })!;
-			expect(judged.folds).toEqual(original.folds);
+			expect(judged.folds.map((f) => f.verdict)).toEqual(["hot"]); // the fold carries the label it was planned with, for the ledger
+			expect(judged.folds.map(({ verdict: _, ...f }) => f)).toEqual(original.folds);
+			expect(original.folds[0].verdict).toBeUndefined();
 			expect(judged.ctxAfterFolds).toBe(original.ctxAfterFolds);
 		}
 	});
@@ -1159,6 +1161,39 @@ describe("Zip integration", () => {
 		zip.messageEnd(message, ctx);
 		const out = await zip.turnEnd(event, ctx);
 		expect(out?.entries.some((e: Any) => e.type === "context_edit")).toBe(true);
+		zip.shutdown();
+	});
+
+	test("fold and recall ledger records carry the judge's label at fold time", async () => {
+		const entries = longTurn(100, { chars: 12_000 });
+		const { pi } = fakePi();
+		const { ctx } = fakeCtx(entries, { model, branch: entries.map((e) => e.sourceEntry), modelRegistry: { getAvailable: () => [model], complete: async () => textReply("not a verdict") } });
+		const zip = new Zip(pi); zip.sessionStart(ctx); await startZip(zip, ctx);
+		const recs: Any[] = [];
+		zip.ledger = (rec: Any) => { recs.push(rec); };
+		(zip as Any).judge.labels = () => new Map([[h(1), "cold"], [h(2), "hot"]]);
+		const message = { role: "assistant", stopReason: "toolUse" };
+		const event = { message, entries: [], context: { contextEntries: entries } };
+		zip.messageEnd(message, ctx);
+		await zip.turnEnd(event, ctx);
+		const fold = recs.find((r) => r.type === "fold");
+		expect(fold).toBeDefined();
+		expect(fold.verdicts).toHaveLength(fold.handles.length);
+		const at = (hd: string) => fold.verdicts[fold.handles.indexOf(hd)];
+		expect(at(h(1))).toBe("cold");
+		const other = fold.handles.find((hd: string) => hd !== h(1) && hd !== h(2));
+		if (other) expect(at(other)).toBe("unscored");
+		// h(9999): never folded here
+		zip.onRecall([h(1), other ?? h(1), "h9999"], 10, [null, null, null]);
+		expect(recs.at(-1)).toMatchObject({ type: "recall", foldVerdicts: ["cold", other ? "unscored" : "cold", "?"] });
+		// a recall with no labelled fold among its handles stays as before
+		zip.onRecall(["h9999"], 10, [null]);
+		expect(recs.at(-1).foldVerdicts).toBeUndefined();
+		// a new session forgets this process's fold labels
+		zip.sessionStart(ctx);
+		zip.ledger = (rec: Any) => { recs.push(rec); };
+		zip.onRecall([h(1)], 10, [null]);
+		expect(recs.at(-1).foldVerdicts).toBeUndefined();
 		zip.shutdown();
 	});
 

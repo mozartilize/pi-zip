@@ -120,7 +120,7 @@ export function plan(entries: Any[], o: PlanOpts): { f: PlanResult; c: PlanResul
 		const { ph, phTok } = replacement;
 		tokOverride.set(b.idx, phTok);
 		const call = callOf(calls, b.msg);
-		folds.push({ entryId: b.entryId!, toolCallId: b.msg.toolCallId, visIdx: visOfBlock[b.idx] ?? -1, contentKey: contentKeyOf(b.msg.content), tool: call?.name ?? b.msg.toolName ?? "tool", args: call ? shortArgs(call.args) : "", entryTokens: b.tokens, phTokens: phTok, ph, trig, recover: classify(b) });
+		folds.push({ entryId: b.entryId!, toolCallId: b.msg.toolCallId, visIdx: visOfBlock[b.idx] ?? -1, contentKey: contentKeyOf(b.msg.content), tool: call?.name ?? b.msg.toolName ?? "tool", args: call ? shortArgs(call.args) : "", entryTokens: b.tokens, phTokens: phTok, ph, trig, recover: classify(b), ...(o.verdicts?.size ? { verdict: verdict(b) ?? "unscored" } : {}) });
 		return true;
 	};
 	const candidates = foldCandidates(blocks, calls, o);

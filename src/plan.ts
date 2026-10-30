@@ -552,6 +552,7 @@ export interface FoldTarget {
 	ph: string; // placeholder text: byte-identical in the request-local view and the persisted context_edit
 	trig: string;
 	recover?: Recover;
+	verdict?: string; // the judge's label when planned (cold/warm/hot/need, or "unscored" when the judge had labels but none for it); absent: no judge labels
 }
 
 export interface Cut {
