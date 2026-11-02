@@ -75,7 +75,9 @@ export function checkEdits(blocks: Block[], userTurns: number, folds: FoldTarget
 	const cutBlock = cut ? byId.get(cut.firstKeptEntryId) : undefined;
 	if (cut && !cutBlock) return `cut target ${cut.firstKeptEntryId} is not in the projection`;
 	const forcedIdx = forced?.size ? new Set(live.filter((t) => forced.has(t.entryId)).map((t) => byId.get(t.entryId)!.idx)) : undefined;
-	return validateEdits(blocks, { folds: new Map(live.map((t) => [byId.get(t.entryId)!.idx, t.ph])), recover: new Map(live.map((t) => [byId.get(t.entryId)!.idx, t.recover])), cut: cutBlock ? cutBlock.idx : null, ...(forcedIdx ? { forced: forcedIdx } : {}) }, userTurns);
+	const earlyCold = new Map(live.filter((t) => t.verdict === "cold" && t.earlyFold)
+		.map((t) => [byId.get(t.entryId)!.idx, t.earlyFold!.minAge]));
+	return validateEdits(blocks, { earlyCold, folds: new Map(live.map((t) => [byId.get(t.entryId)!.idx, t.ph])), recover: new Map(live.map((t) => [byId.get(t.entryId)!.idx, t.recover])), cut: cutBlock ? cutBlock.idx : null, ...(forcedIdx ? { forced: forcedIdx } : {}) }, userTurns);
 }
 
 // ---- clock --------------------------------------------------------------------------------------------------------------------

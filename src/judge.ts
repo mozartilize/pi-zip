@@ -2,7 +2,7 @@
 // A verdict only ranks folds the deterministic planner already allows. It never lowers a protected output's age.
 import { createHash, randomUUID } from "node:crypto";
 import { isAbsolute, normalize, resolve } from "node:path";
-import type { Block, PlanOpts } from "./plan.ts";
+import { settings, type Block, type PlanOpts } from "./plan.ts";
 import { callOf, foldCandidates, foldPlaceholder, type Calls } from "./fold-policy.ts";
 import type { Verdict } from "./plan-fork.ts";
 import { handleFor, handleTokens, outcomeHint, pickKeyLines, shortArgs, RECALL_TOOL } from "./fold-format.ts";
@@ -886,12 +886,14 @@ export class Judge {
 			const slot = this.index.meta.get(h);
 			if (slot) this.verdicts.set(h, { v: "cold", atReq: reqCount, locator: slot.locator, nOk: false, fixed: true });
 		}
+		const regularAge = opts.inturnAge ?? settings().inturnAge, earlyAge = opts.earlyFoldAge ?? 0;
+		const scoringAge = regularAge > 0 && earlyAge > 0 ? Math.min(regularAge, Math.max(earlyAge, this.judgeAge)) : regularAge;
 		const skip = (reason: string, handles: string[] = []) => {
 			// Repeated boundaries with the same gate and candidate set add no diagnostic information.
-			const stamp = `${this.generation}:${reason}:${handles.join(",")}`;
+			const stamp = `${this.generation}:${regularAge}:${earlyAge}:${reason}:${handles.join(",")}`;
 			if (stamp === this.skipStamp) return;
 			this.skipStamp = stamp;
-			this.ledger({ type: "judge_skip", reason, reqCount, contextTokens, coldCap, judgeAge: this.judgeAge,
+			this.ledger({ type: "judge_skip", reason, reqCount, contextTokens, coldCap, judgeAge: this.judgeAge, scoringAge, earlyFoldAge: earlyAge, regularAge,
 				handles, sinceLastCall: Number.isFinite(this.lastReq) ? reqCount - this.lastReq : null });
 		};
 		// Observe invalidations even below pressure/cadence gates and while a provider is still running.
@@ -900,7 +902,9 @@ export class Judge {
 		if (contextTokens < 0.8 * coldCap) return skip("below-pressure");
 		const stale = (h: string) => !this.verdicts.has(h) || (!this.verdicts.get(h)!.fixed && reqCount - this.verdicts.get(h)!.atReq > 20);
 		const handleOf = (b: Block) => (b.idx !== undefined && this.index.slots[b.idx]?.entryId === b.entryId && this.index.slots[b.idx]?.handle) || handleFor(b.entryId!);
-		const eligible = [...new Set(foldCandidates(blocks, calls, opts).flat())]
+		// Score prospective early candidates before they have labels. The planner still requires a cold verdict; lowering its
+		// gate alone would otherwise leave these outputs unscored until the ordinary age was reached.
+		const eligible = [...new Set(foldCandidates(blocks, calls, { ...opts, inturnAge: scoringAge }).flat())]
 			.filter((b) => b.age >= this.judgeAge && stale(handleOf(b)));
 		const selected = new Set([...this.citedFolded].filter(stale));
 		const foldedHit = selected.size > 0;
@@ -930,7 +934,7 @@ export class Judge {
 		const tainted = new Set<string>();
 		this.controller = controller; this.pendingHandles = input.manifest; this.pendingTainted = tainted;
 		const meta = new Map([...input.manifest].map((h) => [h, { folded: input.folded.has(h), locator: input.catalogue.get(h)?.locator ?? null }]));
-		const why = { protocol: JUDGE_PROTOCOL, reqCount, superseded: superseded.size, eligible: eligibleCount, foldedHit, scopeChanged, known: input.manifest.size, folded: input.folded.size,
+		const why = { protocol: JUDGE_PROTOCOL, reqCount, scoringAge, earlyFoldAge: earlyAge, regularAge, superseded: superseded.size, eligible: eligibleCount, foldedHit, scopeChanged, known: input.manifest.size, folded: input.folded.size,
 			reused: [...this.verdicts].filter(([h, v]) => !input.manifest.has(h) && (v.fixed || reqCount - v.atReq <= 20)).length,
 			addedTokens, evidence: input.evidence.length, inputTokens: tok4(input.text + JUDGE_SYSTEM) };
 		this.pending = this.complete(ctx, input.text, input.manifest, input.evidence, meta, scope, reqCount, generation, controller, why, tainted)

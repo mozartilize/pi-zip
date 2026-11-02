@@ -1,10 +1,10 @@
-// Fork planner: plan(), selectPlan() and planContext() with the summary pressure gates, judge reordering, tier-merge reserve,
+// Fork planner: plan(), selectPlan() and planContext() with summary pressure gates, early cold eligibility, judge reordering, tier-merge reserve,
 // checkpoint refresh and model-switch rescue. Upstream's planner in plan.ts is kept unmodified (unused at runtime) so upstream
 // syncs merge cleanly; port wanted upstream planner fixes here.
 import { ACTIVE_INPUT_TOKENS, estimateMergeWork, type MergeWork } from "./summary-engine.ts";
 import { classifyRecoverability, type Recover } from "./read-policy.ts";
 import { handleFor, shortArgs } from "./fold-format.ts";
-import { callOf, foldCandidates, foldPlaceholder, type Call } from "./fold-policy.ts";
+import { callOf, earlyCold, foldCandidates, foldPlaceholder, type Call } from "./fold-policy.ts";
 import { recordSummaryPressure, summaryPrepareThreshold, type SummaryGate } from "./summary-pressure.ts";
 import { lawPrices } from "./learn.ts";
 import {
@@ -24,12 +24,20 @@ declare module "./plan.ts" {
 		overflow?: { requiredTokens: number; availableTokens: number };
 		summaryDiagnostics?: Record<string, unknown>;
 	}
+	interface FoldTarget {
+		age?: number;
+		earlyFold?: { minAge: number; regularAge: number };
+	}
 	interface PlanOpts {
 		verdicts?: ReadonlyMap<string, Verdict>;
+		/** Fork runtime always supplies 10. Isolated/base callers may omit this. Requires cold advice and an enabled ordinary age gate. */
+		earlyFoldAge?: number;
 		/** Ledger only: candidate eligibility and the final application decision, populated by core.decideEdits. */
 		foldDecision?: {
+			earlyFoldAge: number;
+			regularAge: number;
 			reason: "selected" | "back-to-back" | "guard-rejected" | "no-plan";
-			outputs: Array<{ h: string; age: number; verdict: Verdict | "unscored"; group: number | null; planned: boolean; selected: boolean }>;
+			outputs: Array<{ h: string; age: number; tokens: number; tool?: string; eligibility: string; early: boolean; verdict: Verdict | "unscored"; group: number | null; planned: boolean; selected: boolean }>;
 		};
 		/** Output diagnostic, overwritten on each plan; sizes are calibrated whole-context tokens. */
 		summaryGate?: SummaryGate;
@@ -120,7 +128,9 @@ export function plan(entries: Any[], o: PlanOpts): { f: PlanResult; c: PlanResul
 		const { ph, phTok } = replacement;
 		tokOverride.set(b.idx, phTok);
 		const call = callOf(calls, b.msg);
-		folds.push({ entryId: b.entryId!, toolCallId: b.msg.toolCallId, visIdx: visOfBlock[b.idx] ?? -1, contentKey: contentKeyOf(b.msg.content), tool: call?.name ?? b.msg.toolName ?? "tool", args: call ? shortArgs(call.args) : "", entryTokens: b.tokens, phTokens: phTok, ph, trig, recover: classify(b), ...(o.verdicts?.size ? { verdict: verdict(b) ?? "unscored" } : {}) });
+		const earlyFold = trig.endsWith("(inturn)") && earlyCold(b, o) && !o.rescue?.force?.has(b.entryId!)
+			? { minAge: o.earlyFoldAge!, regularAge: o.inturnAge ?? s.inturnAge } : undefined;
+		folds.push({ age: b.age, ...(earlyFold ? { earlyFold } : {}), entryId: b.entryId!, toolCallId: b.msg.toolCallId, visIdx: visOfBlock[b.idx] ?? -1, contentKey: contentKeyOf(b.msg.content), tool: call?.name ?? b.msg.toolName ?? "tool", args: call ? shortArgs(call.args) : "", entryTokens: b.tokens, phTokens: phTok, ph, trig, recover: classify(b), ...(o.verdicts?.size ? { verdict: verdict(b) ?? "unscored" } : {}) });
 		return true;
 	};
 	const candidates = foldCandidates(blocks, calls, o);
@@ -144,11 +154,11 @@ export function plan(entries: Any[], o: PlanOpts): { f: PlanResult; c: PlanResul
 	// that is gone, and that turn's big re-readable reads are what makes the return expensive: they come back exactly
 	take(candidates[1], `${trig}(relax)`);
 	// in-turn: outputs of the protected turns that are many requests old, whatever their recoverability class (every fold stays
-	// recallable). Age = assistant requests since the call was issued (the newest outputs, age < inturnAge, always stay).
+	// recallable). Age = assistant requests since the call was issued; cold non-error outputs may use the earlier configured age.
 	take(candidates[2], `${trig}(inturn)`);
 	};
 	choose();
-	// Rent, production, cuts and the permission to rewrite always use the original plan. Reorder only its accepted folds.
+	// Eligibility (including early cold outputs) is priced first. Ranking must not weaken that plan's saving.
 	const capReal = coldTarget(o.coldCap ?? s.coldCap, O, room);
 	const finish = (q: { f: PlanResult; c: PlanResult | null; a: PlanResult | null }, cutsLeft = false) => {
 		if (o.verdicts?.size) for (const p of [q.f, q.a]) {

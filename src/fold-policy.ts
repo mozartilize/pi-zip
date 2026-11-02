@@ -43,8 +43,15 @@ export function callOf(calls: Calls, msg: Any): Call | undefined {
 	return calls.get(msg?.toolCallId);
 }
 
+/** Only fresh cold advice can shorten the ordinary age gate; 0 on either gate disables this path. */
+export function earlyCold(b: Block, o: PlanOpts): boolean {
+	const regular = o.inturnAge ?? settings().inturnAge, early = o.earlyFoldAge ?? 0;
+	return regular > 0 && early > 0 && b.age >= early && b.age < regular && !b.msg.isError
+		&& o.verdicts?.get(handleFor(b.entryId!)) === "cold";
+}
+
 /** Candidate groups in planner order. Shared with the background judge; economics still belongs to plan(). */
-export function foldCandidates(blocks: Block[], calls: Calls, o: PlanOpts): [Block[], Block[], Block[]] {
+export function foldCandidates(blocks: Block[], calls: Calls, o: PlanOpts, reasons?: Map<string, string>): [Block[], Block[], Block[]] {
 	const s = settings(), scale = o.scale ?? UNIT;
 	const turns = countUserTurns(blocks) + (o.promptPending && !openStarter(blocks) ? 1 : 0);
 	const age = o.inturnAge ?? s.inturnAge;
@@ -54,19 +61,26 @@ export function foldCandidates(blocks: Block[], calls: Calls, o: PlanOpts): [Blo
 	let start = 0;
 	for (const b of blocks) {
 		const pos = start; start += b.tokens;
-		if (b.kind !== "toolResult" || b.edited || !b.entryId || pos < head || (o.recalled?.size ? o.recalled.has(handleFor(b.entryId)) : false)) continue;
+		if (b.kind !== "toolResult" || !b.entryId) continue;
+		const reason = (why: string) => reasons?.set(b.entryId!, why);
+		if (b.edited) { reason("already-edited"); continue; }
+		if (pos < head) { reason("automatic-cache-prefix"); continue; }
+		if (o.recalled?.has(handleFor(b.entryId))) { reason("recalled"); continue; }
 		const text = textOf((b.raw ?? b.msg).content);
-		if (tok4(text) <= (o.foldMin ?? s.foldMin)) continue;
+		if (tok4(text) <= (o.foldMin ?? s.foldMin)) { reason("too-small"); continue; }
 		const call = callOf(calls, b.msg), name = call?.name ?? b.msg.toolName;
 		if (name === RECALL_TOOL || (name === "bash" && commandNamesRecall(call?.args?.command))
-			|| (["read", "grep", "find", "ls"].includes(name) && !!parseRecallPath(call?.args?.path))) continue;
+			|| (["read", "grep", "find", "ls"].includes(name) && !!parseRecallPath(call?.args?.path))) { reason("recall-output"); continue; }
 		const rereadable = () => classifyRecoverability(name ?? "", call?.args, text, o.cwd, (b.raw ?? b.msg).content) === "rereadable";
-		if (o.rereadOnly && !rereadable()) continue;
-		if (b.userTurn < turns - PROTECT_USER_TURNS + 1) groups[0].push(b);
-		else if (o.rescue?.force?.has(b.entryId)) groups[2].push(b);
+		if (o.rereadOnly && !rereadable()) { reason("not-rereadable"); continue; }
+		if (b.userTurn < turns - PROTECT_USER_TURNS + 1) { groups[0].push(b); reason("old-turn"); }
+		else if (o.rescue?.force?.has(b.entryId)) { groups[2].push(b); reason("rescue"); }
 		else {
-			if (o.pause && b.userTurn < turns && rereadable()) groups[1].push(b);
-			if (age > 0 && b.age >= age) groups[2].push(b);
+			reason(age <= 0 ? "inturn-disabled" : b.age < (o.earlyFoldAge ?? 0) ? "too-young" : b.msg.isError ? "error-protected" : "protected-age");
+			const relaxed = o.pause && b.userTurn < turns && rereadable();
+			if (relaxed) { groups[1].push(b); reason("pause-rereadable"); }
+			if (age > 0 && b.age >= age) { groups[2].push(b); if (!relaxed) reason("regular-age"); }
+			else if (earlyCold(b, o)) { groups[2].push(b); if (!relaxed) reason("early-cold"); }
 		}
 	}
 	return groups;
@@ -85,17 +99,20 @@ export function foldPlaceholder(b: Block, calls: Calls, o: PlanOpts): { ph: stri
 export function recordFoldDecision(o: PlanOpts, q: ReturnType<typeof plan>, p: PlanResult | null, b2b: boolean, entries: Any[]) {
 	if (o.trace) {
 		const blocks = q?.f.blocks ?? buildBlocks(entries), calls = q?.f.calls ?? toolCallIndex(blocks);
-		const groups = new Map<string, number>();
-		foldCandidates(blocks, calls, o).forEach((xs, i) => xs.forEach((b) => groups.set(b.entryId!, i)));
+		const groups = new Map<string, number>(), reasons = new Map<string, string>();
+		foldCandidates(blocks, calls, o, reasons).forEach((xs, i) => xs.forEach((b) => groups.set(b.entryId!, i)));
 		// The guard may try a ready-summary plan and then the folds-only fallback. Record proposals from both paths.
 		const proposed = [q?.a, q?.f, p].flatMap((x) => x ? [...x.folds, ...(x.judged?.folds ?? [])] : []);
 		const planned = new Set(proposed.map((f) => f.entryId));
 		const selected = new Set(p?.folds.map((f) => f.entryId) ?? []);
 		o.foldDecision = {
+			earlyFoldAge: o.earlyFoldAge ?? 0, regularAge: o.inturnAge ?? settings().inturnAge,
 			reason: b2b ? "back-to-back" : p ? "selected" : o.trace.some((t) => t.where === "guard" && !t.ok && t.A < t.B) ? "guard-rejected" : "no-plan",
 			outputs: blocks.filter((b) => b.kind === "toolResult" && b.entryId && !b.edited && b.tokens > (o.foldMin ?? settings().foldMin)).map((b) => {
 				const h = handleFor(b.entryId!);
-				return { h, age: b.age, verdict: o.verdicts?.get(h) ?? "unscored", group: groups.get(b.entryId!) ?? null,
+				return { h, age: b.age, tokens: b.tokens, tool: callOf(calls, b.msg)?.name ?? b.msg.toolName,
+					eligibility: reasons.get(b.entryId!) ?? "unknown", early: reasons.get(b.entryId!) === "early-cold",
+					verdict: o.verdicts?.get(h) ?? "unscored", group: groups.get(b.entryId!) ?? null,
 					planned: planned.has(b.entryId!), selected: selected.has(b.entryId!) };
 			}),
 		};

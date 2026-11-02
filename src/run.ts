@@ -1539,6 +1539,7 @@ export class Zip implements ZipControl {
 		for (const t of live) this.foldVerdicts.set(handleFor(t.entryId), t.verdict ?? null);
 		if (live.length) this.ledger({
 			...(verdicts ? { verdicts } : {}),
+			ages: live.map((t) => byId.get(t.entryId)!.age), plannedAges: live.map((t) => t.age ?? null), earlyFold: live.map((t) => t.earlyFold ?? null),
 			type: "fold", trigger: plan.source, turnIndex: e.turnIndex, count: live.length, entries: live.map((t) => t.entryId), tools: live.map((t) => t.tool),
 			recoverability: live.map((t) => t.recover ?? "?"), trigs: live.map((t) => t.trig), handles: live.map((t) => handleFor(t.entryId)),
 			entryTokensBefore: before, entryTokensAfter: after, ctxBefore: Math.round(ctxTokens), ctxAfter: Math.round(ctxAfter), O: Math.round(sc.O), c: Math.round(sc.c * 1000) / 1000, usageTotal: o.usageTotal,

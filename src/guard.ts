@@ -10,6 +10,7 @@ export interface EditSet {
 	recover?: Map<number, string | undefined>; // block idx -> "rereadable" | "nonrereadable" (needed for folds in the previous user turn)
 	inturnAge?: number; // default settings().inturnAge: an output (any class) at least this many assistant requests old may fold in a protected turn (0 = never)
 	forced?: ReadonlySet<number>; // model-switch rescue: these outputs fold whatever their turn or age (every fold stays recallable)
+	earlyCold?: ReadonlyMap<number, number>; // cold advice: block index -> minimum age, independently checked at commit
 }
 
 /**
@@ -54,7 +55,9 @@ export function validateEdits(blocks: Block[], plan: EditSet, userTurns: number)
 		if (!b || b.kind !== "toolResult") return `fold target ${i} is not a toolResult`;
 		if (b.edited) return `fold target ${i} already edited`;
 		const rereadable = plan.recover?.get(i) === "rereadable";
-		const aged = inturnAge > 0 && b.age >= inturnAge; // old enough: allowed anywhere, any class (same rule as the planner)
+		const earlyAge = plan.earlyCold?.get(i) ?? 0;
+		const early = inturnAge > 0 && Number.isFinite(earlyAge) && earlyAge > 0 && b.age >= earlyAge && !b.msg.isError;
+		const aged = (inturnAge > 0 && b.age >= inturnAge) || early; // both eligibility paths still preserve structural checks
 		const forced = plan.forced?.has(i) ?? false;
 		if (b.userTurn >= userTurns && !aged && !forced) return `fold target ${i} is inside the latest user turn`;
 		if (b.userTurn === userTurns - 1 && !aged && !rereadable && !forced) return `fold target ${i} is in the previous user turn and not re-readable`;

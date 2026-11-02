@@ -269,6 +269,7 @@ export class ZipFork extends Zip {
 	}
 	override ledger(rec: Record<string, unknown>) { this.decisionLog.write(rec); }
 	protected override configurePlan(o: PlanOpts, entries: Any[]) {
+		o.earlyFoldAge = 10;
 		if (this.inRun && this.active()) o.verdicts = this.judge.labels(this.judgeReq, latestProjectedUser(entries));
 	}
 	protected override onConflict() { this.memory?.cancelRetrieval(); }

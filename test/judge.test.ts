@@ -521,7 +521,7 @@ describe("judge folds keep the existing decision", () => {
 			expect(judged.ctxAfterFolds).toBe(original.ctxAfterFolds);
 		}
 	});
-	test("cold at age 59 does not open an early fold; age 60 stays inside the normal rule", () => {
+	test("with early folding disabled, cold at age 59 stays; age 60 uses the normal rule", () => {
 		const entries = longTurn(72), opts = plannerOpts(entries);
 		const blocks = buildBlocks(entries);
 		const old = blocks.find((b) => b.kind === "toolResult" && b.age === 60)!;
@@ -540,6 +540,61 @@ describe("judge folds keep the existing decision", () => {
 			expect(q?.folds.some((f) => f.entryId === old.entryId) ?? false).toBe(false);
 		}
 		expect(plan(entries, { ...opts, inturnAge: 0 })?.stuck).toBe(true);
+	});
+
+	test("early cold eligibility has a real age boundary, preserves baseline/disable semantics and requires non-error cold advice", () => {
+		const entries = longTurn(24), blocks = buildBlocks(entries), calls = toolCallIndex(blocks);
+		// The last request is 25: r16 is age 9, r15 age 10, r14 age 11.
+		const verdicts = new Map([[h(16), "cold"], [h(15), "cold"], [h(14), "cold"], [h(13), "hot"], [h(12), "need"], [h(11), "warm"], [h(10), "cold"]] as const);
+		blocks.find((b) => b.entryId === "r10")!.msg.isError = true;
+		const opts = plannerOpts(entries, { earlyFoldAge: 10, inturnAge: 60, verdicts });
+		const ids = (o: PlanOpts) => foldCandidates(blocks, calls, o).flat().map((b) => b.entryId);
+		expect(ids(opts)).toEqual(["r14", "r15"]);
+		for (const extra of [{ earlyFoldAge: 0 }, { inturnAge: 0 }, { verdicts: undefined }]) expect(ids({ ...opts, ...extra })).toEqual([]);
+		expect(ids({ ...opts, recalled: new Set([h(15)]) })).toEqual(["r14"]);
+		const p = planContext(entries, { ...opts, coldCap: 4000 })!;
+		expect(p.folds.map((f) => f.entryId).sort()).toEqual(["r14", "r15"]);
+		expect(p.folds.map((f) => f.age).sort()).toEqual([10, 11]);
+		expect(p.folds.every((f) => f.earlyFold?.minAge === 10 && f.earlyFold.regularAge === 60)).toBe(true);
+		expect(checkEdits(p.blocks, p.userTurns, p.folds, null)).toBeNull();
+		// A forged permission with no cold label, a too-young target, or an error must still fail commit validation.
+		expect(checkEdits(p.blocks, p.userTurns, p.folds.map((f) => ({ ...f, verdict: "hot" })), null)).not.toBeNull();
+		expect(checkEdits(p.blocks, p.userTurns, [{ ...p.folds[0], entryId: "r16" }], null)).not.toBeNull();
+		expect(checkEdits(blocks, p.userTurns, [{ ...p.folds[0], entryId: "r10" }], null)).not.toBeNull();
+		expect(plan(entries, { ...opts, coldCap: 1_000_000 })).toBeNull(); // no new rewrite below the target
+	});
+
+	test("early candidates still obey automatic prefix, recall-output and reread-only protections", () => {
+		const entries = longTurn(24), blocks = buildBlocks(entries), calls = toolCallIndex(blocks);
+		const target = blocks.find((b) => b.entryId === "r15")!;
+		const opts = plannerOpts(entries, { earlyFoldAge: 10, verdicts: new Map([[h(15), "cold"]]) });
+		const ids = (o: PlanOpts) => foldCandidates(blocks, calls, o).flat().map((b) => b.entryId);
+		expect(ids(opts)).toEqual(["r15"]);
+		const call = calls.byResult!.get(target.msg)!;
+		const name = call.name; call.name = "write"; // non-rereadable, even though judge says cold
+		expect(ids({ ...opts, rereadOnly: true })).toEqual([]);
+		call.name = "zip_recall";
+		expect(ids(opts)).toEqual([]);
+		call.name = name;
+		// Put all outputs inside the protected automatic-cache prefix, irrespective of their ages and labels.
+		expect(ids({ ...opts, scale: { ...UNIT, O: 0, c: 0.000001 }, law: { pr: lawPrices("automatic", false), g: 1, pWarm: 1 } })).toEqual([]);
+	});
+
+	test("early-fold diagnostics distinguish eligibility from economic rejection and committed selection", () => {
+		const entries = longTurn(24), opts = plannerOpts(entries, { coldCap: 4000, earlyFoldAge: 10, verdicts: new Map([[h(15), "cold"], [h(16), "cold"]]) });
+		const run = (rent: number, justEdited = false) => decideEdits({ at: "turn_end", justEdited, pWarm: 1, entries, ready: [],
+			opts: () => ({ o: { ...opts, trace: [], rent, law: { pr: lawPrices("explicit", false), g: 1_000_000_000, pWarm: 1 } } }) });
+		const rejected = run(0);
+		expect(rejected.p).toBeNull();
+		expect(rejected.o.foldDecision).toMatchObject({ earlyFoldAge: 10, regularAge: 60, reason: "guard-rejected" });
+		expect(rejected.o.foldDecision!.outputs.find((r) => r.h === h(15))).toMatchObject({ eligibility: "early-cold", age: 10, early: true, planned: true, selected: false });
+		expect(rejected.o.foldDecision!.outputs.find((r) => r.h === h(16))).toMatchObject({ eligibility: "too-young", early: false, planned: false });
+		const paid = run(1_000_000_000_000);
+		expect(paid.p?.folds.map((f) => f.entryId)).toEqual(["r15"]);
+		expect(paid.o.foldDecision!.outputs.find((r) => r.h === h(15))!.selected).toBe(true);
+		const b2b = run(1_000_000_000_000, true);
+		expect(b2b.p).toBeNull();
+		expect(b2b.o.foldDecision!.reason).toBe("back-to-back");
 	});
 
 	test("an output below judgeAge stays; hot and need are last, not immune", () => {
@@ -604,6 +659,19 @@ describe("judge folds keep the existing decision", () => {
 });
 
 describe("incremental judge selection", () => {
+	test("early policy scores prospective candidates before a cold label exists; zero preserves ordinary scoring", async () => {
+		for (const earlyFoldAge of [0, 10]) {
+			const r = rig(async () => textReply(`${h(15)} N Y N`));
+			r.run(24, r.blocks, 40_000, { inturnAge: 60, earlyFoldAge });
+			await r.judge.running;
+			expect(r.calls.length).toBe(earlyFoldAge ? 1 : 0);
+			if (!earlyFoldAge) expect(r.records.find((x) => x.type === "judge_skip")).toMatchObject({ earlyFoldAge: 0, regularAge: 60, scoringAge: 60 });
+			if (earlyFoldAge) {
+				expect(r.judge.labels(24, "do the long task")?.get(h(15))).toBe("cold");
+				expect(r.records.find((x) => x.type === "judge")).toMatchObject({ scoringAge: 10, regularAge: 60, earlyFoldAge: 10 });
+			}
+		}
+	});
 	test("default protected outputs generate no call; age 60 and size boundaries use planner candidates", async () => {
 		const r = rig();
 		r.run(24, r.blocks, 40_000, { inturnAge: 60 });
@@ -1215,6 +1283,30 @@ describe("Zip integration", () => {
 		zip.onRecall([h(1)], 10, [null]);
 		expect(recs.at(-1).foldVerdicts).toBeUndefined();
 		zip.shutdown();
+	});
+
+	test("runtime always enables early eligibility but only cold advice can use it", async () => {
+		for (const cold of [true, false]) {
+			const entries = longTurn(24, { chars: 12_000 });
+			const { pi } = fakePi();
+			const { ctx } = fakeCtx(entries, { model, branch: entries.map((e) => e.sourceEntry), modelRegistry: { getAvailable: () => [model], complete: async () => textReply("no verdict") } });
+			const zip = new Zip(pi); zip.sessionStart(ctx); await startZip(zip, ctx);
+			const records: Any[] = [];
+			zip.ledger = (r: Any) => { records.push(r); };
+			(zip as Any).rent = 1_000_000_000_000; // pay the existing cache-rewrite guard; eligibility alone must not bypass it
+			(zip as Any).judge.labels = () => new Map([[h(15), cold ? "cold" : "hot"]]);
+			const message = { role: "assistant", stopReason: "toolUse" };
+			zip.messageEnd(message, ctx);
+			const out = await zip.turnEnd({ message, entries: [], context: { contextEntries: entries } }, ctx);
+			const fold = records.find((r) => r.type === "fold");
+			if (cold) {
+				expect(out?.entries.some((e: Any) => e.type === "context_edit")).toBe(true);
+				expect(fold).toMatchObject({ handles: [h(15)], ages: [10], plannedAges: [10], verdicts: ["cold"], earlyFold: [{ minAge: 10, regularAge: 60 }] });
+				zip.onRecall([h(15)], 42, ["r15"]);
+				expect(records.at(-1)).toMatchObject({ type: "recall", handles: [h(15)], foldVerdicts: ["cold"] });
+			} else expect(fold).toBeUndefined();
+			zip.shutdown();
+		}
 	});
 
 	test("the card shows judge counters only when enabled", () => {
