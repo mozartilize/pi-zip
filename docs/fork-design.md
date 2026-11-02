@@ -1,51 +1,182 @@
 # Fork planning and summary policy
 
-These rules override the corresponding upstream rules in [design.md](design.md).
+These rules override the upstream rules in [design.md](design.md).
 
-## Summary pressure and model switches
+## Summary pressure and thresholds
 
-pi-zip plans the same eligible outputs at every cache probability. It folds the biggest outputs in each protection class until the working view is reached. Summary compaction is gated separately from folding with two thresholds (`PI_ZIP_SUMMARY_AT` overrides both): background preparation starts once the calibrated context after folds reaches `min(0.8 * room, 140,339)` (`140,339` is the 80% threshold of a 200K-window model), while summary application requires `min(0.8 * room, 400,000)` for the active model. On a 1M-window model, a checkpoint summary is prepared from `140.3K` upward without compacting the live context until `400K` (about 40% of its window). A 500K model applies from `~380.3K`, while 200K/272K models keep their `~140.3K`/`~197.9K` thresholds. A newer checkpoint is prepared only when the context after the existing one is again at the preparation threshold and the new cut covers at least a quarter of that threshold (`~35K`) more; a new cut ID alone does not re-read the prefix. Pi checks its compaction threshold before each request, before extension context hooks. After a switch to a smaller window, pi-zip answers that threshold compaction least loss first: (1) if folds alone fit 90% of the new room, it cancels Pi's compaction and this run's next request carries the folds; (2) a READY checkpoint whose summary plus the kept turns (after their folds) stays below the room compacts only its prefix; (3) a checkpoint still being written is waited for; (4) otherwise the cut the window needs is summarised at once, its narrative read by the previous model when its window is larger (the new model reads it when that call fails and the prefix fits); (5) when the two protected turns alone are too big, the cut may go up to the current user message, and only as many of the kept outputs fold, biggest first, as the window needs (each stays recallable). The economic law never refuses these cuts: the alternative is Pi's own summary or an overflow. Only when the summary retention contract plus the current request cannot fit the room does pi-zip cancel the compaction and abort the run, with the history intact. A switch that lands after Pi's check is caught in the context hook and aborted the same way. A cold cache or model switch makes an already eligible rewrite cheap; it does not authorize summarizing a context that still has room. A completed summary's call is already paid; application uses its actual size and the rent guard. Otherwise, the decision tries folds alone and asks the background producer for the missing summary.
+The fork plans folding with the upstream 40K working target.
+It folds the largest outputs in each protection class until context reaches that target.
+Summary compaction uses two distinct pressure thresholds.
+`PI_ZIP_SUMMARY_AT` overrides both gates when set.
+
+1. **Preparation gate:** `min(0.8 * room, 140,339)`.
+   The background worker starts preparing a checkpoint when context after folds reaches this value.
+   On a 200K window, this value is 140,339 tokens (80% of window).
+2. **Application gate:** `min(0.8 * room, 400,000)`.
+   The active run applies the summary only after context reaches this value.
+   On a 1M window, preparation starts at 140.3K, while application waits until 400K.
+   A 500K model applies at ~380.3K.
+   Models with 200K or 272K windows keep ~140.3K and ~197.9K thresholds.
+
+A new checkpoint starts only when post-checkpoint context reaches the preparation gate again.
+The new cut must also cover at least 35K additional tokens (one-quarter of the threshold).
+A new cut identifier alone does not cause a prefix re-read.
+
+## Model switches and rescue compaction
+
+Pi checks its compaction threshold before each request, ahead of extension hooks.
+When you switch to a smaller window, pi-zip resolves the pressure with minimal information loss:
+
+1. **Folds only:** If folds alone fit within 90% of the new window, pi-zip cancels compaction.
+   The next request carries the folded view.
+2. **Ready checkpoint:** If a ready summary plus kept turns fits the window, pi-zip compacts only that prefix.
+3. **Pending checkpoint:** If a checkpoint is currently running, pi-zip waits for it to finish.
+4. **Immediate summary:** Otherwise, pi-zip summarizes the required cut immediately.
+   The previous model reads the narrative when it has a larger window.
+   If that call fails and the prefix fits, the new model reads the narrative.
+5. **Rescue fold:** If the two protected turns exceed the window, the cut can extend to the current user message.
+   Kept outputs fold largest-first.
+   All folded originals remain recallable.
+6. **Hard limit abort:** If the minimal summary and current request cannot fit the window, pi-zip aborts the run without deleting history.
+
+A switch after Pi's check triggers the same abort sequence in the context hook.
+A cold cache or model switch reduces rewrite cost, but does not trigger compaction when room remains.
 
 ## Lookup cue
 
-A new user request can name an earlier tool output by its exact handle, or by the same full path or URL that a call used. Then the first request of that user request carries one short request-local note before the model can repeat the call. The note names at most three outputs and asks for `zip_recall` instead of a repeated call. The match is exact and uses no model call. It reads the session branch, so it also finds outputs that a compaction took out of the view. It has no context-pressure gate and does not need the judge. A path counts only through the newest call on it. That call must not be an `edit` or `write` and must have returned a recallable output (no error, at least 1,000 chars), so an `edit` or `write` after a read gives no cue for the stale read or for a long diff report. A basename, a parent directory or a longer path does not count. An output shown in full in that request, and a `zip_recall` result, never count. The branch is scanned once per user request. A reference that does not fit is kept for the next request. The note requires `zip_recall` (tool recall mode). It is not persisted, is not a steer and does not mark a recall. `PI_ZIP_LOOKUP=0` turns it off.
+Users can name an earlier output by its exact handle, full file path, or URL.
+When this occurs, the first outgoing request carries a short note.
+The note names up to three matching outputs.
+It tells the model to call `zip_recall` instead of repeating the tool call.
 
-## Optional judge
+- Matching is exact and requires no model calls.
+- The check searches the session branch, including outputs removed by compaction.
+- It runs without context pressure requirements and without the judge.
+- Paths match only through their newest tool call.
+- That call must not be an `edit` or `write`.
+- The call must have returned at least 1,000 characters without errors.
+- Edits or writes after a read disable cues for that path.
+- Basenames, parent directories, and full outputs in view receive no note.
+- The note does not persist in session history.
+- Set `PI_ZIP_LOOKUP=0` to disable lookup cues.
 
-With `PI_ZIP_JUDGE=1`, a background chat call answers three independent factual questions per candidate: `<handle> <active> <finished> <lookup>`, with `Y`, `N` or `U` in each field and no citations. Code calculates priority: `lookup=Y` with an exact handle or full locator in recent user/assistant work becomes need if folded or hot if live; otherwise `active=Y` becomes hot (even when `finished=Y` or when a lookup reference is uncited); `N Y N` becomes cold; all other combinations and missing or duplicate rows stay warm. Switching files, age, silence and mere same-path calls do not establish `finished=Y`. A valid cold label can lower protected-turn eligibility for non-error outputs to 10 assistant requests. This policy is always enabled in the fork, without a separate toggle. The ordinary in-turn age gate must also be enabled. All other protections remain: recalls, recall outputs, the automatic-cache prefix, reread-only mode and minimum useful saving. The planner prices this candidate set using the existing law, then may substitute ranked folds: cold, warm, hot, then need. Ranking must save at least as many tokens as the initial eligible plan, including the last fold's overshoot. Carried placeholders stay byte-identical. The working target, rewrite-price law, back-to-back guard and summary pressure thresholds do not change; a different eligible fold set can change the resulting savings, rent and summary demand. Commit validation separately checks the early minimum age, cold label and non-error status. Thinking after a tool output alone never authorizes early folding.
+## Background judge (`PI_ZIP_JUDGE=1`)
 
-The judge uses Pi's model registry, with at most one call in flight and a 30-second timeout. Planning never waits for it. An explicit thinking level is sent only when the model advertises support; otherwise the provider default is kept. With no explicit level, a model whose provider picks the effort when none is named (GitHub Copilot on the Responses API, or a thinking-level map with `off: null`) is asked for its lowest supported level above `off`. At the provider default the call can outlast the 30-second timeout. Session changes discard verdicts. Run end, model changes, shutdown and `/zip off` abort the call. Failed calls retain still-valid verdicts until their 20-request expiry. The latest user request changing invalidates the whole scope. A new explicit handle/path reference, a live/folded transition, or recall invalidates the affected verdict. Removed handles are pruned. Invalidation runs before boundary planning, including below pressure and cooldown gates. Affected rows of an in-flight call are tainted and never applied; unaffected rows can finish and be used. The call is aborted when every submitted row is tainted or the whole request scope changes. Two consecutive provider/parse failures stop calls for the rest of the run.
+Enable the background judge by setting `PI_ZIP_JUDGE=1`.
+The judge runs a background chat call to score candidate tool outputs.
+It reports three factual values per candidate: `<handle> <active> <finished> <lookup>`.
+Each value must be `Y`, `N`, or `U`.
+The call includes no citations.
 
-Supersession is exact and needs no model: an output is cold when the same tool later ran again with the same arguments (key order ignored), or when a later successful `edit` or `write` changed the file at its full path. A failed later call, or a read of another range of the same file, supersedes nothing. These labels are set at every boundary, below every gate, are not submitted, and a model reply cannot replace them; they go when the superseding output leaves the view. Evidence rows carry assistant prose, thinking text and `call <tool> <args>` lines, never signatures or raw provider JSON; a row cut by the window keeps its start, because a row cut at its start cannot be cited.
+Code determines output priority from these facts:
+- `lookup=Y` with an exact handle or path in recent work assigns `need` (if folded) or `hot` (if live).
+- `active=Y` assigns `hot`, even if `finished=Y` or lookup validation fails.
+- `N Y N` assigns `cold`.
+- All other combinations, missing lines, and duplicates assign `warm`.
+- Switching files, silence, or same-path calls do not prove `finished=Y`.
 
-The judge and planner share fold candidate and placeholder-saving checks. To obtain cold labels before ordinary eligibility, the judge considers prospective candidates at `min(ordinary age, max(early age, judge age))` when early folding is enabled. Scoring does not authorize folding: the resulting label must be cold and the planner's separate checks must pass. Pressure, batch-size and cadence gates remain unchanged. Only new, invalidated or expired actionable candidates are submitted. Valid unsubmitted verdicts retain their original timestamps. Submitted omissions replace old advice with warm. Reuse bounds cost and staleness, but does not establish semantic correctness.
+### Early cold eligibility
 
-Retained catalogue rows keep their bytes and insertion order. Rows without a live or folded original are removed. Catalogue rows and their changing state share a hard 12K chars/4-token budget. Submitted candidates take priority over retained rows not needed by this call. Within that set, exact references take priority, then folded originals, then newest live outputs. Only selected rows are serialized. Eviction can change the cached prefix. The latest user request and a bounded recent-work tail follow. Candidate filtering does not filter that evidence tail.
+A valid `cold` label lowers protected-turn eligibility for non-error outputs to 10 assistant requests (from 60).
+This policy is always active in the fork when you set `PI_ZIP_JUDGE=1`.
+The ordinary in-turn age gate must also remain active.
+All other safety rules stay intact:
+- Recalls and recall outputs stay protected.
+- The automatic-cache prefix remains unchanged.
+- Re-read-only mode stays enforced.
+- Minimum useful token savings still apply.
 
-Calls still require 80% context pressure. They need at least five stale eligible live outputs or a stale, explicitly cited folded original. The cooldown is eight requests unless selected output growth reaches 10K chars/4 tokens. Growth sums positive differences against per-handle submitted sizes, not a catalogue total that eviction can shrink. No candidates means no prompt serialization or call. Recall traffic is not evidence. A valid `N` may add a lookup note with at most three handles to a request already going out. Only handles actually shown are remembered in the session; unshown handles remain eligible within the verdict's 20-request lifetime. A note never starts a run or replaces an original output in place.
+The planner ranks candidate folds: cold, warm, hot, then need.
+The new plan must save at least as many tokens as the default plan.
+Placeholders remain byte-identical.
+Model thinking after a tool output never triggers early folding on its own.
 
-The transport uses validated `Y/N/U` fact lines (`protocol: facts-v1`). No schema-enforcement capability is verified for the configured chat endpoint, so no provider-specific schema parameter is sent. This is not independent-logit classification. The ledger reports submitted handles, reused verdicts, input size, growth, usage, latency and failures. [Offline replay](judge-replay.md) separates fresh-call consistency, annotated correctness and cost. Unit tests use mocked answers and make no model-quality claim.
+### Judge runtime limits
 
-## Narrative continuity and production cost
+- The judge uses models from Pi's registry with at most one concurrent call.
+- The call has a 30-second timeout.
+- Planning never waits for judge results.
+- The call sends an explicit thinking level only when the model supports it.
+- Copilot models on Responses API, or models with `off: null`, run at their lowest level above `off`.
+- Changing the session discards verdicts.
+- Ending a run, switching models, shutting down, or running `/zip off` cancels active calls.
+- Failed calls keep existing valid verdicts until their 20-request expiration.
+- A new user prompt invalidates the entire scope.
+- Two consecutive provider or parse failures disable the judge for the rest of the run.
 
-Durable epochs are appended from each new slice and merged only when over budget. The narrative call also receives at most 500 chars/4 tokens of previous active state, not the durable epochs. It must retain open work unless the new slice shows completion or supersession, and writes each open item as its own `- [ ] ` line. If it omits the active section, the previous state is retained. The active state is bounded by whole lines, both as call input and in the summary: open-work lines (`- [ ]` items, or lines that name a todo, blocker, pending item or next step) are kept before other lines, kept lines stay in order, and one closing marker counts the open items and other lines that did not fit. An open item can still be dropped when open items alone exceed the bound; the marker then says how many. This reconciliation is model-written, not a deterministic guarantee of semantic fidelity.
+### Exact supersession
 
-Format v2 (`PI_ZIP_SUMMARY_V2=1`) makes each epoch own its part of the conversation. An epoch holds the user requests made in it (numbered from the raw branch; verbatim except for skill references and emergency excerpts), the model's findings, the assistant's stated commitments and the tool evidence of its slice, with a count of what was left out. The next summary parses the previous one and carries every old epoch as written. Only prose is merged by a model call; requests, evidence and omission counts of merged epochs are joined by code. Each execution record names the request it was made under (`R<n>`, the raw-branch number). A result that arrives after its call was summarised belongs to that call: the call is found in the raw branch, not in the summary text. If the call's record is still in the summary, the result is added to it, so one execution never shows up twice. If that record was dropped for budget, the new epoch's row carries the result, still under the call's execution id. A tool result belongs to the newest call issued before it with its id; one message issuing an id twice leaves the association unresolved. Every consumer (fold placeholders, recoverability, summary rows, recall) uses that rule.
+Code marks outputs `cold` through deterministic rules without model calls:
+- A tool ran again with identical arguments.
+- A later successful `edit` or `write` modified the target file.
 
-Format v3 (the default) replaces the epoch history with a state digest of numbered items: architecture, settled decisions, discarded approaches, test health and open work. Each narrative call only adds, edits, moves or drops items by number, a drop needs a reason, and the code carries every item the call does not name, so a fact the model forgets is not lost. Intent quotes name the item they are about. Evidence is limited to outputs the model selected or the digest names. Only the newest substantive requests stay verbatim; a request leaves the resident view only when the raw branch can return its exact text. Go-ahead-only requests are folded on the model's judgement alone, never on keywords, and only when they are short. Details: [details](fork.md#format-v3-a-state-digest).
+Failed tool calls and reads of different file offsets do not supersede earlier outputs.
+Deterministic supersession runs at every boundary and overrides model replies.
 
-Skill command expansions in v2 request rows are represented as `/skill:name`, with the user's trailing text unchanged. The narrative call reads the full skill expansion. Only the complete Pi user-message envelope is abbreviated; quoted examples and malformed blocks are not. Such request rows are labelled `skill references`, not `verbatim`. Normalization happens before budgeting, including for old expanded requests carried from previous summaries. Raw session requests and recall remain unchanged. `skillReferenceCount` counts these rows; request character diagnostics measure the skill-reference representation rather than expanded skill bodies.
+### Judge scheduling and gates
 
-The same narrative call proposes assistant commitments as JSON lines in `COMMITMENTS`, each with `sourceHandle` and an exact visible assistant quote. Code validates the source role and NFC quote span, deduplicates and bounds the records, but does not prove that a selected quote is semantically a commitment. No language keyword fallback creates commitments when proposals are absent, malformed or the model call fails. Historical commitment rows are still carried unchanged.
+The judge scores candidates at `min(ordinary age, max(early age, judge age))`.
+Calls require:
+- Context pressure of at least 80%.
+- At least five stale live candidates, or one stale cited folded output.
+- A cooldown of eight requests, unless selected candidate growth reaches 10,000 characters.
 
-The v2 narrative call also proposes up to eight `EVIDENCE` source/quote pairs: outputs supporting retained findings, final verification results for distinct scopes, or still-open blockers. Code accepts only exact NFC spans from tool results in that slice. Selected quotes replace generic hints and persist with their execution rows across compactions; selection does not prove the model's judgement of relevance. Missing or invalid proposals create no selected evidence.
+The transport uses the `facts-v1` line protocol.
+The system does not send provider-enforced schemas to chat endpoints.
 
-A verified routine read is left out of the catalogue unless it is an error, selected evidence, or the findings, current state, commitment or intent names it by handle, path or whole file name. Selected evidence and references from the final text of every kept epoch pin rows under the soft budget; an error status alone does not. A file-name mention alone does not pin a successful edit/write acknowledgement, though an explicit handle, execution id or model selection can. The narrative must name the outputs its findings rest on, by tool and path or command. Current intent lists the user's own words, proposed by the narrative call and accepted only as an exact NFC substring of a user request. When the call fails, the previous quotes are kept. The plan's summary size is a soft target. Unselected, unreferenced evidence is dropped in priority order: successful edit/write acknowledgements, ordinary observations, then historical errors. Within each tier, oldest records go first; records are never partially cut. An old failure is not automatically an unresolved blocker. The hard bound is the compaction room: the largest summary that keeps the compacted view below the model's room. Above it, unselected evidence goes before selected evidence, then commitments, then the intent quotes (the requests keep those words), then old prose, then the current state. An epoch whose prose no longer fits at all keeps its requests and evidence.
+## Narrative continuity and summary formats
 
-If the user requests still exceed the room, internal overflow triggers deterministic emergency request compaction (E1): the emergency floor (active state, validated intents, newest epoch prose) is restored in priority order if minimal request excerpts still fit alongside it. Remaining room is distributed among requests via water-filling: short requests remain verbatim, while long requests keep head (2/3) and tail (1/3) of raw text with the standard middle omission marker and handle (`emergency excerpt · original <n> chars`). The summary header notes `Requests: emergency excerpts — N of M requests shortened to fit the window; recall by R<n>/handle returns exact text.` Later compactions rebuild verbatim requests from the raw session branch. Only when the minimal emergency representation + mandatory summary structure exceeds the room does the summary fail closed as `request-budget-overflow`, and no checkpoint or model switch uses it.
+The summary pipeline updates narrative state across compactions.
+A narrative call receives at most 500 characters of previous active state.
+It must keep open work unless the slice shows completion.
+The call outputs open tasks as `- [ ]` lines.
+If the call omits the active section, the system keeps the previous state.
 
-Bash execution rows retain test counts alongside exit status. Exit 1 is labelled `differences (exit 1)`, not an error, for direct `diff` commands and direct `git diff --exit-code/--quiet/--no-index` commands without `--check`, `--ext-diff` or `--textconv`. Compound shell commands and unsupported syntax remain conservative: a nonzero exit is still an error because it may come from another operation.
+### Format v2 (`PI_ZIP_SUMMARY_V2=1`)
 
-The production gate reserves tier-merge cost as well as the narrative call and bounded active-state input. It simulates tier selection with maximum-sized merged replies, at the smallest possible narrative budget, for at most three calls. Each merge has its own word-sized output cap (normally 1024–3000 tokens), bounded by the model limit. Reasoning counts toward that cap. So a reasoning model that reasons even when no effort is asked for gets `PI_ZIP_SUM_MERGE_REASONING_TOKENS` (default 4,096) more on each merge call, and the reserve prices it. These are models whose thinking-level map has `off: null`, GitHub Copilot models, and a model whose provider refused a request without reasoning. A ready summary's calls remain sunk cost and are not priced again. The ledger's `summary_merge_cost` record reports `predicted_merge_cost` and `actual_merge_cost` in USD; predictions use the model's listed input/output prices and actuals use provider-reported charges.
+Format v2 appends conversation slices into durable epochs.
+Each epoch stores user requests (`R<n>`), findings, assistant commitments, and tool evidence.
+- The model merges prose sections.
+- Code joins requests, evidence records, and omission counts.
+- Late tool results bind to their originating call via execution identifiers.
+- Pi skill expansions show as `/skill:name` plus trailing user text.
+  The narrative call reads the expanded skill body.
+- Code saves assistant commitments in `COMMITMENTS` lines with exact quotes.
+- Code keeps up to eight tool outputs as `EVIDENCE` quotes.
+- Soft budgeting drops evidence in order: file write confirmations, ordinary observations, then old errors.
+- Hard room limits drop unselected evidence, selected evidence, commitments, intent quotes, old prose, then active state.
+- If requests exceed room, emergency water-filling (E1) shortens long requests to head and tail excerpts.
+- If minimal excerpts still exceed room, the summary fails with `request-budget-overflow`.
 
-The proofs and measurements below describe the default policy, not judge classification quality or its additional API cost.
+### Format v3 (default)
+
+Format v3 replaces growing epoch history with a bounded five-section digest:
+1. Architecture
+2. Settled decisions
+3. Discarded approaches
+4. Test health
+5. Open work
+
+Items use stable numbers (`- [i12]`).
+The narrative call emits delta operations only: `ADD`, `EDIT`, `MOVE`, and `DROP iN: reason`.
+Code retains any item not named in the model response.
+Intent quotes link directly to digest items (`about i37`).
+Evidence includes only items selected by the model or named in the digest.
+The newest substantive requests remain verbatim.
+Older requests become digested ranges once verified in the raw branch.
+Short go-ahead requests fold into compact ranges based on model judgment.
+Summaries exceeding target room emit a minimal summary and log `overRoom`.
+Format v3 never fails with `request-budget-overflow`.
+
+## Shell commands and production costs
+
+Code marks direct `diff` and `git diff` commands that exit with code 1 as `differences (exit 1)` instead of errors.
+Compound commands with nonzero exits remain classified as errors.
+
+The production cost gate reserves funds for:
+- Tier merges.
+- The narrative call.
+- Active-state input.
+
+Reasoning models receive `PI_ZIP_SUM_MERGE_REASONING_TOKENS` (default 4,096) extra tokens per merge call.
+The system logs predicted and actual costs in `summary_merge_cost` records.

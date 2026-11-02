@@ -1,6 +1,8 @@
 # pi-zip
 
-> Fork users: see [fork features](docs/fork.md) for v2/v3 summaries, memory, judge and recovery behavior. The remaining text is the upstream reference. [Upstream sync guide](UPSTREAM.md).
+> **Fork overview:** This fork adds format v3 state digests, SQLite session memory retrieval, an optional background judge, and safe multi-window recovery.
+> See [fork features](docs/fork.md), [fork design](docs/fork-design.md), and [judge replay](docs/judge-replay.md).
+> Upstream sync guide: [UPSTREAM.md](UPSTREAM.md). The remaining text below is the upstream reference.
 
 
 Keeps long [Pi](https://github.com/earendil-works/pi) sessions cheap without losing anything.
