@@ -125,6 +125,7 @@ Ledger record types:
 - `judge_skip`: Explains why a judge call did not run (pressure, cadence, or small batch).
 - `judge`: Records submitted handles, age gates, stream chunks, and fact verdicts.
 - `law.foldDecision`: Records candidate groups, eligibility reasons, and cost-benefit decisions.
+- `law.steps`: One row per cost check (`B`, `A`, `K`, `phi`, `eta`). The `guard` row also carries `rent`: tokens saved since the last rewrite that can pay for this one.
 - `fold`: Confirms committed folds with savings and verdict metadata.
 
 ## Lookup cues

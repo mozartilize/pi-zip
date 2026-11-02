@@ -186,7 +186,7 @@ describe("through the extension: the free signal is learned, persisted and used;
 		expect(law).toMatchObject({ where: "run", g: 2500, pWarm: 0, survSrc: "prior", cls: "explicit", wr: 12.5, prSrc: "class" });
 		expect(law.steps.at(-1)).toMatchObject({ at: "guard", ok: true });
 		expect(law.steps.at(-1).K).toBeLessThan(0);
-		expect(Object.keys(law.steps.at(-1))).toEqual(["at", "ok", "B", "A", "T", "Tsuf", "phi", "K", "eta"]);
+		expect(Object.keys(law.steps.at(-1))).toEqual(["at", "ok", "B", "A", "T", "Tsuf", "phi", "K", "eta", "rent"]);
 		expect(law.steps.at(-1).T).toBe(law.steps.at(-1).A);
 		expect(law.summaryGate).toMatchObject({ reason: "below-target", eligible: false });
 	});

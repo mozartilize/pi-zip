@@ -1299,6 +1299,10 @@ describe("Zip integration", () => {
 			zip.messageEnd(message, ctx);
 			const out = await zip.turnEnd({ message, entries: [], context: { contextEntries: entries } }, ctx);
 			const fold = records.find((r) => r.type === "fold");
+			// the guard step logs the rent it was offered; the other steps are not paid from rent and carry none
+			const steps = records.find((r) => r.type === "law" && r.where === "turn_end").steps;
+			expect(steps.filter((s: Any) => s.at === "guard").map((s: Any) => s.rent)).toEqual([1_000_000_000_000]);
+			expect(steps.filter((s: Any) => s.at !== "guard").some((s: Any) => "rent" in s)).toBe(false);
 			if (cold) {
 				expect(out?.entries.some((e: Any) => e.type === "context_edit")).toBe(true);
 				expect(fold).toMatchObject({ handles: [h(15)], ages: [10], plannedAges: [10], verdicts: ["cold"], earlyFold: [{ minAge: 10, regularAge: 60 }] });
