@@ -762,7 +762,7 @@ describe("Memory at a new user prompt", () => {
 
 	async function run(replies: Array<string | Error>, e: Any = { messageType: "user", prompt: PROMPT }, o: Parameters<typeof fakeSession>[1] = { hidden: COMPACTED }, entries: Any[] = withSibling()) {
 		const s = fakeSession(entries, { leaf: "om", ...o });
-		const { sent, reg } = registry(replies);
+		const { sent, reg, options } = registry(replies);
 		const ctx = { ...s.ctx, modelRegistry: reg };
 		const logs: Any[] = [];
 		const mem = new Memory((r) => logs.push(r));
@@ -771,7 +771,7 @@ describe("Memory at a new user prompt", () => {
 		await mem.settled();
 		const note = mem.current(ctx);
 		mem.shutdown();
-		return { sent, note, logs, retrieval: logs.find((r) => r.type === "memory_retrieval"), ctx };
+		return { sent, options, note, logs, retrieval: logs.find((r) => r.type === "memory_retrieval"), ctx };
 	}
 	test("a tool result carries the outcome of its whole output, which the excerpt alone may not show", () => {
 		const out = "PASS retry 1\n" + "pad\n".repeat(400) + "21 pass\n1 fail\nCommand exited with code 1";
@@ -784,8 +784,9 @@ describe("Memory at a new user prompt", () => {
 	});
 
 	test("plan, then search, then the answer: the planner's keywords are the query and the note cites the real handle", async () => {
-		const { sent, note, retrieval } = await run([PLAN, ANSWER]);
+		const { sent, options, note, retrieval } = await run([PLAN, ANSWER]);
 		expect(sent.map(isPlan)).toEqual([true, false]);
+		expect(options.map((o) => o.cacheRetention)).toEqual(["none", "none"]);
 		expect(sent[0].messages[0].content[0].text).toContain(PROMPT);
 		const input = sent[1].messages[0].content[0].text;
 		expect(input).toContain(`conclusion [handle ${handleFor("a3")}] — answer to: "fix the retry timeout in src/retry.ts"`);

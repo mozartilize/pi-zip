@@ -291,7 +291,7 @@ export class RetrievalConversation {
 			const maxTokens = Math.min(o.maxTokens ?? 4000, Number(this.model.maxTokens) > 0 ? Number(this.model.maxTokens) : 4000);
 			const user = { role: "user", content: [{ type: "text", text }], timestamp: Date.now() };
 			const context = { systemPrompt: step === "plan" ? PLAN_SYSTEM : ANSWER_SYSTEM, messages: [user] };
-			const options = { maxTokens, signal: sig, cacheRetention: "short" };
+			const options = { maxTokens, signal: sig, cacheRetention: "none" };
 			sig.throwIfAborted(); // cancellation may arrive while model selection is awaiting the registry
 			const reg = this.ctx.modelRegistry;
 			const res: Any = level && reg.streamSimple
