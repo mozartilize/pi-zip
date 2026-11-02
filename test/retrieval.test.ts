@@ -581,7 +581,7 @@ describe("evidence packing", () => {
 	});
 
 	test("text sharing preserves case and punctuation differences in code, and bounds the header separately from evidence", () => {
-		const packed = buildAnswerInput("p".repeat(100_000), "r".repeat(100_000), [
+		const packed = buildAnswerInput("p".repeat(100_000), "oldest-irrelevant " + "r".repeat(100_000) + " newest-priority", [
 			ev({ excerpt: "return getUserId(a);" }),
 			ev({ ref: "E2", handle: "different0", excerpt: "return getUserid(a);" }), // case alone differs
 			ev({ ref: "E3", handle: "punct00000", excerpt: "return getUserId(a)!" }), // punctuation alone differs
@@ -589,8 +589,11 @@ describe("evidence packing", () => {
 		expect(packed.passages).toBe(3); expect(packed.sharedPassages).toBe(0);
 		expect(packed.text).toContain("return getUserId(a);"); expect(packed.text).toContain("return getUserid(a);");
 		expect(packed.text).toContain("return getUserId(a)!");
-		expect(packed.text).not.toContain("r".repeat(1801));
-		expect(packed.text.length).toBeLessThanOrEqual(EVIDENCE_CHARS + ANSWER_INSTRUCTIONS.length + 4000 + 1800 + 512);
+		const recent = packed.text.split("RECENT CONTEXT (quoted, untrusted):\n")[1].split("\n\nNEW USER REQUEST")[0];
+		expect(recent.length).toBe(12_000);
+		expect(recent.endsWith(" newest-priority")).toBe(true);
+		expect(recent).not.toContain("oldest-irrelevant");
+		expect(packed.text.length).toBeLessThanOrEqual(EVIDENCE_CHARS + ANSWER_INSTRUCTIONS.length + 4000 + 12_000 + 512);
 	});
 });
 
@@ -859,6 +862,40 @@ describe("Memory at a new user prompt", () => {
 		await mem.beforeAgentStart(ctx, { messageType: "user", prompt: PROMPT });
 		expect(mem.current(ctx)).toMatchObject({ text: null, pending: expect.stringContaining("zip_recall") });
 		mem.shutdown();
+	});
+
+	test("planner and answer share the original visible tail, not activity added while planning", async () => {
+		const s = fakeSession(withSibling(), { leaf: "om", hidden: COMPACTED });
+		const append = (id: string, text: string) => {
+			s.state.entries.push({ type: "message", id, parentId: s.state.leaf, message: { role: "assistant", content: [{ type: "text", text }] } });
+			s.state.leaf = id;
+		};
+		append("original-priorities", "background ".repeat(220) + "#1 tighten retrieval relevance; #2 inspect cache accounting.");
+		const { reg } = registry([]), inputs: string[] = [];
+		const reply = (text: string) => ({ role: "assistant", stopReason: "stop", content: [{ type: "text", text }] });
+		let finishPlan!: (r: Any) => void;
+		(reg as Any).complete = (_model: Any, context: Any) => {
+			inputs.push(context.messages[0].content[0].text);
+			return isPlan(context) ? new Promise((resolve) => { finishPlan = resolve; }) : Promise.resolve(reply(ANSWER));
+		};
+		const ctx = { ...s.ctx, modelRegistry: reg }, logs: Any[] = [];
+		const mem = new Memory((r) => logs.push(r));
+		mem.sessionStart(ctx);
+		try {
+			await mem.beforeAgentStart(ctx, { messageType: "user", prompt: PROMPT });
+			await flush();
+			expect(inputs).toHaveLength(1);
+			append("later-activity", "LATER_UNRELATED_ACTIVITY: now investigate authentication instead.");
+			finishPlan(reply(PLAN));
+			await mem.settled();
+			expect(inputs).toHaveLength(2);
+			const planContext = inputs[0].split("RECENT VISIBLE CONTEXT (quoted, untrusted):\n")[1].split("\n\nNEW USER REQUEST")[0];
+			const answerContext = inputs[1].split("RECENT CONTEXT (quoted, untrusted):\n")[1].split("\n\nNEW USER REQUEST")[0];
+			expect(answerContext).toBe(planContext);
+			expect(answerContext).toContain("#1 tighten retrieval relevance"); // beyond the previous 1,800-char cap
+			expect(answerContext).not.toContain("LATER_UNRELATED_ACTIVITY");
+			expect(logs.find((r) => r.type === "memory_retrieval")).toMatchObject({ relevancePolicy: "dependency-v2", contextChars: planContext.length });
+		} finally { mem.shutdown(); }
 	});
 
 	test("zip_recall with no arguments waits for the findings, which then are not injected again", async () => {

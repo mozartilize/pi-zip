@@ -1,0 +1,75 @@
+[
+  {
+    "id": "performance-not-test-history",
+    "prompt": "Several sessions ran after the changes. Check recent judge and retrieval performance.",
+    "recent": "assistant: Early folding and retrieval changes are committed. Judge latency, cancellations and retrieval usefulness are what we want to measure next.",
+    "evidence": [{"ref":"E1","text":"bun test test/judge.test.ts: 62 pass, 1 fail. Failure: early candidates still obey automatic prefix, recall-output and reread-only protections. No assertion details or runtime measurements were printed."}],
+    "expected": [],
+    "why": "A test-suite failure contains no runtime performance measurement or demonstrated cause of a performance problem."
+  },
+  {
+    "id": "test-history-direct-question",
+    "prompt": "Which test failed in the earlier judge test run?",
+    "recent": "assistant: The original test output has been folded.",
+    "evidence": [{"ref":"E1","text":"bun test test/judge.test.ts: 62 pass, 1 fail. Failure: early candidates still obey automatic prefix, recall-output and reread-only protections. No assertion details or runtime measurements were printed."}],
+    "expected": ["E1"],
+    "why": "The same output directly answers a question about the earlier test failure."
+  },
+  {
+    "id": "performance-mixed-evidence",
+    "prompt": "Check judge performance in the sessions after the change.",
+    "recent": "assistant: The new version was deployed on November 1. We have not inspected its runtime metrics yet.",
+    "evidence": [
+      {"ref":"E1","text":"Before deployment: bun test test/judge.test.ts: 62 pass, 1 fail. Failure: early candidates obey automatic prefix protection."},
+      {"ref":"E2","text":"Runtime log aggregation for November 1-2, after deployment: judge calls=15, applied=10, cancelled=5, latency p50=8.2s p90=12.5s; recorded cost=$0.013."}
+    ],
+    "expected": ["E2"],
+    "why": "Only the runtime aggregation contributes the measurements requested."
+  },
+  {
+    "id": "definition-not-occurrence",
+    "prompt": "What does shipment status 6030 mean?",
+    "recent": "assistant: We know 6030 occurs in shipment payloads, but have not found its definition.",
+    "evidence": [{"ref":"E1","text":"Payload: shipment_status_code=6030, location_role=UL, timestamp=2026-10-29T08:00:00Z. This excerpt contains no enum, status description or mapping definition."}],
+    "expected": [],
+    "why": "Another occurrence cannot establish the meaning of the code."
+  },
+  {
+    "id": "definition-supported",
+    "prompt": "What does shipment status 6030 mean?",
+    "recent": "assistant: We know 6030 occurs in shipment payloads, but have not found its definition.",
+    "evidence": [
+      {"ref":"E1","text":"Payload: shipment_status_code=6030, location_role=UL, timestamp=2026-10-29T08:00:00Z. This excerpt contains no enum, status description or mapping definition."},
+      {"ref":"E2","text":"Recorded status catalogue, version 2: code 6030 = APPOINTMENT_UNLOAD_TAKEN, meaning an unloading appointment has been booked."}
+    ],
+    "expected": ["E2"],
+    "why": "The catalogue supports a historical definition; an extra occurrence adds nothing."
+  },
+  {
+    "id": "historical-baseline-needed",
+    "prompt": "Compare the old judge latency with the current sessions.",
+    "recent": "assistant: Current sessions have median judge latency 8.2 seconds. The old median is not visible here.",
+    "evidence": [
+      {"ref":"E1","text":"Before the change, session log measurements gave median judge latency 27.1 seconds across 39 calls."},
+      {"ref":"E2","text":"Current sessions have median judge latency 8.2 seconds."}
+    ],
+    "expected": ["E1"],
+    "why": "Old evidence is useful when explicitly comparing with a historical baseline; the current value is already visible."
+  },
+  {
+    "id": "explicit-reference-analogy",
+    "prompt": "Create a Databricks query skill similar to our psql-tracing skill, preserving its query limits and credential-safety rules.",
+    "recent": "assistant: The psql-tracing skill's earlier contents are folded. We have not checked its limits in this run.",
+    "evidence": [{"ref":"E1","text":"psql-tracing: read-only queries; 30-second statement timeout; maximum 200 rows per query. Never print or commit short-lived credentials. Its authentication mechanism is PostgreSQL IAM, not Databricks OAuth."}],
+    "expected": ["E1"],
+    "why": "The request explicitly asks for this reference's rules; analogous history is not categorically irrelevant."
+  },
+  {
+    "id": "numbered-followup-not-old-failure",
+    "prompt": "ok #1 first",
+    "recent": "assistant: Next priorities: 1. Tighten retrieval relevance so a note contributes a missing fact, not just shared vocabulary. 2. Investigate early-fold economics. 3. Verify cache accounting. No current judge correctness failure was reported.",
+    "evidence": [{"ref":"E1","text":"Earlier judge test run: 62 pass, 1 fail. Failure: early candidates still obey automatic prefix, recall-output and reread-only protections."}],
+    "expected": [],
+    "why": "The visible numbered list resolves the follow-up to retrieval relevance, not an old judge test failure."
+  }
+]

@@ -1,5 +1,5 @@
-// The query planner: the first, awaited model call of a prompt. It reads the new request and a bounded tail of the visible context,
-// says whether the request is a bare continuation (then nothing is searched), and otherwise writes multilingual keyword queries
+// The query planner: a background model call using a snapshot of the prompt's visible context. It reads the new request and its tail,
+// says whether it is a bare continuation (no expanded search or answer call), and otherwise writes multilingual keyword queries
 // along four facets (what / why / how / when) for the local FTS search. It never judges whether the visible context or the history
 // is sufficient: that is not decidable from the visible context alone.
 import { visibleText } from "../ledger/source.ts";
@@ -20,15 +20,19 @@ reasoning, tool calls and tool outputs that the model can no longer see.
 TASK 1: CONTINUATION GATE
 If the new request is purely an acknowledgement, confirmation, or simple instruction to proceed without asking questions or requiring historical context (e.g., "ok", "continue", "proceed", "go ahead", "thanks", "commit"), reply:
 {"continue": true, "queries": []}
-Do not judge whether visible context is already sufficient; only check if the request itself is a trivial continuation.
+Resolve a short reference like "ok #1 first" against the visible numbered list. If it only approves a proposed next step, treat it as
+proceeding with that step; do not invent a question about older history. An explicit request to recall or compare earlier facts is not
+a bare continuation. Do not otherwise judge whether visible context is sufficient.
 
 TASK 2: FORMULATE SEARCH QUERIES
 Otherwise, first split the request into its distinct sub-questions (aspects): one aspect per separate thing the request asks about
 (one claim to verify, one component, one incident, one requirement). Name each aspect with 1-3 words.
-Then, for each aspect, write its queries. Every aspect gets at least:
-- "what": the aspect's own terms, files, symbols.
-- "why": the specifications, requirements, design decisions or reviews that govern that aspect (Rule 3).
-Add "how" and "when" for the aspect when the request needs steps, commands, versions, or chronology.
+Then write queries for the relation the user actually asks about, not every possible topic associated with the component.
+Every aspect gets "what": the aspect's own terms and the requested facts. Add "why" only when intent, causes, requirements or design
+rationale are relevant to that request (Rule 3). Add "how" and "when" when the request needs steps, commands, versions, or chronology.
+A runtime performance check should search measured latency, usage, cancellations, costs and relevant comparison periods. Do not
+replace those measurements with generic specification or old test-failure queries merely because they mention the same component.
+A code-meaning question should search definitions or mappings, rather than treating occurrences as definitions.
 - "what": Core subjects, files, symbols, config keys, error codes, interfaces.
 - "why": Governing specifications, requirements, design decisions, rationales, rules, and code reviews behind the feature's behavior.
 - "how": Implementation details, functions, test commands, scripts, verification steps.
@@ -38,13 +42,14 @@ QUERY RULES:
 1. VERBATIM TERMS: Use exact identifiers, function names, file paths, and distinctive phrases that would literally appear in source code or logs.
 2. NO GENERIC STOPWORDS OR ANECDOTAL LABELS: Never include words like "code", "file", "fix", "error", "issue", "explain", "why", "how", "check", "update", or labels naming individual test cases, runs, or chunks (e.g. any word matching case, chunk, step, or item followed by a number).
 3. INVESTIGATING CLAIMS, BUGS, OR BEHAVIOR:
-   When an analysis, review, or user report claims that a function or component behaves incorrectly (e.g. "function X mistakenly includes Y" or "component Z drops W"):
-   Always query for the ORIGINAL SPECIFICATIONS, DESIGN DECISIONS, REQUIREMENTS, or ACCEPTED CODE REVIEWS of that component to check its intended contract:
+   When the request disputes the intended contract (e.g. whether function X should include Y or component Z may drop W), query for
+   its ORIGINAL SPECIFICATIONS, DESIGN DECISIONS, REQUIREMENTS, or ACCEPTED CODE REVIEWS:
    - Identify the component at issue and query for its specification and governing design rationales (e.g. why it was designed to include or exclude that data, what its contract specifies).
-   - Focus on the governing design policy and rules, not on the incidental log metrics or sample data quoted in the report.
+   - For a disputed behavioral contract, search its governing policy. For an empirical measurement request, preserve its metrics and
+     time scope instead; add design-policy queries only if the request also asks whether that behavior is intended.
 4. MULTI-QUESTION COVERAGE: Cover all distinct questions or subjects in the request (e.g. if the request asks both about a command/tool and a code decision, generate queries for each).
-5. BILINGUAL FUSION: Combine English technical terms (code, paths, commands) and the user's natural language terms (decisions, requirements) within the same facet query. Do NOT split into redundant English-only and native-language-only queries; emit 3 to 4 strong, unified queries in total.
-6. ONE ASPECT PER QUERY: tag every query with the name of the sub-question it serves ("aspect"). Up to 4 aspects, each with its what and why (plus how/when); at most ${PLAN_LIMITS.queries} queries in total.
+5. BILINGUAL FUSION: Combine English technical terms and the user's natural language terms within the same facet query. Do NOT split into redundant English-only and native-language-only queries. Prefer a few precise queries; do not add facets just to meet a count.
+6. ONE ASPECT PER QUERY: tag every query with the name of the sub-question it serves ("aspect"). Up to 4 aspects, with only the facets needed for each; at most ${PLAN_LIMITS.queries} queries in total.
 7. LENGTH: 4 to 8 distinctive keywords or 2-3 word phrases per query, most specific first.
 
 Example input: "> The connection retry limit was lowered to 2; that was left as configured. why was that done?"

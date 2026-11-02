@@ -146,11 +146,19 @@ Key memory properties:
 - **Deterministic storage:** FTS5 indexes text from user, assistant, thinking, and tool blocks.
   Graph edges connect calls to results and requests to steps.
 - **Session-local:** The indexer processes only the active session, up to 500 entries per batch.
-- **Background planning:** A background call splits new prompts into sub-questions across four facets (what, why, how, when).
+- **Background planning:** A background call splits new prompts into sub-questions, using only relevant facets (what, why, how, when).
+  Performance questions search measurements and comparison periods, not generic design-policy or test-failure records.
+  A numbered approval such as "ok #1 first" resolves against the visible list and can skip expanded retrieval.
 - **Fast local search:** While the planner runs, local keyword search runs immediately as a fallback.
 - **Graph traversal:** Prompts with paths or symbols query up to 6 paths and 6 symbols across the referential graph.
 - **Candidate pool:** The candidate count scales as `min(32, ceil(8 * sqrt(T)))` for `T` topics.
 - **Input packing:** The answer call receives at most 48,000 characters of evidence.
+  Planner and answer share one request-time snapshot of recent visible context, capped at 12,000 characters with the newest tail retained.
+  Later tools, steers or a successor run do not replace that snapshot.
+- **Relevance selection:** A finding must contribute a missing fact or necessary premise for the actual request, not just mention its subject.
+  An old unit-test failure does not answer a runtime performance question; a code occurrence does not define that code.
+  Historical baselines and explicitly requested reference rules remain eligible. Existing citation/provenance checks remain unchanged.
+  `memory_retrieval.relevancePolicy` records `dependency-v2`; `contextChars` records the snapshot size. Decisions still record each item's need and reason.
 - **Background delivery:** An initial pending note alerts the model that retrieval is running.
   Findings append to the next message once ready, or return immediately via `zip_recall({})`.
 
@@ -161,6 +169,13 @@ Configuration:
 - `PI_ZIP_MEMORY_TRACE=0`: Disables raw reply logging in the ledger.
 
 Run `npm run index <session.jsonl>...` to build or inspect the memory database offline.
+
+For a small live answer-selection diagnostic, run:
+```sh
+bun bench/retrieval-relevance.ts provider/model /tmp/relevance-results.json
+```
+This sends eight synthetic contrastive cases through the configured model runtime and can incur provider charges.
+Expected source IDs are specified in `test/fixtures/retrieval-relevance.json`. This tests focused cases, not production precision.
 
 ## Optional background judge
 

@@ -9,7 +9,7 @@ import { randomUUID } from "node:crypto";
 import { Ledger, type LedgerCounts } from "./ledger/projector.ts";
 import { readSource, visibleText } from "./ledger/source.ts";
 import { sqliteAvailable } from "./ledger/db.ts";
-import { ageOf, type CallInfo, memoryTraceEnabled, requestText, RetrievalConversation } from "./retrieval/assistant.ts";
+import { ageOf, type CallInfo, memoryTraceEnabled, requestText, RetrievalConversation, RECENT_CHARS, RELEVANCE_POLICY } from "./retrieval/assistant.ts";
 import { type DropStats, PACKET_LIMITS, renderPacket } from "./retrieval/packet.ts";
 import { type Plan, visibleTail } from "./retrieval/planner.ts";
 import { DEFAULT_LIMITS, hiddenOutputs, type Query, queryOf, retrieve, type Scope, scopeOf } from "./retrieval/search.ts";
@@ -248,7 +248,7 @@ export class Memory {
 		// One record per prompt, joined to its calls and its injection by requestId. `stage` says where a skipped run stopped, so a
 		// log can be read without replaying the session; `latency` and `evidence` are what tuning needs (which candidate carried a
 		// finding, and how long each step took). Nothing here changes behaviour.
-		const rec: Record<string, unknown> = { type: "memory_retrieval", requestId, stage: "start" };
+		const rec: Record<string, unknown> = { type: "memory_retrieval", requestId, stage: "start", relevancePolicy: RELEVANCE_POLICY };
 		const latency: Record<string, number> = {};
 		let background = false;
 		try {
@@ -266,7 +266,11 @@ export class Memory {
 			this.stats.prompts++;
 			rec.promptChars = e.prompt.length;
 			const query = queryOf(e.prompt);
-			const planned = conv.plan(requestText(e.prompt), visibleTail(ctx, e.prompt));
+			// Freeze the request's visible tail before either call yields. Later tools, steers or a successor run must not change
+			// what the answer selector treats as the request's context. Both calls receive the same bounded snapshot.
+			const recent = visibleTail(ctx, e.prompt).slice(-RECENT_CHARS);
+			rec.contextChars = recent.length;
+			const planned = conv.plan(requestText(e.prompt), recent);
 			planned.catch(() => {}); // owned by the background step
 			// The prompt's own words are searched while the planner call is in flight: the main model waits for this only.
 			let t = Date.now();
@@ -277,7 +281,7 @@ export class Memory {
 			this.note = { sessionId: src.sessionId, requestId, prompt: e.prompt, pending: early?.evidence.length ? pendingNote(early.evidence.length) : "", text: null, found: false, cited: [], delivered: false };
 			background = true;
 			latency.foreground = Date.now() - t0;
-			job.answer = this.background(ctx, e, job, signal, conv, planned, query, early, led, scope, src.sessionId, revision, rec, latency, t0)
+			job.answer = this.background(ctx, e, job, signal, conv, planned, recent, query, early, led, scope, src.sessionId, revision, rec, latency, t0)
 				.catch((err) => { try { this.log({ type: "error", where: "memory/background", requestId, error: errText(err) }); } catch {} });
 		} catch (err) {
 			rec.error = errText(err);
@@ -289,7 +293,7 @@ export class Memory {
 		}
 	}
 
-	private async background(ctx: Any, e: Any, job: RetrievalJob, signal: AbortSignal, conv: RetrievalConversation, planned: Promise<Plan | null>,
+	private async background(ctx: Any, e: Any, job: RetrievalJob, signal: AbortSignal, conv: RetrievalConversation, planned: Promise<Plan | null>, recent: string,
 		query: Query, early: Retrieved | null, led: Ledger, scope: Scope, sessionId: string, revision: string, rec: Record<string, unknown>, latency: Record<string, number>, t0: number) {
 		const drops: DropStats = { unknownHandle: 0, empty: 0, cap: 0, notFolded: 0, notNeeded: 0 };
 		let own: { text: string; cited: string[] } | null = null, related: (cited: string[]) => boolean = () => false;
@@ -331,7 +335,7 @@ export class Memory {
 			if (note && !note.pending && !this.pendingShown) note.pending = pendingNote(r.evidence.length); // shown text never changes
 			this.stats.calls++;
 			t = Date.now();
-			const packet = await conv.answer(e.prompt, recentContext(ctx), r.evidence, job.requestId, revision, drops);
+			const packet = await conv.answer(e.prompt, recent, r.evidence, job.requestId, revision, drops);
 			latency.answer = Date.now() - t;
 			// A provider may ignore abort. Never publish its late response into another run or branch.
 			if (stale()) return void (rec.skip = "cancelled");
