@@ -112,6 +112,9 @@ zip_recall({})                                     // Wait for pending retrieval
 - Request numbers use 1-based raw branch indexing.
 - Assistant recall returns visible text only, not private thinking.
 - Calling `zip_recall` without arguments waits for background retrieval results.
+- All arguments are optional. Exact handle/request recalls omit `scope`; it selects record kinds only for unanchored `grep` searches.
+- Responses API payloads explicitly send `strict: false` for `zip_recall`, including incremental tool declarations.
+  This prevents the endpoint from turning optional fields into required arguments. Explicit strict settings, other tools and other provider protocols are unchanged.
 - In file-only mode, `requests.txt` supplies the request ledger.
 - A failed or unanswered recall does not mark an output as recalled.
 

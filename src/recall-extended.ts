@@ -338,6 +338,34 @@ export interface RecallHooks {
 	retrievalNote?(ctx: Any, signal?: AbortSignal): Promise<string | null>;
 }
 
+/** Responses endpoints can make every field required when strict is omitted. Preserve recall's optional arguments explicitly.
+ * Only wire declarations are touched, including incremental additions; transcript data and explicit strict settings stay intact. */
+export function recallProviderPayload(api: string, payload: Any): Any | undefined {
+	if (!["openai-responses", "openai-codex-responses", "azure-openai-responses"].includes(api) || !payload || typeof payload !== "object" || Array.isArray(payload)) return undefined;
+	const patchTools = (tools: Any): Any => {
+		if (!Array.isArray(tools)) return tools;
+		let changed = false;
+		const next = tools.map((tool) => {
+			if (tool?.type !== "function" || tool.name !== RECALL_TOOL || tool.strict != null) return tool;
+			changed = true;
+			return { ...tool, strict: false };
+		});
+		return changed ? next : tools;
+	};
+	const tools = patchTools(payload.tools);
+	let input = payload.input;
+	if (Array.isArray(input)) {
+		const next = input.map((item: Any) => {
+			if (item?.type !== "additional_tools" && item?.type !== "tool_search_output") return item;
+			const tools = patchTools(item.tools);
+			return tools === item.tools ? item : { ...item, tools };
+		});
+		if (next.some((item: Any, i: number) => item !== input[i])) input = next;
+	}
+	if (tools === payload.tools && input === payload.input) return undefined;
+	return { ...payload, ...(tools !== payload.tools ? { tools } : {}), ...(input !== payload.input ? { input } : {}) };
+}
+
 export function registerRecallTool(pi: ExtensionAPI, hooks: RecallHooks) {
 	pi.registerTool({
 		name: RECALL_TOOL,

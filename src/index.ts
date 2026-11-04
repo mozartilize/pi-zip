@@ -3,7 +3,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { Any } from "./util.ts";
 import { type NoticeData, registerZipCommand, renderNotice } from "./notice.ts";
 import { RECALL_TOOL } from "./placeholder.ts";
-import { registerRecallTool } from "./recall-extended.ts";
+import { recallProviderPayload, registerRecallTool } from "./recall-extended.ts";
 import { parseRecallPath } from "./recallfile.ts";
 import { NOTICE_CUSTOM } from "./run.ts";
 import { ZipFork } from "./run-fork.ts";
@@ -175,7 +175,10 @@ export default function piZip(pi: ExtensionAPI) {
 		return r;
 	});
 	pi.on("agent_before_settle", (e, ctx) => zip.settle(e, ctx));
-	pi.on("before_provider_request", (e, ctx) => zip.providerRequest(e, ctx));
+	pi.on("before_provider_request", async (e, ctx) => {
+		const guarded = await zip.providerRequest(e, ctx);
+		return recallProviderPayload(e.api ?? ctx?.model?.api, guarded ?? e.payload) ?? guarded;
+	});
 	pi.on("model_select", (e) => zip.modelSelect(e.model)); // a mid-run /model has no run start
 	pi.on("tool_call", (e, ctx) => zip.toolCall(e, ctx)); // a recall file named by a built-in tool: this machine's copy, written on demand
 	// Pi's idle cache warming: observed only (the return value is undefined, so Pi's own decision stands); an older Pi never fires it
